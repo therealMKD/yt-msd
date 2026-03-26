@@ -1,6 +1,11 @@
+#Open Source Software under the Apache License, Version 2.0
+#This was only partially vibe coded, I swear I know what I'm doing.
+#Running this script as-is will require you to have the following dependencies installed THROUGH PYTHON (not individually):
+# yt-dlp "py -m pip install yt-dlp"
+
 import yt_dlp
 
-
+# Youtube search function. If you aren't finding what you want in the first 10 results, you can change max_results to something higher
 def search_youtube(query, max_results=10):
     ydl_opts = {
         'quiet': True,
@@ -10,8 +15,7 @@ def search_youtube(query, max_results=10):
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(f"ytsearch{max_results}:{query}", download=False)
-
-        # Filter only actual videos (skip channels/playlists)
+        
         results = []
         for entry in info['entries']:
             if entry.get('_type') == 'url' or entry.get('ie_key') == 'Youtube':
@@ -20,28 +24,56 @@ def search_youtube(query, max_results=10):
         return results
 
 
-def download_audio(url):
+def choose_format():
+    print("\nSelect output format (leave blank for mp3):")
+    print("  1) mp4")
+    print("  2) flac")
+    print("  3) wav")
+    print("  4) aac")
+    print("Or type a custom yt-dlp format string (e.g., 'bestaudio/best') or codec name.")
+    choice = input("Format [mp3]: ").strip()
+# By default, this script will download in mp3. If you want a different format by default, you can substitute it in the return statement below.
+    if not choice:
+        return {'codec': 'mp3', 'format': None}
+
+    low = choice.lower()
+    if low in ('1', 'mp4'):
+        return {'codec': 'm4a', 'format': None}
+    if low in ('2', 'flac'):
+        return {'codec': 'flac', 'format': None}
+    if low in ('3', 'wav'):
+        return {'codec': 'wav', 'format': None}
+    if low in ('4', 'aac'):
+        return {'codec': 'aac', 'format': None}
+
+    return {'codec': None, 'format': choice}
+
+
+def download_audio(url, chosen=None):
+    if chosen is None:
+        chosen = choose_format()
+#If you want to hard code a download path, delete this input statement and insert the path as a string. E.g. "C:/Users/user/Music"
     download_path = input("Enter download path (leave blank for current directory): ").strip()
-    if download_path:
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'outtmpl': f"{download_path}/%(title)s.%(ext)s",
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '320',
-            }],
-        }
+
+    ydl_opts = {}
+
+    if chosen.get('format'):
+        ydl_opts['format'] = chosen['format']
     else:
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'outtmpl': '%(title)s.%(ext)s',
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
+        ydl_opts['format'] = 'bestaudio/best'
+
+    outtmpl = '%(title)s.%(ext)s'
+    if download_path:
+        outtmpl = f"{download_path}/%(title)s.%(ext)s"
+
+    ydl_opts['outtmpl'] = outtmpl
+
+    if chosen.get('codec'):
+        ydl_opts['postprocessors'] = [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': chosen['codec'],
             'preferredquality': '320',
-        }],
-    }
+        }]
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
@@ -56,8 +88,7 @@ def main():
     if not results:
         print("No valid video results found.")
         return
-
-    # Display results with channel names
+    
     for i, video in enumerate(results):
         title = video.get('title', 'Unknown title')
         channel = video.get('uploader', 'Unknown channel')
