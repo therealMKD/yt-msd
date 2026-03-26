@@ -21,13 +21,25 @@ def search_youtube(query, max_results=10):
 
 
 def download_audio(url):
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'outtmpl': '%(title)s.%(ext)s',
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
+    download_path = input("Enter download path (leave blank for current directory): ").strip()
+    if download_path:
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'outtmpl': f"{download_path}/%(title)s.%(ext)s",
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
-            'preferredquality': '192',
+            'preferredquality': '320',
+            }],
+        }
+    else:
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'outtmpl': '%(title)s.%(ext)s',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '320',
         }],
     }
 
