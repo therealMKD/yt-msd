@@ -4,6 +4,31 @@
 # yt-dlp "py -m pip install yt-dlp"
 
 import yt_dlp
+import json
+import os
+
+CONFIG_FILE = "config.json"
+DEFAULT_CONFIG = {
+    "use_config": False,
+    "format": "",
+    "download_path": ""
+}
+
+def load_config():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    config_path = os.path.join(script_dir, CONFIG_FILE)
+    
+    if not os.path.exists(config_path):
+        with open(config_path, "w") as f:
+            json.dump(DEFAULT_CONFIG, f, indent=4)
+        return DEFAULT_CONFIG
+    
+    with open(config_path, "r") as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            print("Error reading config.json, using default settings.")
+            return DEFAULT_CONFIG
 
 # Youtube search function. If you aren't finding what you want in the first 10 results, you can change max_results to something higher
 def search_youtube(query, max_results=10):
@@ -24,16 +49,19 @@ def search_youtube(query, max_results=10):
         return results
 
 
-def choose_format():
-    print("\nSelect output format (leave blank for mp3): Keep in mind, Youtube has already compressed the audio, so wav and flac will not be better quality.")
-    print("  1) mp4")
-    print("  2) flac")
-    print("  3) wav")
-    print("  4) aac")
-    print("Or type a custom yt-dlp format string (e.g., 'bestaudio/best') or codec name.")
-    choice = input("Format [mp3]: ").strip()
+def choose_format(config):
+    if config.get("use_config"):
+        choice = config.get("format", "")
+    else:
+        print("\nSelect output format (leave blank for mp3): Keep in mind, Youtube has already compressed the audio, so wav and flac will not be better quality.")
+        print("  1) mp4")
+        print("  2) flac")
+        print("  3) wav")
+        print("  4) aac")
+        print("Or type a custom yt-dlp format string (e.g., 'bestaudio/best') or codec name.")
+        choice = input("Format [mp3]: ").strip()
 # By default, this script will download in mp3. If you want a different format by default, you can substitute it in the return statement below.
-    if not choice:
+    if not choice or choice.lower() == 'mp3':
         return {'codec': 'mp3', 'format': None}
 
     low = choice.lower()
@@ -49,11 +77,14 @@ def choose_format():
     return {'codec': None, 'format': choice}
 
 
-def download_audio(url, chosen=None):
+def download_audio(url, config, chosen=None):
     if chosen is None:
-        chosen = choose_format()
+        chosen = choose_format(config)
 #If you want to hard code a download path, delete this input statement and insert the path as a string. E.g. "C:/Users/user/Music"
-    download_path = input("Enter download path (leave blank for current directory): ").strip()
+    if config.get("use_config"):
+        download_path = config.get("download_path", "")
+    else:
+        download_path = input("Enter download path (leave blank for current directory): ").strip()
 
     ydl_opts = {}
 
@@ -80,6 +111,8 @@ def download_audio(url, chosen=None):
 
 
 def main():
+    config = load_config()
+
     query = input("Search YouTube: ")
 
     print("\nSearching...\n")
@@ -106,7 +139,7 @@ def main():
     url = f"https://www.youtube.com/watch?v={selected['id']}"
 
     print(f"\nDownloading: {selected.get('title', 'Unknown')}\n")
-    download_audio(url)
+    download_audio(url, config)
 
     print("\nDownload complete!")
 
