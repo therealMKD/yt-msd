@@ -12,6 +12,7 @@ CONFIG_FILE = "config.json"
 DEFAULT_CONFIG = {
     "use_config": False,
     "format": "mp3",
+    "bitrate": "192",
     "download_path": "",
     "recent_paths": [],
     "last_custom_format": ""
@@ -68,6 +69,7 @@ def search_youtube(query, max_results=10):
 def choose_format(config):
     if config.get("use_config"):
         choice = config.get("format", "")
+        bitrate = str(config.get("bitrate", "192"))
     else:
         print("\nSelect output format (leave blank for mp3): Keep in mind, Youtube has already compressed the audio, so wav and flac will not be better quality.")
         print("  1) mp4")
@@ -85,22 +87,35 @@ def choose_format(config):
         elif choice and choice.lower() not in ('1', 'mp4', '2', 'flac', '3', 'wav', '4', 'aac', 'mp3'):
             config["last_custom_format"] = choice
             save_config(config)
+            
+        print("\nSelect audio bitrate:")
+        print("  1) 192 (Default)")
+        print("  2) 256 (Medium)")
+        print("  3) 320 (High)")
+        br_input = input("Bitrate [1]: ").strip()
+
+        if br_input == '3':
+            bitrate = '320'
+        elif br_input == '2':
+            bitrate = '256'
+        else:
+            bitrate = '192'
 
 # By default, this script will download in mp3. If you want a different format by default, you can substitute it in the config.json
     if not choice or choice.lower() == 'mp3':
-        return {'codec': 'mp3', 'format': None}
+        return {'codec': 'mp3', 'format': None, 'bitrate': bitrate}
 
     low = choice.lower()
     if low in ('1', 'mp4'):
-        return {'codec': 'm4a', 'format': None}
+        return {'codec': 'm4a', 'format': None, 'bitrate': bitrate}
     if low in ('2', 'flac'):
-        return {'codec': 'flac', 'format': None}
+        return {'codec': 'flac', 'format': None, 'bitrate': bitrate}
     if low in ('3', 'wav'):
-        return {'codec': 'wav', 'format': None}
+        return {'codec': 'wav', 'format': None, 'bitrate': bitrate}
     if low in ('4', 'aac'):
-        return {'codec': 'aac', 'format': None}
+        return {'codec': 'aac', 'format': None, 'bitrate': bitrate}
 
-    return {'codec': None, 'format': choice}
+    return {'codec': None, 'format': choice, 'bitrate': bitrate}
 
 
 def download_audio(url, config, chosen=None):
@@ -116,7 +131,7 @@ def download_audio(url, config, chosen=None):
             for idx, path in enumerate(recent_paths, 1):
                 print(f"  {idx}) {path}")
         
-        download_path_input = input("\nEnter download path (leave blank for current directory, or choose a number from above): ").strip()
+        download_path_input = input("\nEnter download path (leave blank for current directory, or choose a saved previous directory): ").strip()
         
         if download_path_input.isdigit() and 1 <= int(download_path_input) <= len(recent_paths):
             download_path = recent_paths[int(download_path_input) - 1]
@@ -148,7 +163,7 @@ def download_audio(url, config, chosen=None):
         ydl_opts['postprocessors'] = [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': chosen['codec'],
-            'preferredquality': '320',
+            'preferredquality': chosen.get('bitrate', '192'),
         }]
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -160,7 +175,8 @@ def main():
 
     try:
         while True:
-            query = input("\nSearch YouTube or enter a video/playlist URL (Ctrl+C to quit): ").strip()
+            print("\nThis is the CLI version of yt-msd. The GUI version has more opt")
+            query = input("Search YouTube or enter a video/playlist URL (Ctrl+C to quit): ").strip()
             if not query:
                 continue
                 
@@ -168,7 +184,10 @@ def main():
                 print(f"\nDownloading URL: {query}\n")
                 download_audio(query, config)
                 print("\nDownload complete!")
-                print("\nIf you want to automatically apply custom settings, edit the config.json file, and enable it.")
+                if not config.get("use_config"):
+                    print("\nIf you want to automatically apply custom settings, edit the config.json file, and enable it.")
+                else:
+                    print("")
                 continue
 
             print("\nSearching...\n")
@@ -204,7 +223,10 @@ def main():
             download_audio(url, config)
 
             print("\nDownload complete!")
-            print("\nIf you want to automatically apply custom settings, edit the config.json file, and enable it.")
+            if not config.get("use_config"):
+                print("\nIf you want to automatically apply custom settings, edit the config.json file, and enable it.")
+            else:
+                print("")
             
     except KeyboardInterrupt:
         print("\n\nExiting program...\nThank you, Come again!")
