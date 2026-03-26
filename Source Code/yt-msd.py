@@ -25,7 +25,7 @@ def search_youtube(query, max_results=10):
 
 
 def choose_format():
-    print("\nSelect output format (leave blank for mp3):")
+    print("\nSelect output format (leave blank for mp3): Keep in mind, Youtube has already compressed the audio, so wav and flac will not be better quality.")
     print("  1) mp4")
     print("  2) flac")
     print("  3) wav")
