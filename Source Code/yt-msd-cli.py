@@ -9,6 +9,15 @@
 import yt_dlp
 import json
 import os
+import threading
+
+#Color references, the colors are what it says on the tin
+C_INFO = '\033[96m'    # Bright Cyan
+C_PROMPT = '\033[93m'  # Bright Yellow
+C_SUCCESS = '\033[92m' # Bright Green
+C_ERROR = '\033[91m'   # Bright Red
+C_RESET = '\033[0m'    # Reset
+
 #If you change the download path in the config.json file, you MUST use forward slashes instead of backslashes.
 CONFIG_FILE = "config.json"
 DEFAULT_CONFIG = {
@@ -37,7 +46,7 @@ def load_config():
                     config[key] = value
             return config
     except json.JSONDecodeError:
-        print("Error reading config.json. Did you mess it up? Overwriting with default settings.")
+        print(f"{C_ERROR}Error reading config.json. Did you mess it up? Overwriting with default settings.{C_RESET}")
         with open(config_path, "w") as f:
             json.dump(DEFAULT_CONFIG, f, indent=4)
         return DEFAULT_CONFIG
@@ -49,9 +58,9 @@ def save_config(config):
         with open(config_path, "w") as f:
             json.dump(config, f, indent=4)
     except Exception as e:
-        print(f"Error saving config: {e}")
+        print(f"{C_ERROR}Error saving config: {e}{C_RESET}")
 
-# Youtube search function. If you aren't finding what you want in the first 10 results, you can change max_results to something higher
+#Youtube search function. If you aren't finding what you want in the first 10 results, you can change max_results to something higher
 def search_youtube(query, max_results=10):
     ydl_opts = {
         'quiet': True,
@@ -75,7 +84,8 @@ def choose_format(config):
         choice = config.get("format", "")
         bitrate = str(config.get("bitrate", "192"))
     else:
-        print("\nSelect output format (leave blank for mp3): Keep in mind, Youtube has already compressed the audio, so wav and flac will not be better quality.")
+        #You can change these default options in the code if you want, just make sure your new ones are valid yt-dlp arguments.
+        print(f"\n{C_INFO}Select output format (leave blank for mp3): Keep in mind, Youtube has already compressed the audio, so wav and flac will not be better quality.")
         print("  1) mp4")
         print("  2) flac")
         print("  3) wav")
@@ -83,8 +93,8 @@ def choose_format(config):
         last_fmt = config.get("last_custom_format")
         if last_fmt:
             print(f"  5) Last custom: {last_fmt}")
-        print("Or type a custom yt-dlp format string (e.g., 'bestaudio/best') or codec name.")
-        choice = input("Format [mp3]: ").strip()
+        print(f"Or type a custom yt-dlp format string (e.g., 'bestaudio/best') or codec name.{C_RESET}")
+        choice = input(f"{C_PROMPT}Format [mp3]: {C_RESET}").strip()
 
         if choice == '5' and last_fmt:
             choice = last_fmt
@@ -92,11 +102,11 @@ def choose_format(config):
             config["last_custom_format"] = choice
             save_config(config)
             
-        print("\nSelect audio bitrate: (This doesn't really matter since youtube has already compressed the audio. Higher bitrates will give you larger files)")
+        print(f"\n{C_INFO}Select audio bitrate: (This doesn't really matter since youtube has already compressed the audio. Higher bitrates will give you larger files)")
         print("  1) 192 (Default)")
         print("  2) 256 (Medium)")
-        print("  3) 320 (High)")
-        br_input = input("Bitrate [1]: ").strip()
+        print(f"  3) 320 (High){C_RESET}")
+        br_input = input(f"{C_PROMPT}Bitrate [1]: {C_RESET}").strip()
 
         if br_input == '3':
             bitrate = '320'
@@ -105,7 +115,7 @@ def choose_format(config):
         else:
             bitrate = '192'
 
-# By default, this script will download in mp3. If you want a different format by default, you can substitute it in the config.json
+#By default, this script will download in mp3. If you want a different format by default, you can substitute it in the config.json
     if not choice or choice.lower() == 'mp3':
         return {'codec': 'mp3', 'format': None, 'bitrate': bitrate}
 
@@ -125,17 +135,17 @@ def choose_format(config):
 def download_audio(url, config, chosen=None):
     if chosen is None:
         chosen = choose_format(config)
-# If you want to hard code a download path, insert it into the config.json file
+#If you want to hard code a download path, insert it into the config.json file
     if config.get("use_config"):
         download_path = config.get("download_path", "")
     else:
         recent_paths = config.get("recent_paths", [])
         if recent_paths:
-            print("\nRecent download paths:")
+            print(f"\n{C_INFO}Recent download paths:")
             for idx, path in enumerate(recent_paths, 1):
-                print(f"  {idx}) {path}")
+                print(f"  {idx}) {path}{C_RESET}")
         
-        download_path_input = input("\nEnter download path (leave blank for current directory, or choose a saved previous directory): ").strip()
+        download_path_input = input(f"\n{C_PROMPT}Enter download path (leave blank for current directory, or choose a saved previous directory): {C_RESET}").strip()
         
         if download_path_input.isdigit() and 1 <= int(download_path_input) <= len(recent_paths):
             download_path = recent_paths[int(download_path_input) - 1]
@@ -147,7 +157,7 @@ def download_audio(url, config, chosen=None):
             if download_path in recent_paths:
                 recent_paths.remove(download_path)
             recent_paths.insert(0, download_path)
-            config["recent_paths"] = recent_paths[:3]  # keep only last 3
+            config["recent_paths"] = recent_paths[:3]
             save_config(config)
 
     ydl_opts = {}
@@ -178,29 +188,47 @@ def main():
     config = load_config()
 
     try:
-        print("\nThis is the CLI version of yt-msd. The GUI version has more options, and can be found at https://github.com/therealMKD/yt-msd")
+        #Is it necessary? Nope. Is it cool? Yes.
+        ascii_art = [
+            r" __ __  _____       _____  _____  ____  ",
+            r"|  |  ||_   _| ___ |     ||   __||    \ ",
+            r"|_   _|  | |  |___|| | | ||__   ||  |  |",
+            r"  |_|    |_|       |_|_|_||_____||____/ "
+        ]
+        colors = [91, 93, 92, 96, 94, 95]
+        for line in ascii_art:
+            print("".join(f"\033[{colors[(i // 7) % len(colors)]}m{char}" for i, char in enumerate(line)) + "\033[0m")
+        print(f"\n{C_INFO}This is the CLI version of yt-msd. The GUI version has more options, and can be found at https://github.com/therealMKD/yt-msd{C_RESET}")
         while True:
-            query = input("Search YouTube or enter a video/playlist URL (Ctrl+C to quit): ").strip()
+            query = input(f"{C_PROMPT}Search YouTube or enter a video/playlist URL (Ctrl+C to quit): {C_RESET}").strip()
             if not query:
                 continue
                 
             if query.startswith(("http://", "https://", "www.youtube.com", "youtu.be")):
-                print(f"\nDownloading URL: {query}\n")
+                print(f"\n{C_INFO}Downloading URL: {query}\n{C_RESET}")
                 download_audio(query, config)
-                print("\nDownload complete!")
+                print(f"\n{C_SUCCESS}Download complete!{C_RESET}")
                 if not config.get("use_config"):
-                    print("\nIf you want to automatically apply custom settings, edit the config.json file, and enable it.")
+                    print(f"\n{C_INFO}If you want to automatically apply custom settings, edit the config.json file, and enable it.{C_RESET}")
                 else:
-                    print("\nYou are currently using a config file. If you want to change settings, change them in the config, or disable the config.")
+                    print(f"\n{C_INFO}You are currently using a config file. If you want to change settings, change them in the config, or disable the config.{C_RESET}")
                 continue
 
-            print("\nSearching...\n")
+            print(f"\n{C_INFO}Searching...{C_RESET}\n")
             current_limit = 10
             results = search_youtube(query, max_results=current_limit)
 
             if not results:
-                print("No valid video results found.")
+                print(f"{C_ERROR}No valid video results found.{C_RESET}")
                 continue
+
+            def bg_fetch():
+                more_results = search_youtube(query, max_results=110)
+                if len(more_results) > len(results):
+                    results.extend(more_results[len(results):])
+
+            bg_thread = threading.Thread(target=bg_fetch, daemon=True)
+            bg_thread.start()
 
             display_start = 0
             selected = None
@@ -209,17 +237,17 @@ def main():
                 page_results = results[display_start:display_start + 10]
 
                 if not page_results:
-                    print("\nNo more results available. Try searching on youtube on your own, and pasting the URL in.")
+                    print(f"\n{C_ERROR}No more results available. Try searching on youtube on your own, and pasting the URL in.{C_RESET}")
                     break
                 
                 for i, video in enumerate(page_results):
                     title = video.get('title', 'Unknown title')
                     channel = video.get('uploader', 'Unknown channel')
 
-                    print(f"{display_start + i + 1}. {title} | Channel: {channel}")
+                    print(f"{C_INFO}{display_start + i + 1}. {title} | Channel: {channel}{C_RESET}")
 
                 print("")
-                choice_str = input("Select a number to download (or 'next' for more, Enter to cancel): ").strip()
+                choice_str = input(f"{C_PROMPT}Select a number to download (or 'next' for more, Enter to cancel): {C_RESET}").strip()
                 
                 if not choice_str:
                     break
@@ -228,31 +256,24 @@ def main():
                     display_start += 10
                     
                     if display_start >= len(results):
-                        if current_limit < 110:
-                            next_limit = min(current_limit + 50, 110)
-                            print("\nFetching more results...\n")
-                            more_results = search_youtube(query, max_results=next_limit)
-                            new_results = more_results[len(results):]
-                            results.extend(new_results)
-                            current_limit = next_limit
+                        if bg_thread.is_alive():
+                            print(f"\n{C_INFO}Hold on one sec - Still doing stuff{C_RESET}")
+                            bg_thread.join()
                             
-                            if not new_results:
-                                print("No more results available. Try searching on youtube on your own, and pasting the URL in.")
-                                break
-                        else:
-                            print("\nNo more results available. Try searching on youtube on your own, and pasting the URL in.")
+                        if display_start >= len(results):
+                            print(f"\n{C_ERROR}No more results available. Try searching on youtube on your own, and pasting the URL in.{C_RESET}")
                             break
                     continue
                 
                 try:
                     choice = int(choice_str) - 1
                     if choice < 0 or choice >= len(results):
-                        print("Invalid selection.")
+                        print(f"{C_ERROR}Invalid selection.{C_RESET}")
                         continue
                     selected = results[choice]
                     break
                 except ValueError:
-                    print("Invalid selection.")
+                    print(f"{C_ERROR}Invalid selection.{C_RESET}")
                     continue
             
             if not selected:
@@ -260,17 +281,17 @@ def main():
 
             url = f"https://www.youtube.com/watch?v={selected['id']}"
 
-            print(f"\nDownloading: {selected.get('title', 'Unknown')}\n")
+            print(f"\n{C_INFO}Downloading: {selected.get('title', 'Unknown')}\n{C_RESET}")
             download_audio(url, config)
 
-            print("\nDownload complete!")
+            print(f"\n{C_SUCCESS}Download complete!{C_RESET}")
             if not config.get("use_config"):
-                print("\nIf you want to automatically apply custom settings, edit the config.json file, and enable it.")
+                print(f"\n{C_INFO}If you want to automatically apply custom settings, edit the config.json file, and enable it.{C_RESET}")
             else:
-                print("\nYou are currently using a config file. If you want to change settings, change them in the config, or disable the config.")
+                print(f"\n{C_INFO}You are currently using a config file. If you want to change settings, change them in the config, or disable the config.{C_RESET}")
             
     except KeyboardInterrupt:
-        print("\n\nExiting program...\nThank you, Come again!")
+        print(f"\n\n{C_INFO}Exiting program...\nThank you, Come again!{C_RESET}")
 
 if __name__ == "__main__":
     main()
