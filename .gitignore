@@ -3,7 +3,8 @@ config.json
 
 # Ignore test directories / generic folders created
 Test Songs/
-#C#/
+CLI Version/
+build/
 
 # Python artifacts
 __pycache__/
@@ -12,3 +13,6 @@ __pycache__/
 
 # Executables
 *.exe
+
+# Python build residues
+*.spec
