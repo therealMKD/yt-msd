@@ -1,0 +1,11 @@
+# Configuration Files
+config.json
+
+# Ignore test directories / generic folders created
+Test Songs/
+#C#/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
