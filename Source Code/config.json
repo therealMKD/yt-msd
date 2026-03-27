@@ -1,5 +1,8 @@
 {
-    "use_config": false,
+    "use_config": true,
     "format": "mp3",
-    "download_path": "C:/Users/mason/OneDrive/Documents/GitHub/yt-msd/Test Songs"
+    "bitrate": "192",
+    "download_path": "C:/Users/mason/OneDrive/Documents/GitHub/yt-msd/Test Songs",
+    "recent_paths": [],
+    "last_custom_format": ""
 }

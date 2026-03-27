@@ -1,6 +1,7 @@
 #Open Source Software under the Apache License, Version 2.0
 #This was only partially vibe coded, I swear I know what I'm doing.
-#There will be a config.json file in the same directory as this script. By default, it is OFF. The script will ignore it, unless you change it to ON.
+#There will be a config.json file in the same directory as this script once you have ran it once. 
+#By default, it is OFF. The script will ignore it, unless you change it to ON.
 #Running this script as-is will require you to have the following dependencies installed THROUGH PYTHON (not individually):
 # yt-dlp "py -m pip install yt-dlp"
 
@@ -27,16 +28,18 @@ def load_config():
             json.dump(DEFAULT_CONFIG, f, indent=4)
         return DEFAULT_CONFIG
     
-    with open(config_path, "r") as f:
-        try:
+    try:
+        with open(config_path, "r") as f:
             config = json.load(f)
             for key, value in DEFAULT_CONFIG.items():
                 if key not in config:
                     config[key] = value
             return config
-        except json.JSONDecodeError:
-            print("Error reading config.json, using default settings.")
-            return DEFAULT_CONFIG
+    except json.JSONDecodeError:
+        print("Error reading config.json. Did you mess it up? Overwriting with default settings.")
+        with open(config_path, "w") as f:
+            json.dump(DEFAULT_CONFIG, f, indent=4)
+        return DEFAULT_CONFIG
 
 def save_config(config):
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -88,7 +91,7 @@ def choose_format(config):
             config["last_custom_format"] = choice
             save_config(config)
             
-        print("\nSelect audio bitrate:")
+        print("\nSelect audio bitrate: (This doesn't really matter since youtube has already compressed the audio. Higher bitrates will give you larger files)")
         print("  1) 192 (Default)")
         print("  2) 256 (Medium)")
         print("  3) 320 (High)")
@@ -121,7 +124,7 @@ def choose_format(config):
 def download_audio(url, config, chosen=None):
     if chosen is None:
         chosen = choose_format(config)
-#If you want to hard code a download path, insert it into the config.json file
+# If you want to hard code a download path, insert it into the config.json file
     if config.get("use_config"):
         download_path = config.get("download_path", "")
     else:
@@ -174,8 +177,8 @@ def main():
     config = load_config()
 
     try:
+        print("\nThis is the CLI version of yt-msd. The GUI version has more options, and can be found at https://github.com/therealMKD/yt-msd")
         while True:
-            print("\nThis is the CLI version of yt-msd. The GUI version has more opt")
             query = input("Search YouTube or enter a video/playlist URL (Ctrl+C to quit): ").strip()
             if not query:
                 continue
@@ -187,34 +190,56 @@ def main():
                 if not config.get("use_config"):
                     print("\nIf you want to automatically apply custom settings, edit the config.json file, and enable it.")
                 else:
-                    print("")
+                    print("\nYou are currently using a config file. If you want to change settings, change them in the config, or disable the config.")
                 continue
 
             print("\nSearching...\n")
-            results = search_youtube(query)
+            results = search_youtube(query, max_results=50)
 
             if not results:
                 print("No valid video results found.")
                 continue
-            
-            for i, video in enumerate(results):
-                title = video.get('title', 'Unknown title')
-                channel = video.get('uploader', 'Unknown channel')
 
-                print(f"{i + 1}. {title}")
-                print(f"   Channel: {channel}\n")
+            current_page = 0
+            page_size = 10
+            selected = None
 
-            try:
-                choice_str = input("Select a number to download (or press Enter to cancel): ")
-                if not choice_str.strip():
+            while True:
+                start_idx = current_page * page_size
+                end_idx = start_idx + page_size
+                page_results = results[start_idx:end_idx]
+
+                if not page_results:
+                    print("No more results available. Try searching youtube on your own, and pasting the URL in.")
+                    break
+                
+                for i, video in enumerate(page_results):
+                    title = video.get('title', 'Unknown title')
+                    channel = video.get('uploader', 'Unknown channel')
+
+                    print(f"{start_idx + i + 1}. {title} | Channel: {channel}\n")
+
+                choice_str = input("Select a number to download (or 'next' for more, Enter to cancel): ").strip()
+                
+                if not choice_str:
+                    break
+                
+                if choice_str.lower() == 'next':
+                    current_page += 1
                     continue
-                choice = int(choice_str) - 1
-                if choice < 0 or choice >= len(results):
+                
+                try:
+                    choice = int(choice_str) - 1
+                    if choice < 0 or choice >= len(results):
+                        print("Invalid selection.")
+                        continue
+                    selected = results[choice]
+                    break
+                except ValueError:
                     print("Invalid selection.")
                     continue
-                selected = results[choice]
-            except ValueError:
-                print("Invalid selection.")
+            
+            if not selected:
                 continue
 
             url = f"https://www.youtube.com/watch?v={selected['id']}"
@@ -226,7 +251,7 @@ def main():
             if not config.get("use_config"):
                 print("\nIf you want to automatically apply custom settings, edit the config.json file, and enable it.")
             else:
-                print("")
+                print("\nYou are currently using a config file. If you want to change settings, change them in the config, or disable the config.")
             
     except KeyboardInterrupt:
         print("\n\nExiting program...\nThank you, Come again!")
