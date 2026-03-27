@@ -203,11 +203,10 @@ def main():
                 continue
 
             display_start = 0
-            display_count = len(results)
             selected = None
 
             while True:
-                page_results = results[display_start:display_start + display_count]
+                page_results = results[display_start:display_start + 10]
 
                 if not page_results:
                     print("\nNo more results available. Try searching on youtube on your own, and pasting the URL in.")
@@ -226,7 +225,7 @@ def main():
                     break
                 
                 if choice_str.lower() == 'next':
-                    display_start += display_count
+                    display_start += 10
                     
                     if display_start >= len(results):
                         if current_limit < 110:
@@ -235,7 +234,6 @@ def main():
                             more_results = search_youtube(query, max_results=next_limit)
                             new_results = more_results[len(results):]
                             results.extend(new_results)
-                            display_count = len(new_results)
                             current_limit = next_limit
                             
                             if not new_results:
