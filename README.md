@@ -10,7 +10,8 @@ As of now, the only release is the CLI version. This will search youtube with yt
 There are 2 versions of the CLI: The python version, which requires python to be installed, as well as yt-dlp `pip install yt-dlp` and ffmpeg `pip install ffpmeg`, and the exe version. This will run as a standalone program, and everything you need will be bundled with it. This can also be added to the system's PATH, so that you can run yt-msd from anywhere by just initializing it with `yt-msd` in the terminal. Both versions will generate a config.json file in their root directory. 
 
 **If your system says that the exe is unsafe, ignore it! It is a false positive-you can safely click "run anyway"**
-https://www.virustotal.com/gui/file/677290f643940924759b4535de5e67ae8738fd1109de63e4ae82e975002b40fa/
+
+[VirusTotal Scan](https://www.virustotal.com/gui/file/cb981f81650fef81f7cf2e21eac775f2dac844d2eaeb132fca3e5140ecee31ee)
 
 ### By default the "config.json" file will generate like this:
 
