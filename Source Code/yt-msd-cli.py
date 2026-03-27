@@ -1,4 +1,5 @@
 #Open Source Software under the Apache License, Version 2.0
+#This is the CLI version of yt-msd. It is much more limited than the GUI version, but if you only need simple downloading, this works.
 #This was only partially vibe coded, I swear I know what I'm doing.
 #There will be a config.json file in the same directory as this script once you have ran it once. 
 #By default, it is OFF. The script will ignore it, unless you change it to ON.
@@ -194,38 +195,55 @@ def main():
                 continue
 
             print("\nSearching...\n")
-            results = search_youtube(query, max_results=50)
+            current_limit = 10
+            results = search_youtube(query, max_results=current_limit)
 
             if not results:
                 print("No valid video results found.")
                 continue
 
-            current_page = 0
-            page_size = 10
+            display_start = 0
+            display_count = len(results)
             selected = None
 
             while True:
-                start_idx = current_page * page_size
-                end_idx = start_idx + page_size
-                page_results = results[start_idx:end_idx]
+                page_results = results[display_start:display_start + display_count]
 
                 if not page_results:
-                    print("No more results available. Try searching youtube on your own, and pasting the URL in.")
+                    print("\nNo more results available. Try searching on youtube on your own, and pasting the URL in.")
                     break
                 
                 for i, video in enumerate(page_results):
                     title = video.get('title', 'Unknown title')
                     channel = video.get('uploader', 'Unknown channel')
 
-                    print(f"{start_idx + i + 1}. {title} | Channel: {channel}\n")
+                    print(f"{display_start + i + 1}. {title} | Channel: {channel}")
 
+                print("")
                 choice_str = input("Select a number to download (or 'next' for more, Enter to cancel): ").strip()
                 
                 if not choice_str:
                     break
                 
                 if choice_str.lower() == 'next':
-                    current_page += 1
+                    display_start += display_count
+                    
+                    if display_start >= len(results):
+                        if current_limit < 110:
+                            next_limit = min(current_limit + 50, 110)
+                            print("\nFetching more results...\n")
+                            more_results = search_youtube(query, max_results=next_limit)
+                            new_results = more_results[len(results):]
+                            results.extend(new_results)
+                            display_count = len(new_results)
+                            current_limit = next_limit
+                            
+                            if not new_results:
+                                print("No more results available. Try searching on youtube on your own, and pasting the URL in.")
+                                break
+                        else:
+                            print("\nNo more results available. Try searching on youtube on your own, and pasting the URL in.")
+                            break
                     continue
                 
                 try:
