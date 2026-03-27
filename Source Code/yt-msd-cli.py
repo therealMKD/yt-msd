@@ -12,10 +12,11 @@ import os
 import threading
 
 #Color references, the colors are what it says on the tin
-C_INFO = '\033[96m'    # Bright Cyan
-C_PROMPT = '\033[93m'  # Bright Yellow
+C_INFO = '\033[94m'    # Bright Blue
+C_PROMPT = '\033[38;5;165m'  # Purple (Couldn't get the color I wanted so I switched to 256 color mode)
 C_SUCCESS = '\033[92m' # Bright Green
 C_ERROR = '\033[91m'   # Bright Red
+C_RESULT = '\033[97m'  # White (Is there such a thing as bright white?)
 C_RESET = '\033[0m'    # Reset
 
 #If you change the download path in the config.json file, you MUST use forward slashes instead of backslashes.
@@ -85,15 +86,15 @@ def choose_format(config):
         bitrate = str(config.get("bitrate", "192"))
     else:
         #You can change these default options in the code if you want, just make sure your new ones are valid yt-dlp arguments.
-        print(f"\n{C_INFO}Select output format (leave blank for mp3): Keep in mind, Youtube has already compressed the audio, so wav and flac will not be better quality.")
-        print("  1) mp4")
-        print("  2) flac")
-        print("  3) wav")
-        print("  4) aac")
+        print(f"\n{C_INFO}Select output format (leave blank for mp3): Keep in mind, Youtube has already compressed the audio, so wav and flac will not be better quality.{C_RESET}")
+        print(f"{C_RESULT}  1) mp4")
+        print(f"{C_RESULT}  2) flac")
+        print(f"{C_RESULT}  3) wav")
+        print(f"  4) aac{C_RESET}")
         last_fmt = config.get("last_custom_format")
         if last_fmt:
-            print(f"  5) Last custom: {last_fmt}")
-        print(f"Or type a custom yt-dlp format string (e.g., 'bestaudio/best') or codec name.{C_RESET}")
+            print(f"{C_RESULT}  5) Last custom: {C_RESET}")
+        print(f"{C_INFO}Or type a custom yt-dlp format string (e.g., 'bestaudio/best') or codec name.{C_RESET}")
         choice = input(f"{C_PROMPT}Format [mp3]: {C_RESET}").strip()
 
         if choice == '5' and last_fmt:
@@ -102,8 +103,8 @@ def choose_format(config):
             config["last_custom_format"] = choice
             save_config(config)
             
-        print(f"\n{C_INFO}Select audio bitrate: (This doesn't really matter since youtube has already compressed the audio. Higher bitrates will give you larger files)")
-        print("  1) 192 (Default)")
+        print(f"\n{C_INFO}Select audio bitrate: (This doesn't really matter since youtube has already compressed the audio. Higher bitrates will give you larger files){C_RESET}")
+        print(f"{C_RESULT}  1) 192 (Default)")
         print("  2) 256 (Medium)")
         print(f"  3) 320 (High){C_RESET}")
         br_input = input(f"{C_PROMPT}Bitrate [1]: {C_RESET}").strip()
@@ -153,7 +154,7 @@ def download_audio(url, config, chosen=None):
             download_path = download_path_input
 
         if download_path:
-            download_path = download_path.replace("\\", "/")
+            download_path = download_path.strip(' \t"\'').replace("\\", "/")
             if download_path in recent_paths:
                 recent_paths.remove(download_path)
             recent_paths.insert(0, download_path)
@@ -197,7 +198,7 @@ def main():
         ]
         colors = [91, 93, 92, 96, 94, 95]
         for line in ascii_art:
-            print("".join(f"\033[{colors[(i // 7) % len(colors)]}m{char}" for i, char in enumerate(line)) + "\033[0m")
+            print("".join(f"\033[{colors[i % len(colors)]}m{char}" for i, char in enumerate(line)) + "\033[0m")
         print(f"\n{C_INFO}This is the CLI version of yt-msd. The GUI version has more options, and can be found at https://github.com/therealMKD/yt-msd{C_RESET}")
         while True:
             query = input(f"{C_PROMPT}Search YouTube or enter a video/playlist URL (Ctrl+C to quit): {C_RESET}").strip()
@@ -244,7 +245,7 @@ def main():
                     title = video.get('title', 'Unknown title')
                     channel = video.get('uploader', 'Unknown channel')
 
-                    print(f"{C_INFO}{display_start + i + 1}. {title} | Channel: {channel}{C_RESET}")
+                    print(f"{C_RESULT}{display_start + i + 1}. {title} | Channel: {channel}{C_RESET}")
 
                 print("")
                 choice_str = input(f"{C_PROMPT}Select a number to download (or 'next' for more, Enter to cancel): {C_RESET}").strip()
@@ -281,7 +282,7 @@ def main():
 
             url = f"https://www.youtube.com/watch?v={selected['id']}"
 
-            print(f"\n{C_INFO}Downloading: {selected.get('title', 'Unknown')}\n{C_RESET}")
+            print(f"\n{C_RESULT}Downloading: {selected.get('title', 'Unknown')}\n{C_RESET}")
             download_audio(url, config)
 
             print(f"\n{C_SUCCESS}Download complete!{C_RESET}")
@@ -291,7 +292,7 @@ def main():
                 print(f"\n{C_INFO}You are currently using a config file. If you want to change settings, change them in the config, or disable the config.{C_RESET}")
             
     except KeyboardInterrupt:
-        print(f"\n\n{C_INFO}Exiting program...\nThank you, Come again!{C_RESET}")
+        print(f"\n\n{C_RESULT}Exiting program...\nThank you, Come again!{C_RESET}")
 
 if __name__ == "__main__":
     main()
