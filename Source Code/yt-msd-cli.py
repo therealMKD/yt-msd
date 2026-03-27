@@ -66,6 +66,12 @@ C_RESET = '\033[0m'    # Reset
 
 #If you change the download path in the config.json file, you MUST use forward slashes instead of backslashes.
 CONFIG_FILE = "config.json"
+
+def get_config_dir():
+    """Returns the directory where config.json should live — next to the .exe when frozen, next to the .py when running as a script."""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = {
     "use_config": False,
     "format": "mp3",
@@ -76,8 +82,7 @@ DEFAULT_CONFIG = {
 }
 
 def load_config():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    config_path = os.path.join(script_dir, CONFIG_FILE)
+    config_path = os.path.join(get_config_dir(), CONFIG_FILE)
     
     if not os.path.exists(config_path):
         with open(config_path, "w") as f:
@@ -98,8 +103,7 @@ def load_config():
         return DEFAULT_CONFIG
 
 def save_config(config):
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    config_path = os.path.join(script_dir, CONFIG_FILE)
+    config_path = os.path.join(get_config_dir(), CONFIG_FILE)
     try:
         with open(config_path, "w") as f:
             json.dump(config, f, indent=4)
