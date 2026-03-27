@@ -10,6 +10,51 @@ import yt_dlp
 import json
 import os
 import threading
+import sys
+
+def get_ffmpeg_path():
+    if getattr(sys, 'frozen', False):
+        return getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
+    return None
+
+def self_install_to_path():
+    #Only runs when packaged as an .exe — skips entirely when running as a .py script
+    if not getattr(sys, 'frozen', False):
+        return
+    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+    user_path = os.environ.get('PATH', '')
+    #Check if the exe's folder is already accessible via PATH
+    if exe_dir.lower() in [p.lower() for p in user_path.split(os.pathsep)]:
+        return
+    #Also check the persistent User PATH from the registry
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Environment', 0, winreg.KEY_READ) as key:
+            saved_path, _ = winreg.QueryValueEx(key, 'PATH')
+    except (FileNotFoundError, OSError):
+        saved_path = ''
+    if exe_dir.lower() in [p.lower() for p in saved_path.split(os.pathsep)]:
+        return
+    print(f"{C_INFO}yt-msd is not on your system PATH yet.{C_RESET}")
+    print(f"{C_INFO}Adding it would let you run 'yt-msd' from any terminal window.{C_RESET}")
+    answer = input(f"{C_PROMPT}Add to PATH? (y/n): {C_RESET}").strip().lower()
+    if answer in ('y', 'yes'):
+        new_path = f"{saved_path};{exe_dir}" if saved_path else exe_dir
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Environment', 0, winreg.KEY_SET_VALUE) as key:
+                winreg.SetValueEx(key, 'PATH', 0, winreg.REG_EXPAND_SZ, new_path)
+            #Broadcast the change so Explorer picks it up without a reboot
+            import ctypes
+            HWND_BROADCAST = 0xFFFF
+            WM_SETTINGCHANGE = 0x001A
+            ctypes.windll.user32.SendMessageTimeoutW(
+                HWND_BROADCAST, WM_SETTINGCHANGE, 0, 'Environment', 0x0002, 5000, ctypes.byref(ctypes.c_long())
+            )
+            print(f"{C_SUCCESS}Done! Open a new terminal and you can use 'yt-msd' from anywhere.{C_RESET}")
+        except OSError as e:
+            print(f"{C_ERROR}Could not update PATH: {e}{C_RESET}")
+    else:
+        print(f"{C_INFO}Skipped. You can always move yt-msd.exe into a folder on your PATH later.{C_RESET}")
 
 #Color references, the colors are what it says on the tin
 C_INFO = '\033[94m'    # Bright Blue
@@ -163,6 +208,10 @@ def download_audio(url, config, chosen=None):
 
     ydl_opts = {}
 
+    ffmpeg_location = get_ffmpeg_path()
+    if ffmpeg_location:
+        ydl_opts['ffmpeg_location'] = ffmpeg_location
+
     if chosen.get('format'):
         ydl_opts['format'] = chosen['format']
     else:
@@ -187,6 +236,7 @@ def download_audio(url, config, chosen=None):
 
 def main():
     config = load_config()
+    self_install_to_path()
 
     try:
         #Is it necessary? Nope. Is it cool? Yes.
