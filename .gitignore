@@ -9,3 +9,6 @@ Test Songs/
 __pycache__/
 *.py[cod]
 *$py.class
+
+# Executables
+*.exe
