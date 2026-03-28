@@ -5,6 +5,7 @@ config.json
 Test Songs/
 CLI Version/
 build/
+GUI Version/
 
 # Python artifacts
 __pycache__/
