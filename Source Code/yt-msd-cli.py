@@ -110,7 +110,6 @@ def save_config(config):
     except Exception as e:
         print(f"{C_ERROR}Error saving config: {e}{C_RESET}")
 
-#Youtube search function. If you aren't finding what you want in the first 10 results, you can change max_results to something higher
 def search_youtube(query, max_results=10):
     ydl_opts = {
         'quiet': True,
