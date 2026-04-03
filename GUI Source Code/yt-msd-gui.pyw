@@ -174,7 +174,7 @@ class YtMsdGui(ctk.CTk):
         self.is_searching = False; self.is_downloading = False; self.divider_dragging = False
         self.current_playing_title = ""; self.current_status_text = "Ready"
         self._last_divider_update = 0; self._vol_save_id = None; self._last_v_applied = -1
-        self.viz_bars = []; self._viz_ani_id = None; self._current_hover_btn = None; self._hover_hide_id = None
+        self._current_hover_btn = None; self._hover_hide_id = None
         self._is_muted = False
         self.drag_data = {"item": None, "original_index": -1, "proxy": None}
         self.config_corrupted = getattr(self, "config_corrupted", False) # Carry over from loader
@@ -295,15 +295,6 @@ class YtMsdGui(ctk.CTk):
         r_f = ctk.CTkFrame(self.player_frame, fg_color="transparent")
         r_f.grid(row=0, column=2, sticky="e", padx=20, pady=(5, 0))
         
-        # Audio Visualizer (Jitter-free Canvas)
-        self.viz_canvas = ctk.CTkCanvas(r_f, width=30, height=20, bg=self.player_frame.cget("fg_color")[1 if ctk.get_appearance_mode()=="Dark" else 0], highlightthickness=0, bd=0)
-        self.viz_canvas.pack(side="left", padx=10)
-        self.viz_bars = []
-        for i in range(4):
-            # Draw 4 bars initially at the bottom
-            bar = self.viz_canvas.create_rectangle(i*7, 20, i*7+3, 18, fill=accent, outline="")
-            self.viz_bars.append(bar)
-
         self.time_label = ctk.CTkLabel(r_f, text="0:00 / 0:00", font=("Consolas", 11), width=100)
         self.time_label.pack(side="right")
 
@@ -339,9 +330,6 @@ class YtMsdGui(ctk.CTk):
         
         # Update existing play buttons instantly
         if hasattr(self, 'play_pause_btn'): self.play_pause_btn.configure(text_color=accent)
-        if hasattr(self, 'viz_canvas'):
-            self.viz_canvas.configure(bg=self.player_frame.cget("fg_color")[1 if ctk.get_appearance_mode()=="Dark" else 0])
-            for bar in self.viz_bars: self.viz_canvas.itemconfig(bar, fill=accent)
         if hasattr(self, 'results_frame'):
             for item in self.results_frame.winfo_children():
                 for c in item.winfo_children():
@@ -663,12 +651,11 @@ class YtMsdGui(ctk.CTk):
         self.vlc_player.play()
         self.is_playing = True
         self.play_pause_btn.configure(text="\uE769" if self.is_playing else "\uE768")
-        self._animate_viz()
+        self._update_player_ui()
 
     def _on_window_restore(self):
         if self.is_playing:
             self._update_player_ui()
-            self._animate_viz()
 
     def _toggle_playback(self):
         if not self.current_video_id: return
@@ -678,21 +665,7 @@ class YtMsdGui(ctk.CTk):
         else:
             self.vlc_player.play()
             self.play_pause_btn.configure(text="\uE769")
-            self._animate_viz()
         self.is_playing = not self.is_playing
-
-    def _animate_viz(self):
-        if not self.is_playing: 
-            self._viz_ani_id = None
-            return
-        if self._viz_ani_id: self.after_cancel(self._viz_ani_id)
-        
-        import random
-        for i, bar in enumerate(self.viz_bars):
-            h = random.randint(4, 18)
-            # Update rectangle coords: bottom (y=20) is fixed. top (y=20-h) changes.
-            self.viz_canvas.coords(bar, i*7, 20-h, i*7+3, 20)
-        self._viz_ani_id = self.after(100, self._animate_viz)
 
     def _on_volume(self, val):
         if self._is_muted: self._toggle_mute() # Auto-unmute on volume change
@@ -760,6 +733,6 @@ class YtMsdGui(ctk.CTk):
             self.progress_slider.set(pos)
             
         if self.is_playing or self.vlc_player.is_playing():
-             self.after(500, self._update_player_ui)
+             self.after(100, self._update_player_ui)
 
 if __name__ == "__main__": app = YtMsdGui(); app.mainloop()
