@@ -234,7 +234,7 @@ class YtMsdGui(ctk.CTk):
         self.control_panel.grid_columnconfigure(0, weight=1)
         search_f = ctk.CTkFrame(self.control_panel, fg_color="transparent"); search_f.grid(row=0, column=0, sticky="ew", padx=20, pady=(15, 10))
         search_f.grid_columnconfigure(0, weight=1)
-        self.search_entry = ctk.CTkEntry(search_f, placeholder_text="Search YouTube...", height=40, font=self.main_font, corner_radius=8); self.search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        self.search_entry = ctk.CTkEntry(search_f, placeholder_text="Search YouTube or Paste a Video Link", height=40, font=self.main_font, corner_radius=8); self.search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
         self.search_entry.bind("<Return>", lambda e: self._start_search())
         self.search_button = ctk.CTkButton(search_f, text="\uE721", font=(self.icon_font, 16), width=50, height=40, command=self._start_search, corner_radius=8); self.search_button.grid(row=0, column=1)
 
