@@ -1,5 +1,6 @@
 # Configuration Files
 config.json
+gui_config.json
 
 # Ignore test directories / generic folders created
 Test Songs/
