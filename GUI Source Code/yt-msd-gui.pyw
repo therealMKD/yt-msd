@@ -175,7 +175,7 @@ class YtMsdGui(ctk.CTk):
         self.current_playing_title = ""; self.current_status_text = "Ready"
         self._last_divider_update = 0; self._vol_save_id = None; self._last_v_applied = -1
         self._current_hover_btn = None; self._hover_hide_id = None
-        self._is_muted = False
+        self._is_muted = False; self._player_ui_id = None
         self.drag_data = {"item": None, "original_index": -1, "proxy": None}
         self.config_corrupted = getattr(self, "config_corrupted", False) # Carry over from loader
 
@@ -649,13 +649,10 @@ class YtMsdGui(ctk.CTk):
         media = self.vlc_instance.media_new(url)
         self.vlc_player.set_media(media)
         self.vlc_player.play()
-        self.is_playing = True
-        self.play_pause_btn.configure(text="\uE769" if self.is_playing else "\uE768")
         self._update_player_ui()
 
     def _on_window_restore(self):
-        if self.is_playing:
-            self._update_player_ui()
+        pass # The loop is already robust
 
     def _toggle_playback(self):
         if not self.current_video_id: return
@@ -720,19 +717,23 @@ class YtMsdGui(ctk.CTk):
         self.vlc_player.set_time(cur_ms + (seconds * 1000))
 
     def _update_player_ui(self):
+        # Cancel any pending update to prevent loop stacking
+        if self._player_ui_id: self.after_cancel(self._player_ui_id); self._player_ui_id = None
         if not self.vlc_player or not self.current_video_id: return
         
+        # Sync is_playing with VLC's actual state
+        self.is_playing = self.vlc_player.is_playing()
+        self.play_pause_btn.configure(text="\uE769" if self.is_playing else "\uE768")
+
         pos = self.vlc_player.get_position() * 100
-        ms = self.vlc_player.get_time()
-        total_ms = self.vlc_player.get_length()
-        
+        ms = self.vlc_player.get_time(); total_ms = self.vlc_player.get_length()
         if total_ms > 0:
             cur_str = f"{int(ms/60000)}:{int((ms%60000)/1000):02d}"
             tot_str = f"{int(total_ms/60000)}:{int((total_ms%60000)/1000):02d}"
             self.time_label.configure(text=f"{cur_str} / {tot_str}")
             self.progress_slider.set(pos)
             
-        if self.is_playing or self.vlc_player.is_playing():
-             self.after(100, self._update_player_ui)
+        # Recursive loop
+        self._player_ui_id = self.after(100, self._update_player_ui)
 
 if __name__ == "__main__": app = YtMsdGui(); app.mainloop()
