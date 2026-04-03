@@ -442,15 +442,27 @@ class YtMsdGui(ctk.CTk):
         threading.Thread(target=self._perform_staged_search, args=(query, count), daemon=True).start()
 
     def _perform_staged_search(self, q, count):
+        is_url = "youtube.com/" in q or "youtu.be/" in q or "http://" in q or "https://" in q
         try:
             with yt_dlp.YoutubeDL({'quiet': True, 'extract_flat': True}) as ydl:
-                info = ydl.extract_info(f"ytsearch{count}:{q}", download=False)
-                res = [e for e in info['entries'] if e.get('id')]
+                if is_url:
+                    info = ydl.extract_info(q, download=False)
+                    # Force only one result, even for playlists
+                    if 'entries' in info: res = [info['entries'][0]] if len(info['entries']) > 0 else []
+                    else: res = [info]
+                    res = [e for e in res if e.get('id')] # Filter valid entries
+                else:
+                    info = ydl.extract_info(f"ytsearch{count}:{q}", download=False)
+                    res = [e for e in info['entries'] if e.get('id')]
+            
             self.after(0, lambda: self._update_results(res))
-            threading.Thread(target=self._background_fetch_full, args=(q, len(res)), daemon=True).start()
+            if not is_url:
+                threading.Thread(target=self._background_fetch_full, args=(q, len(res)), daemon=True).start()
+            else:
+                self.after(0, lambda: self._update_status(f"Loaded URL: {len(res)} items", color="gray"))
         except Exception as e:
             import traceback; traceback.print_exc()
-            self.after(0, lambda: self._handle_error("Search failed"))
+            self.after(0, lambda: self._handle_error("Search failed or Invalid URL"))
 
     def _background_fetch_full(self, q, f):
         try:
