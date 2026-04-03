@@ -32,7 +32,7 @@ class YtMsdGui(ctk.CTk):
 
         # State variables
         self.search_results = []
-        self.queue_items = [] # List of dicts: {'video': video_data, 'status': 'Pending', 'widget': frame_widget}
+        self.queue_items = [] # List of dicts: {'video': video_data, 'status': 'Pending'}
         self.download_path_var = ctk.StringVar(value=os.path.join(os.path.expanduser("~"), "Downloads"))
         self.format_var = ctk.StringVar(value="mp3")
         self.bitrate_var = ctk.StringVar(value="192")
@@ -44,7 +44,7 @@ class YtMsdGui(ctk.CTk):
         self.is_downloading = False
         
         # Drag and drop state
-        self.drag_data = {"item": None, "y": 0, "start_index": -1}
+        self.drag_data = {"item": None, "original_index": -1, "proxy": None}
 
         self._create_widgets()
 
@@ -137,7 +137,7 @@ class YtMsdGui(ctk.CTk):
         self.status_label = ctk.CTkLabel(self.control_panel, text="Ready", font=("Segoe UI", 11), text_color="gray")
         self.status_label.grid(row=2, column=0, sticky="w", padx=20, pady=(0, 10))
 
-    # --- Search Logic ---
+    # --- Search Logic (STAGED) ---
     def _browse_folder(self):
         folder = filedialog.askdirectory(initialdir=self.download_path_var.get())
         if folder: self.download_path_var.set(folder)
@@ -154,90 +154,105 @@ class YtMsdGui(ctk.CTk):
         self.status_label.configure(text="Searching YouTube...", text_color="#0067c0")
         self.search_button.configure(state="disabled")
         for widget in self.results_frame.winfo_children(): widget.destroy()
-        threading.Thread(target=self._perform_search, args=(query,), daemon=True).start()
+        
+        # Run staged search: Step 1 (Initial Wave)
+        threading.Thread(target=self._perform_staged_search, args=(query,), daemon=True).start()
 
-    def _perform_search(self, query):
+    def _perform_staged_search(self, query):
+        try:
+            initial_count = int(self.result_count_var.get())
+            ydl_opts = {'quiet': True, 'extract_flat': True, 'skip_download': True}
+            
+            # Step 1: Initial fast fetch
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(f"ytsearch{initial_count}:{query}", download=False)
+                results = [e for e in info['entries'] if e.get('_type') == 'url' or e.get('ie_key') == 'Youtube' or e.get('id')]
+            
+            self.after(0, lambda: self._update_results(results))
+            
+            # Step 2: Background fetch the remaining results (up to 110)
+            threading.Thread(target=self._background_fetch_full, args=(query, len(results)), daemon=True).start()
+            
+        except Exception as e:
+            self.after(0, lambda: self._handle_error(f"Search error: {e}"))
+
+    def _background_fetch_full(self, query, already_fetched):
         try:
             ydl_opts = {'quiet': True, 'extract_flat': True, 'skip_download': True}
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(f"ytsearch110:{query}", download=False)
-                results = [e for e in info['entries'] if e.get('_type') == 'url' or e.get('ie_key') == 'Youtube' or e.get('id')]
-            self.after(0, lambda: self._update_results(results))
-        except Exception as e:
-            self.after(0, lambda: self._handle_error(f"Search error: {e}"))
+                full_results = [e for e in info['entries'] if e.get('_type') == 'url' or e.get('ie_key') == 'Youtube' or e.get('id')]
+            
+            # Update internal list but don't force a redraw unless it's beneficial
+            self.search_results = full_results
+            self.after(0, lambda: self.status_label.configure(text=f"Loaded {len(full_results)} results total", text_color="gray"))
+        except:
+            pass # Background failure is silent
 
     def _update_results(self, results):
         self.search_results = results
         self.is_searching = False
         self.search_button.configure(state="normal")
         for widget in self.results_frame.winfo_children(): widget.destroy()
+        
         limit = int(self.result_count_var.get())
         display_results = results[:limit]
-        self.status_label.configure(text=f"Showing {len(display_results)} of {len(results)} results", text_color="gray")
+        self.status_label.configure(text=f"Showing top {len(display_results)} results", text_color="gray")
         
         for video in display_results:
             self._create_result_item(video)
 
     def _create_result_item(self, video):
-        item_frame = ctk.CTkFrame(self.results_frame, fg_color="transparent", height=32)
-        item_frame.pack(fill="x", padx=5, pady=1)
+        item_frame = ctk.CTkFrame(self.results_frame, fg_color="transparent")
+        item_frame.pack(fill="x", padx=5, pady=0)
         
-        # Check if video is already in queue
         is_queued = any(q['video']['id'] == video['id'] for q in self.queue_items)
-        cb = ctk.CTkCheckBox(item_frame, text=f"{video.get('title', 'Unknown Title')} | {video.get('uploader', 'Unknown Channel')}", font=self.main_font, width=0, checkbox_width=18, checkbox_height=18, border_width=2, command=lambda v=video: self._toggle_queue(v))
-        cb.pack(side="left", fill="x", expand=True)
+        cb = ctk.CTkCheckBox(item_frame, text=f"{video.get('title')} | {video.get('uploader')}", font=self.main_font, width=0, checkbox_width=18, checkbox_height=18, command=lambda v=video: self._toggle_queue(v))
+        cb.pack(side="left", fill="x", expand=True, pady=1)
         if is_queued: cb.select()
         video['checkbox'] = cb
 
     # --- Queue Logic ---
     def _toggle_queue(self, video):
-        is_now_selected = video['checkbox'].get()
-        if is_now_selected:
-            # Check if already there (shouldn't happen with GUI)
+        if video['checkbox'].get():
             if not any(q['video']['id'] == video['id'] for q in self.queue_items):
                 self.queue_items.append({'video': video, 'status': 'Pending'})
         else:
             self.queue_items = [q for q in self.queue_items if q['video']['id'] != video['id']]
-        
         self._refresh_queue_display()
 
     def _refresh_queue_display(self):
         for widget in self.queue_frame.winfo_children(): widget.destroy()
         self.queue_label.configure(text=f"Download Queue ({len(self.queue_items)})")
-        
         for i, q_item in enumerate(self.queue_items):
             self._create_queue_widget(q_item, i)
 
     def _create_queue_widget(self, q_item, index):
         video = q_item['video']
         status = q_item['status']
-        
-        bg_color = "#2a2a2a" if status == "Pending" else "#1a1a1a"
         text_color = "gray" if status == "Finished" else "white"
         
-        f = ctk.CTkFrame(self.queue_frame, fg_color=bg_color, corner_radius=5, height=40)
+        f = ctk.CTkFrame(self.queue_frame, fg_color="#2a2a2a", corner_radius=5, height=40)
         f.pack(fill="x", padx=5, pady=2)
         
-        # Status Label/Icon
         status_text = ""
-        if status == "Finished": status_text = "\uE73E " # Checkmark MDL2
-        elif status == "Downloading": status_text = "\uE896 " # Downloading/Wait icon
+        if status == "Finished": status_text = "\uE73E "
+        elif status == "Downloading": status_text = "\uE896 "
         
-        lbl = ctk.CTkLabel(f, text=f"{status_text}{video.get('title')}", font=self.main_font, text_color=text_color, anchor="w", cursor="hand2")
+        lbl = ctk.CTkLabel(f, text=f"{status_text}{video.get('title')}", font=self.main_font, text_color=text_color, anchor="w", cursor="fleur")
         lbl.pack(side="left", fill="x", expand=True, padx=10)
         
-        # Remove button
         rem_btn = ctk.CTkButton(f, text="\uE711", font=(self.icon_font, 12), width=30, height=30, fg_color="transparent", hover_color="#444444", command=lambda idx=index: self._remove_from_queue(idx))
         rem_btn.pack(side="right", padx=5)
 
-        # Drag events
-        lbl.bind("<Button-1>", lambda e, idx=index, widget=f: self._on_drag_start(e, idx, widget))
-        lbl.bind("<B1-Motion>", self._on_drag_motion)
-        lbl.bind("<ButtonRelease-1>", self._on_drag_stop)
+        # Re-attach drag handlers to both frame and label for better feel
+        for w in [f, lbl]:
+            w.bind("<Button-1>", lambda e, idx=index, data=q_item: self._on_drag_start(e, idx, data), add="+")
+            w.bind("<B1-Motion>", self._on_drag_motion, add="+")
+            w.bind("<ButtonRelease-1>", self._on_drag_stop, add="+")
 
     def _remove_from_queue(self, index):
         removed_video = self.queue_items.pop(index)['video']
-        # Uncheck in results if visible
         for res in self.search_results:
             if res['id'] == removed_video['id'] and 'checkbox' in res:
                 res['checkbox'].deselect()
@@ -247,49 +262,56 @@ class YtMsdGui(ctk.CTk):
         self.queue_items = [q for q in self.queue_items if q['status'] != "Finished"]
         self._refresh_queue_display()
 
-    # --- Drag & Drop logic ---
-    def _on_drag_start(self, event, index, widget):
-        self.drag_data["item"] = widget
-        self.drag_data["y"] = event.y
-        self.drag_data["start_index"] = index
-        widget.configure(border_width=2, border_color="#0067c0")
-        widget.lift()
+    # --- ADVANCED Drag & Drop logic ---
+    def _on_drag_start(self, event, index, q_item):
+        self.drag_data["original_index"] = index
+        self.drag_data["item"] = q_item
+        
+        # Create a "lifted" proxy frame that follows the cursor
+        self.drag_data["proxy"] = ctk.CTkFrame(self, fg_color="#3a3a3a", border_width=2, border_color="#0067c0", corner_radius=5, width=400, height=40)
+        proxy_title = ctk.CTkLabel(self.drag_data["proxy"], text=f"\uE76F {q_item['video']['title'][:50]}...", font=self.main_font)
+        proxy_title.pack(padx=20, pady=8)
+        
+        # Position it initially
+        self.drag_data["proxy"].place(x=event.x_root - self.winfo_rootx() - 200, y=event.y_root - self.winfo_rooty() - 20)
+        self.status_label.configure(text=f"Moving: {q_item['video']['title']}", text_color="#0067c0")
 
     def _on_drag_motion(self, event):
-        delta_y = event.y - self.drag_data["y"]
-        # In a real app we'd move the frame visually, but Tkinter scrollable frame
-        # makes this complex. For now, we'll just track the mouse and swap on release.
-        self.status_label.configure(text="Dragging item to reorder...", text_color="#0067c0")
+        if self.drag_data["proxy"]:
+            # Move the floating proxy with the mouse
+            new_x = event.x_root - self.winfo_rootx() - 200
+            new_y = event.y_root - self.winfo_rooty() - 20
+            self.drag_data["proxy"].place(x=new_x, y=new_y)
 
     def _on_drag_stop(self, event):
+        if self.drag_data["proxy"]:
+            self.drag_data["proxy"].destroy()
+            self.drag_data["proxy"] = None
+        
         if self.drag_data["item"] is None: return
         
-        # Calculate new index based on mouse final position
-        y_pos = event.y_root - self.queue_frame.winfo_rooty()
-        new_index = max(0, min(len(self.queue_items) - 1, int(y_pos / 44))) # 44 is approx height+pady
+        # Calculate landing index
+        # y_root logic relative to the queue frame's scrollable interior
+        y_rel = event.y_root - self.queue_frame.winfo_rooty()
+        new_index = max(0, min(len(self.queue_items) - 1, int(y_rel / 44)))
         
-        if new_index != self.drag_data["start_index"]:
-            item = self.queue_items.pop(self.drag_data["start_index"])
+        if new_index != self.drag_data["original_index"]:
+            item = self.queue_items.pop(self.drag_data["original_index"])
             self.queue_items.insert(new_index, item)
             self._refresh_queue_display()
-        else:
-            self.drag_data["item"].configure(border_width=0)
-            
-        self.drag_data = {"item": None, "y": 0, "start_index": -1}
+        
+        self.drag_data = {"item": None, "original_index": -1, "proxy": None}
         self.status_label.configure(text="Ready", text_color="gray")
 
-    # --- Download Logic ---
+    # --- Batch Download Logic ---
     def _start_batch_download(self):
         if self.is_downloading: return
-        
-        # Get only pending items
         pending = [q for q in self.queue_items if q['status'] == "Pending"]
         if not pending:
             messagebox.showinfo("Queue Empty", "No pending downloads in the queue.")
             return
-
         self.is_downloading = True
-        self.download_button.configure(state="disabled", text="Downloading Queue...")
+        self.download_button.configure(state="disabled", text="Processing Queue...")
         threading.Thread(target=self._process_queue, daemon=True).start()
 
     def _process_queue(self):
@@ -297,10 +319,8 @@ class YtMsdGui(ctk.CTk):
             if q_item['status'] == "Pending":
                 q_item['status'] = "Downloading"
                 self.after(0, self._refresh_queue_display)
-                
                 url = f"https://www.youtube.com/watch?v={q_item['video']['id']}"
                 self._perform_single_download(url, q_item)
-                
                 q_item['status'] = "Finished"
                 self.after(0, self._refresh_queue_display)
 
@@ -310,30 +330,19 @@ class YtMsdGui(ctk.CTk):
 
     def _perform_single_download(self, url, q_item):
         try:
-            download_path = self.download_path_var.get().replace("\\", "/")
-            format_ext = self.format_var.get()
-            bitrate = self.bitrate_var.get()
-
             ydl_opts = {
                 'format': 'bestaudio/best',
-                'outtmpl': f"{download_path}/%(title)s.%(ext)s",
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': format_ext,
-                    'preferredquality': bitrate,
-                }],
+                'outtmpl': f"{self.download_path_var.get()}/%(title)s.%(ext)s",
+                'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': self.format_var.get(), 'preferredquality': self.bitrate_var.get()}],
                 'progress_hooks': [self._progress_hook],
                 'quiet': True, 'no_warnings': True
             }
-
             if getattr(sys, 'frozen', False):
-                ffmpeg_path = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
-                ydl_opts['ffmpeg_location'] = ffmpeg_path
+                ydl_opts['ffmpeg_location'] = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl: ydl.download([url])
         except Exception as e:
-            self.after(0, lambda: messagebox.showerror("Download Error", f"Error downloading {q_item['video']['title']}: {e}"))
+            self.after(0, lambda: messagebox.showerror("Download Error", f"Failed: {q_item['video']['title']}"))
 
     def _progress_hook(self, d):
         if d['status'] == 'downloading':
@@ -343,7 +352,7 @@ class YtMsdGui(ctk.CTk):
     def _handle_error(self, msg):
         self.is_searching = False
         self.search_button.configure(state="normal")
-        self.status_label.configure(text="Error occurred", text_color="#dc3545")
+        self.status_label.configure(text="Error", text_color="red")
         messagebox.showerror("Error", msg)
 
 if __name__ == "__main__":
