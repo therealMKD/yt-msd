@@ -33,6 +33,57 @@ THEME_COLORS = {
     "White": ("#FFFFFF", "#E5E5E5")
 }
 
+import random
+
+class PlaylistDialog(ctk.CTkToplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent = parent
+        self.title("Open Playlist")
+        
+        # Proper Positioning
+        w, h = 420, 200
+        curr_x, curr_y = self.parent.winfo_x(), self.parent.winfo_y()
+        self.geometry(f"{w}x{h}+{curr_x+100}+{curr_y+100}")
+        self.attributes("-topmost", True); self.resizable(False, False)
+
+        f = ctk.CTkFrame(self, fg_color="transparent")
+        f.pack(fill="both", expand=True, padx=20, pady=20)
+
+        ctk.CTkLabel(f, text="Enter URL or select from history:", font=self.parent.header_font).pack(anchor="w", pady=(0, 5))
+        
+        display_values = []
+        for p in self.parent.recent_playlists:
+            if isinstance(p, dict): display_values.append(p.get("name", "Unknown Playlist"))
+            else: display_values.append(str(p))
+            
+        self.url_cb = ctk.CTkComboBox(f, values=display_values, font=self.parent.main_font, width=380, height=32)
+        self.url_cb.pack(fill="x", pady=(0, 20))
+        if display_values: self.url_cb.set(display_values[0])
+        else: self.url_cb.set("")
+
+        btn_f = ctk.CTkFrame(f, fg_color="transparent")
+        btn_f.pack(fill="x", side="bottom")
+        
+        c_btn = ctk.CTkButton(btn_f, text="Cancel", font=self.parent.main_font, width=80, height=32, fg_color=("#888888", "#444444"), hover_color=("#666666", "#555555"), command=self.destroy)
+        c_btn.pack(side="right", padx=(10, 0))
+        
+        o_btn = ctk.CTkButton(btn_f, text="Open Playlist", font=self.parent.main_font, width=120, height=32, command=self._open)
+        o_btn.pack(side="right")
+        
+    def _open(self):
+        val = self.url_cb.get().strip()
+        if not val: return
+        
+        url = val
+        for p in self.parent.recent_playlists:
+            if isinstance(p, dict) and p.get("name") == val:
+                url = p.get("url")
+                break
+                
+        self.parent._start_search(url, is_playlist=True)
+        self.destroy()
+
 class SettingsWindow(ctk.CTkToplevel):
     def __init__(self, parent):
         super().__init__(parent)
@@ -165,6 +216,12 @@ class YtMsdGui(ctk.CTk):
         self.thumbnail_cache = {}
         self.thumbnail_cache_size = 0
         self.minimize_to_tray_var = ctk.BooleanVar(value=False)
+        self.recent_playlists = []
+        
+        # Playback navigation state
+        self.playback_index = -1
+        self.is_shuffled = False
+        self.shuffle_order = []
 
         # VLC Engine
         try:
@@ -203,6 +260,26 @@ class YtMsdGui(ctk.CTk):
         if self.config_corrupted:
             self.status_label.configure(text="Config file corrupted. Settings reset to defaults.", text_color="#e31e24")
 
+    def _quit(self):
+        # Stop all background activity immediately before exit
+        try:
+            if hasattr(self, '_loop_after_id') and self._loop_after_id:
+                self.after_cancel(self._loop_after_id)
+        except: pass
+        try:
+            if self.vlc_player: self.vlc_player.stop()
+            if self.vlc_instance: self.vlc_instance.release()
+        except: pass
+        try:
+            if hasattr(self, 'tray_manager') and self.tray_manager.icon:
+                self.tray_manager.icon.stop()
+        except: pass
+        self._save_config()
+        os._exit(0)  # Bypass Python GC / thread join delays entirely
+
+    def destroy(self):
+        self._quit()
+
     def _create_widgets(self):
         box_bg, ctrl_bg = ("#f0f0f0", "#1e1e1e"), ("#e0e0e0", "#333333")
         self.layout_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -212,7 +289,7 @@ class YtMsdGui(ctk.CTk):
         # 1. Results
         self.results_col = ctk.CTkFrame(self.layout_frame, fg_color="transparent")
         self.results_col.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
-        self.results_col.grid_columnconfigure(0, weight=1); self.results_col.grid_rowconfigure(1, weight=1)
+        self.results_col.grid_columnconfigure(0, weight=1)
         res_header = ctk.CTkFrame(self.results_col, fg_color="transparent"); res_header.grid(row=0, column=0, sticky="ew", pady=(0, 5))
         self.res_label = ctk.CTkLabel(res_header, text="Search Results", font=self.header_font); self.res_label.grid(row=0, column=0, sticky="w")
         
@@ -220,13 +297,40 @@ class YtMsdGui(ctk.CTk):
         header_controls.grid(row=0, column=1, sticky="e")
         res_header.grid_columnconfigure(0, weight=1) # Push controls to the right
         
+        # Hidden Playlist Controls Row
+        self.playlist_controls_f = ctk.CTkFrame(self.results_col, fg_color="transparent")
+        self.playlist_controls_f.grid(row=1, column=0, sticky="ew", pady=(0, 5))
+        self.playlist_controls_f.grid_remove() # Hidden by default
+        
+        self.check_all_cb = ctk.CTkCheckBox(self.playlist_controls_f, text="Check All", font=self.main_font, width=0, command=self._on_check_all)
+        self.check_all_cb.pack(side="left", padx=(5, 10))
+        self.play_all_btn = ctk.CTkButton(self.playlist_controls_f, text="Play All", font=self.main_font, width=80, height=26, command=self._play_list)
+        self.play_all_btn.pack(side="left", padx=5)
+        self.shuffle_btn = ctk.CTkButton(self.playlist_controls_f, text="\uE8B1  Shuffle", font=self.main_font, width=100, height=26, fg_color="transparent", border_width=1, border_color=("#888888", "#444444"), text_color=("#333333", "#bbbbbb"), hover_color=("#dddddd", "#444444"), command=self._toggle_shuffle)
+        self.shuffle_btn.pack(side="left", padx=5)
+        
+        p_search_f = ctk.CTkFrame(self.playlist_controls_f, fg_color="transparent")
+        p_search_f.pack(side="right", padx=(5, 5))
+        self.playlist_search_var = ctk.StringVar()
+        self.playlist_search_var.trace_add("write", lambda *a: self._filter_playlist())
+        self.playlist_search_entry = ctk.CTkEntry(p_search_f, placeholder_text="Filter playlist...", font=("Segoe UI", 11), width=150, height=26, textvariable=self.playlist_search_var)
+        self.playlist_search_entry.pack(side="right")
+        # Guard: if geometry events steal focus mid-type, reclaim immediately
+        self.playlist_search_entry.bind("<FocusOut>", self._on_playlist_filter_focusout)
+        self.playlist_search_icon = ctk.CTkLabel(p_search_f, text="\uE721", font=(self.icon_font, 14), text_color="gray")
+        self.playlist_search_icon.pack(side="right", padx=(0, 5))
+        
         self.show_thumb_cb = ctk.CTkCheckBox(header_controls, text="Show Thumbnails", font=("Segoe UI", 11), variable=self.show_thumbnails_var, command=self._save_config)
         self.show_thumb_cb.grid(row=0, column=0, padx=(0, 15))
         
-        ctk.CTkLabel(header_controls, text="Show:", font=self.main_font).grid(row=0, column=1, padx=5)
+        self.show_label = ctk.CTkLabel(header_controls, text="Show:", font=self.main_font)
+        self.show_label.grid(row=0, column=1, padx=5)
         self.count_menu = ctk.CTkComboBox(header_controls, values=["10", "20", "50", "100"], variable=self.result_count_var, width=70, height=28, state="readonly")
         self.count_menu.grid(row=0, column=2)
-        self.results_frame = ctk.CTkScrollableFrame(self.results_col, fg_color=box_bg, corner_radius=10); self.results_frame.grid(row=1, column=0, sticky="nsew")
+        
+        # Results Frame pushed down by 1 row due to playlist_controls_f
+        self.results_col.grid_rowconfigure(2, weight=1)
+        self.results_frame = ctk.CTkScrollableFrame(self.results_col, fg_color=box_bg, corner_radius=10); self.results_frame.grid(row=2, column=0, sticky="nsew")
 
         # 2. Resizer Handle
         self.handle = ctk.CTkFrame(self.layout_frame, width=4, fg_color=ctrl_bg, cursor="sb_h_double_arrow")
@@ -251,6 +355,7 @@ class YtMsdGui(ctk.CTk):
         self.search_entry = ctk.CTkEntry(search_f, placeholder_text="Search YouTube or Paste a Video Link", height=40, font=self.main_font, corner_radius=8); self.search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
         self.search_entry.bind("<Return>", lambda e: self._start_search())
         self.search_button = ctk.CTkButton(search_f, text="\uE721", font=(self.icon_font, 16), width=50, height=40, command=self._start_search, corner_radius=8); self.search_button.grid(row=0, column=1)
+        self.playlist_button = ctk.CTkButton(search_f, text="\uE142", font=(self.icon_font, 16), width=50, height=40, command=lambda: PlaylistDialog(self), corner_radius=8, fg_color="transparent", border_width=1, border_color=("#888888", "#444444"), text_color=("#333333", "#ffffff"), hover_color=("#dddddd", "#444444")); self.playlist_button.grid(row=0, column=2, padx=(10, 0))
 
         sets_f = ctk.CTkFrame(self.control_panel, fg_color="transparent"); sets_f.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 10)); sets_f.grid_columnconfigure(5, weight=1)
         ctk.CTkLabel(sets_f, text="Format:", font=self.main_font).grid(row=0, column=0, padx=(0, 5))
@@ -295,7 +400,7 @@ class YtMsdGui(ctk.CTk):
 
         trans_f = ctk.CTkFrame(self.player_frame, fg_color="transparent")
         trans_f.grid(row=0, column=1, sticky="n", pady=(5, 0))
-        self.rew_btn = ctk.CTkButton(trans_f, text="\uE100", font=(self.icon_font, 14), width=35, height=35, fg_color="transparent", text_color=("#333333", "#ffffff"), command=lambda: self._seek_relative(-10))
+        self.rew_btn = ctk.CTkButton(trans_f, text="\uE892", font=(self.icon_font, 14), width=35, height=35, fg_color="transparent", text_color=("#333333", "#ffffff"), command=self._play_previous)
         self.rew_btn.pack(side="left", padx=10)
         
         # Cleaner Play/Pause (No circle)
@@ -303,7 +408,7 @@ class YtMsdGui(ctk.CTk):
         self.play_pause_btn = ctk.CTkButton(trans_f, text="\uE768", font=(self.icon_font, 28), width=50, height=50, fg_color="transparent", text_color=accent, hover_color=("#dddddd", "#3d3d3d"), command=self._toggle_playback)
         self.play_pause_btn.pack(side="left", padx=10)
         
-        self.ff_btn = ctk.CTkButton(trans_f, text="\uE101", font=(self.icon_font, 14), width=35, height=35, fg_color="transparent", text_color=("#333333", "#ffffff"), command=lambda: self._seek_relative(10))
+        self.ff_btn = ctk.CTkButton(trans_f, text="\uE893", font=(self.icon_font, 14), width=35, height=35, fg_color="transparent", text_color=("#333333", "#ffffff"), command=self._play_next)
         self.ff_btn.pack(side="left", padx=10)
 
         r_f = ctk.CTkFrame(self.player_frame, fg_color="transparent")
@@ -316,6 +421,10 @@ class YtMsdGui(ctk.CTk):
         self.progress_slider = ctk.CTkSlider(self.player_frame, from_=0, to=100, height=12, command=self._on_seek)
         self.progress_slider.grid(row=1, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 10))
         self.progress_slider.set(0)
+        
+        self.progress_slider.bind("<Button-1>", lambda e: self.progress_slider.focus_set())
+        self.progress_slider.bind("<Key-Left>", lambda e: self._seek_relative(-10))
+        self.progress_slider.bind("<Key-Right>", lambda e: self._seek_relative(10))
 
     # --- Advanced Args Logic ---
     def _get_current_args_string(self):
@@ -415,6 +524,7 @@ class YtMsdGui(ctk.CTk):
                     self.custom_args_var.set(c.get('custom_args', ""))
                     self.volume_var.set(c.get('volume', 100))
                     self.minimize_to_tray_var.set(c.get('minimize_to_tray', False))
+                    self.recent_playlists = c.get('recent_playlists', [])
                     self.download_path_var.set(self.recent_folders[0])
                     return
             except Exception:
@@ -430,7 +540,8 @@ class YtMsdGui(ctk.CTk):
         if cur and cur not in self.recent_folders: self.recent_folders.insert(0, cur); self.recent_folders = self.recent_folders[:5]
         c = {'format': self.format_var.get(), 'bitrate': self.bitrate_var.get(), 'mode': self.appearance_mode_var.get(), 'accent': self.accent_color_var.get(), 
              'divider': self.divider_percent.get(), 'folders': self.recent_folders, 'use_custom_args': self.use_custom_args_var.get(), 'custom_args': self.custom_args_var.get(),
-             'show_thumbnails': self.show_thumbnails_var.get(), 'volume': self.volume_var.get(), 'minimize_to_tray': self.minimize_to_tray_var.get()}
+             'show_thumbnails': self.show_thumbnails_var.get(), 'volume': self.volume_var.get(), 'minimize_to_tray': self.minimize_to_tray_var.get(),
+             'recent_playlists': self.recent_playlists}
         try:
             with open(self.config_path, 'w') as f: json.dump(c, f, indent=4)
             if hasattr(self, 'path_menu'): self.path_menu.configure(values=self.recent_folders)
@@ -457,39 +568,72 @@ class YtMsdGui(ctk.CTk):
     def _on_count_changed(self):
         if self.search_results and not self.is_searching: self._update_results(self.search_results)
 
-    def _start_search(self):
+    def _start_search(self, query=None, is_playlist=False):
         if self.is_searching: return
-        query = self.search_entry.get().strip()
-        if not query: return
+        q = query if query is not None else self.search_entry.get().strip()
+        if not q: return
         self.is_searching = True
-        self.res_label.configure(text=f"Search Results - [{query}]")
+        
+        if is_playlist:
+            self.res_label.configure(text=f"Loading Playlist...")
+            self.count_menu.grid_remove()
+            self.show_label.grid_remove()
+        else:
+            self.res_label.configure(text=f"Search Results - [{q}]")
+            self.count_menu.grid()
+            self.show_label.grid()
+            self.playlist_controls_f.grid_remove()
+
         self.search_entry.delete(0, 'end')
-        self._update_status("Searching YouTube...", color="#0067c0")
+        if query: self.search_entry.insert(0, query)
+        
+        self._update_status("Fetching data...", color="#0067c0")
         self.search_button.configure(state="disabled")
+        if hasattr(self, 'playlist_button'): self.playlist_button.configure(state="disabled")
         for w in self.results_frame.winfo_children(): w.destroy()
+        
         try: count = int(self.result_count_var.get())
         except: count = 10
-        threading.Thread(target=self._perform_staged_search, args=(query, count), daemon=True).start()
+        threading.Thread(target=self._perform_staged_search, args=(q, count, is_playlist), daemon=True).start()
 
-    def _perform_staged_search(self, q, count):
+    def _perform_staged_search(self, q, count, is_playlist):
         is_url = "youtube.com/" in q or "youtu.be/" in q or "http://" in q or "https://" in q
         try:
             with yt_dlp.YoutubeDL({'quiet': True, 'extract_flat': True}) as ydl:
                 if is_url:
                     info = ydl.extract_info(q, download=False)
-                    # Force only one result, even for playlists
-                    if 'entries' in info: res = [info['entries'][0]] if len(info['entries']) > 0 else []
-                    else: res = [info]
-                    res = [e for e in res if e.get('id')] # Filter valid entries
+                    title = info.get('title', 'Unknown')
+                    if is_playlist or ('entries' in info and len(info['entries']) > 1):
+                        res = [e for e in info.get('entries', []) if e.get('id')]
+                        if is_playlist:
+                            # Upsert: upgrade bare URL string to a named dict, or insert new
+                            updated = False
+                            for i, rp in enumerate(self.recent_playlists):
+                                if isinstance(rp, dict) and rp.get("url") == q:
+                                    self.recent_playlists[i]["name"] = title  # refresh name
+                                    updated = True; break
+                                elif rp == q:  # old bare-URL format — upgrade it
+                                    self.recent_playlists[i] = {"name": title, "url": q}
+                                    updated = True; break
+                            if not updated:
+                                self.recent_playlists.insert(0, {"name": title, "url": q})
+                                self.recent_playlists = self.recent_playlists[:5]
+                            self._save_config()
+                        self.after(0, lambda t=title: self.res_label.configure(text=f"{t} - Youtube Playlist"))
+                        self.after(0, lambda: self.playlist_controls_f.grid())
+                        is_playlist = True
+                    else:
+                        if 'entries' in info: res = [info['entries'][0]] if len(info['entries']) > 0 else []
+                        else: res = [info]
+                        res = [e for e in res if e.get('id')]
+                        self.after(0, lambda: self.playlist_controls_f.grid_remove())
                 else:
                     info = ydl.extract_info(f"ytsearch{count}:{q}", download=False)
                     res = [e for e in info['entries'] if e.get('id')]
             
-            self.after(0, lambda: self._update_results(res))
-            if not is_url:
-                threading.Thread(target=self._background_fetch_full, args=(q, len(res)), daemon=True).start()
-            else:
-                self.after(0, lambda: self._update_status(f"Loaded URL: {len(res)} items", color="gray"))
+            self.after(0, lambda: self._update_results(res, is_playlist))
+            if not is_url: threading.Thread(target=self._background_fetch_full, args=(q, len(res)), daemon=True).start()
+            else: self.after(0, lambda: self._update_status(f"Loaded URL: {len(res)} items", color="gray"))
         except Exception as e:
             import traceback; traceback.print_exc()
             self.after(0, lambda: self._handle_error("Search failed or Invalid URL"))
@@ -501,15 +645,109 @@ class YtMsdGui(ctk.CTk):
             self.after(0, lambda: self._update_status(f"Loaded {len(self.search_results)} results", color="gray"))
         except: pass
 
-    def _update_results(self, res):
-        self.search_results = res; self.is_searching = False; self.search_button.configure(state="normal")
+    def _update_results(self, res, ignore_limit=False):
+        self.search_results = res; self.is_searching = False
+        self.search_button.configure(state="normal")
+        if hasattr(self, 'playlist_button'): self.playlist_button.configure(state="normal")
+        self.check_all_cb.deselect() # Reset
+        if hasattr(self, 'playlist_search_var'): self.playlist_search_var.set("") # Reset
+        
         for w in self.results_frame.winfo_children(): w.destroy()
-        for v in res[:int(self.result_count_var.get())]: self._create_result_item(v)
+        limit = len(res) if ignore_limit or self.playlist_controls_f.winfo_ismapped() else int(self.result_count_var.get())
+        for v in res[:limit]: self._create_result_item(v)
+
+    def _on_check_all(self):
+        state = self.check_all_cb.get()
+        changed = False
+        queue_ids = {q['video']['id'] for q in self.queue_items}
+        
+        for res in self.search_results:
+            if 'checkbox' in res:
+                cb = res['checkbox']
+                vid_id = res['id']
+                if state and not cb.get():
+                    cb.select()
+                    if vid_id not in queue_ids:
+                        self.queue_items.append({'video': res, 'status': 'Pending'})
+                        queue_ids.add(vid_id)
+                        changed = True
+                elif not state and cb.get():
+                    cb.deselect()
+                    if vid_id in queue_ids:
+                        queue_ids.remove(vid_id)
+                        changed = True
+
+        if changed:
+            if not state:
+                self.queue_items = [q for q in self.queue_items if q['video']['id'] in queue_ids]
+            self._refresh_queue_display()
+
+    def _play_list(self):
+        if not self.search_results: return
+        if self.is_shuffled:
+            self.shuffle_order = list(range(len(self.search_results)))
+            random.shuffle(self.shuffle_order)
+            self.playback_index = self.shuffle_order[0]
+        else:
+            self.playback_index = 0
+            
+        self._on_play_click(self.search_results[self.playback_index])
+
+    def _toggle_shuffle(self):
+        self.is_shuffled = not self.is_shuffled
+        accent = self.current_accent_color
+        if self.is_shuffled:
+            # Regenerate shuffle order centred around current track
+            indices = list(range(len(self.search_results)))
+            if self.playback_index in indices:
+                indices.remove(self.playback_index)
+                random.shuffle(indices)
+                self.shuffle_order = [self.playback_index] + indices
+            else:
+                random.shuffle(indices)
+                self.shuffle_order = indices
+            self.shuffle_btn.configure(fg_color=accent, border_color=accent,
+                                       text_color="#ffffff", hover_color=accent)
+        else:
+            self.shuffle_order = []
+            self.shuffle_btn.configure(fg_color="transparent", border_color=("#888888", "#444444"),
+                                       text_color=("#333333", "#bbbbbb"), hover_color=("#dddddd", "#444444"))
+
+    def _on_playlist_filter_focusout(self, event):
+        # If the user is still in the middle of filtering (has text), reclaim focus immediately
+        # This fires when geometry events momentarily steal focus from the entry
+        if self.playlist_search_var.get():
+            self.after(10, lambda: self.playlist_search_entry.focus_set())
+
+    def _filter_playlist(self, *args):
+        query = self.playlist_search_var.get().lower()
+        if not self.search_results: return
+        is_thumb = self.show_thumbnails_var.get()
+        pad = 6 if is_thumb else 1
+
+        # Batch all pack operations together to reduce geometry events
+        to_show = []
+        to_hide = []
+        for res in self.search_results:
+            if 'frame' in res:
+                title = res.get('title', '').lower()
+                channel = res.get('uploader', '').lower()
+                if query in title or query in channel:
+                    to_show.append(res['frame'])
+                else:
+                    to_hide.append(res['frame'])
+
+        for f in to_hide: f.pack_forget()
+        for f in to_show: f.pack(fill="x", padx=5, pady=pad)
+
+        # Reclaim focus — use a longer delay to win the geometry event race
+        self.after(30, lambda: self.playlist_search_entry.focus_set())
 
     def _create_result_item(self, v):
         is_thumb = self.show_thumbnails_var.get()
         f = ctk.CTkFrame(self.results_frame, fg_color="transparent")
         f.pack(fill="x", padx=5, pady=6 if is_thumb else 1)
+        v['frame'] = f
         accent = self.current_accent_color
 
         # 1. Play Button & Thumb (Left side)
@@ -688,6 +926,26 @@ class YtMsdGui(ctk.CTk):
 
     def _play_media(self, url, v):
         self.current_video_id = v['id']
+        # Update playback_index to the clicked track
+        for i, res in enumerate(self.search_results):
+            if res['id'] == v['id']:
+                new_idx = i
+                break
+        else:
+            new_idx = self.playback_index
+        
+        # If shuffle is on and user manually picked a track, insert it at the
+        # current shuffle position so next/prev navigation stays coherent
+        if self.is_shuffled and self.shuffle_order:
+            if new_idx in self.shuffle_order:
+                # Move it to the front of the remaining list
+                self.shuffle_order.remove(new_idx)
+                self.shuffle_order.insert(0, new_idx)
+            else:
+                self.shuffle_order.insert(0, new_idx)
+        
+        self.playback_index = new_idx
+        
         media = self.vlc_instance.media_new(url)
         self.vlc_player.set_media(media)
         self.vlc_player.play()
@@ -767,6 +1025,36 @@ class YtMsdGui(ctk.CTk):
         cur_ms = self.vlc_player.get_time()
         self.vlc_player.set_time(cur_ms + (seconds * 1000))
 
+    def _play_previous(self):
+        if not self.search_results or self.playback_index < 0: return
+        
+        if self.is_shuffled and self.shuffle_order:
+            try:
+                curr_idx = self.shuffle_order.index(self.playback_index)
+                if curr_idx > 0:
+                    self.playback_index = self.shuffle_order[curr_idx - 1]
+                    self._on_play_click(self.search_results[self.playback_index])
+            except ValueError: pass
+        else:
+            if self.playback_index > 0:
+                self.playback_index -= 1
+                self._on_play_click(self.search_results[self.playback_index])
+
+    def _play_next(self):
+        if not self.search_results or self.playback_index < 0: return
+        
+        if self.is_shuffled and self.shuffle_order:
+            try:
+                curr_idx = self.shuffle_order.index(self.playback_index)
+                if curr_idx + 1 < len(self.shuffle_order):
+                    self.playback_index = self.shuffle_order[curr_idx + 1]
+                    self._on_play_click(self.search_results[self.playback_index])
+            except ValueError: pass
+        else:
+            if self.playback_index + 1 < len(self.search_results):
+                self.playback_index += 1
+                self._on_play_click(self.search_results[self.playback_index])
+
     def _update_player_ui(self):
         # 1. Clear any pending handle to prevent loop stacking (Single-Active loop only)
         if hasattr(self, '_loop_after_id') and self._loop_after_id:
@@ -779,7 +1067,16 @@ class YtMsdGui(ctk.CTk):
         self.is_playing = self.vlc_player.is_playing()
         self.play_pause_btn.configure(text="\uE769" if self.is_playing else "\uE768")
 
-        # 3. Always update progress/time labels (even if paused, for manual seeks)
+        # 3. Handle Auto-Advance (Continuous Playback)
+        state = self.vlc_player.get_state()
+        if state == vlc.State.Ended:
+            if not getattr(self, '_ended_trigger', False):
+                self._ended_trigger = True
+                self._play_next()
+        else:
+            self._ended_trigger = False
+
+        # 4. Always update progress/time labels (even if paused, for manual seeks)
         pos = self.vlc_player.get_position() * 100
         ms = self.vlc_player.get_time(); total_ms = self.vlc_player.get_length()
         if total_ms > 0:
@@ -788,7 +1085,7 @@ class YtMsdGui(ctk.CTk):
             self.time_label.configure(text=f"{cur_str} / {tot_str}")
             self.progress_slider.set(pos)
             
-        # 4. Sync Tray Menu if it exists and state changed
+        # 5. Sync Tray Menu if it exists and state changed
         if hasattr(self, 'tray_manager') and self.tray_manager.icon:
             if not hasattr(self.tray_manager, '_last_play_state') or self.tray_manager._last_play_state != self.is_playing:
                 self.tray_manager._last_play_state = self.is_playing
