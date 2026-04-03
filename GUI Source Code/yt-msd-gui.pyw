@@ -173,7 +173,7 @@ class YtMsdGui(ctk.CTk):
         if self.vlc_player: self.vlc_player.audio_set_volume(self.volume_var.get())
         self.is_searching = False; self.is_downloading = False; self.divider_dragging = False
         self.current_playing_title = ""; self.current_status_text = "Ready"
-        self._last_divider_update = 0; self._vol_save_id = None
+        self._last_divider_update = 0; self._vol_save_id = None; self._last_v_applied = -1
         self.drag_data = {"item": None, "original_index": -1, "proxy": None}
         self.config_corrupted = getattr(self, "config_corrupted", False) # Carry over from loader
 
@@ -316,10 +316,17 @@ class YtMsdGui(ctk.CTk):
             if isinstance(w, ctk.CTkButton): w.configure(fg_color=accent, hover_color=hover, text_color=t_c)
             elif isinstance(w, ctk.CTkOptionMenu): w.configure(fg_color=accent, button_color=accent, button_hover_color=hover, text_color=t_c)
             elif isinstance(w, ctk.CTkComboBox): w.configure(button_color=accent, button_hover_color=hover, border_color=accent, text_color=("#1a1a1a", "#ffffff"))
-        self.show_thumb_cb.configure(border_color=accent, checkmark_color=accent)
-        for widget in list(self.results_frame.winfo_children()):
-             for child in widget.winfo_children():
-                if isinstance(child, ctk.CTkCheckBox): child.configure(border_color=accent, checkmark_color=accent)
+        if hasattr(self, 'vol_slider') and self.volume_var.get() <= 100:
+            self.vol_slider.configure(progress_color=accent)
+        
+        # Update existing play buttons instantly
+        if hasattr(self, 'play_pause_btn'): self.play_pause_btn.configure(text_color=accent)
+        if hasattr(self, 'results_frame'):
+            for item in self.results_frame.winfo_children():
+                for c in item.winfo_children():
+                    if isinstance(c, ctk.CTkButton) and c.cget("text") == "\uE768":
+                        c.configure(text_color=accent)
+                    if isinstance(c, ctk.CTkCheckBox): c.configure(border_color=accent, checkmark_color=accent)
         if hasattr(self, 'vol_slider') and self.volume_var.get() <= 100:
             self.vol_slider.configure(progress_color=accent)
 
@@ -459,8 +466,7 @@ class YtMsdGui(ctk.CTk):
         title = v.get('title', 'Unknown')
         if len(title) > 100: title = title[:97] + "..."
         uploader = v.get('uploader', 'Unknown')
-        accent = self._get_system_accent_color() if self.accent_color_var.get() == "System" else THEME_COLORS.get(self.accent_color_var.get(), THEME_COLORS["Blue"])[0]
-        
+        accent = self.current_accent_color
         cb = ctk.CTkCheckBox(f, text=f"{title}\n{uploader}" if is_thumb else f"{title} | {uploader}", font=self.main_font if not is_thumb else ("Segoe UI", 11), width=0, checkbox_width=18, checkbox_height=18, border_color=accent, checkmark_color=accent, command=lambda video=v: self._toggle_queue(video))
         cb.pack(side="left", fill="x", expand=True)
         if any(q['video']['id'] == v['id'] for q in self.queue_items): cb.select()
@@ -616,16 +622,26 @@ class YtMsdGui(ctk.CTk):
 
     def _on_volume(self, val):
         v = int(float(val))
-        self.volume_var.set(v)
-        if hasattr(self, 'vol_readout'): self.vol_readout.configure(text=f"{v}%")
-        if v > 100: self.vol_slider.configure(progress_color="#e31e24")
-        else: self.vol_slider.configure(progress_color=self.current_accent_color)
+        if self._last_v_applied == v: return # EXIT FAST: NO CHANGE
+        self._last_v_applied = v
         
+        # 1. Update Audio engine FIRST for zero perceived latency
         if self.vlc_player: self.vlc_player.audio_set_volume(v)
         
-        # Debounce config saving to prevent disk lag
+        # 2. Variable set for persistence
+        self.volume_var.set(v)
+        
+        # 3. Optimized UI Updates
+        if hasattr(self, 'vol_readout'): self.vol_readout.configure(text=f"{v}%")
+        
+        is_red = v > 100
+        if not hasattr(self, '_vol_is_red') or self._vol_is_red != is_red:
+            self._vol_is_red = is_red
+            self.vol_slider.configure(progress_color="#e31e24" if is_red else self.current_accent_color)
+        
+        # 4. Debounce Config Save (Disk I/O is very slow)
         if self._vol_save_id: self.after_cancel(self._vol_save_id)
-        self._vol_save_id = self.after(500, self._save_config)
+        self._vol_save_id = self.after(1000, self._save_config)
 
     def _on_vol_keydown(self, event):
         step = 5
