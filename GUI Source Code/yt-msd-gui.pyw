@@ -9,7 +9,11 @@ import threading
 import winreg
 import yt_dlp
 import shlex
+import webbrowser
+import urllib.request
+import io
 import customtkinter as ctk
+from PIL import Image
 from tkinter import filedialog, messagebox
 
 # Theme Mapping for custom colors
@@ -146,6 +150,9 @@ class YtMsdGui(ctk.CTk):
         # Advanced Args vars
         self.use_custom_args_var = ctk.BooleanVar(value=False)
         self.custom_args_var = ctk.StringVar(value="")
+        self.show_thumbnails_var = ctk.BooleanVar(value=False)
+        self.thumbnail_cache = {}
+        self.thumbnail_cache_size = 0
         self.config_corrupted = False
 
         self._load_config()
@@ -155,7 +162,9 @@ class YtMsdGui(ctk.CTk):
 
         self._create_widgets()
         ctk.set_appearance_mode(self.appearance_mode_var.get()); self._apply_accent_color(self.accent_color_var.get())
+        
         self.result_count_var.trace_add("write", lambda *args: self._on_count_changed())
+        self.show_thumbnails_var.trace_add("write", lambda *args: self._on_count_changed())
         
         if self.config_corrupted:
             self.status_label.configure(text="Config file corrupted. Settings reset to defaults.", text_color="#e31e24")
@@ -171,9 +180,18 @@ class YtMsdGui(ctk.CTk):
         self.results_col.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
         self.results_col.grid_columnconfigure(0, weight=1); self.results_col.grid_rowconfigure(1, weight=1)
         res_header = ctk.CTkFrame(self.results_col, fg_color="transparent"); res_header.grid(row=0, column=0, sticky="ew", pady=(0, 5))
-        self.results_label = ctk.CTkLabel(res_header, text="Search Results", font=self.header_font); self.results_label.pack(side="left")
-        self.count_menu = ctk.CTkOptionMenu(res_header, values=["10", "20", "50", "100"], variable=self.result_count_var, width=70, height=26); self.count_menu.pack(side="right")
-        ctk.CTkLabel(res_header, text="Show:", font=self.main_font).pack(side="right", padx=5)
+        self.res_label = ctk.CTkLabel(res_header, text="Search Results", font=self.header_font); self.res_label.grid(row=0, column=0, sticky="w")
+        
+        header_controls = ctk.CTkFrame(res_header, fg_color="transparent")
+        header_controls.grid(row=0, column=1, sticky="e")
+        res_header.grid_columnconfigure(0, weight=1) # Push controls to the right
+        
+        self.show_thumb_cb = ctk.CTkCheckBox(header_controls, text="Show Thumbnails", font=("Segoe UI", 11), variable=self.show_thumbnails_var, command=self._save_config)
+        self.show_thumb_cb.grid(row=0, column=0, padx=(0, 15))
+        
+        ctk.CTkLabel(header_controls, text="Show:", font=self.main_font).grid(row=0, column=1, padx=5)
+        self.count_menu = ctk.CTkComboBox(header_controls, values=["10", "20", "50", "100"], variable=self.result_count_var, width=70, height=28, state="readonly")
+        self.count_menu.grid(row=0, column=2)
         self.results_frame = ctk.CTkScrollableFrame(self.results_col, fg_color=box_bg, corner_radius=10); self.results_frame.grid(row=1, column=0, sticky="nsew")
 
         # 2. Resizer Handle
@@ -236,6 +254,7 @@ class YtMsdGui(ctk.CTk):
             if isinstance(w, ctk.CTkButton): w.configure(fg_color=accent, hover_color=hover, text_color=t_c)
             elif isinstance(w, ctk.CTkOptionMenu): w.configure(fg_color=accent, button_color=accent, button_hover_color=hover, text_color=t_c)
             elif isinstance(w, ctk.CTkComboBox): w.configure(button_color=accent, button_hover_color=hover, border_color=accent, text_color=("#1a1a1a", "#ffffff"))
+        self.show_thumb_cb.configure(border_color=accent, checkmark_color=accent)
         for widget in list(self.results_frame.winfo_children()):
              for child in widget.winfo_children():
                 if isinstance(child, ctk.CTkCheckBox): child.configure(border_color=accent, checkmark_color=accent)
@@ -271,6 +290,7 @@ class YtMsdGui(ctk.CTk):
                     self.recent_folders = c.get('folders', [default_dl])
                     if not isinstance(self.recent_folders, list) or not self.recent_folders:
                         self.recent_folders = [default_dl]
+                    self.show_thumbnails_var.set(c.get('show_thumbnails', False))
                     self.use_custom_args_var.set(c.get('use_custom_args', False))
                     self.custom_args_var.set(c.get('custom_args', ""))
                     self.download_path_var.set(self.recent_folders[0])
@@ -287,7 +307,8 @@ class YtMsdGui(ctk.CTk):
         cur = self.download_path_var.get()
         if cur and cur not in self.recent_folders: self.recent_folders.insert(0, cur); self.recent_folders = self.recent_folders[:5]
         c = {'format': self.format_var.get(), 'bitrate': self.bitrate_var.get(), 'mode': self.appearance_mode_var.get(), 'accent': self.accent_color_var.get(), 
-             'divider': self.divider_percent.get(), 'folders': self.recent_folders, 'use_custom_args': self.use_custom_args_var.get(), 'custom_args': self.custom_args_var.get()}
+             'divider': self.divider_percent.get(), 'folders': self.recent_folders, 'use_custom_args': self.use_custom_args_var.get(), 'custom_args': self.custom_args_var.get(),
+             'show_thumbnails': self.show_thumbnails_var.get()}
         try:
             with open(self.config_path, 'w') as f: json.dump(c, f, indent=4)
             if hasattr(self, 'path_menu'): self.path_menu.configure(values=self.recent_folders)
@@ -305,7 +326,7 @@ class YtMsdGui(ctk.CTk):
         query = self.search_entry.get().strip()
         if not query: return
         self.is_searching = True
-        self.results_label.configure(text=f"Search Results - [{query}]")
+        self.res_label.configure(text=f"Search Results - [{query}]")
         self.search_entry.delete(0, 'end')
         self.status_label.configure(text="Searching YouTube...", text_color="#0067c0")
         self.search_button.configure(state="disabled")
@@ -335,15 +356,51 @@ class YtMsdGui(ctk.CTk):
         for v in res[:int(self.result_count_var.get())]: self._create_result_item(v)
 
     def _create_result_item(self, v):
+        is_thumb = self.show_thumbnails_var.get()
         f = ctk.CTkFrame(self.results_frame, fg_color="transparent")
-        f.pack(fill="x", padx=5)
+        f.pack(fill="x", padx=5, pady=6 if is_thumb else 1)
+        
+        # 1. Thumbnail (if enabled)
+        if is_thumb:
+            thumb_label = ctk.CTkLabel(f, text="", width=90, height=50, fg_color=("#dbdbdb", "#2b2b2b"), corner_radius=4)
+            thumb_label.pack(side="left", padx=(0, 10))
+            threading.Thread(target=self._fetch_thumbnail, args=(v, thumb_label), daemon=True).start()
+
+        # 2. Results Info (Title + Checkbox)
         title = v.get('title', 'Unknown')
-        if len(title) > 180: title = title[:177] + "..."
+        if len(title) > 100: title = title[:97] + "..."
+        uploader = v.get('uploader', 'Unknown')
         accent = self._get_system_accent_color() if self.accent_color_var.get() == "System" else THEME_COLORS.get(self.accent_color_var.get(), THEME_COLORS["Blue"])[0]
-        cb = ctk.CTkCheckBox(f, text=f"{title} | {v.get('uploader')}", font=self.main_font, width=0, checkbox_width=18, checkbox_height=18, border_color=accent, checkmark_color=accent, command=lambda video=v: self._toggle_queue(video))
-        cb.pack(side="left", fill="x", expand=True, pady=1)
+        
+        cb = ctk.CTkCheckBox(f, text=f"{title}\n{uploader}" if is_thumb else f"{title} | {uploader}", font=self.main_font if not is_thumb else ("Segoe UI", 11), width=0, checkbox_width=18, checkbox_height=18, border_color=accent, checkmark_color=accent, command=lambda video=v: self._toggle_queue(video))
+        cb.pack(side="left", fill="x", expand=True)
         if any(q['video']['id'] == v['id'] for q in self.queue_items): cb.select()
         v['checkbox'] = cb
+
+        # 3. External Link Button
+        link_btn = ctk.CTkButton(f, text="\uE8A7", font=(self.icon_font, 14), width=30, height=30, fg_color="transparent", hover_color=("#dddddd", "#3d3d3d"), text_color=("#333333", "#ffffff"), command=lambda: webbrowser.open(f"https://youtube.com/watch?v={v['id']}"))
+        link_btn.pack(side="right", padx=5)
+
+    def _fetch_thumbnail(self, v, label):
+        vid_id = v.get('id')
+        if not vid_id: return
+        if vid_id in self.thumbnail_cache:
+            self.after(0, lambda: label.configure(image=self.thumbnail_cache[vid_id]))
+            return
+
+        try:
+            url = f"https://i.ytimg.com/vi/{vid_id}/mqdefault.jpg"
+            with urllib.request.urlopen(url) as req:
+                data = req.read()
+                if self.thumbnail_cache_size + len(data) > 256 * 1024 * 1024:
+                    self.thumbnail_cache.clear(); self.thumbnail_cache_size = 0 # Simple flush
+                
+                img = Image.open(io.BytesIO(data))
+                ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(90, 50))
+                self.thumbnail_cache[vid_id] = ctk_img
+                self.thumbnail_cache_size += len(data)
+                self.after(0, lambda: label.configure(image=ctk_img))
+        except: pass
 
     def _toggle_queue(self, v):
         if v['checkbox'].get():
