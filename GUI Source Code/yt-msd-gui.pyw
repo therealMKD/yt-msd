@@ -80,11 +80,38 @@ class SettingsWindow(ctk.CTkToplevel):
 
         ctk.CTkLabel(self.main_f, text="\uE946 Manual override ignores GUI bitrate/format settings.", font=("Segoe UI", 10), text_color="gray").pack(anchor="w", padx=32)
 
-        # 4. Footer - Right Aligned Close
+        # 4. Reset Defaults
+        self.reset_btn = ctk.CTkButton(self.main_f, text="Reset to Default Config", font=self.parent.main_font, height=32, fg_color="transparent", border_width=1, border_color=("#888888", "#444444"), text_color=("#555555", "#aaaaaa"), hover_color=("#dddddd", "#3d3d3d"), command=self._reset_defaults)
+        self.reset_btn.pack(fill="x", side="bottom", pady=(10, 0))
+
+        # 5. Footer - Right Aligned Close
         footer = ctk.CTkFrame(self.main_f, fg_color="transparent")
-        footer.pack(fill="x", side="bottom", pady=(20, 0))
+        footer.pack(fill="x", side="bottom", pady=(10, 0))
         self.close_btn = ctk.CTkButton(footer, text="Close", font=self.parent.main_font, width=100, height=32, fg_color=("#888888", "#444444"), hover_color=("#666666", "#555555"), command=self.destroy)
         self.close_btn.pack(side="right")
+
+    def _reset_defaults(self):
+        if messagebox.askyesno("Confirm Reset", "This will wipe your custom arguments, theme choices, and folder history. Continue?", parent=self):
+            if os.path.exists(self.parent.config_path):
+                os.remove(self.parent.config_path)
+            # Re-init fresh
+            self.parent.format_var.set("mp3")
+            self.parent.bitrate_var.set("192")
+            self.parent.appearance_mode_var.set("System")
+            self.parent.accent_color_var.set("Blue")
+            self.parent.use_custom_args_var.set(False)
+            self.parent.custom_args_var.set(self.parent._get_current_args_string())
+            self.parent.divider_percent.set(0.6)
+            self.parent.recent_folders = [os.path.join(os.path.expanduser("~"), "Downloads")]
+            self.parent.download_path_var.set(self.parent.recent_folders[0])
+            
+            # Apply
+            ctk.set_appearance_mode("System")
+            self.parent._apply_accent_color("Blue")
+            self.parent._update_column_weights()
+            self._update_color_selection_visuals()
+            self.destroy()
+            messagebox.showinfo("Reset", "Settings have been restored to defaults.", parent=self.parent)
 
     def _update_color_selection_visuals(self):
         current_color = self.parent.accent_color_var.get()
@@ -119,14 +146,19 @@ class YtMsdGui(ctk.CTk):
         # Advanced Args vars
         self.use_custom_args_var = ctk.BooleanVar(value=False)
         self.custom_args_var = ctk.StringVar(value="")
+        self.config_corrupted = False
 
         self._load_config()
         self.is_searching = False; self.is_downloading = False; self.divider_dragging = False
         self.drag_data = {"item": None, "original_index": -1, "proxy": None}
+        self.config_corrupted = getattr(self, "config_corrupted", False) # Carry over from loader
 
         self._create_widgets()
         ctk.set_appearance_mode(self.appearance_mode_var.get()); self._apply_accent_color(self.accent_color_var.get())
         self.result_count_var.trace_add("write", lambda *args: self._on_count_changed())
+        
+        if self.config_corrupted:
+            self.status_label.configure(text="Config file corrupted. Settings reset to defaults.", text_color="#e31e24")
 
     def _create_widgets(self):
         box_bg, ctrl_bg = ("#f0f0f0", "#1e1e1e"), ("#e0e0e0", "#333333")
@@ -231,15 +263,25 @@ class YtMsdGui(ctk.CTk):
             try:
                 with open(self.config_path, 'r') as f:
                     c = json.load(f)
-                    self.format_var.set(c.get('format', 'mp3')); self.bitrate_var.set(c.get('bitrate', '192'))
-                    self.appearance_mode_var.set(c.get('mode', 'System')); self.accent_color_var.set(c.get('accent', 'System'))
-                    self.divider_percent.set(c.get('divider', 0.6)); self.recent_folders = c.get('folders', [default_dl])
+                    self.format_var.set(c.get('format', 'mp3'))
+                    self.bitrate_var.set(c.get('bitrate', '192'))
+                    self.appearance_mode_var.set(c.get('mode', 'System'))
+                    self.accent_color_var.set(c.get('accent', 'System'))
+                    self.divider_percent.set(max(0.2, min(0.8, c.get('divider', 0.6))))
+                    self.recent_folders = c.get('folders', [default_dl])
+                    if not isinstance(self.recent_folders, list) or not self.recent_folders:
+                        self.recent_folders = [default_dl]
                     self.use_custom_args_var.set(c.get('use_custom_args', False))
                     self.custom_args_var.set(c.get('custom_args', ""))
                     self.download_path_var.set(self.recent_folders[0])
                     return
-            except: pass
-        self.recent_folders = [default_dl]; self.download_path_var.set(default_dl)
+            except Exception:
+                self.config_corrupted = True
+                pass
+        
+        # Fallback for fresh/broken config
+        self.recent_folders = [default_dl]
+        self.download_path_var.set(default_dl)
 
     def _save_config(self):
         cur = self.download_path_var.get()
@@ -380,8 +422,15 @@ class YtMsdGui(ctk.CTk):
             ydl_opts.update({'outtmpl': f"{folder}/%(title)s.%(ext)s", 'progress_hooks': [self._progress_hook]})
             if getattr(sys, 'frozen', False): ydl_opts['ffmpeg_location'] = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
             
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl: ydl.download([url])
-        except: self.after(0, lambda: messagebox.showerror("Error", f"Failed: {q['video']['title']}"))
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                result = ydl.download([url])
+                if result != 0:
+                    raise Exception("Download failed with non-zero status")
+        except Exception:
+            msg = f"Failed: {q['video']['title']}"
+            if self.use_custom_args_var.get():
+                msg += "\n\nYour custom arguments might be invalid."
+            self.after(0, lambda: messagebox.showerror("Download Error", msg))
 
     def _progress_hook(self, d):
         if d['status'] == 'downloading': self.after(0, lambda: self.status_label.configure(text=f"Progress... {d.get('_percent_str', '0%')}"))
