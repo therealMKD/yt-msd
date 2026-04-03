@@ -18,12 +18,12 @@ class YtMsdGui(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        # Window configuration
+        # Window configuration - Widened for the queue
         self.title("yt-msd | YouTube Media Downloader")
-        self.geometry("900x700")
+        self.geometry("1400x850")
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(0, weight=1)  # Results area
-        self.grid_rowconfigure(1, weight=0)  # Search & Controls
+        self.grid_rowconfigure(0, weight=1)  # Main area
+        self.grid_rowconfigure(1, weight=0)  # Controls
 
         # Icon font for Windows (Segoe MDL2 Assets)
         self.icon_font = "Segoe MDL2 Assets"
@@ -32,145 +32,117 @@ class YtMsdGui(ctk.CTk):
 
         # State variables
         self.search_results = []
-        self.selected_video = None
+        self.queue_items = [] # List of dicts: {'video': video_data, 'status': 'Pending', 'widget': frame_widget}
         self.download_path_var = ctk.StringVar(value=os.path.join(os.path.expanduser("~"), "Downloads"))
         self.format_var = ctk.StringVar(value="mp3")
         self.bitrate_var = ctk.StringVar(value="192")
         self.result_count_var = ctk.StringVar(value="10")
         
-        # Add trace to update display immediately when result count changes
         self.result_count_var.trace_add("write", lambda *args: self._on_count_changed())
         
         self.is_searching = False
         self.is_downloading = False
+        
+        # Drag and drop state
+        self.drag_data = {"item": None, "y": 0, "start_index": -1}
 
         self._create_widgets()
 
     def _create_widgets(self):
-        # Main Container
-        self.main_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.main_frame.grid(row=0, column=0, sticky="nsew", padx=20, pady=(15, 10))
-        self.main_frame.grid_columnconfigure(0, weight=1)
-        self.main_frame.grid_rowconfigure(1, weight=1)
+        # --- Main Layout Container ---
+        self.layout_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.layout_frame.grid(row=0, column=0, sticky="nsew", padx=20, pady=(15, 10))
+        self.layout_frame.grid_columnconfigure(0, weight=3) # Search Results
+        self.layout_frame.grid_columnconfigure(1, weight=0) # Separator
+        self.layout_frame.grid_columnconfigure(2, weight=2) # Download Queue
+        self.layout_frame.grid_rowconfigure(0, weight=1)
 
-        # Results Header with Count Selector
-        self.header_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
-        self.header_frame.grid(row=0, column=0, sticky="ew", pady=(0, 5))
+        # 1. Search Results Column
+        self.results_col = ctk.CTkFrame(self.layout_frame, fg_color="transparent")
+        self.results_col.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        self.results_col.grid_columnconfigure(0, weight=1)
+        self.results_col.grid_rowconfigure(1, weight=1)
+
+        self.res_header = ctk.CTkFrame(self.results_col, fg_color="transparent")
+        self.res_header.grid(row=0, column=0, sticky="ew", pady=(0, 5))
+        ctk.CTkLabel(self.res_header, text="Search Results", font=self.header_font).pack(side="left")
         
-        self.results_label = ctk.CTkLabel(self.header_frame, text="Search Results", font=self.header_font)
-        self.results_label.pack(side="left")
-
-        self.count_menu = ctk.CTkOptionMenu(
-            self.header_frame,
-            values=["10", "20", "50", "100"],
-            variable=self.result_count_var,
-            width=70,
-            height=26,
-            font=self.main_font
-        )
+        self.count_menu = ctk.CTkOptionMenu(self.res_header, values=["10", "20", "50", "100"], variable=self.result_count_var, width=70, height=26, font=self.main_font)
         self.count_menu.pack(side="right")
-        ctk.CTkLabel(self.header_frame, text="Show:", font=self.main_font).pack(side="right", padx=5)
+        ctk.CTkLabel(self.res_header, text="Show:", font=self.main_font).pack(side="right", padx=5)
 
-        # Results Scrollable Frame
-        self.results_frame = ctk.CTkScrollableFrame(self.main_frame, fg_color="#1e1e1e", corner_radius=10)
+        self.results_frame = ctk.CTkScrollableFrame(self.results_col, fg_color="#1e1e1e", corner_radius=10)
         self.results_frame.grid(row=1, column=0, sticky="nsew")
 
-        # Search & Control Panel
+        # 2. Results/Queue Separator
+        ctk.CTkFrame(self.layout_frame, width=2, fg_color="#444444").grid(row=0, column=1, sticky="ns", padx=5)
+
+        # 3. Download Queue Column
+        self.queue_col = ctk.CTkFrame(self.layout_frame, fg_color="transparent")
+        self.queue_col.grid(row=0, column=2, sticky="nsew", padx=(10, 0))
+        self.queue_col.grid_columnconfigure(0, weight=1)
+        self.queue_col.grid_rowconfigure(1, weight=1)
+
+        self.queue_header = ctk.CTkFrame(self.queue_col, fg_color="transparent")
+        self.queue_header.grid(row=0, column=0, sticky="ew", pady=(0, 5))
+        self.queue_label = ctk.CTkLabel(self.queue_header, text="Download Queue (0)", font=self.header_font)
+        self.queue_label.pack(side="left")
+        
+        self.clear_comp_btn = ctk.CTkButton(self.queue_header, text="Clear Completed", font=self.main_font, height=26, width=120, fg_color="#444444", hover_color="#555555", command=self._clear_completed)
+        self.clear_comp_btn.pack(side="right")
+
+        self.queue_frame = ctk.CTkScrollableFrame(self.queue_col, fg_color="#1e1e1e", corner_radius=10)
+        self.queue_frame.grid(row=1, column=0, sticky="nsew")
+
+        # 4. Global Control Panel
         self.control_panel = ctk.CTkFrame(self, height=180, corner_radius=0, fg_color="#333333")
         self.control_panel.grid(row=1, column=0, sticky="ew")
         self.control_panel.grid_columnconfigure(0, weight=1)
 
-        # Search
+        # Search Bar
         self.search_bar_frame = ctk.CTkFrame(self.control_panel, fg_color="transparent")
         self.search_bar_frame.grid(row=0, column=0, sticky="ew", padx=20, pady=(15, 10))
         self.search_bar_frame.grid_columnconfigure(0, weight=1)
 
-        self.search_entry = ctk.CTkEntry(
-            self.search_bar_frame, 
-            placeholder_text="Search YouTube or paste URL here...",
-            height=40,
-            font=self.main_font,
-            corner_radius=8
-        )
+        self.search_entry = ctk.CTkEntry(self.search_bar_frame, placeholder_text="Search YouTube or paste URL here...", height=40, font=self.main_font, corner_radius=8)
         self.search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
         self.search_entry.bind("<Return>", lambda e: self._start_search())
 
-        self.search_button = ctk.CTkButton(
-            self.search_bar_frame,
-            text="\uE721", # Search icon
-            font=(self.icon_font, 16),
-            width=50,
-            height=40,
-            command=self._start_search,
-            corner_radius=8,
-            fg_color="#0067c0",
-            hover_color="#005aab"
-        )
+        self.search_button = ctk.CTkButton(self.search_bar_frame, text="\uE721", font=(self.icon_font, 16), width=50, height=40, command=self._start_search, corner_radius=8, fg_color="#0067c0", hover_color="#005aab")
         self.search_button.grid(row=0, column=1)
 
-        # Controls
+        # Settings
         self.settings_frame = ctk.CTkFrame(self.control_panel, fg_color="transparent")
         self.settings_frame.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 10))
         self.settings_frame.grid_columnconfigure(5, weight=1)
 
-        # Format
         ctk.CTkLabel(self.settings_frame, text="Format:", font=self.main_font).grid(row=0, column=0, padx=(0, 5))
-        self.format_menu = ctk.CTkOptionMenu(
-            self.settings_frame,
-            values=["mp3", "m4a", "flac", "wav", "aac", "opus", "ogg", "vorbis", "mka"],
-            variable=self.format_var,
-            width=80, height=28
-        )
+        self.format_menu = ctk.CTkOptionMenu(self.settings_frame, values=["mp3", "m4a", "flac", "wav", "aac", "opus", "ogg", "vorbis", "mka"], variable=self.format_var, width=80, height=28)
         self.format_menu.grid(row=0, column=1, padx=(0, 10))
 
-        # Bitrate
         ctk.CTkLabel(self.settings_frame, text="Bitrate:", font=self.main_font).grid(row=0, column=2, padx=(0, 5))
-        self.bitrate_menu = ctk.CTkComboBox(
-            self.settings_frame,
-            values=["128", "192", "256", "320"],
-            variable=self.bitrate_var,
-            width=80, height=28,
-            font=self.main_font
-        )
+        self.bitrate_menu = ctk.CTkComboBox(self.settings_frame, values=["128", "192", "256", "320"], variable=self.bitrate_var, width=80, height=28, font=self.main_font)
         self.bitrate_menu.grid(row=0, column=3, padx=(0, 10))
 
-        # Save Folder
         ctk.CTkLabel(self.settings_frame, text="Save to:", font=self.main_font).grid(row=0, column=4, padx=(10, 5))
         self.path_entry = ctk.CTkEntry(self.settings_frame, textvariable=self.download_path_var, font=self.main_font, height=28)
         self.path_entry.grid(row=0, column=5, sticky="ew", padx=(0, 5))
         
-        self.browse_button = ctk.CTkButton(
-            self.settings_frame,
-            text="\uED25", # Folder icon
-            font=(self.icon_font, 14),
-            width=35, height=28,
-            command=self._browse_folder
-        )
+        self.browse_button = ctk.CTkButton(self.settings_frame, text="\uED25", font=(self.icon_font, 14), width=35, height=28, command=self._browse_folder)
         self.browse_button.grid(row=0, column=6, padx=(0, 10))
 
-        # Download Button
-        self.download_button = ctk.CTkButton(
-            self.settings_frame,
-            text="Download",
-            font=("Segoe UI Semibold", 13),
-            height=35,
-            fg_color="#0067c0",
-            hover_color="#005aab",
-            command=self._start_download
-        )
+        self.download_button = ctk.CTkButton(self.settings_frame, text="Download All", font=("Segoe UI Semibold", 13), height=35, width=140, fg_color="#0067c0", hover_color="#005aab", command=self._start_batch_download)
         self.download_button.grid(row=0, column=7)
 
-        # 5. Status
         self.status_label = ctk.CTkLabel(self.control_panel, text="Ready", font=("Segoe UI", 11), text_color="gray")
         self.status_label.grid(row=2, column=0, sticky="w", padx=20, pady=(0, 10))
 
+    # --- Search Logic ---
     def _browse_folder(self):
         folder = filedialog.askdirectory(initialdir=self.download_path_var.get())
-        if folder:
-            self.download_path_var.set(folder)
+        if folder: self.download_path_var.set(folder)
 
     def _on_count_changed(self):
-        # Update results only if we already have some
         if self.search_results and not self.is_searching:
             self._update_results(self.search_results)
 
@@ -178,14 +150,10 @@ class YtMsdGui(ctk.CTk):
         if self.is_searching: return
         query = self.search_entry.get().strip()
         if not query: return
-
         self.is_searching = True
         self.status_label.configure(text="Searching YouTube...", text_color="#0067c0")
         self.search_button.configure(state="disabled")
-
-        for widget in self.results_frame.winfo_children():
-            widget.destroy()
-
+        for widget in self.results_frame.winfo_children(): widget.destroy()
         threading.Thread(target=self._perform_search, args=(query,), daemon=True).start()
 
     def _perform_search(self, query):
@@ -194,7 +162,6 @@ class YtMsdGui(ctk.CTk):
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(f"ytsearch110:{query}", download=False)
                 results = [e for e in info['entries'] if e.get('_type') == 'url' or e.get('ie_key') == 'Youtube' or e.get('id')]
-                
             self.after(0, lambda: self._update_results(results))
         except Exception as e:
             self.after(0, lambda: self._handle_error(f"Search error: {e}"))
@@ -203,73 +170,152 @@ class YtMsdGui(ctk.CTk):
         self.search_results = results
         self.is_searching = False
         self.search_button.configure(state="normal")
-        
-        # Clear existing buttons from results frame
-        for widget in self.results_frame.winfo_children():
-            widget.destroy()
-            
+        for widget in self.results_frame.winfo_children(): widget.destroy()
         limit = int(self.result_count_var.get())
         display_results = results[:limit]
-        
         self.status_label.configure(text=f"Showing {len(display_results)} of {len(results)} results", text_color="gray")
-
-        if not results:
-            ctk.CTkLabel(self.results_frame, text="No results found.", font=self.main_font).pack(pady=20)
-            return
-
-        for i, video in enumerate(display_results):
-            btn = ctk.CTkButton(
-                self.results_frame,
-                text=f"{video.get('title', 'Unknown Title')} | {video.get('uploader', 'Unknown Channel')}",
-                font=self.main_font,
-                anchor="w",
-                fg_color="transparent",
-                text_color="white",
-                hover_color="#3a3a3a",
-                height=32,
-                corner_radius=5,
-                command=lambda v=video, idx=i: self._select_video(v, idx)
-            )
-            btn.pack(fill="x", padx=5, pady=1)
-            video['widget'] = btn
-
-    def _select_video(self, video, idx):
-        for res in self.search_results:
-            if 'widget' in res:
-                res['widget'].configure(fg_color="transparent")
         
-        video['widget'].configure(fg_color="#0067c0")
-        self.selected_video = video
-        self.status_label.configure(text=f"Selected: {video.get('title')}", text_color="white")
+        for video in display_results:
+            self._create_result_item(video)
 
-    def _start_download(self):
+    def _create_result_item(self, video):
+        item_frame = ctk.CTkFrame(self.results_frame, fg_color="transparent", height=32)
+        item_frame.pack(fill="x", padx=5, pady=1)
+        
+        # Check if video is already in queue
+        is_queued = any(q['video']['id'] == video['id'] for q in self.queue_items)
+        cb = ctk.CTkCheckBox(item_frame, text=f"{video.get('title', 'Unknown Title')} | {video.get('uploader', 'Unknown Channel')}", font=self.main_font, width=0, checkbox_width=18, checkbox_height=18, border_width=2, command=lambda v=video: self._toggle_queue(v))
+        cb.pack(side="left", fill="x", expand=True)
+        if is_queued: cb.select()
+        video['checkbox'] = cb
+
+    # --- Queue Logic ---
+    def _toggle_queue(self, video):
+        is_now_selected = video['checkbox'].get()
+        if is_now_selected:
+            # Check if already there (shouldn't happen with GUI)
+            if not any(q['video']['id'] == video['id'] for q in self.queue_items):
+                self.queue_items.append({'video': video, 'status': 'Pending'})
+        else:
+            self.queue_items = [q for q in self.queue_items if q['video']['id'] != video['id']]
+        
+        self._refresh_queue_display()
+
+    def _refresh_queue_display(self):
+        for widget in self.queue_frame.winfo_children(): widget.destroy()
+        self.queue_label.configure(text=f"Download Queue ({len(self.queue_items)})")
+        
+        for i, q_item in enumerate(self.queue_items):
+            self._create_queue_widget(q_item, i)
+
+    def _create_queue_widget(self, q_item, index):
+        video = q_item['video']
+        status = q_item['status']
+        
+        bg_color = "#2a2a2a" if status == "Pending" else "#1a1a1a"
+        text_color = "gray" if status == "Finished" else "white"
+        
+        f = ctk.CTkFrame(self.queue_frame, fg_color=bg_color, corner_radius=5, height=40)
+        f.pack(fill="x", padx=5, pady=2)
+        
+        # Status Label/Icon
+        status_text = ""
+        if status == "Finished": status_text = "\uE73E " # Checkmark MDL2
+        elif status == "Downloading": status_text = "\uE896 " # Downloading/Wait icon
+        
+        lbl = ctk.CTkLabel(f, text=f"{status_text}{video.get('title')}", font=self.main_font, text_color=text_color, anchor="w", cursor="hand2")
+        lbl.pack(side="left", fill="x", expand=True, padx=10)
+        
+        # Remove button
+        rem_btn = ctk.CTkButton(f, text="\uE711", font=(self.icon_font, 12), width=30, height=30, fg_color="transparent", hover_color="#444444", command=lambda idx=index: self._remove_from_queue(idx))
+        rem_btn.pack(side="right", padx=5)
+
+        # Drag events
+        lbl.bind("<Button-1>", lambda e, idx=index, widget=f: self._on_drag_start(e, idx, widget))
+        lbl.bind("<B1-Motion>", self._on_drag_motion)
+        lbl.bind("<ButtonRelease-1>", self._on_drag_stop)
+
+    def _remove_from_queue(self, index):
+        removed_video = self.queue_items.pop(index)['video']
+        # Uncheck in results if visible
+        for res in self.search_results:
+            if res['id'] == removed_video['id'] and 'checkbox' in res:
+                res['checkbox'].deselect()
+        self._refresh_queue_display()
+
+    def _clear_completed(self):
+        self.queue_items = [q for q in self.queue_items if q['status'] != "Finished"]
+        self._refresh_queue_display()
+
+    # --- Drag & Drop logic ---
+    def _on_drag_start(self, event, index, widget):
+        self.drag_data["item"] = widget
+        self.drag_data["y"] = event.y
+        self.drag_data["start_index"] = index
+        widget.configure(border_width=2, border_color="#0067c0")
+        widget.lift()
+
+    def _on_drag_motion(self, event):
+        delta_y = event.y - self.drag_data["y"]
+        # In a real app we'd move the frame visually, but Tkinter scrollable frame
+        # makes this complex. For now, we'll just track the mouse and swap on release.
+        self.status_label.configure(text="Dragging item to reorder...", text_color="#0067c0")
+
+    def _on_drag_stop(self, event):
+        if self.drag_data["item"] is None: return
+        
+        # Calculate new index based on mouse final position
+        y_pos = event.y_root - self.queue_frame.winfo_rooty()
+        new_index = max(0, min(len(self.queue_items) - 1, int(y_pos / 44))) # 44 is approx height+pady
+        
+        if new_index != self.drag_data["start_index"]:
+            item = self.queue_items.pop(self.drag_data["start_index"])
+            self.queue_items.insert(new_index, item)
+            self._refresh_queue_display()
+        else:
+            self.drag_data["item"].configure(border_width=0)
+            
+        self.drag_data = {"item": None, "y": 0, "start_index": -1}
+        self.status_label.configure(text="Ready", text_color="gray")
+
+    # --- Download Logic ---
+    def _start_batch_download(self):
         if self.is_downloading: return
         
-        query = self.search_entry.get().strip()
-        if query.startswith(("http://", "https://", "www.youtube.com", "youtu.be")):
-            url = query
-            title = "Direct URL"
-        elif self.selected_video:
-            url = f"https://www.youtube.com/watch?v={self.selected_video['id']}"
-            title = self.selected_video.get('title')
-        else:
-            messagebox.showwarning("No Selection", "Please select a video or paste a URL.")
+        # Get only pending items
+        pending = [q for q in self.queue_items if q['status'] == "Pending"]
+        if not pending:
+            messagebox.showinfo("Queue Empty", "No pending downloads in the queue.")
             return
 
         self.is_downloading = True
-        self.download_button.configure(state="disabled", text="Downloading...")
-        self.status_label.configure(text=f"Downloading: {title}", text_color="#0067c0")
+        self.download_button.configure(state="disabled", text="Downloading Queue...")
+        threading.Thread(target=self._process_queue, daemon=True).start()
 
-        threading.Thread(target=self._perform_download, args=(url,), daemon=True).start()
+    def _process_queue(self):
+        for q_item in self.queue_items:
+            if q_item['status'] == "Pending":
+                q_item['status'] = "Downloading"
+                self.after(0, self._refresh_queue_display)
+                
+                url = f"https://www.youtube.com/watch?v={q_item['video']['id']}"
+                self._perform_single_download(url, q_item)
+                
+                q_item['status'] = "Finished"
+                self.after(0, self._refresh_queue_display)
 
-    def _perform_download(self, url):
+        self.is_downloading = False
+        self.after(0, lambda: self.download_button.configure(state="normal", text="Download All"))
+        self.after(0, lambda: self.status_label.configure(text="Batch Download Complete!", text_color="#28a745"))
+
+    def _perform_single_download(self, url, q_item):
         try:
             download_path = self.download_path_var.get().replace("\\", "/")
             format_ext = self.format_var.get()
             bitrate = self.bitrate_var.get()
 
             ydl_opts = {
-                'format': f'bestaudio/best',
+                'format': 'bestaudio/best',
                 'outtmpl': f"{download_path}/%(title)s.%(ext)s",
                 'postprocessors': [{
                     'key': 'FFmpegExtractAudio',
@@ -286,26 +332,17 @@ class YtMsdGui(ctk.CTk):
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
-
-            self.after(0, self._download_finished)
         except Exception as e:
-            self.after(0, lambda: self._handle_error(f"Download error: {e}"))
+            self.after(0, lambda: messagebox.showerror("Download Error", f"Error downloading {q_item['video']['title']}: {e}"))
 
     def _progress_hook(self, d):
         if d['status'] == 'downloading':
             p = d.get('_percent_str', '0.0%')
-            self.after(0, lambda: self.status_label.configure(text=f"Downloading... {p}"))
-
-    def _download_finished(self):
-        self.is_downloading = False
-        self.download_button.configure(state="normal", text="Download")
-        self.status_label.configure(text="Download Complete!", text_color="#28a745")
+            self.after(0, lambda: self.status_label.configure(text=f"Batch Progress... {p}"))
 
     def _handle_error(self, msg):
         self.is_searching = False
-        self.is_downloading = False
         self.search_button.configure(state="normal")
-        self.download_button.configure(state="normal", text="Download")
         self.status_label.configure(text="Error occurred", text_color="#dc3545")
         messagebox.showerror("Error", msg)
 
