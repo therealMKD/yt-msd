@@ -13,6 +13,7 @@ import urllib.request
 import io
 import vlc
 import shlex
+import time
 import customtkinter as ctk
 from PIL import Image
 from tkinter import filedialog, messagebox
@@ -141,6 +142,7 @@ class YtMsdGui(ctk.CTk):
         # Fonts & Misc
         self.icon_font = "Segoe MDL2 Assets"; self.main_font = ("Segoe UI", 12); self.header_font = ("Segoe UI Semibold", 15)
         self.config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui_config.json")
+        self.current_accent_color = "#3B8ED0"
 
         # State variables
         self.search_results = []; self.queue_items = []
@@ -171,6 +173,7 @@ class YtMsdGui(ctk.CTk):
         if self.vlc_player: self.vlc_player.audio_set_volume(self.volume_var.get())
         self.is_searching = False; self.is_downloading = False; self.divider_dragging = False
         self.current_playing_title = ""; self.current_status_text = "Ready"
+        self._last_divider_update = 0; self._vol_save_id = None
         self.drag_data = {"item": None, "original_index": -1, "proxy": None}
         self.config_corrupted = getattr(self, "config_corrupted", False) # Carry over from loader
 
@@ -257,9 +260,19 @@ class YtMsdGui(ctk.CTk):
         vol_f = ctk.CTkFrame(self.player_frame, fg_color="transparent")
         vol_f.grid(row=0, column=0, sticky="w", padx=20, pady=(5, 0))
         ctk.CTkLabel(vol_f, text="\uE767", font=(self.icon_font, 14)).pack(side="left", padx=(0, 5))
-        self.vol_slider = ctk.CTkSlider(vol_f, from_=0, to=100, width=100, height=16, command=self._on_volume)
+        self.vol_slider = ctk.CTkSlider(vol_f, from_=0, to=150, width=100, height=16, command=self._on_volume)
         self.vol_slider.pack(side="left")
         self.vol_slider.set(self.volume_var.get())
+        self.vol_readout = ctk.CTkLabel(vol_f, text=f"{self.volume_var.get()}%", font=("Consolas", 11), width=45)
+        self.vol_readout.pack(side="left", padx=(5, 0))
+        
+        # Bindings for Slider
+        self.vol_slider.bind("<Button-1>", lambda e: self.vol_slider.focus_set())
+        self.vol_slider.bind("<Key-Left>", self._on_vol_keydown)
+        self.vol_slider.bind("<Key-Right>", self._on_vol_keydown)
+        self.vol_slider.bind("<Key-Up>", self._on_vol_keydown)
+        self.vol_slider.bind("<Key-Down>", self._on_vol_keydown)
+        self.vol_slider.bind("<Double-Button-1>", self._reset_vol)
 
         trans_f = ctk.CTkFrame(self.player_frame, fg_color="transparent")
         trans_f.grid(row=0, column=1, sticky="n", pady=(5, 0))
@@ -296,6 +309,7 @@ class YtMsdGui(ctk.CTk):
     def _apply_accent_color(self, color_name):
         if color_name == "System": accent = self._get_system_accent_color(); hover = accent
         else: accent, hover = THEME_COLORS.get(color_name, THEME_COLORS["Blue"])
+        self.current_accent_color = accent
         t_c = "#000000" if color_name in ["White", "Yellow", "Grey"] else "#ffffff"
         wb = [self.search_button, self.download_button, self.format_menu, self.count_menu, self.browse_button, self.bitrate_menu, self.path_menu]
         for w in wb:
@@ -306,6 +320,8 @@ class YtMsdGui(ctk.CTk):
         for widget in list(self.results_frame.winfo_children()):
              for child in widget.winfo_children():
                 if isinstance(child, ctk.CTkCheckBox): child.configure(border_color=accent, checkmark_color=accent)
+        if hasattr(self, 'vol_slider') and self.volume_var.get() <= 100:
+            self.vol_slider.configure(progress_color=accent)
 
     def _get_system_accent_color(self):
         try:
@@ -318,8 +334,15 @@ class YtMsdGui(ctk.CTk):
     # --- Resizer & Logic Reused ---
     def _update_column_weights(self):
         w = self.divider_percent.get(); self.layout_frame.grid_columnconfigure(0, weight=int(w * 100)); self.layout_frame.grid_columnconfigure(2, weight=int((1-w)*100))
+        self.update_idletasks()
+
     def _on_divider_drag(self, e):
         if not self.divider_dragging: return
+        # Throttle layout updates to ~60fps (16ms)
+        now = time.time()
+        if now - self._last_divider_update < 0.016: return
+        self._last_divider_update = now
+        
         tot = self.layout_frame.winfo_width()
         if tot: self.divider_percent.set(max(0.2, min(0.8, (e.x_root - self.layout_frame.winfo_rootx())/tot))); self._update_column_weights()
     def _stop_divider_drag(self, e): self.divider_dragging = False; self._save_config()
@@ -592,9 +615,28 @@ class YtMsdGui(ctk.CTk):
         self.is_playing = not self.is_playing
 
     def _on_volume(self, val):
-        self.volume_var.set(int(float(val)))
-        if self.vlc_player: self.vlc_player.audio_set_volume(self.volume_var.get())
-        self._save_config()
+        v = int(float(val))
+        self.volume_var.set(v)
+        if hasattr(self, 'vol_readout'): self.vol_readout.configure(text=f"{v}%")
+        if v > 100: self.vol_slider.configure(progress_color="#e31e24")
+        else: self.vol_slider.configure(progress_color=self.current_accent_color)
+        
+        if self.vlc_player: self.vlc_player.audio_set_volume(v)
+        
+        # Debounce config saving to prevent disk lag
+        if self._vol_save_id: self.after_cancel(self._vol_save_id)
+        self._vol_save_id = self.after(500, self._save_config)
+
+    def _on_vol_keydown(self, event):
+        step = 5
+        curr = self.volume_var.get()
+        if event.keysym in ["Left", "Down"]: new_v = max(0, curr - step)
+        elif event.keysym in ["Right", "Up"]: new_v = min(150, curr + step)
+        else: return
+        self.vol_slider.set(new_v); self._on_volume(new_v)
+
+    def _reset_vol(self, event=None):
+        self.vol_slider.set(100); self._on_volume(100)
 
     def _on_seek(self, val):
         if self.vlc_player: self.vlc_player.set_position(float(val)/100.0)
