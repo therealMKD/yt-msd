@@ -8,10 +8,11 @@ import json
 import threading
 import winreg
 import yt_dlp
-import shlex
 import webbrowser
 import urllib.request
 import io
+import vlc
+import shlex
 import customtkinter as ctk
 from PIL import Image
 from tkinter import filedialog, messagebox
@@ -148,11 +149,21 @@ class YtMsdGui(ctk.CTk):
         self.accent_color_var = ctk.StringVar(value="Blue"); self.divider_percent = ctk.DoubleVar(value=0.6); self.recent_folders = []
         
         # Advanced Args vars
+        self.show_thumbnails_var = ctk.BooleanVar(value=False)
         self.use_custom_args_var = ctk.BooleanVar(value=False)
         self.custom_args_var = ctk.StringVar(value="")
-        self.show_thumbnails_var = ctk.BooleanVar(value=False)
         self.thumbnail_cache = {}
         self.thumbnail_cache_size = 0
+
+        # VLC Engine
+        try:
+            self.vlc_instance = vlc.Instance('--quiet', '--no-video')
+            self.vlc_player = self.vlc_instance.media_player_new()
+        except:
+            self.vlc_instance = None; self.vlc_player = None
+
+        self.is_playing = False
+        self.current_video_id = None
         self.config_corrupted = False
 
         self._load_config()
@@ -233,6 +244,40 @@ class YtMsdGui(ctk.CTk):
         status_r = ctk.CTkFrame(self.control_panel, fg_color="transparent"); status_r.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 10)); status_r.grid_columnconfigure(0, weight=1)
         self.status_label = ctk.CTkLabel(status_r, text="Ready", font=("Segoe UI", 11), text_color="gray"); self.status_label.grid(row=0, column=0, sticky="w")
         self.settings_btn = ctk.CTkButton(status_r, text="\uE713", font=(self.icon_font, 16), width=40, height=30, fg_color="transparent", hover_color=("#dddddd", "#444444"), text_color=("#333333", "#ffffff"), command=lambda: SettingsWindow(self)); self.settings_btn.grid(row=0, column=1, sticky="e")
+
+        # 5. Bottom Player Bar
+        self.player_frame = ctk.CTkFrame(self, height=80, corner_radius=0, fg_color=ctrl_bg)
+        self.player_frame.grid(row=2, column=0, sticky="ew")
+        self.player_frame.grid_columnconfigure(1, weight=1)
+
+        # 1. Controls Top
+        vol_f = ctk.CTkFrame(self.player_frame, fg_color="transparent")
+        vol_f.grid(row=0, column=0, sticky="w", padx=20, pady=(5, 0))
+        ctk.CTkLabel(vol_f, text="\uE767", font=(self.icon_font, 14)).pack(side="left", padx=(0, 5))
+        self.vol_slider = ctk.CTkSlider(vol_f, from_=0, to=100, width=100, height=16, command=self._on_volume)
+        self.vol_slider.pack(side="left")
+        self.vol_slider.set(100)
+
+        trans_f = ctk.CTkFrame(self.player_frame, fg_color="transparent")
+        trans_f.grid(row=0, column=1, sticky="n", pady=(5, 0))
+        self.rew_btn = ctk.CTkButton(trans_f, text="\uE100", font=(self.icon_font, 14), width=35, height=35, fg_color="transparent", text_color=("#333333", "#ffffff"), command=lambda: self._seek_relative(-10))
+        self.rew_btn.pack(side="left", padx=10)
+        
+        # Cleaner Play/Pause (No circle)
+        accent = self._get_system_accent_color() if self.accent_color_var.get() == "System" else THEME_COLORS.get(self.accent_color_var.get(), THEME_COLORS["Blue"])[0]
+        self.play_pause_btn = ctk.CTkButton(trans_f, text="\uE768", font=(self.icon_font, 28), width=50, height=50, fg_color="transparent", text_color=accent, hover_color=("#dddddd", "#3d3d3d"), command=self._toggle_playback)
+        self.play_pause_btn.pack(side="left", padx=10)
+        
+        self.ff_btn = ctk.CTkButton(trans_f, text="\uE101", font=(self.icon_font, 14), width=35, height=35, fg_color="transparent", text_color=("#333333", "#ffffff"), command=lambda: self._seek_relative(10))
+        self.ff_btn.pack(side="left", padx=10)
+
+        self.time_label = ctk.CTkLabel(self.player_frame, text="0:00 / 0:00", font=("Consolas", 11), width=100)
+        self.time_label.grid(row=0, column=2, sticky="e", padx=20, pady=(5, 0))
+
+        # 2. Progress Slider Bottom
+        self.progress_slider = ctk.CTkSlider(self.player_frame, from_=0, to=100, height=12, command=self._on_seek)
+        self.progress_slider.grid(row=1, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 10))
+        self.progress_slider.set(0)
 
     # --- Advanced Args Logic ---
     def _get_current_args_string(self):
@@ -331,17 +376,20 @@ class YtMsdGui(ctk.CTk):
         self.status_label.configure(text="Searching YouTube...", text_color="#0067c0")
         self.search_button.configure(state="disabled")
         for w in self.results_frame.winfo_children(): w.destroy()
-        threading.Thread(target=self._perform_staged_search, args=(query,), daemon=True).start()
+        try: count = int(self.result_count_var.get())
+        except: count = 10
+        threading.Thread(target=self._perform_staged_search, args=(query, count), daemon=True).start()
 
-    def _perform_staged_search(self, q):
+    def _perform_staged_search(self, q, count):
         try:
-            count = int(self.result_count_var.get())
             with yt_dlp.YoutubeDL({'quiet': True, 'extract_flat': True}) as ydl:
                 info = ydl.extract_info(f"ytsearch{count}:{q}", download=False)
                 res = [e for e in info['entries'] if e.get('id')]
             self.after(0, lambda: self._update_results(res))
             threading.Thread(target=self._background_fetch_full, args=(q, len(res)), daemon=True).start()
-        except: self.after(0, lambda: self._handle_error("Search failed"))
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self.after(0, lambda: self._handle_error("Search failed"))
 
     def _background_fetch_full(self, q, f):
         try:
@@ -379,7 +427,11 @@ class YtMsdGui(ctk.CTk):
 
         # 3. External Link Button
         link_btn = ctk.CTkButton(f, text="\uE8A7", font=(self.icon_font, 14), width=30, height=30, fg_color="transparent", hover_color=("#dddddd", "#3d3d3d"), text_color=("#333333", "#ffffff"), command=lambda: webbrowser.open(f"https://youtube.com/watch?v={v['id']}"))
-        link_btn.pack(side="right", padx=5)
+        link_btn.pack(side="right", padx=2)
+        
+        # 4. Play Button
+        play_btn = ctk.CTkButton(f, text="\uE768", font=(self.icon_font, 16), width=30, height=30, fg_color="transparent", hover_color=("#dddddd", "#3d3d3d"), text_color=accent, command=lambda video=v: self._on_play_click(video))
+        play_btn.pack(side="right", padx=2)
 
     def _fetch_thumbnail(self, v, label):
         vid_id = v.get('id')
@@ -401,6 +453,20 @@ class YtMsdGui(ctk.CTk):
                 self.thumbnail_cache_size += len(data)
                 self.after(0, lambda: label.configure(image=ctk_img))
         except: pass
+
+    def _on_play_click(self, v):
+        self.status_label.configure(text=f"Fetching stream: {v['title'][:30]}...", text_color="#0067c0")
+        threading.Thread(target=self._fetch_and_play, args=(v,), daemon=True).start()
+
+    def _fetch_and_play(self, v):
+        try:
+            with yt_dlp.YoutubeDL({'quiet': True, 'format': 'bestaudio/best'}) as ydl:
+                info = ydl.extract_info(f"https://www.youtube.com/watch?v={v['id']}", download=False)
+                url = info['url']
+                self.after(0, lambda: self._play_media(url, v))
+                self.after(0, lambda: self.status_label.configure(text=f"Now Playing: {v['title'][:50]}", text_color="gray"))
+        except Exception:
+            self.after(0, lambda: self.status_label.configure(text="Stream failed", text_color="#e31e24"))
 
     def _toggle_queue(self, v):
         if v['checkbox'].get():
@@ -476,22 +542,62 @@ class YtMsdGui(ctk.CTk):
                 ydl_opts = {'format': 'bestaudio/best', 'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': self.format_var.get(), 'preferredquality': self.bitrate_var.get()}], 'quiet': True}
             
             # Inject mandatory app settings
-            ydl_opts.update({'outtmpl': f"{folder}/%(title)s.%(ext)s", 'progress_hooks': [self._progress_hook]})
+            ydl_opts.update({'outtmpl': f"{folder}/%(title)s.%(ext)s"})
             if getattr(sys, 'frozen', False): ydl_opts['ffmpeg_location'] = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                result = ydl.download([url])
-                if result != 0:
-                    raise Exception("Download failed with non-zero status")
-        except Exception:
-            msg = f"Failed: {q['video']['title']}"
+                ydl.download([url])
+                
+        except Exception as e:
+            msg = f"Download failed: {q['video']['title'][:50]}..."
             if self.use_custom_args_var.get():
-                msg += "\n\nYour custom arguments might be invalid."
-            self.after(0, lambda: messagebox.showerror("Download Error", msg))
+                msg += "\n\nCheck for errors in your custom arguments."
+            self.after(0, lambda: self.status_label.configure(text=msg, text_color="#e31e24"))
 
-    def _progress_hook(self, d):
-        if d['status'] == 'downloading': self.after(0, lambda: self.status_label.configure(text=f"Progress... {d.get('_percent_str', '0%')}"))
-    def _handle_error(self, m):
-        self.is_searching = False; self.search_button.configure(state="normal"); self.status_label.configure(text="Error", text_color="red"); messagebox.showerror("Error", m)
+    def _play_media(self, url, v):
+        self.current_video_id = v['id']
+        media = self.vlc_instance.media_new(url)
+        self.vlc_player.set_media(media)
+        self.vlc_player.play()
+        self.is_playing = True
+        self.play_pause_btn.configure(text="\uE769") # Pause icon
+        self._update_player_ui()
+
+    def _toggle_playback(self):
+        if not self.current_video_id: return
+        if self.is_playing:
+            self.vlc_player.pause()
+            self.play_pause_btn.configure(text="\uE768")
+        else:
+            self.vlc_player.play()
+            self.play_pause_btn.configure(text="\uE769")
+        self.is_playing = not self.is_playing
+
+    def _on_volume(self, val):
+        if self.vlc_player: self.vlc_player.audio_set_volume(int(float(val)))
+
+    def _on_seek(self, val):
+        if self.vlc_player: self.vlc_player.set_position(float(val)/100.0)
+
+    def _seek_relative(self, seconds):
+        if not self.vlc_player: return
+        cur_ms = self.vlc_player.get_time()
+        self.vlc_player.set_time(cur_ms + (seconds * 1000))
+
+    def _update_player_ui(self):
+        if not self.vlc_player or not self.current_video_id: return
+        
+        pos = self.vlc_player.get_position() * 100
+        ms = self.vlc_player.get_time()
+        total_ms = self.vlc_player.get_length()
+        
+        if total_ms > 0:
+            cur_str = f"{int(ms/60000)}:{int((ms%60000)/1000):02d}"
+            tot_str = f"{int(total_ms/60000)}:{int((total_ms%60000)/1000):02d}"
+            self.time_label.configure(text=f"{cur_str} / {tot_str}")
+            self.progress_slider.set(pos)
+            
+        if self.is_playing or self.vlc_player.is_playing():
+             self.after(500, self._update_player_ui)
 
 if __name__ == "__main__": app = YtMsdGui(); app.mainloop()
