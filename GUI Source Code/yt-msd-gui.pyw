@@ -152,6 +152,7 @@ class YtMsdGui(ctk.CTk):
         self.show_thumbnails_var = ctk.BooleanVar(value=False)
         self.use_custom_args_var = ctk.BooleanVar(value=False)
         self.custom_args_var = ctk.StringVar(value="")
+        self.volume_var = ctk.IntVar(value=100)
         self.thumbnail_cache = {}
         self.thumbnail_cache_size = 0
 
@@ -167,7 +168,9 @@ class YtMsdGui(ctk.CTk):
         self.config_corrupted = False
 
         self._load_config()
+        if self.vlc_player: self.vlc_player.audio_set_volume(self.volume_var.get())
         self.is_searching = False; self.is_downloading = False; self.divider_dragging = False
+        self.current_playing_title = ""; self.current_status_text = "Ready"
         self.drag_data = {"item": None, "original_index": -1, "proxy": None}
         self.config_corrupted = getattr(self, "config_corrupted", False) # Carry over from loader
 
@@ -256,7 +259,7 @@ class YtMsdGui(ctk.CTk):
         ctk.CTkLabel(vol_f, text="\uE767", font=(self.icon_font, 14)).pack(side="left", padx=(0, 5))
         self.vol_slider = ctk.CTkSlider(vol_f, from_=0, to=100, width=100, height=16, command=self._on_volume)
         self.vol_slider.pack(side="left")
-        self.vol_slider.set(100)
+        self.vol_slider.set(self.volume_var.get())
 
         trans_f = ctk.CTkFrame(self.player_frame, fg_color="transparent")
         trans_f.grid(row=0, column=1, sticky="n", pady=(5, 0))
@@ -338,6 +341,7 @@ class YtMsdGui(ctk.CTk):
                     self.show_thumbnails_var.set(c.get('show_thumbnails', False))
                     self.use_custom_args_var.set(c.get('use_custom_args', False))
                     self.custom_args_var.set(c.get('custom_args', ""))
+                    self.volume_var.set(c.get('volume', 100))
                     self.download_path_var.set(self.recent_folders[0])
                     return
             except Exception:
@@ -353,11 +357,25 @@ class YtMsdGui(ctk.CTk):
         if cur and cur not in self.recent_folders: self.recent_folders.insert(0, cur); self.recent_folders = self.recent_folders[:5]
         c = {'format': self.format_var.get(), 'bitrate': self.bitrate_var.get(), 'mode': self.appearance_mode_var.get(), 'accent': self.accent_color_var.get(), 
              'divider': self.divider_percent.get(), 'folders': self.recent_folders, 'use_custom_args': self.use_custom_args_var.get(), 'custom_args': self.custom_args_var.get(),
-             'show_thumbnails': self.show_thumbnails_var.get()}
+             'show_thumbnails': self.show_thumbnails_var.get(), 'volume': self.volume_var.get()}
         try:
             with open(self.config_path, 'w') as f: json.dump(c, f, indent=4)
             if hasattr(self, 'path_menu'): self.path_menu.configure(values=self.recent_folders)
         except: pass
+
+    def _update_status(self, text=None, is_playing=False, color=None):
+        if is_playing: self.current_playing_title = text if text else ""
+        elif text: self.current_status_text = text
+        
+        full_text = self.current_status_text
+        if self.current_playing_title: full_text += f" - Playing: {self.current_playing_title}"
+            
+        if hasattr(self, 'status_label'):
+            self.status_label.configure(text=full_text)
+            if color: self.status_label.configure(text_color=color)
+
+    def _handle_error(self, msg):
+        self._update_status(msg, color="#e31e24")
 
     def _browse_folder(self):
         folder = filedialog.askdirectory(initialdir=self.download_path_var.get())
@@ -373,7 +391,7 @@ class YtMsdGui(ctk.CTk):
         self.is_searching = True
         self.res_label.configure(text=f"Search Results - [{query}]")
         self.search_entry.delete(0, 'end')
-        self.status_label.configure(text="Searching YouTube...", text_color="#0067c0")
+        self._update_status("Searching YouTube...", color="#0067c0")
         self.search_button.configure(state="disabled")
         for w in self.results_frame.winfo_children(): w.destroy()
         try: count = int(self.result_count_var.get())
@@ -395,7 +413,7 @@ class YtMsdGui(ctk.CTk):
         try:
             with yt_dlp.YoutubeDL({'quiet': True, 'extract_flat': True}) as ydl: info = ydl.extract_info(f"ytsearch110:{q}", download=False)
             self.search_results = [e for e in info['entries'] if e.get('id')]
-            self.after(0, lambda: self.status_label.configure(text=f"Loaded {len(self.search_results)} results", text_color="gray"))
+            self.after(0, lambda: self._update_status(f"Loaded {len(self.search_results)} results", color="gray"))
         except: pass
 
     def _update_results(self, res):
@@ -455,7 +473,7 @@ class YtMsdGui(ctk.CTk):
         except: pass
 
     def _on_play_click(self, v):
-        self.status_label.configure(text=f"Fetching stream: {v['title'][:30]}...", text_color="#0067c0")
+        self._update_status(f"Fetching stream: {v['title'][:30]}...", color="#0067c0")
         threading.Thread(target=self._fetch_and_play, args=(v,), daemon=True).start()
 
     def _fetch_and_play(self, v):
@@ -464,9 +482,9 @@ class YtMsdGui(ctk.CTk):
                 info = ydl.extract_info(f"https://www.youtube.com/watch?v={v['id']}", download=False)
                 url = info['url']
                 self.after(0, lambda: self._play_media(url, v))
-                self.after(0, lambda: self.status_label.configure(text=f"Now Playing: {v['title'][:50]}", text_color="gray"))
+                self.after(0, lambda: self._update_status(v['title'][:50], is_playing=True, color="gray"))
         except Exception:
-            self.after(0, lambda: self.status_label.configure(text="Stream failed", text_color="#e31e24"))
+            self.after(0, lambda: self._update_status("Stream failed", color="#e31e24"))
 
     def _toggle_queue(self, v):
         if v['checkbox'].get():
@@ -529,7 +547,7 @@ class YtMsdGui(ctk.CTk):
                 self._perform_single_download(f"https://www.youtube.com/watch?v={q['video']['id']}", q, folder)
                 q['status'] = "Finished"; self.after(0, self._refresh_queue_display)
         self.is_downloading = False; self.after(0, lambda: self.download_button.configure(state="normal", text="Download All"))
-        self.after(0, lambda: self.status_label.configure(text=f"Batch Complete! Saved to: {folder}", text_color="#28a745"))
+        self.after(0, lambda: self._update_status(f"Batch Complete! Saved to: {folder}", color="#28a745"))
 
     def _perform_single_download(self, url, q, folder):
         try:
@@ -552,7 +570,7 @@ class YtMsdGui(ctk.CTk):
             msg = f"Download failed: {q['video']['title'][:50]}..."
             if self.use_custom_args_var.get():
                 msg += "\n\nCheck for errors in your custom arguments."
-            self.after(0, lambda: self.status_label.configure(text=msg, text_color="#e31e24"))
+            self.after(0, lambda: self._update_status(msg, color="#e31e24"))
 
     def _play_media(self, url, v):
         self.current_video_id = v['id']
@@ -574,7 +592,9 @@ class YtMsdGui(ctk.CTk):
         self.is_playing = not self.is_playing
 
     def _on_volume(self, val):
-        if self.vlc_player: self.vlc_player.audio_set_volume(int(float(val)))
+        self.volume_var.set(int(float(val)))
+        if self.vlc_player: self.vlc_player.audio_set_volume(self.volume_var.get())
+        self._save_config()
 
     def _on_seek(self, val):
         if self.vlc_player: self.vlc_player.set_position(float(val)/100.0)
