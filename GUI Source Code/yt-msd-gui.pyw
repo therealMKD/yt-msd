@@ -175,6 +175,7 @@ class YtMsdGui(ctk.CTk):
         self.current_playing_title = ""; self.current_status_text = "Ready"
         self._last_divider_update = 0; self._vol_save_id = None; self._last_v_applied = -1
         self.viz_bars = []; self._viz_ani_id = None; self._current_hover_btn = None; self._hover_hide_id = None
+        self._is_muted = False
         self.drag_data = {"item": None, "original_index": -1, "proxy": None}
         self.config_corrupted = getattr(self, "config_corrupted", False) # Carry over from loader
 
@@ -183,6 +184,7 @@ class YtMsdGui(ctk.CTk):
         
         self.result_count_var.trace_add("write", lambda *args: self._on_count_changed())
         self.show_thumbnails_var.trace_add("write", lambda *args: self._on_count_changed())
+        self.bind("<Map>", lambda e: self._on_window_restore())
         
         if self.config_corrupted:
             self.status_label.configure(text="Config file corrupted. Settings reset to defaults.", text_color="#e31e24")
@@ -260,7 +262,9 @@ class YtMsdGui(ctk.CTk):
         # 1. Controls Top
         vol_f = ctk.CTkFrame(self.player_frame, fg_color="transparent")
         vol_f.grid(row=0, column=0, sticky="w", padx=20, pady=(5, 0))
-        ctk.CTkLabel(vol_f, text="\uE767", font=(self.icon_font, 14)).pack(side="left", padx=(0, 5))
+        self.vol_icon_label = ctk.CTkLabel(vol_f, text="\uE767", font=(self.icon_font, 14), cursor="hand2")
+        self.vol_icon_label.pack(side="left", padx=(0, 5))
+        self.vol_icon_label.bind("<Button-1>", lambda e: self._toggle_mute())
         self.vol_slider = ctk.CTkSlider(vol_f, from_=0, to=150, width=100, height=16, command=self._on_volume)
         self.vol_slider.pack(side="left")
         self.vol_slider.set(self.volume_var.get())
@@ -658,9 +662,13 @@ class YtMsdGui(ctk.CTk):
         self.vlc_player.set_media(media)
         self.vlc_player.play()
         self.is_playing = True
-        self.play_pause_btn.configure(text="\uE769") # Pause icon
-        self._update_player_ui()
+        self.play_pause_btn.configure(text="\uE769" if self.is_playing else "\uE768")
         self._animate_viz()
+
+    def _on_window_restore(self):
+        if self.is_playing:
+            self._update_player_ui()
+            self._animate_viz()
 
     def _toggle_playback(self):
         if not self.current_video_id: return
@@ -687,6 +695,7 @@ class YtMsdGui(ctk.CTk):
         self._viz_ani_id = self.after(100, self._animate_viz)
 
     def _on_volume(self, val):
+        if self._is_muted: self._toggle_mute() # Auto-unmute on volume change
         v = int(float(val))
         if self._last_v_applied == v: return # EXIT FAST: NO CHANGE
         self._last_v_applied = v
@@ -708,6 +717,15 @@ class YtMsdGui(ctk.CTk):
         # 4. Debounce Config Save (Disk I/O is very slow)
         if self._vol_save_id: self.after_cancel(self._vol_save_id)
         self._vol_save_id = self.after(1000, self._save_config)
+
+    def _toggle_mute(self):
+        self._is_muted = not self._is_muted
+        if self.vlc_player: self.vlc_player.audio_set_mute(self._is_muted)
+        
+        # UI Feedback
+        self.vol_icon_label.configure(text="\uE74F" if self._is_muted else "\uE767")
+        accent = self.current_accent_color
+        self.vol_slider.configure(progress_color="gray" if self._is_muted else ("#e31e24" if self.volume_var.get() > 100 else accent))
 
     def _on_vol_keydown(self, event):
         step = 5
