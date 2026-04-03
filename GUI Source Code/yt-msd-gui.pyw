@@ -139,9 +139,11 @@ class SettingsWindow(ctk.CTkToplevel):
 
         ctk.CTkLabel(self.main_f, text="\uE946 Manual override ignores GUI bitrate/format settings.", font=("Segoe UI", 10), text_color="gray").pack(anchor="w", padx=32)
 
-        # 4. Minimize to Tray
         self.tray_cb = ctk.CTkCheckBox(self.main_f, text="Minimize to System Tray", font=self.parent.header_font, variable=self.parent.minimize_to_tray_var, command=self.parent._save_config)
-        self.tray_cb.pack(anchor="w", pady=(0, 20))
+        self.tray_cb.pack(anchor="w", pady=(5, 5))
+
+        self.save_place_cb = ctk.CTkCheckBox(self.main_f, text="Restore Last Session on Startup", font=self.parent.header_font, variable=self.parent.save_place_var, command=self.parent._save_config)
+        self.save_place_cb.pack(anchor="w", pady=(0, 20))
 
         # 5. Reset Defaults
         self.reset_btn = ctk.CTkButton(self.main_f, text="Reset to Default Config", font=self.parent.main_font, height=32, fg_color="transparent", border_width=1, border_color=("#888888", "#444444"), text_color=("#555555", "#aaaaaa"), hover_color=("#dddddd", "#3d3d3d"), command=self._reset_defaults)
@@ -216,7 +218,9 @@ class YtMsdGui(ctk.CTk):
         self.thumbnail_cache = {}
         self.thumbnail_cache_size = 0
         self.minimize_to_tray_var = ctk.BooleanVar(value=False)
+        self.save_place_var = ctk.BooleanVar(value=False)
         self.recent_playlists = []
+        self.last_session = {}
         
         # Playback navigation state
         self.playback_index = -1
@@ -260,7 +264,36 @@ class YtMsdGui(ctk.CTk):
         if self.config_corrupted:
             self.status_label.configure(text="Config file corrupted. Settings reset to defaults.", text_color="#e31e24")
 
+        # Restore session after UI is fully ready
+        if self.save_place_var.get() and self.last_session:
+            self.after(500, self._restore_session)
+
     def _quit(self):
+        # Save session state before exit
+        if self.save_place_var.get():
+            sess = {}
+            if self.current_video_id:
+                # Find which result was playing to get the title
+                title = self.current_playing_title or self.current_video_id
+                sess['playing_id'] = self.current_video_id
+                sess['playing_title'] = title
+            if self.playlist_controls_f.winfo_ismapped():
+                # We're in a playlist — save the URL from the search entry
+                sess['mode'] = 'playlist'
+                sess['query'] = self.search_entry.get().strip() or ''
+                sess['label'] = self.res_label.cget('text')
+            elif hasattr(self, 'res_label'):
+                label = self.res_label.cget('text')
+                if 'Search Results - [' in label:
+                    import re
+                    m = re.search(r'Search Results - \[(.+)\]', label)
+                    if m:
+                        sess['mode'] = 'search'
+                        sess['query'] = m.group(1)
+            self.last_session = sess
+        else:
+            self.last_session = {}
+
         # Stop all background activity immediately before exit
         try:
             if hasattr(self, '_loop_after_id') and self._loop_after_id:
@@ -524,7 +557,9 @@ class YtMsdGui(ctk.CTk):
                     self.custom_args_var.set(c.get('custom_args', ""))
                     self.volume_var.set(c.get('volume', 100))
                     self.minimize_to_tray_var.set(c.get('minimize_to_tray', False))
+                    self.save_place_var.set(c.get('save_place', False))
                     self.recent_playlists = c.get('recent_playlists', [])
+                    self.last_session = c.get('last_session', {})
                     self.download_path_var.set(self.recent_folders[0])
                     return
             except Exception:
@@ -540,12 +575,53 @@ class YtMsdGui(ctk.CTk):
         if cur and cur not in self.recent_folders: self.recent_folders.insert(0, cur); self.recent_folders = self.recent_folders[:5]
         c = {'format': self.format_var.get(), 'bitrate': self.bitrate_var.get(), 'mode': self.appearance_mode_var.get(), 'accent': self.accent_color_var.get(), 
              'divider': self.divider_percent.get(), 'folders': self.recent_folders, 'use_custom_args': self.use_custom_args_var.get(), 'custom_args': self.custom_args_var.get(),
-             'show_thumbnails': self.show_thumbnails_var.get(), 'volume': self.volume_var.get(), 'minimize_to_tray': self.minimize_to_tray_var.get(),
-             'recent_playlists': self.recent_playlists}
+             'show_thumbnails': self.show_thumbnails_var.get(), 'volume': self.volume_var.get(),
+             'minimize_to_tray': self.minimize_to_tray_var.get(), 'save_place': self.save_place_var.get(),
+             'recent_playlists': self.recent_playlists, 'last_session': self.last_session}
         try:
             with open(self.config_path, 'w') as f: json.dump(c, f, indent=4)
             if hasattr(self, 'path_menu'): self.path_menu.configure(values=self.recent_folders)
         except: pass
+
+    def _restore_session(self):
+        sess = self.last_session
+        if not sess: return
+        mode = sess.get('mode')
+        query = sess.get('query', '')
+        playing_id = sess.get('playing_id')
+        playing_title = sess.get('playing_title', '')
+
+        # Restore the search/playlist view
+        if mode == 'playlist' and query:
+            self._start_search(query, is_playlist=True)
+        elif mode == 'search' and query:
+            self._start_search(query, is_playlist=False)
+
+        # If a video was playing, fetch its stream but leave it paused at 0:00
+        if playing_id:
+            self._update_status(f"Restoring: {playing_title[:40]}...", color="#0067c0")
+            # Build a minimal video dict for _fetch_and_pause
+            v = {'id': playing_id, 'title': playing_title}
+            threading.Thread(target=self._fetch_and_pause, args=(v,), daemon=True).start()
+
+    def _fetch_and_pause(self, v):
+        """Fetch stream URL, load into VLC, but leave paused at the start."""
+        try:
+            with yt_dlp.YoutubeDL({'quiet': True, 'format': 'bestaudio/best'}) as ydl:
+                info = ydl.extract_info(f"https://www.youtube.com/watch?v={v['id']}", download=False)
+                url = info['url']
+                def _load_paused():
+                    self.current_video_id = v['id']
+                    media = self.vlc_instance.media_new(url)
+                    self.vlc_player.set_media(media)
+                    # Play briefly then pause immediately so VLC buffers metadata
+                    self.vlc_player.play()
+                    self.after(300, lambda: (self.vlc_player.pause(), self.vlc_player.set_time(0), self._update_player_ui()))
+                    self._update_status(v['title'][:50], is_playing=False, color="gray")
+                self.after(0, _load_paused)
+        except Exception:
+            self.after(0, lambda: self._update_status("Session restore: stream unavailable", color="#e31e24"))
+
 
     def _update_status(self, text=None, is_playing=False, color=None):
         if is_playing: self.current_playing_title = text if text else ""
