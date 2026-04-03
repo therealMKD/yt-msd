@@ -15,7 +15,9 @@ import vlc
 import shlex
 import time
 import customtkinter as ctk
-from PIL import Image
+import pystray
+from pystray import MenuItem as item
+from PIL import Image, ImageDraw
 from tkinter import filedialog, messagebox
 
 # Theme Mapping for custom colors
@@ -28,7 +30,7 @@ THEME_COLORS = {
     "Yellow": ("#FFD700", "#FFC800"),
     "Orange": ("#FF8C00", "#FF7B00"),
     "Grey": ("#808080", "#555555"),
-    "White": ("#E0E0E0", "#BBBBBB")
+    "White": ("#FFFFFF", "#E5E5E5")
 }
 
 class SettingsWindow(ctk.CTkToplevel):
@@ -38,7 +40,7 @@ class SettingsWindow(ctk.CTkToplevel):
         self.title("Settings")
         
         # Proper Positioning
-        w, h = 600, 480
+        w, h = 600, 540
         curr_x, curr_y = self.parent.winfo_x(), self.parent.winfo_y()
         self.geometry(f"{w}x{h}+{curr_x+50}+{curr_y+50}")
         self.attributes("-topmost", True); self.resizable(False, False)
@@ -86,14 +88,18 @@ class SettingsWindow(ctk.CTkToplevel):
 
         ctk.CTkLabel(self.main_f, text="\uE946 Manual override ignores GUI bitrate/format settings.", font=("Segoe UI", 10), text_color="gray").pack(anchor="w", padx=32)
 
-        # 4. Reset Defaults
+        # 4. Minimize to Tray
+        self.tray_cb = ctk.CTkCheckBox(self.main_f, text="Minimize to System Tray", font=self.parent.header_font, variable=self.parent.minimize_to_tray_var, command=self.parent._save_config)
+        self.tray_cb.pack(anchor="w", pady=(0, 20))
+
+        # 5. Reset Defaults
         self.reset_btn = ctk.CTkButton(self.main_f, text="Reset to Default Config", font=self.parent.main_font, height=32, fg_color="transparent", border_width=1, border_color=("#888888", "#444444"), text_color=("#555555", "#aaaaaa"), hover_color=("#dddddd", "#3d3d3d"), command=self._reset_defaults)
         self.reset_btn.pack(fill="x", side="bottom", pady=(10, 0))
 
         # 5. Footer - Right Aligned Close
         footer = ctk.CTkFrame(self.main_f, fg_color="transparent")
-        footer.pack(fill="x", side="bottom", pady=(10, 0))
-        self.close_btn = ctk.CTkButton(footer, text="Close", font=self.parent.main_font, width=100, height=32, fg_color=("#888888", "#444444"), hover_color=("#666666", "#555555"), command=self.destroy)
+        footer.pack(fill="x", side="bottom", pady=(20, 0))
+        self.close_btn = ctk.CTkButton(footer, text="Close", font=self.parent.main_font, width=120, height=40, fg_color=("#888888", "#444444"), hover_color=("#666666", "#555555"), command=self.destroy)
         self.close_btn.pack(side="right")
 
     def _reset_defaults(self):
@@ -110,6 +116,7 @@ class SettingsWindow(ctk.CTkToplevel):
             self.parent.divider_percent.set(0.6)
             self.parent.recent_folders = [os.path.join(os.path.expanduser("~"), "Downloads")]
             self.parent.download_path_var.set(self.parent.recent_folders[0])
+            self.parent.minimize_to_tray_var.set(False)
             
             # Apply
             ctk.set_appearance_mode("System")
@@ -157,6 +164,7 @@ class YtMsdGui(ctk.CTk):
         self.volume_var = ctk.IntVar(value=100)
         self.thumbnail_cache = {}
         self.thumbnail_cache_size = 0
+        self.minimize_to_tray_var = ctk.BooleanVar(value=False)
 
         # VLC Engine
         try:
@@ -184,7 +192,13 @@ class YtMsdGui(ctk.CTk):
         
         self.result_count_var.trace_add("write", lambda *args: self._on_count_changed())
         self.show_thumbnails_var.trace_add("write", lambda *args: self._on_count_changed())
+        
         self.bind("<Map>", lambda e: self._on_window_restore())
+        self.bind("<Unmap>", self._on_window_unmap)
+
+        # Tray Manager
+        self.tray_manager = TrayIconManager(self)
+        self.tray_manager.start()
         
         if self.config_corrupted:
             self.status_label.configure(text="Config file corrupted. Settings reset to defaults.", text_color="#e31e24")
@@ -318,18 +332,33 @@ class YtMsdGui(ctk.CTk):
         if color_name == "System": accent = self._get_system_accent_color(); hover = accent
         else: accent, hover = THEME_COLORS.get(color_name, THEME_COLORS["Blue"])
         self.current_accent_color = accent
-        t_c = "#000000" if color_name in ["White", "Yellow", "Grey"] else "#ffffff"
+        # Smart text color for buttons vs theme-force for dropdown fields
+        # Yellow and White now always use black text for better contrast on bright accents
+        btn_tc = "#000000" if color_name in ["White", "Yellow"] else ("#000000" if color_name == "Grey" and ctk.get_appearance_mode() == "Light" else "#ffffff")
+        field_tc = ("#1a1a1a", "#ffffff") # Forced theme-consistent text for ComboBoxes
+        
         wb = [self.search_button, self.download_button, self.format_menu, self.count_menu, self.browse_button, self.bitrate_menu, self.path_menu]
+        bc = accent # Always use accent for borders/indicators
+
         for w in wb:
-            if isinstance(w, ctk.CTkButton): w.configure(fg_color=accent, hover_color=hover, text_color=t_c)
-            elif isinstance(w, ctk.CTkOptionMenu): w.configure(fg_color=accent, button_color=accent, button_hover_color=hover, text_color=t_c)
-            elif isinstance(w, ctk.CTkComboBox): w.configure(button_color=accent, button_hover_color=hover, border_color=accent, text_color=("#1a1a1a", "#ffffff"))
+            if isinstance(w, ctk.CTkButton): w.configure(fg_color=accent, hover_color=hover, text_color=btn_tc)
+            elif isinstance(w, ctk.CTkOptionMenu): w.configure(fg_color=accent, button_color=accent, button_hover_color=hover, text_color=btn_tc)
+            elif isinstance(w, ctk.CTkComboBox): 
+                # Refined: Special high-contrast background ONLY for White/Yellow in Dark Mode
+                is_dark = ctk.get_appearance_mode() == "Dark"
+                if is_dark and color_name in ["White", "Yellow"]:
+                    w.configure(fg_color="#e0e0e0", button_color=accent, button_hover_color=hover, border_color=bc, text_color="#000000")
+                else:
+                    # Explicitly restore standard dynamic background for all other themes
+                    w.configure(fg_color=("#F9F9FA", "#343638"), button_color=accent, button_hover_color=hover, border_color=bc, text_color=field_tc)
+        
         if hasattr(self, 'vol_slider'):
             is_red = self.volume_var.get() > 100
-            self.vol_slider.configure(progress_color="#e31e24" if is_red else accent)
+            self.vol_slider.configure(progress_color="#e31e24" if is_red else accent, button_color=accent)
         
         # Update existing play buttons instantly
         if hasattr(self, 'play_pause_btn'): self.play_pause_btn.configure(text_color=accent)
+        if hasattr(self, 'tray_manager'): self.tray_manager.update_icon()
         if hasattr(self, 'results_frame'):
             for item in self.results_frame.winfo_children():
                 for c in item.winfo_children():
@@ -385,6 +414,7 @@ class YtMsdGui(ctk.CTk):
                     self.use_custom_args_var.set(c.get('use_custom_args', False))
                     self.custom_args_var.set(c.get('custom_args', ""))
                     self.volume_var.set(c.get('volume', 100))
+                    self.minimize_to_tray_var.set(c.get('minimize_to_tray', False))
                     self.download_path_var.set(self.recent_folders[0])
                     return
             except Exception:
@@ -400,7 +430,7 @@ class YtMsdGui(ctk.CTk):
         if cur and cur not in self.recent_folders: self.recent_folders.insert(0, cur); self.recent_folders = self.recent_folders[:5]
         c = {'format': self.format_var.get(), 'bitrate': self.bitrate_var.get(), 'mode': self.appearance_mode_var.get(), 'accent': self.accent_color_var.get(), 
              'divider': self.divider_percent.get(), 'folders': self.recent_folders, 'use_custom_args': self.use_custom_args_var.get(), 'custom_args': self.custom_args_var.get(),
-             'show_thumbnails': self.show_thumbnails_var.get(), 'volume': self.volume_var.get()}
+             'show_thumbnails': self.show_thumbnails_var.get(), 'volume': self.volume_var.get(), 'minimize_to_tray': self.minimize_to_tray_var.get()}
         try:
             with open(self.config_path, 'w') as f: json.dump(c, f, indent=4)
             if hasattr(self, 'path_menu'): self.path_menu.configure(values=self.recent_folders)
@@ -664,17 +694,26 @@ class YtMsdGui(ctk.CTk):
         self._update_player_ui()
 
     def _on_window_restore(self):
-        pass # The loop is already robust
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+    def _on_window_unmap(self, event):
+        if self.minimize_to_tray_var.get() and self.state() == 'iconic':
+            self.withdraw()
 
     def _toggle_playback(self):
-        if not self.current_video_id: return
-        if self.is_playing:
+        if not self.vlc_player: return
+        
+        # Query VLC's actual state to avoid desync
+        really_playing = self.vlc_player.is_playing()
+        if really_playing:
             self.vlc_player.pause()
-            self.play_pause_btn.configure(text="\uE768")
         else:
             self.vlc_player.play()
-            self.play_pause_btn.configure(text="\uE769")
-        self.is_playing = not self.is_playing
+        
+        # Ensure the loop is running to catch the state shift
+        self._update_player_ui()
 
     def _on_volume(self, val):
         if self._is_muted: self._toggle_mute() # Auto-unmute on volume change
@@ -729,14 +768,18 @@ class YtMsdGui(ctk.CTk):
         self.vlc_player.set_time(cur_ms + (seconds * 1000))
 
     def _update_player_ui(self):
-        # Cancel any pending update to prevent loop stacking
-        if self._player_ui_id: self.after_cancel(self._player_ui_id); self._player_ui_id = None
+        # 1. Clear any pending handle to prevent loop stacking (Single-Active loop only)
+        if hasattr(self, '_loop_after_id') and self._loop_after_id:
+            self.after_cancel(self._loop_after_id)
+            self._loop_after_id = None
+        
         if not self.vlc_player or not self.current_video_id: return
         
-        # Sync is_playing with VLC's actual state
+        # 2. Sync is_playing with VLC's actual background state
         self.is_playing = self.vlc_player.is_playing()
         self.play_pause_btn.configure(text="\uE769" if self.is_playing else "\uE768")
 
+        # 3. Always update progress/time labels (even if paused, for manual seeks)
         pos = self.vlc_player.get_position() * 100
         ms = self.vlc_player.get_time(); total_ms = self.vlc_player.get_length()
         if total_ms > 0:
@@ -745,7 +788,118 @@ class YtMsdGui(ctk.CTk):
             self.time_label.configure(text=f"{cur_str} / {tot_str}")
             self.progress_slider.set(pos)
             
-        # Recursive loop
-        self._player_ui_id = self.after(100, self._update_player_ui)
+        # 4. Sync Tray Menu if it exists and state changed
+        if hasattr(self, 'tray_manager') and self.tray_manager.icon:
+            if not hasattr(self.tray_manager, '_last_play_state') or self.tray_manager._last_play_state != self.is_playing:
+                self.tray_manager._last_play_state = self.is_playing
+                self.tray_manager.icon.menu = self.tray_manager._make_menu()
+
+        # 5. Reschedule the NEXT tick immediately
+        # We keep the loop alive ALWAYS while a video is loaded
+        self._loop_after_id = self.after(100, self._update_player_ui)
+
+class MiniPlayerPopup(ctk.CTkToplevel):
+    def __init__(self, parent, video_id, title):
+        super().__init__(parent)
+        self.overrideredirect(True); self.attributes("-topmost", True)
+        self.configure(fg_color=parent.player_frame.cget("fg_color"))
+        
+        # Position near tray (Bottom Right)
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        w, h = 300, 100
+        self.geometry(f"{w}x{h}+{sw-w-20}+{sh-h-60}")
+        
+        self.alpha = 1.0; self.attributes("-alpha", self.alpha)
+        
+        f = ctk.CTkFrame(self, fg_color="transparent")
+        f.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        self.thumb_label = ctk.CTkLabel(f, text="", width=120 if video_id else 1, height=80 if video_id else 1)
+        self.thumb_label.pack(side="left", padx=(0, 10) if video_id else 0)
+        
+        if video_id: parent._fetch_thumbnail({'id': video_id}, self.thumb_label)
+        
+        title_lbl = ctk.CTkLabel(f, text=title, font=("Segoe UI Semibold", 12), wraplength=150, justify="left")
+        title_lbl.pack(side="left", fill="both", expand=True)
+        
+        self.bind("<FocusOut>", lambda e: self.destroy())
+        self.after(2000, self._fade_out)
+
+    def _fade_out(self):
+        self.alpha -= 0.1
+        if self.alpha <= 0: self.destroy()
+        else: self.attributes("-alpha", self.alpha); self.after(50, self._fade_out)
+
+class TrayIconManager:
+    def __init__(self, app):
+        self.app = app; self.icon = None
+        self._last_click_time = 0
+        
+    def _create_image(self):
+        accent = self.app.current_accent_color
+        img = Image.new('RGB', (64, 64), (30, 30, 30))
+        d = ImageDraw.Draw(img)
+        d.ellipse([8, 8, 56, 56], fill=accent)
+        return img
+
+    def update_icon(self):
+        if self.icon: self.icon.icon = self._create_image()
+
+    def _make_menu(self):
+        cv = self.app.volume_var.get()
+        # Closest multiple of 10
+        active_v = round(cv / 10) * 10
+        
+        def make_vol_callback(val): 
+            # Use a factory to prevent pystray from overwriting our 'val' with the 'item' object
+            return lambda *_: self.app.after(0, lambda: self._apply_vol_safe(val))
+        
+        vol_items = []
+        for v in range(0, 151, 10):
+            prefix = "\u2713 " if v == active_v else "  "
+            vol_items.append(item(f"{prefix}{v}%", make_vol_callback(v)))
+        
+        return pystray.Menu(
+            item('Restore', lambda: self.app.after(0, self.app._on_window_restore), default=True),
+            item('Pause' if self.app.is_playing else 'Play', lambda: self.app.after(0, self.app._toggle_playback)),
+            item('Volume', pystray.Menu(*vol_items)),
+            pystray.Menu.SEPARATOR,
+            item('Exit', lambda: self.app.after(0, self.app.destroy))
+        )
+
+    def _apply_vol_safe(self, v):
+        # Full sync: engine, slider, readout, and config save
+        self.app.vol_slider.set(v)
+        self.app._on_volume(v)
+        # Refresh tray menu for checkmark
+        self.icon.menu = self._make_menu()
+
+    def _sync_vol_widgets(self, v):
+        # Sync UI widgets in case window is visible or about to be
+        self.app.vol_slider.set(v)
+        if hasattr(self.app, 'vol_readout'): self.app.vol_readout.configure(text=f"{v}%")
+        self.app._on_volume(v) # Trigger state check/save
+
+    def _on_activate(self, icon):
+        # Double Click detection (Windows pystray uses on_activate for both)
+        ct = time.time()
+        if ct - self._last_click_time < 0.3: # Double Click
+            self.app.after(0, self.app._on_window_restore)
+            self._last_click_time = 0 # Reset
+        else:
+            self._last_click_time = ct
+            # Delay the popup slightly to see if a second click arrives
+            self.app.after(350, self._check_single_click, ct)
+
+    def _check_single_click(self, original_time):
+        if self._last_click_time == original_time:
+            # Still the same click, show the popup
+            title = self.app.current_playing_title or "No Song Playing"
+            MiniPlayerPopup(self.app, self.app.current_video_id, title)
+
+    def start(self):
+        self.icon = pystray.Icon("ytmsd", self._create_image(), "yt-msd", self._make_menu())
+        self.icon.on_activate = self._on_activate # Separate click handler
+        threading.Thread(target=self.icon.run, daemon=True).start()
 
 if __name__ == "__main__": app = YtMsdGui(); app.mainloop()
