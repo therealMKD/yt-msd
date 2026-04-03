@@ -250,9 +250,9 @@ class YtMsdGui(ctk.CTk):
         
         is_queued = any(q['video']['id'] == video['id'] for q in self.queue_items)
         
-        # Truncate title for search results
+        # Truncate title for search results - higher limit for wide window
         display_title = video.get('title', 'Unknown')
-        if len(display_title) > 100: display_title = display_title[:97] + "..."
+        if len(display_title) > 180: display_title = display_title[:177] + "..."
         
         cb = ctk.CTkCheckBox(item_frame, text=f"{display_title} | {video.get('uploader')}", font=self.main_font, width=0, checkbox_width=18, checkbox_height=18, command=lambda v=video: self._toggle_queue(v))
         cb.pack(side="left", fill="x", expand=True, pady=1)
@@ -283,14 +283,16 @@ class YtMsdGui(ctk.CTk):
         if status == "Finished": status_text = "\uE73E "
         elif status == "Downloading": status_text = "\uE896 "
         
-        # Truncate title for queue to keep the (X) button visible
+        # Truncate title for queue - much higher limit (150)
         display_title = video.get('title', 'Unknown')
-        if len(display_title) > 60: display_title = display_title[:57] + "..."
+        if len(display_title) > 150: display_title = display_title[:147] + "..."
         
-        lbl = ctk.CTkLabel(f, text=f"{status_text}{display_title}", font=self.main_font, text_color=text_color, anchor="w", cursor="fleur")
-        lbl.pack(side="left", fill="x", expand=True, padx=10)
+        # PACK BUTTON FIRST to ensure it stays on the right
         rem_btn = ctk.CTkButton(f, text="\uE711", font=(self.icon_font, 12), width=30, height=30, fg_color="transparent", hover_color="#444444", command=lambda idx=index: self._remove_from_queue(idx))
         rem_btn.pack(side="right", padx=5)
+
+        lbl = ctk.CTkLabel(f, text=f"{status_text}{display_title}", font=self.main_font, text_color=text_color, anchor="w", cursor="fleur")
+        lbl.pack(side="left", fill="x", expand=True, padx=10)
         for w in [f, lbl]:
             w.bind("<Button-1>", lambda e, idx=index, data=q_item: self._on_drag_start(e, idx, data), add="+")
             w.bind("<B1-Motion>", self._on_drag_motion, add="+")
