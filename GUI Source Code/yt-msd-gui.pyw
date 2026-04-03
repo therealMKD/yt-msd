@@ -174,6 +174,7 @@ class YtMsdGui(ctk.CTk):
         self.is_searching = False; self.is_downloading = False; self.divider_dragging = False
         self.current_playing_title = ""; self.current_status_text = "Ready"
         self._last_divider_update = 0; self._vol_save_id = None; self._last_v_applied = -1
+        self.viz_bars = []; self._viz_ani_id = None; self._current_hover_btn = None; self._hover_hide_id = None
         self.drag_data = {"item": None, "original_index": -1, "proxy": None}
         self.config_corrupted = getattr(self, "config_corrupted", False) # Carry over from loader
 
@@ -287,8 +288,20 @@ class YtMsdGui(ctk.CTk):
         self.ff_btn = ctk.CTkButton(trans_f, text="\uE101", font=(self.icon_font, 14), width=35, height=35, fg_color="transparent", text_color=("#333333", "#ffffff"), command=lambda: self._seek_relative(10))
         self.ff_btn.pack(side="left", padx=10)
 
-        self.time_label = ctk.CTkLabel(self.player_frame, text="0:00 / 0:00", font=("Consolas", 11), width=100)
-        self.time_label.grid(row=0, column=2, sticky="e", padx=20, pady=(5, 0))
+        r_f = ctk.CTkFrame(self.player_frame, fg_color="transparent")
+        r_f.grid(row=0, column=2, sticky="e", padx=20, pady=(5, 0))
+        
+        # Audio Visualizer (Jitter-free Canvas)
+        self.viz_canvas = ctk.CTkCanvas(r_f, width=30, height=20, bg=self.player_frame.cget("fg_color")[1 if ctk.get_appearance_mode()=="Dark" else 0], highlightthickness=0, bd=0)
+        self.viz_canvas.pack(side="left", padx=10)
+        self.viz_bars = []
+        for i in range(4):
+            # Draw 4 bars initially at the bottom
+            bar = self.viz_canvas.create_rectangle(i*7, 20, i*7+3, 18, fill=accent, outline="")
+            self.viz_bars.append(bar)
+
+        self.time_label = ctk.CTkLabel(r_f, text="0:00 / 0:00", font=("Consolas", 11), width=100)
+        self.time_label.pack(side="right")
 
         # 2. Progress Slider Bottom
         self.progress_slider = ctk.CTkSlider(self.player_frame, from_=0, to=100, height=12, command=self._on_seek)
@@ -316,14 +329,22 @@ class YtMsdGui(ctk.CTk):
             if isinstance(w, ctk.CTkButton): w.configure(fg_color=accent, hover_color=hover, text_color=t_c)
             elif isinstance(w, ctk.CTkOptionMenu): w.configure(fg_color=accent, button_color=accent, button_hover_color=hover, text_color=t_c)
             elif isinstance(w, ctk.CTkComboBox): w.configure(button_color=accent, button_hover_color=hover, border_color=accent, text_color=("#1a1a1a", "#ffffff"))
-        if hasattr(self, 'vol_slider') and self.volume_var.get() <= 100:
-            self.vol_slider.configure(progress_color=accent)
+        if hasattr(self, 'vol_slider'):
+            is_red = self.volume_var.get() > 100
+            self.vol_slider.configure(progress_color="#e31e24" if is_red else accent)
         
         # Update existing play buttons instantly
         if hasattr(self, 'play_pause_btn'): self.play_pause_btn.configure(text_color=accent)
+        if hasattr(self, 'viz_canvas'):
+            self.viz_canvas.configure(bg=self.player_frame.cget("fg_color")[1 if ctk.get_appearance_mode()=="Dark" else 0])
+            for bar in self.viz_bars: self.viz_canvas.itemconfig(bar, fill=accent)
         if hasattr(self, 'results_frame'):
             for item in self.results_frame.winfo_children():
                 for c in item.winfo_children():
+                    if isinstance(c, ctk.CTkFrame): # Search result thumb container
+                        for sub in c.winfo_children():
+                            if isinstance(sub, ctk.CTkButton) and sub.cget("text") == "\uE768":
+                                sub.configure(text_color=accent)
                     if isinstance(c, ctk.CTkButton) and c.cget("text") == "\uE768":
                         c.configure(text_color=accent)
                     if isinstance(c, ctk.CTkCheckBox): c.configure(border_color=accent, checkmark_color=accent)
@@ -455,18 +476,45 @@ class YtMsdGui(ctk.CTk):
         is_thumb = self.show_thumbnails_var.get()
         f = ctk.CTkFrame(self.results_frame, fg_color="transparent")
         f.pack(fill="x", padx=5, pady=6 if is_thumb else 1)
-        
-        # 1. Thumbnail (if enabled)
-        if is_thumb:
-            thumb_label = ctk.CTkLabel(f, text="", width=90, height=50, fg_color=("#dbdbdb", "#2b2b2b"), corner_radius=4)
-            thumb_label.pack(side="left", padx=(0, 10))
-            threading.Thread(target=self._fetch_thumbnail, args=(v, thumb_label), daemon=True).start()
-
-        # 2. Results Info (Title + Checkbox)
-        title = v.get('title', 'Unknown')
-        if len(title) > 100: title = title[:97] + "..."
-        uploader = v.get('uploader', 'Unknown')
         accent = self.current_accent_color
+
+        # 1. Play Button & Thumb (Left side)
+        if is_thumb:
+            c = ctk.CTkFrame(f, fg_color="transparent")
+            c.pack(side="left", padx=(0, 10))
+            
+            t_l = ctk.CTkLabel(c, text="", width=90, height=50, fg_color=("#dbdbdb", "#2b2b2b"), corner_radius=4)
+            t_l.pack()
+            threading.Thread(target=self._fetch_thumbnail, args=(v, t_l), daemon=True).start()
+            
+            p_b = ctk.CTkButton(c, text="\uE768", font=(self.icon_font, 22), width=90, height=50, fg_color="transparent", hover_color=("#00000033", "#ffffff22"), text_color=accent, corner_radius=0, command=lambda video=v: self._on_play_click(video))
+            p_b.place(relx=0.5, rely=0.5, anchor="center")
+            p_b.place_forget()
+            
+            def _on_e(e, b=p_b):
+                if self._hover_hide_id: self.after_cancel(self._hover_hide_id); self._hover_hide_id = None
+                if self._current_hover_btn and self._current_hover_btn != b:
+                    try: self._current_hover_btn.place_forget()
+                    except: pass
+                b.place(relx=0.5, rely=0.5, anchor="center")
+                self._current_hover_btn = b
+                
+            def _on_l(e, b=p_b):
+                if self._hover_hide_id: self.after_cancel(self._hover_hide_id)
+                self._hover_hide_id = self.after(100, lambda: self._do_hide(b))
+                    
+            c.bind("<Enter>", _on_e); c.bind("<Leave>", _on_l)
+            t_l.bind("<Enter>", _on_e); t_l.bind("<Leave>", _on_l)
+            p_b.bind("<Enter>", _on_e); p_b.bind("<Leave>", _on_l)
+        else:
+            p_b = ctk.CTkButton(f, text="\uE768", font=(self.icon_font, 16), width=30, height=30, fg_color="transparent", hover_color=("#dddddd", "#3d3d3d"), text_color=accent, command=lambda video=v: self._on_play_click(video))
+            p_b.pack(side="left", padx=(0, 10))
+
+        # 2. Results Info
+        title = v.get('title', 'Unknown')
+        if len(title) > 55: title = title[:52] + "..."
+        uploader = v.get('uploader', 'Unknown')
+        if len(uploader) > 35: uploader = uploader[:32] + "..."
         cb = ctk.CTkCheckBox(f, text=f"{title}\n{uploader}" if is_thumb else f"{title} | {uploader}", font=self.main_font if not is_thumb else ("Segoe UI", 11), width=0, checkbox_width=18, checkbox_height=18, border_color=accent, checkmark_color=accent, command=lambda video=v: self._toggle_queue(video))
         cb.pack(side="left", fill="x", expand=True)
         if any(q['video']['id'] == v['id'] for q in self.queue_items): cb.select()
@@ -475,10 +523,13 @@ class YtMsdGui(ctk.CTk):
         # 3. External Link Button
         link_btn = ctk.CTkButton(f, text="\uE8A7", font=(self.icon_font, 14), width=30, height=30, fg_color="transparent", hover_color=("#dddddd", "#3d3d3d"), text_color=("#333333", "#ffffff"), command=lambda: webbrowser.open(f"https://youtube.com/watch?v={v['id']}"))
         link_btn.pack(side="right", padx=2)
-        
-        # 4. Play Button
-        play_btn = ctk.CTkButton(f, text="\uE768", font=(self.icon_font, 16), width=30, height=30, fg_color="transparent", hover_color=("#dddddd", "#3d3d3d"), text_color=accent, command=lambda video=v: self._on_play_click(video))
-        play_btn.pack(side="right", padx=2)
+
+    def _do_hide(self, b):
+        try:
+            b.place_forget()
+            if self._current_hover_btn == b: self._current_hover_btn = None
+        except: pass
+        self._hover_hide_id = None
 
     def _fetch_thumbnail(self, v, label):
         vid_id = v.get('id')
@@ -609,6 +660,7 @@ class YtMsdGui(ctk.CTk):
         self.is_playing = True
         self.play_pause_btn.configure(text="\uE769") # Pause icon
         self._update_player_ui()
+        self._animate_viz()
 
     def _toggle_playback(self):
         if not self.current_video_id: return
@@ -618,7 +670,21 @@ class YtMsdGui(ctk.CTk):
         else:
             self.vlc_player.play()
             self.play_pause_btn.configure(text="\uE769")
+            self._animate_viz()
         self.is_playing = not self.is_playing
+
+    def _animate_viz(self):
+        if not self.is_playing: 
+            self._viz_ani_id = None
+            return
+        if self._viz_ani_id: self.after_cancel(self._viz_ani_id)
+        
+        import random
+        for i, bar in enumerate(self.viz_bars):
+            h = random.randint(4, 18)
+            # Update rectangle coords: bottom (y=20) is fixed. top (y=20-h) changes.
+            self.viz_canvas.coords(bar, i*7, 20-h, i*7+3, 20)
+        self._viz_ani_id = self.after(100, self._animate_viz)
 
     def _on_volume(self, val):
         v = int(float(val))
