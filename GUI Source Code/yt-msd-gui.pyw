@@ -15,7 +15,7 @@ from tkinter import filedialog, messagebox
 # Theme Mapping for custom colors
 THEME_COLORS = {
     "Blue": ("#3B8ED0", "#1F6AA5"),
-    "Green": ("#2CC985", "#2FA572"),
+    "Green": ("#1abd33", "#148024"),
     "Red": ("#E31E24", "#C42B1C"),
     "Purple": ("#9146FF", "#6441A5"),
     "Pink": ("#FF4B8B", "#D12D69"),
