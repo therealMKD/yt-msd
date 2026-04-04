@@ -14,7 +14,7 @@ The pre-release of the GUI edition is also now out, but it is python only. Also,
 
 # CLI Version Readme
 
-There are 2 versions of the CLI: The python version, which requires python to be installed, as well as yt-dlp `pip install yt-dlp` and ffmpeg `pip install ffpmeg`, and the exe version. This will run as a standalone program, and everything you need will be bundled with it. This can also be added to the system's PATH, so that you can run yt-msd from anywhere by just initializing it with `yt-msd` in the terminal. Both versions will generate a config.json file in their root directory. 
+There are 3 versions of the CLI: The python version, which requires python to be installed, as well as yt-dlp `pip install yt-dlp` and ffmpeg `pip install ffpmeg`, the pex version, which only requires python, and the exe version. This will run as a standalone program, and everything you need will be bundled with it. This can also be added to the system's PATH, so that you can run yt-msd from anywhere by just initializing it with `yt-msd` in the terminal. All versions will generate a config.json file in their root directory. 
 
 **If your system says that the exe is unsafe, ignore it! It is a false positive-you can safely click "run anyway"**
 
@@ -46,12 +46,10 @@ There are 2 versions of the CLI: The python version, which requires python to be
 `"last_custom_format":` This is another string used by the program to store the last used custom file extension (one other than mp3, mp4, wav, flac, or aac) so that you can use it again quickly. You shouldn't need to touch this.   
 
 **Special Note for the EXE CLI version**:
-When you add the exe to PATH, it will work from anywhere AS LONG as it isn't moved. If you move the exe's location, you will have to run it manually by finding it and doubleclicking on it, and accepting the add to path prompt again. You can also just manually edit the PATH in windows settings. Note that running it and adding it to path twice will leave the old PATH variable there, so if you move it a bunch and re-add it, you will have a bunch of garbage PATH entries.
+When you add the exe to PATH, it will work from anywhere AS LONG as it isn't moved. If you move the exe's location, you will have to run it manually by finding it and doubleclicking on it, and accepting the add to path prompt again. You can also just manually edit the PATH in windows settings. Note that running it and adding it to path twice will leave the old PATH variable there, so if you move it a bunch and re-add it, you will have a bunch of garbage PATH entries. If you don't want to add it to PATH, and you also don't want to tell it no every time you launch it, use the pex version instead.
 
 ## Support for other operating systems:
-**MacOS**: Exe files don't run on MacOS, so you will have to install python and use the python file. You could also use wine to emulate the exe. I don't have any apple pcs to test on, so there will likely be no proper support.
-I won't give you any installation instructions, since I don't have a Mac and I don't know for sure, but just figure out how to install python and pip, and then use the pip commands: `pip install yt-dlp` and `pip install ffmpeg` to install the correct dependencies.
+**MacOS**: Exe files don't run on MacOS, so you will have to use the pex version or the python version. I don't have a mac, so you'll need to figure out how to install python yourself. If you are using the python version, you will also need to install pip and the required dependencies with `pip install yt-dlp` and `pip install ffmpeg`
 
-**Linux**: Linux also doesn't support exes, so for now, your solution is the python file, or wine. However, I DO have linux pcs for testing, so linux support will be coming, although likely not until after I get the windows GUI version released.
-To install python on linux: Most distros have python preinstalled, but you still need to install pip. You can do so with `sudo apt install python3-pip` on debian-based linux, or `sudo dnf install python3-pip -y` on fedora. If you use Arch, well, figure it out.
-Once you have pip installed, you can use the same commands to install the dependencies as on windows: `pip install yt-dlp` and `pip install ffmpeg`
+**Linux**: Linux also doesn't support exes, so you must use the python or pex version. To install python on linux: Use `sudo apt install python3-pip` on debian-based linux, or `sudo dnf install python3-pip -y` on fedora. If you use Arch, well, figure it out.
+If you are using the normal python version and not pex, you must also install the dependencies with `pip install yt-dlp` and `pip install ffmpeg`
