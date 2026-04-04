@@ -14,7 +14,7 @@ The pre-release of the GUI edition is also now out, but it is python only. Also,
 
 # GUI Version Readme
 
-Coming soon<sup>TM once I finish up the GUI version.
+Coming soon<sup>TM</sup> once I finish up the GUI version.
 
 # CLI Version Readme
 
