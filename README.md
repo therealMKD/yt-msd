@@ -12,6 +12,10 @@ I don't want to deal with spotify's ads, and youtube playlist's don't have worki
 As of now, the only release is the CLI version. This will search youtube with yt-dlp, and fetch the videos. You can select one, choose the format, and the bitrate, as well as the destination. The program will remember the last 3 destinations used, and you can use the config.json file to force certain settings.
 The pre-release of the GUI edition is also now out, but it is python only. Also, I'm an idiot and thought it would be a good idea to make this whole thing in `customtkinter`, which is quickly becoming a horrible decision. Before I move on with anything, I'm going to rewrite the whole thing in `Pyside6`, which should fix the glaring GUI bugs. Who knows how long that will take, but for now, if you want to use the GUI version, it is in the releases section.
 
+# GUI Version Readme
+
+Coming soon<sup>TM once I finish up the GUI version.
+
 # CLI Version Readme
 
 There are 3 versions of the CLI: The python version, which requires python to be installed, as well as yt-dlp `pip install yt-dlp` and ffmpeg `pip install ffpmeg`, the pex version, which only requires python, and the exe version. This will run as a standalone program, and everything you need will be bundled with it. This can also be added to the system's PATH, so that you can run yt-msd from anywhere by just initializing it with `yt-msd` in the terminal. All versions will generate a config.json file in their root directory. 
