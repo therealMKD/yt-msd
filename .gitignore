@@ -10,6 +10,7 @@ GUI Version/
 wheels/
 .pex/
 build_dir/
+build_dir_gui/
 
 
 # Python artifacts

@@ -6,7 +6,10 @@ import os
 import sys
 import json
 import threading
-import winreg
+try:
+    import winreg
+except ImportError:
+    winreg = None
 import yt_dlp
 import webbrowser
 import urllib.request
@@ -203,7 +206,15 @@ class YtMsdGui(ctk.CTk):
 
         # Fonts & Misc
         self.icon_font = "Segoe MDL2 Assets"; self.main_font = ("Segoe UI", 12); self.header_font = ("Segoe UI Semibold", 15)
-        self.config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui_config.json")
+        # Config path handling (ZipApp/PEX aware)
+        if getattr(sys, 'frozen', False):
+            self.config_dir = os.path.dirname(os.path.abspath(sys.executable))
+        elif ".pex" in __file__ or ".pyz" in __file__ or ".zip" in __file__:
+            self.config_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        else:
+            self.config_dir = os.path.dirname(os.path.abspath(__file__))
+            
+        self.config_path = os.path.join(self.config_dir, "gui_config.json")
         self.current_accent_color = "#3B8ED0"
 
         # State variables
@@ -1446,4 +1457,21 @@ class TrayIconManager:
         self.icon.on_activate = self._on_activate # Separate click handler
         threading.Thread(target=self.icon.run, daemon=True).start()
 
-if __name__ == "__main__": app = YtMsdGui(); app.mainloop()
+def hide_console():
+    """Hides the console window on Windows if it exists."""
+    if os.name == 'nt':
+        import ctypes
+        try:
+            hWnd = ctypes.windll.kernel32.GetConsoleWindow()
+            if hWnd:
+                ctypes.windll.user32.ShowWindow(hWnd, 0)
+        except:
+            pass
+
+def main():
+    hide_console()
+    app = YtMsdGui()
+    app.mainloop()
+
+if __name__ == "__main__":
+    main()
