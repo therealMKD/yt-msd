@@ -27,6 +27,8 @@ def self_install_to_path():
     if exe_dir.lower() in [p.lower() for p in user_path.split(os.pathsep)]:
         return
     #Also check the persistent User PATH from the registry
+    if sys.platform != 'win32':
+        return
     import winreg
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Environment', 0, winreg.KEY_READ) as key:
@@ -68,9 +70,15 @@ C_RESET = '\033[0m'    # Reset
 CONFIG_FILE = "config.json"
 
 def get_config_dir():
-    """Returns the directory where config.json should live — next to the .exe when frozen, next to the .py when running as a script."""
+    """Returns the directory where config.json should live — next to the .exe when frozen, next to the .py when running as a script, or next to the .pex when running as a ZipApp."""
     if getattr(sys, 'frozen', False):
         return os.path.dirname(os.path.abspath(sys.executable))
+    
+    # Check if we are running from a zipapp/pex
+    if ".pex" in __file__ or ".pyz" in __file__ or ".zip" in __file__:
+        # Return the directory of the script itself (the .pex file)
+        return os.path.dirname(os.path.abspath(sys.argv[0]))
+        
     return os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = {
     "use_config": False,

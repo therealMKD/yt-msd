@@ -7,6 +7,10 @@ Test Songs/
 CLI Version/
 build/
 GUI Version/
+wheels/
+.pex/
+build_dir/
+
 
 # Python artifacts
 __pycache__/
