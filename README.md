@@ -3,10 +3,20 @@
 
 **DISCLAIMER:** This program is for educational purposes ONLY, and is not intended to be used for any form of piracy. This is intended to be a tool to allow you to have your music in an OFFLINE playlist, NOT as a way to distribute or sell music. I am NOT liable in any way for any illegal use of this program, and I DO NOT condone it. This program is for PERSONAL use ONLY. Don't do stupid stuff with it.
 
+## Why did I make this program?
+
 I don't want to deal with spotify's ads, and youtube playlist's don't have working shuffle features, so I started downloading the mp3s of my playlist with yt-dlp, but it is still annoying to do, so I created this tool to make it faster. This program WILL function as a bare bones music player, but I would highly recommend using a dedicated program (I use MusicBee) that has more options. However, if you just want to have your music in a folder and listen to it, this will do it for you (Once I get it ready).
-NOTE: As of 4/3/2026, this is rapidly becoming a more and more full-featured music player. We'll see where this takes us, but Musicbee will still be able to do much more.
+
+**NOTE:** As of 4/3/2026, this is rapidly becoming a more and more full-featured music player. We'll see where this takes us, but Musicbee will still be able to do much more.
 
 As of now, the only release is the CLI version. This will search youtube with yt-dlp, and fetch the videos. You can select one, choose the format, and the bitrate, as well as the destination. The program will remember the last 3 destinations used, and you can use the config.json file to force certain settings.
+The pre-release of the GUI edition is also now out, but it is python only, and it requires libraries. Also, I'm an idiot and thought it would be a good idea to make this whole thing in customtkinter, which is quickly becoming a horrible decision. Before I move on with anything, I'm going to rewrite the whole thing in Pyside6, which should fix the glaring GUI bugs. Who knows how long that will take, but for now, if you want to use the GUI version, it is in the releases section as a pre-release, and you will need additional libraries installed through python (listed in the release notes). 
+
+Next weekend, I hope to re-release both the beta GUI version, and the CLI version as .pex files, meaning you ONLY need python installed, and all the libraries are included in the file. This will make running on Linux and MacOS easier, since only python needs to be installed to run the program, instead of having to install the additional libraries.
+
+Right after I published prerelease 2, I added a bare-bones, limited initial version of local file playing. This is still buggy in it's current state, but you can download the python file from the GUI source code folder, and run it with the same dependencies as the prerelease 2 version. Note, it isn't complete yet, but if you want local playing, it will do that for you.
+
+# CLI Version Readme
 
 There are 2 versions of the CLI: The python version, which requires python to be installed, as well as yt-dlp `pip install yt-dlp` and ffmpeg `pip install ffpmeg`, and the exe version. This will run as a standalone program, and everything you need will be bundled with it. This can also be added to the system's PATH, so that you can run yt-msd from anywhere by just initializing it with `yt-msd` in the terminal. Both versions will generate a config.json file in their root directory. 
 
