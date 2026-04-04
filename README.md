@@ -12,6 +12,8 @@ I don't want to deal with spotify's ads, and youtube playlist's don't have worki
 As of now, the only release is the CLI version. This will search youtube with yt-dlp, and fetch the videos. You can select one, choose the format, and the bitrate, as well as the destination. The program will remember the last 3 destinations used, and you can use the config.json file to force certain settings.
 The pre-release of the GUI edition is also now out, but it is python only, and it requires libraries. Also, I'm an idiot and thought it would be a good idea to make this whole thing in customtkinter, which is quickly becoming a horrible decision. Before I move on with anything, I'm going to rewrite the whole thing in Pyside6, which should fix the glaring GUI bugs. Who knows how long that will take, but for now, if you want to use the GUI version, it is in the releases section as a pre-release, and you will need additional libraries installed through python (listed in the release notes). 
 
+Next weekend, I hope to re-release both the beta GUI version, and the CLI version as .pex files, meaning you ONLY need python installed, and all the libraries are included in the file. This will make running on Linux and MacOS easier, since only python needs to be installed to run the program, instead of having to install the additional libraries.
+
 Right after I published prerelease 2, I added a bare-bones, limited initial version of local file playing. This is still buggy in it's current state, but you can download the python file from the GUI source code folder, and run it with the same dependencies as the prerelease 2 version. Note, it isn't complete yet, but if you want local playing, it will do that for you.
 
 # CLI Version Readme
