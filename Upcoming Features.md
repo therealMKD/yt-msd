@@ -1,6 +1,5 @@
-- Local file playback
-- Local playlist creation and playback
-- Import/Export feature
-- File extension conversion
-- Exe (after everything else is done)
-- Linux support
+- Migrate to Pyside 6 (Next up)
+- Finish up local file support
+- Local playlist support
+- Audio file metadata reading/editing
+- Import/Export logic (Config, songs, playlists)
