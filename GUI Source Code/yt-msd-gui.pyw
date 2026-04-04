@@ -33,6 +33,8 @@ THEME_COLORS = {
     "White": ("#FFFFFF", "#E5E5E5")
 }
 
+AUDIO_EXTENSIONS = {'.mp3', '.flac', '.wav', '.m4a', '.ogg', '.opus', '.aac', '.wma', '.mka', '.aiff', '.alac', '.ape', '.wv'}
+
 import random
 
 class PlaylistDialog(ctk.CTkToplevel):
@@ -193,7 +195,7 @@ class SettingsWindow(ctk.CTkToplevel):
 class YtMsdGui(ctk.CTk):
     def __init__(self):
         super().__init__()
-        width, height = 1400, 850
+        width, height = 1640, 850
         screen_w, screen_h = self.winfo_screenwidth(), self.winfo_screenheight()
         self.geometry(f"{width}x{height}+{(screen_w-width)//2}+{(screen_h-height)//2}")
         self.title("yt-msd | YouTube Media Downloader")
@@ -209,6 +211,8 @@ class YtMsdGui(ctk.CTk):
         self.download_path_var = ctk.StringVar(); self.format_var = ctk.StringVar(value="mp3"); self.bitrate_var = ctk.StringVar(value="192")
         self.result_count_var = ctk.StringVar(value="10"); self.appearance_mode_var = ctk.StringVar(value="System")
         self.accent_color_var = ctk.StringVar(value="Blue"); self.divider_percent = ctk.DoubleVar(value=0.6); self.recent_folders = []
+        self.local_divider_percent = ctk.DoubleVar(value=0.15); self.local_folders = []; self.local_folder_var = ctk.StringVar()
+        self.local_search_var = ctk.StringVar(); self.local_current_path = ""
         
         # Advanced Args vars
         self.show_thumbnails_var = ctk.BooleanVar(value=False)
@@ -240,9 +244,9 @@ class YtMsdGui(ctk.CTk):
 
         self._load_config()
         if self.vlc_player: self.vlc_player.audio_set_volume(self.volume_var.get())
-        self.is_searching = False; self.is_downloading = False; self.divider_dragging = False
+        self.is_searching = False; self.is_downloading = False; self.divider_dragging = False; self.local_divider_dragging = False
         self.current_playing_title = ""; self.current_status_text = "Ready"
-        self._last_divider_update = 0; self._vol_save_id = None; self._last_v_applied = -1
+        self._last_divider_update = 0; self._last_local_divider_update = 0; self._vol_save_id = None; self._last_v_applied = -1
         self._current_hover_btn = None; self._hover_hide_id = None
         self._is_muted = False; self._player_ui_id = None
         self.drag_data = {"item": None, "original_index": -1, "proxy": None}
@@ -319,9 +323,20 @@ class YtMsdGui(ctk.CTk):
         self.layout_frame.grid(row=0, column=0, sticky="nsew", padx=20, pady=(15, 10))
         self.layout_frame.grid_rowconfigure(0, weight=1); self._update_column_weights()
 
-        # 1. Results
+        # 0. Local Folder Browser
+        self.local_col = ctk.CTkFrame(self.layout_frame, fg_color="transparent")
+        self.local_col.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        
+        # 1. Local Handle
+        self.local_handle = ctk.CTkFrame(self.layout_frame, width=4, fg_color=ctrl_bg, cursor="sb_h_double_arrow")
+        self.local_handle.grid(row=0, column=1, sticky="ns", padx=2)
+        self.local_handle.bind("<Button-1>", lambda e: setattr(self, "local_divider_dragging", True))
+        self.local_handle.bind("<B1-Motion>", self._on_local_divider_drag)
+        self.local_handle.bind("<ButtonRelease-1>", self._stop_local_divider_drag)
+
+        # 2. Results
         self.results_col = ctk.CTkFrame(self.layout_frame, fg_color="transparent")
-        self.results_col.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        self.results_col.grid(row=0, column=2, sticky="nsew", padx=5)
         self.results_col.grid_columnconfigure(0, weight=1)
         res_header = ctk.CTkFrame(self.results_col, fg_color="transparent"); res_header.grid(row=0, column=0, sticky="ew", pady=(0, 5))
         self.res_label = ctk.CTkLabel(res_header, text="Search Results", font=self.header_font); self.res_label.grid(row=0, column=0, sticky="w")
@@ -365,15 +380,15 @@ class YtMsdGui(ctk.CTk):
         self.results_col.grid_rowconfigure(2, weight=1)
         self.results_frame = ctk.CTkScrollableFrame(self.results_col, fg_color=box_bg, corner_radius=10); self.results_frame.grid(row=2, column=0, sticky="nsew")
 
-        # 2. Resizer Handle
+        # 3. Resizer Handle
         self.handle = ctk.CTkFrame(self.layout_frame, width=4, fg_color=ctrl_bg, cursor="sb_h_double_arrow")
-        self.handle.grid(row=0, column=1, sticky="ns", padx=2)
+        self.handle.grid(row=0, column=3, sticky="ns", padx=2)
         self.handle.bind("<Button-1>", lambda e: setattr(self, "divider_dragging", True))
         self.handle.bind("<B1-Motion>", self._on_divider_drag); self.handle.bind("<ButtonRelease-1>", self._stop_divider_drag)
 
-        # 3. Queue
+        # 4. Queue
         self.queue_col = ctk.CTkFrame(self.layout_frame, fg_color="transparent")
-        self.queue_col.grid(row=0, column=2, sticky="nsew", padx=(5, 0))
+        self.queue_col.grid(row=0, column=4, sticky="nsew", padx=(5, 0))
         self.queue_col.grid_columnconfigure(0, weight=1); self.queue_col.grid_rowconfigure(1, weight=1)
         q_header = ctk.CTkFrame(self.queue_col, fg_color="transparent"); q_header.grid(row=0, column=0, sticky="ew", pady=(0, 5))
         self.queue_label = ctk.CTkLabel(q_header, text="Download Queue (0)", font=self.header_font); self.queue_label.pack(side="left")
@@ -399,12 +414,15 @@ class YtMsdGui(ctk.CTk):
         self.bitrate_menu = ctk.CTkComboBox(sets_f, values=["128", "192", "256", "320"], variable=self.bitrate_var, width=90, height=28, command=lambda _: self._save_config()); self.bitrate_menu.grid(row=0, column=3, padx=(0, 10))
         ctk.CTkLabel(sets_f, text="Save to:", font=self.main_font).grid(row=0, column=4, padx=(10, 5))
         self.path_menu = ctk.CTkComboBox(sets_f, values=self.recent_folders, variable=self.download_path_var, font=self.main_font, height=28, command=lambda _: self._save_config()); self.path_menu.grid(row=0, column=5, sticky="ew", padx=(0, 5))
-        self.browse_button = ctk.CTkButton(sets_f, text="\uED25", font=(self.icon_font, 14), width=35, height=28, command=self._browse_folder); self.browse_button.grid(row=0, column=6, padx=(0, 10))
-        self.download_button = ctk.CTkButton(sets_f, text="Download All", font=("Segoe UI Semibold", 13), height=35, width=140, command=self._start_batch_download); self.download_button.grid(row=0, column=7)
+        self.browse_button = ctk.CTkButton(sets_f, text="\uED25", font=(self.icon_font, 14), width=35, height=28, command=self._browse_folder); self.browse_button.grid(row=0, column=6, padx=(0, 2))
+        self.open_save_path_btn = ctk.CTkButton(sets_f, text="\uE8A7", font=(self.icon_font, 14), width=35, height=28, command=self._open_save_folder, fg_color="transparent", border_width=1, border_color=("#888888", "#444444"), text_color=("#333333", "#ffffff"), hover_color=("#dddddd", "#444444")); self.open_save_path_btn.grid(row=0, column=7, padx=(0, 10))
+        self.download_button = ctk.CTkButton(sets_f, text="Download All", font=("Segoe UI Semibold", 13), height=35, width=140, command=self._start_batch_download); self.download_button.grid(row=0, column=8)
 
         status_r = ctk.CTkFrame(self.control_panel, fg_color="transparent"); status_r.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 10)); status_r.grid_columnconfigure(0, weight=1)
         self.status_label = ctk.CTkLabel(status_r, text="Ready", font=("Segoe UI", 11), text_color="gray"); self.status_label.grid(row=0, column=0, sticky="w")
         self.settings_btn = ctk.CTkButton(status_r, text="\uE713", font=(self.icon_font, 16), width=40, height=30, fg_color="transparent", hover_color=("#dddddd", "#444444"), text_color=("#333333", "#ffffff"), command=lambda: SettingsWindow(self)); self.settings_btn.grid(row=0, column=1, sticky="e")
+
+        self._create_local_panel()
 
         # 5. Bottom Player Bar
         self.player_frame = ctk.CTkFrame(self, height=80, corner_radius=0, fg_color=ctrl_bg)
@@ -524,18 +542,48 @@ class YtMsdGui(ctk.CTk):
 
     # --- Resizer & Logic Reused ---
     def _update_column_weights(self):
-        w = self.divider_percent.get(); self.layout_frame.grid_columnconfigure(0, weight=int(w * 100)); self.layout_frame.grid_columnconfigure(2, weight=int((1-w)*100))
+        lw = self.local_divider_percent.get()
+        rw = self.divider_percent.get()
+        
+        # 5 Columns: [Local (0)] [Handle (1)] [Results (2)] [Handle (3)] [Queue (4)]
+        self.layout_frame.grid_columnconfigure(0, weight=int(lw * 1000))
+        self.layout_frame.grid_columnconfigure(1, weight=0)
+        
+        # Results and Queue split the remaining space
+        rem = 1.0 - lw
+        self.layout_frame.grid_columnconfigure(2, weight=int(rem * rw * 1000))
+        self.layout_frame.grid_columnconfigure(3, weight=0)
+        self.layout_frame.grid_columnconfigure(4, weight=int(rem * (1.0 - rw) * 1000))
         self.update_idletasks()
+
+    def _on_local_divider_drag(self, e):
+        if not self.local_divider_dragging: return
+        now = time.time()
+        if now - self._last_local_divider_update < 0.016: return
+        self._last_local_divider_update = now
+        
+        tot = self.layout_frame.winfo_width()
+        if tot:
+            self.local_divider_percent.set(max(0.05, min(0.4, (e.x_root - self.layout_frame.winfo_rootx())/tot)))
+            self._update_column_weights()
+    def _stop_local_divider_drag(self, e): self.local_divider_dragging = False; self._save_config()
 
     def _on_divider_drag(self, e):
         if not self.divider_dragging: return
-        # Throttle layout updates to ~60fps (16ms)
         now = time.time()
         if now - self._last_divider_update < 0.016: return
         self._last_divider_update = now
         
         tot = self.layout_frame.winfo_width()
-        if tot: self.divider_percent.set(max(0.2, min(0.8, (e.x_root - self.layout_frame.winfo_rootx())/tot))); self._update_column_weights()
+        if tot:
+            # We want the ratio RELATIVE to the remaining space (Results + Queue area)
+            # But the math is simpler if we just track it relative to that zone
+            local_px = self.local_divider_percent.get() * tot
+            results_px = e.x_root - self.layout_frame.winfo_rootx() - local_px
+            rem_px = tot - local_px
+            if rem_px > 0:
+                self.divider_percent.set(max(0.2, min(0.8, results_px / rem_px)))
+                self._update_column_weights()
     def _stop_divider_drag(self, e): self.divider_dragging = False; self._save_config()
 
     def _load_config(self):
@@ -560,6 +608,9 @@ class YtMsdGui(ctk.CTk):
                     self.save_place_var.set(c.get('save_place', False))
                     self.recent_playlists = c.get('recent_playlists', [])
                     self.last_session = c.get('last_session', {})
+                    self.local_divider_percent.set(max(0.05, min(0.4, c.get('local_divider', 0.15))))
+                    self.local_folders = c.get('local_folders', [])
+                    self.local_current_path = c.get('local_current_path', "")
                     self.download_path_var.set(self.recent_folders[0])
                     return
             except Exception:
@@ -574,7 +625,9 @@ class YtMsdGui(ctk.CTk):
         cur = self.download_path_var.get()
         if cur and cur not in self.recent_folders: self.recent_folders.insert(0, cur); self.recent_folders = self.recent_folders[:5]
         c = {'format': self.format_var.get(), 'bitrate': self.bitrate_var.get(), 'mode': self.appearance_mode_var.get(), 'accent': self.accent_color_var.get(), 
-             'divider': self.divider_percent.get(), 'folders': self.recent_folders, 'use_custom_args': self.use_custom_args_var.get(), 'custom_args': self.custom_args_var.get(),
+             'divider': self.divider_percent.get(), 'local_divider': self.local_divider_percent.get(),
+             'folders': self.recent_folders, 'local_folders': self.local_folders, 'local_current_path': self.local_current_path,
+             'use_custom_args': self.use_custom_args_var.get(), 'custom_args': self.custom_args_var.get(),
              'show_thumbnails': self.show_thumbnails_var.get(), 'volume': self.volume_var.get(),
              'minimize_to_tray': self.minimize_to_tray_var.get(), 'save_place': self.save_place_var.get(),
              'recent_playlists': self.recent_playlists, 'last_session': self.last_session}
@@ -633,6 +686,124 @@ class YtMsdGui(ctk.CTk):
         if hasattr(self, 'status_label'):
             self.status_label.configure(text=full_text)
             if color: self.status_label.configure(text_color=color)
+
+    def _open_save_folder(self):
+        folder = self.download_path_var.get()
+        if os.path.exists(folder): os.startfile(folder)
+        else: self._handle_error("Save folder does not exist.")
+
+    def _create_local_panel(self):
+        box_bg = ("#f0f0f0", "#1e1e1e")
+        self.local_col.grid_columnconfigure(0, weight=1); self.local_col.grid_rowconfigure(3, weight=1)
+        
+        ctk.CTkLabel(self.local_col, text="Local Folder", font=self.header_font).grid(row=0, column=0, sticky="w", pady=(0, 5))
+        
+        path_f = ctk.CTkFrame(self.local_col, fg_color="transparent")
+        path_f.grid(row=1, column=0, sticky="ew", pady=(0, 5))
+        path_f.grid_columnconfigure(0, weight=1)
+        
+        self.local_path_menu = ctk.CTkComboBox(path_f, values=self.local_folders, variable=self.local_folder_var, font=("Segoe UI", 11), height=28, command=self._load_local_folder)
+        self.local_path_menu.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        if self.local_current_path: self.local_folder_var.set(self.local_current_path)
+        
+        ctk.CTkButton(path_f, text="\uED25", font=(self.icon_font, 12), width=30, height=28, command=self._browse_local_folder).grid(row=0, column=1, padx=2)
+        ctk.CTkButton(path_f, text="\uE8A7", font=(self.icon_font, 12), width=30, height=28, command=self._open_local_folder_in_explorer, fg_color="transparent", border_width=1, border_color=("#888888", "#444444"), text_color=("#333333", "#ffffff"), hover_color=("#dddddd", "#444444")).grid(row=0, column=2)
+        
+        search_f = ctk.CTkFrame(self.local_col, fg_color="transparent")
+        search_f.grid(row=2, column=0, sticky="ew", pady=(0, 5))
+        search_f.grid_columnconfigure(1, weight=1)
+        
+        ctk.CTkLabel(search_f, text="\uE721", font=(self.icon_font, 14), text_color="gray").grid(row=0, column=0, padx=(5, 5))
+        self.local_search_entry = ctk.CTkEntry(search_f, placeholder_text="Search files...", font=("Segoe UI", 11), height=26, textvariable=self.local_search_var)
+        self.local_search_entry.grid(row=0, column=1, sticky="ew")
+        self.local_search_var.trace_add("write", lambda *a: self._refresh_local_file_list())
+        
+        self.local_frame = ctk.CTkScrollableFrame(self.local_col, fg_color=box_bg, corner_radius=10)
+        self.local_frame.grid(row=3, column=0, sticky="nsew")
+        
+        if self.local_current_path: self._load_local_folder(self.local_current_path)
+
+    def _browse_local_folder(self):
+        folder = filedialog.askdirectory(initialdir=self.local_current_path or os.path.expanduser("~"))
+        if folder: self._load_local_folder(folder)
+
+    def _open_local_folder_in_explorer(self):
+        if self.local_current_path and os.path.exists(self.local_current_path): os.startfile(self.local_current_path)
+
+    def _load_local_folder(self, path=None):
+        if path is None: path = self.local_folder_var.get()
+        if not path or not os.path.exists(path): return
+        
+        path = os.path.abspath(path)
+        self.local_current_path = path
+        self.local_folder_var.set(path)
+        
+        if path not in self.local_folders:
+            self.local_folders.insert(0, path)
+            self.local_folders = self.local_folders[:5]
+            if hasattr(self, 'local_path_menu'): self.local_path_menu.configure(values=self.local_folders)
+        
+        self._refresh_local_file_list()
+        self._save_config()
+
+    def _refresh_local_file_list(self):
+        for w in self.local_frame.winfo_children(): w.destroy()
+        if not self.local_current_path or not os.path.exists(self.local_current_path): return
+        
+        search_q = self.local_search_var.get().lower()
+        items = []
+        try:
+            # 1. Add Parent directory if not at root
+            parent = os.path.dirname(self.local_current_path)
+            if parent and parent != self.local_current_path:
+                items.append({'name': ".. (Back)", 'path': parent, 'is_dir': True})
+            
+            # 2. Scan directory
+            with os.scandir(self.local_current_path) as it:
+                for entry in it:
+                    if entry.is_dir():
+                        items.append({'name': entry.name, 'path': entry.path, 'is_dir': True})
+                    elif entry.is_file():
+                        ext = os.path.splitext(entry.name)[1].lower()
+                        if ext in AUDIO_EXTENSIONS:
+                            items.append({'name': entry.name, 'path': entry.path, 'is_dir': False})
+        except: pass
+        
+        # Sort: Folders first, then files
+        items.sort(key=lambda x: (not x['is_dir'], x['name'].lower()))
+        
+        for item in items:
+            if search_q and search_q not in item['name'].lower(): continue
+            
+            f = ctk.CTkFrame(self.local_frame, fg_color="transparent")
+            f.pack(fill="x", padx=2, pady=1)
+            
+            icon = "\uE8B7" if item['is_dir'] else "\uEC4F"
+            btn = ctk.CTkButton(f, text=f"{icon}  {item['name']}", font=("Segoe UI", 11), height=28, anchor="w", fg_color="transparent", text_color=("#1a1a1a", "#ffffff"), hover_color=("#dddddd", "#3d3d3d"), command=lambda i=item: self._on_local_item_click(i))
+            btn.pack(side="left", fill="x", expand=True)
+
+    def _on_local_item_click(self, item):
+        if item['is_dir']: 
+            self._load_local_folder(item['path'])
+        else:
+            self._play_local_file(item['path'])
+
+    def _play_local_file(self, filepath):
+        self._update_status(f"Playing Local: {os.path.basename(filepath)[:30]}...", color="#0067c0")
+        try:
+            url = filepath.replace("\\", "/") # VLC likes forward slashes or file://
+            if not url.startswith("file:///"): url = "file:///" + url
+            
+            self.current_video_id = "local" # Sentinel
+            self.current_playing_title = os.path.basename(filepath)
+            
+            media = self.vlc_instance.media_new(url)
+            self.vlc_player.set_media(media)
+            self.vlc_player.play()
+            self._update_player_ui()
+            self._update_status(self.current_playing_title, is_playing=True, color="gray")
+        except Exception as e:
+            self._handle_error(f"Failed to play local file: {str(e)}")
 
     def _handle_error(self, msg):
         self._update_status(msg, color="#e31e24")
