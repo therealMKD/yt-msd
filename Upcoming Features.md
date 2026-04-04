@@ -1,0 +1,6 @@
+- Local file playback
+- Local playlist creation and playback
+- Import/Export feature
+- File extension conversion
+- Exe (after everything else is done)
+- Linux support
