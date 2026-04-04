@@ -11,6 +11,7 @@ wheels/
 .pex/
 build_dir/
 build_dir_gui/
+ffmpeg_extracted/
 
 # Python artifacts
 __pycache__/
@@ -23,3 +24,4 @@ __pycache__/
 
 # Python build residues
 *.spec
+ffmpeg.zip
