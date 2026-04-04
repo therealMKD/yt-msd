@@ -12,7 +12,6 @@ wheels/
 build_dir/
 build_dir_gui/
 
-
 # Python artifacts
 __pycache__/
 *.py[cod]
