@@ -12,6 +12,8 @@ I don't want to deal with spotify's ads, and youtube playlist's don't have worki
 As of now, the only release is the CLI version. This will search youtube with yt-dlp, and fetch the videos. You can select one, choose the format, and the bitrate, as well as the destination. The program will remember the last 3 destinations used, and you can use the config.json file to force certain settings.
 The pre-release of the GUI edition is also now out, but it is python only. Also, I'm an idiot and thought it would be a good idea to make this whole thing in `customtkinter`, which is quickly becoming a horrible decision. Before I move on with anything, I'm going to rewrite the whole thing in `Pyside6`, which should fix the glaring GUI bugs. Who knows how long that will take, but for now, if you want to use the GUI version, it is in the releases section.
 
+**Note:** I am aware of the bug with the CLI exe version, where the add to PATH function doesn't work unless the file is named yt-msd-cli. It will be fixed next weekend, but I don't have time to work on it now.
+
 # GUI Version Readme
 
 Coming soon<sup>TM</sup> once I finish up the GUI version.
