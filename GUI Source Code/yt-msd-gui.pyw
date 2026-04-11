@@ -303,17 +303,19 @@ class MainApp(QMainWindow):
         c.addWidget(self.vol_slider)
         
         c.addStretch(1)
-        self.prev_btn = QPushButton("⏮")
+        self.prev_btn = QPushButton("\uE892")
         self.prev_btn.clicked.connect(self.play_previous)
+        self.prev_btn.setStyleSheet("background: transparent; color: white; font-family: 'Segoe MDL2 Assets'; font-size: 14px;")
         c.addWidget(self.prev_btn)
         
-        self.play_btn = QPushButton("▶")
+        self.play_btn = QPushButton("\uE768")
         self.play_btn.clicked.connect(self.toggle_playback)
-        self.play_btn.setMinimumWidth(60)
+        self.play_btn.setStyleSheet("background: transparent; color: white; font-family: 'Segoe MDL2 Assets'; font-size: 28px;")
         c.addWidget(self.play_btn)
         
-        self.next_btn = QPushButton("⏭")
+        self.next_btn = QPushButton("\uE893")
         self.next_btn.clicked.connect(self.play_next)
+        self.next_btn.setStyleSheet("background: transparent; color: white; font-family: 'Segoe MDL2 Assets'; font-size: 14px;")
         c.addWidget(self.next_btn)
         c.addStretch(1)
         
@@ -657,18 +659,18 @@ class MainApp(QMainWindow):
         self.current_playing_title = title
         self.current_video_id = vid_id
         self.is_playing = True
-        self.play_btn.setText("⏸")
+        self.play_btn.setText("\uE769")
         self._on_status_update(f"Playing: {title}", True, "gray")
 
     def toggle_playback(self):
         if not self.vlc_player: return
         if self.vlc_player.is_playing():
             self.vlc_player.pause()
-            self.play_btn.setText("▶")
+            self.play_btn.setText("\uE768")
             self.is_playing = False
         else:
             self.vlc_player.play()
-            self.play_btn.setText("⏸")
+            self.play_btn.setText("\uE769")
             self.is_playing = True
             
     def play_previous(self):
