@@ -66,6 +66,71 @@ def pil_to_qpixmap(pil_image):
     qimg = QImage(data, img.width, img.height, QImage.Format_RGBA8888)
     return QPixmap.fromImage(qimg)
 
+class ThumbnailWidget(QWidget):
+    def __init__(self, video, parent_app, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(90, 50)
+        self.video = video
+        self.parent_app = parent_app
+        
+        self.thumb_label = QLabel(self)
+        self.thumb_label.setFixedSize(90, 50)
+        self.thumb_label.setStyleSheet("background-color: #2b2b2b;")
+        self.thumb_label.setAlignment(Qt.AlignCenter)
+        
+        accent = get_accent_color(parent_app.accent_color_name)
+        self.play_btn = QPushButton("\uE768", self)
+        self.play_btn.setFixedSize(30, 30)
+        self.play_btn.move(30, 10)
+        self.play_btn.setStyleSheet(f"background: rgba(0,0,0,180); color: {accent}; border-radius: 15px; font-weight: bold; font-family: 'Segoe MDL2 Assets'; font-size: 14px; padding: 0px;")
+        self.play_btn.clicked.connect(self.on_play)
+        self.play_btn.hide()
+        
+    def on_play(self, checked=False):
+        self.parent_app.play_result(self.video)
+        
+    def enterEvent(self, event):
+        self.play_btn.show()
+        super().enterEvent(event)
+        
+    def leaveEvent(self, event):
+        self.play_btn.hide()
+        super().leaveEvent(event)
+
+class PlaylistDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Open Playlist")
+        self.setFixedSize(420, 200)
+        self.setWindowFlags(self.windowFlags() | Qt.Tool)
+        l = QVBoxLayout(self)
+        l.setContentsMargins(20, 20, 20, 20)
+        l.addWidget(QLabel("Enter URL or select from history:"))
+        self.url_cb = QComboBox()
+        self.url_cb.setEditable(True)
+        self.url_cb.setMinimumHeight(32)
+        if parent and hasattr(parent, 'recent_playlists'):
+            display_values = []
+            for p in parent.recent_playlists:
+                if isinstance(p, dict): display_values.append(p.get("url", "")) # we could show name but url is simpler for combo
+                else: display_values.append(str(p))
+            self.url_cb.addItems(display_values)
+        l.addWidget(self.url_cb)
+        l.addStretch()
+        h = QHBoxLayout()
+        h.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        open_btn = QPushButton("Open Playlist")
+        open_btn.clicked.connect(self.accept)
+        # Assuming app aesthetic injection
+        accent = get_accent_color(parent.accent_color_name if parent else "Blue")
+        open_btn.setStyleSheet(f"background-color: {accent}; color: white; border-radius: 4px; padding: 6px 12px; font-weight: bold;")
+        cancel_btn.setStyleSheet("background-color: #555555; color: white; border-radius: 4px; padding: 6px 12px; font-weight: bold;")
+        h.addWidget(cancel_btn)
+        h.addWidget(open_btn)
+        l.addLayout(h)
+
 class MainApp(QMainWindow):
     status_signal = Signal(str, bool, str)
     search_results_signal = Signal(list, bool)
@@ -250,8 +315,13 @@ class MainApp(QMainWindow):
         self.search_entry.returnPressed.connect(self.perform_search)
         self.search_btn = QPushButton("Search")
         self.search_btn.clicked.connect(self.perform_search)
+        self.playlist_btn = QPushButton("\uE142")
+        self.playlist_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 16px; background-color: transparent; border: 1px solid #555;")
+        self.playlist_btn.clicked.connect(self.open_playlist_dialog)
+        
         search_r.addWidget(self.search_entry, 1)
         search_r.addWidget(self.search_btn)
+        search_r.addWidget(self.playlist_btn)
         c_layout.addLayout(search_r)
         
         set_r = QHBoxLayout()
@@ -354,7 +424,14 @@ class MainApp(QMainWindow):
     def _setup_results_pane(self):
         w = QWidget()
         l = QVBoxLayout(w); l.setContentsMargins(0,0,0,0)
-        l.addWidget(QLabel("Search Results"))
+        h = QHBoxLayout()
+        h.addWidget(QLabel("Search Results"))
+        h.addStretch()
+        self.show_thumb_cb = QCheckBox("Show Thumbnails")
+        self.show_thumb_cb.setChecked(self.show_thumbnails)
+        self.show_thumb_cb.stateChanged.connect(self.toggle_thumbnails)
+        h.addWidget(self.show_thumb_cb)
+        l.addLayout(h)
         
         self.results_area = QScrollArea()
         self.results_area.setWidgetResizable(True)
@@ -404,8 +481,8 @@ class MainApp(QMainWindow):
             QScrollArea { border: none; background-color: #1a1a1a; border-radius: 6px;}
             QFrame { background-color: #2a2a2a; border-radius: 6px; padding: 5px;}
             QSplitter::handle { background-color: #333333; width: 4px; margin: 0px 4px; }
-            QSlider::groove:horizontal { border: 1px solid #444; height: 6px; background: #333; border-radius: 3px; }
-            QSlider::handle:horizontal { background: %s; width: 14px; margin-top: -4px; margin-bottom: -4px; border-radius: 7px; }
+            QSlider::groove:horizontal { border: 1px solid #444; height: 4px; background: #333; border-radius: 2px; }
+            QSlider::handle:horizontal { background: %s; width: 10px; margin-top: -3px; margin-bottom: -3px; border-radius: 5px; }
         """ % (accent, accent))
 
     # --- Local Folder Logic ---
@@ -458,16 +535,26 @@ class MainApp(QMainWindow):
             self.load_local_folder(item['path'])
         else:
             self._update_status(f"Playing Local: {item['name']}", False, "#3B8ED0")
-            url = item['path'].replace("\\", "/")
-            if not url.startswith("file:///"): url = "file:///" + url
-            media = self.vlc_instance.media_new(url)
+            url = item['path']
+            media = self.vlc_instance.media_new_path(url)
             self.vlc_player.set_media(media)
             self.vlc_player.play()
             self.current_video_id = "local"
             self.playback_started_signal.emit(item['name'], "local")
 
-    # --- Search & Download ---
-    def perform_search(self):
+    def toggle_thumbnails(self, state):
+        self.show_thumbnails = state == Qt.Checked.value
+        self.save_config()
+        if self.search_results:
+            self._on_search_results(self.search_results, False)
+
+    def open_playlist_dialog(self):
+        d = PlaylistDialog(self)
+        if d.exec() == QDialog.Accepted and d.url_cb.currentText():
+            self.search_entry.setText(d.url_cb.currentText())
+            self.perform_search(is_playlist=True)
+
+    def perform_search(self, is_playlist=False):
         query = self.search_entry.text()
         if not query: return
         self._on_status_update("Searching...", False, "#3B8ED0")
@@ -492,6 +579,9 @@ class MainApp(QMainWindow):
     def _on_search_results(self, res, is_playlist):
         self.search_btn.setEnabled(True)
         self.search_results = res
+        self._thumbnail_labels = getattr(self, '_thumbnail_labels', {})
+        self._thumbnail_labels.clear()
+        
         while self.results_vbox.count():
             item = self.results_vbox.takeAt(0)
             if item.widget(): item.widget().deleteLater()
@@ -501,13 +591,20 @@ class MainApp(QMainWindow):
             l = QHBoxLayout(w)
             l.setContentsMargins(2,2,2,2)
             
-            pbtn = QPushButton("▶")
-            pbtn.setFixedWidth(40)
-            pbtn.clicked.connect(lambda checked=False, v=video: self.play_result(v))
-            l.addWidget(pbtn)
-            
+            if self.show_thumbnails:
+                tw = ThumbnailWidget(video, self)
+                l.addWidget(tw)
+                self._thumbnail_labels[video['id']] = tw.thumb_label
+                threading.Thread(target=self._fetch_thumbnail, args=(video,), daemon=True).start()
+            else:
+                pbtn = QPushButton("\uE768")
+                pbtn.setFixedWidth(40)
+                pbtn.setStyleSheet("background: transparent; color: white; font-family: 'Segoe MDL2 Assets'; font-size: 16px;")
+                pbtn.clicked.connect(lambda checked=False, v=video: self.play_result(v))
+                l.addWidget(pbtn)
+                
             title = video.get('title', 'Unknown')
-            if len(title) > 60: title = title[:57] + "..."
+            if len(title) > 55: title = title[:52] + "..."
             cb = QCheckBox(f"{title}")
             
             # Persist checked state
@@ -565,7 +662,7 @@ class MainApp(QMainWindow):
             self.queue_items.pop(idx)
             self.queue_update_signal.emit()
 
-    def clear_completed(self):
+    def clear_completed(self, checked=False):
         self.queue_items = [q for q in self.queue_items if q['status'] != "Finished"]
         self.queue_update_signal.emit()
 
@@ -719,7 +816,31 @@ class MainApp(QMainWindow):
                 self.progress_slider.blockSignals(False)
 
     def _on_thumbnail_loaded(self, vid_id, pixmap):
-        pass # Optimization skip for this phase
+        if hasattr(self, '_thumbnail_labels') and vid_id in self._thumbnail_labels:
+            if not pixmap.isNull():
+                scaled_pixmap = pixmap.scaled(90, 50, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                self._thumbnail_labels[vid_id].setPixmap(scaled_pixmap)
+
+    def _fetch_thumbnail(self, v):
+        vid_id = v.get('id')
+        if not vid_id: return
+        if vid_id in self.thumbnail_cache:
+            self.thumbnails_loaded_signal.emit(vid_id, self.thumbnail_cache[vid_id])
+            return
+
+        try:
+            url = f"https://i.ytimg.com/vi/{vid_id}/mqdefault.jpg"
+            with urllib.request.urlopen(url) as req:
+                data = req.read()
+                if self.thumbnail_cache_size + len(data) > 256 * 1024 * 1024:
+                    self.thumbnail_cache.clear(); self.thumbnail_cache_size = 0
+                
+                img = Image.open(io.BytesIO(data))
+                qpixmap = pil_to_qpixmap(img)
+                self.thumbnail_cache[vid_id] = qpixmap
+                self.thumbnail_cache_size += len(data)
+                self.thumbnails_loaded_signal.emit(vid_id, qpixmap)
+        except: pass
 
 if __name__ == "__main__":
     QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
