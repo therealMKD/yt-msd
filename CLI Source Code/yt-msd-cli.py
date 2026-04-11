@@ -18,45 +18,78 @@ def get_ffmpeg_path():
     return None
 
 def self_install_to_path():
-    #Only runs when packaged as an .exe — skips entirely when running as a .py script
+    # Only runs when packaged as an .exe — skips entirely when running as a .py script
     if not getattr(sys, 'frozen', False):
         return
-    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+    
+    current_exe = os.path.abspath(sys.executable)
+    exe_dir = os.path.dirname(current_exe)
+    exe_filename = os.path.basename(current_exe)
+    
+    # We want it to be callable as 'yt-msd'. 
+    # This works if the exe is named yt-msd.exe OR if a yt-msd.cmd shim exists.
+    is_named_correctly = exe_filename.lower() == "yt-msd.exe"
+    shim_path = os.path.join(exe_dir, "yt-msd.cmd")
+    has_shim = os.path.exists(shim_path)
+    
+    # Check if directory is in PATH
     user_path = os.environ.get('PATH', '')
-    #Check if the exe's folder is already accessible via PATH
-    if exe_dir.lower() in [p.lower() for p in user_path.split(os.pathsep)]:
-        return
-    #Also check the persistent User PATH from the registry
-    if sys.platform != 'win32':
-        return
-    import winreg
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Environment', 0, winreg.KEY_READ) as key:
-            saved_path, _ = winreg.QueryValueEx(key, 'PATH')
-    except (FileNotFoundError, OSError):
-        saved_path = ''
-    if exe_dir.lower() in [p.lower() for p in saved_path.split(os.pathsep)]:
-        return
-    print(f"{C_INFO}yt-msd is not on your system PATH yet.{C_RESET}")
-    print(f"{C_INFO}Adding it would let you run 'yt-msd' from any terminal window.{C_RESET}")
-    answer = input(f"{C_PROMPT}Add to PATH? (y/n): {C_RESET}").strip().lower()
-    if answer in ('y', 'yes'):
-        new_path = f"{saved_path};{exe_dir}" if saved_path else exe_dir
+    in_path = exe_dir.lower() in [p.lower() for p in user_path.split(os.pathsep)]
+    
+    # Check registry too for persistence
+    saved_path = ''
+    if sys.platform == 'win32':
+        import winreg
         try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Environment', 0, winreg.KEY_SET_VALUE) as key:
-                winreg.SetValueEx(key, 'PATH', 0, winreg.REG_EXPAND_SZ, new_path)
-            #Broadcast the change so Explorer picks it up without a reboot
-            import ctypes
-            HWND_BROADCAST = 0xFFFF
-            WM_SETTINGCHANGE = 0x001A
-            ctypes.windll.user32.SendMessageTimeoutW(
-                HWND_BROADCAST, WM_SETTINGCHANGE, 0, 'Environment', 0x0002, 5000, ctypes.byref(ctypes.c_long())
-            )
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Environment', 0, winreg.KEY_READ) as key:
+                saved_path, _ = winreg.QueryValueEx(key, 'PATH')
+        except (FileNotFoundError, OSError):
+            saved_path = ''
+        if exe_dir.lower() in [p.lower() for p in saved_path.split(os.pathsep)]:
+            in_path = True
+
+    # If already in path AND (named correctly OR has shim), we are good
+    if in_path and (is_named_correctly or has_shim):
+        return
+
+    # If we are here, something is missing
+    if not in_path:
+        print(f"{C_INFO}yt-msd is not on your system PATH yet.{C_RESET}")
+        print(f"{C_INFO}Adding it lets you run 'yt-msd' from any terminal window.{C_RESET}")
+    elif not is_named_correctly and not has_shim:
+        print(f"{C_INFO}The program is named '{exe_filename}', but isn't aliased to 'yt-msd'.{C_RESET}")
+        print(f"{C_INFO}Creating an alias lets you just type 'yt-msd' to run it.{C_RESET}")
+
+    answer = input(f"{C_PROMPT}Set up 'yt-msd' command? (y/n): {C_RESET}").strip().lower()
+    if answer in ('y', 'yes'):
+        try:
+            # 1. Create shim if needed
+            if not is_named_correctly:
+                with open(shim_path, 'w') as f:
+                    f.write(f'@echo off\n"%~dp0\\{exe_filename}" %*\n')
+                print(f"{C_SUCCESS}Created command alias: {shim_path}{C_RESET}")
+
+            # 2. Update PATH if needed
+            if not in_path:
+                new_path = f"{saved_path};{exe_dir}" if saved_path else exe_dir
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Environment', 0, winreg.KEY_SET_VALUE) as key:
+                    winreg.SetValueEx(key, 'PATH', 0, winreg.REG_EXPAND_SZ, new_path)
+                
+                # Broadcast the change so Explorer picks it up without a reboot
+                import ctypes
+                HWND_BROADCAST = 0xFFFF
+                WM_SETTINGCHANGE = 0x001A
+                ctypes.windll.user32.SendMessageTimeoutW(
+                    HWND_BROADCAST, WM_SETTINGCHANGE, 0, 'Environment', 0x0002, 5000, ctypes.byref(ctypes.c_long())
+                )
+                print(f"{C_SUCCESS}Added to system PATH.{C_RESET}")
+            
             print(f"{C_SUCCESS}Done! Open a new terminal and you can use 'yt-msd' from anywhere.{C_RESET}")
         except OSError as e:
-            print(f"{C_ERROR}Could not update PATH: {e}{C_RESET}")
+            print(f"{C_ERROR}Could not complete setup: {e}{C_RESET}")
     else:
-        print(f"{C_INFO}Skipped. You can always move yt-msd.exe into a folder on your PATH later.{C_RESET}")
+        print(f"{C_INFO}Skipped. You can always set this up later by running the program again.{C_RESET}")
+
 
 #Color references, the colors are what it says on the tin
 C_INFO = '\033[94m'    # Bright Blue
