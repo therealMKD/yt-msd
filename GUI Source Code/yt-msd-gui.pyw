@@ -22,7 +22,7 @@ from PIL import Image
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QHBoxLayout, QLabel, QPushButton, QLineEdit, 
                                QComboBox, QCheckBox, QSlider, QScrollArea, 
-                               QSplitter, QFileDialog, QMessageBox, QDialog,
+                               QSplitter, QSplitterHandle, QFileDialog, QMessageBox, QDialog,
                                QSystemTrayIcon, QMenu, QFrame, QGridLayout,
                                QSizePolicy)
 from PySide6.QtCore import Qt, Signal, QTimer, Slot, QPoint, QRect, QMargins
@@ -54,6 +54,15 @@ def get_system_accent_color():
         return f"#{r:02x}{g:02x}{b:02x}"
     except Exception:
         return "#0067c0"
+
+def get_system_appearance_mode():
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        val, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+        winreg.CloseKey(key)
+        return "Light" if val == 1 else "Dark"
+    except Exception:
+        return "Dark"
 
 def get_accent_color(color_name):
     if color_name == "System": return get_system_accent_color()
@@ -96,6 +105,145 @@ class ThumbnailWidget(QWidget):
     def leaveEvent(self, event):
         self.play_btn.hide()
         super().leaveEvent(event)
+
+class SettingsDialog(QDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent = parent
+        self.setWindowTitle("Settings")
+        self.setMinimumWidth(500)
+        self.setWindowFlags(self.windowFlags() | Qt.Tool)
+        
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(25, 25, 25, 25)
+        self.layout.setSpacing(15)
+        
+        # APPEARANCE MODE
+        self.layout.addWidget(QLabel("APPEARANCE MODE", font=QFont("Segoe UI Semibold", 10)))
+        mode_layout = QHBoxLayout()
+        self.mode_btns = {}
+        for mode in ["System", "Light", "Dark"]:
+            btn = QPushButton(mode)
+            btn.setCheckable(True)
+            if parent.appearance_mode == mode: btn.setChecked(True)
+            btn.clicked.connect(lambda checked=False, m=mode: self._change_mode(m))
+            mode_layout.addWidget(btn)
+            self.mode_btns[mode] = btn
+        self.layout.addLayout(mode_layout)
+        
+        # ACCENT COLOR
+        self.layout.addWidget(QLabel("ACCENT COLOR", font=QFont("Segoe UI Semibold", 10)))
+        grid = QGridLayout()
+        grid.setSpacing(8)
+        colors = ["System"] + list(THEME_COLORS.keys())
+        self.accent_btns = {}
+        for i, color in enumerate(colors):
+            r, c = i // 5, i % 5
+            btn = QPushButton()
+            btn.setFixedSize(35, 35)
+            c_val = get_system_accent_color() if color == "System" else THEME_COLORS[color][0]
+            btn.setStyleSheet(f"background-color: {c_val}; border-radius: 6px; border: {'2px solid white' if parent.accent_color_name == color else 'none'};")
+            if color == "System": btn.setText("\uE771"); btn.setFont(QFont("Segoe MDL2 Assets", 12))
+            btn.clicked.connect(lambda checked=False, clr=color: self._change_accent(clr))
+            grid.addWidget(btn, r, c)
+            self.accent_btns[color] = btn
+        self.layout.addLayout(grid)
+        
+        # ADVANCED
+        self.layout.addWidget(QLabel("CUSTOM YT-DLP ARGUMENTS (ADVANCED)", font=QFont("Segoe UI Semibold", 10)))
+        arg_h = QHBoxLayout()
+        self.args_cb = QCheckBox()
+        self.args_cb.setChecked(parent.use_custom_args)
+        self.args_cb.toggled.connect(self._toggle_args)
+        arg_h.addWidget(self.args_cb)
+        self.args_edit = QLineEdit(parent.custom_args)
+        self.args_edit.setPlaceholderText("Arguments...")
+        self.args_edit.setEnabled(parent.use_custom_args)
+        self.args_edit.textChanged.connect(self._update_args)
+        arg_h.addWidget(self.args_edit, 1)
+        self.layout.addLayout(arg_h)
+        self.layout.addWidget(QLabel("\uE946 Manual override ignores GUI bitrate/format settings.", font=QFont("Segoe UI", 8)))
+        
+        # OPTIONS
+        self.tray_cb = QCheckBox("Minimize to System Tray")
+        self.tray_cb.setChecked(parent.minimize_to_tray)
+        self.tray_cb.toggled.connect(self._toggle_tray)
+        self.layout.addWidget(self.tray_cb)
+        
+        self.session_cb = QCheckBox("Restore Last Session on Startup")
+        self.session_cb.setChecked(getattr(parent, 'save_place', False))
+        self.session_cb.toggled.connect(self._toggle_session)
+        self.layout.addWidget(self.session_cb)
+        
+        self.layout.addStretch()
+        
+        # RESET
+        self.reset_btn = QPushButton("Reset to Default Config")
+        self.reset_btn.setStyleSheet("background-color: transparent; border: 1px solid #555; font-weight: normal;")
+        self.reset_btn.clicked.connect(self._reset_defaults)
+        self.layout.addWidget(self.reset_btn)
+        
+        # FOOTER
+        footer = QHBoxLayout()
+        footer.addStretch()
+        ok_btn = QPushButton("OK")
+        ok_btn.setFixedWidth(100)
+        ok_btn.clicked.connect(self.accept)
+        footer.addWidget(ok_btn)
+        self.layout.addLayout(footer)
+        
+        self.update_styles()
+
+    def update_styles(self):
+        accent = get_accent_color(self.parent.accent_color_name)
+        mode = self.parent.appearance_mode
+        if mode == "System": mode = get_system_appearance_mode()
+        is_light = mode == "Light"
+        
+        for m, b in self.mode_btns.items():
+            if m == self.parent.appearance_mode:
+                b.setStyleSheet(f"background-color: {accent}; color: white; border-radius: 4px;")
+            else:
+                b.setStyleSheet(f"background-color: {'#ddd' if is_light else '#444'}; color: {'black' if is_light else 'white'}; border-radius: 4px;")
+        
+        for color, btn in self.accent_btns.items():
+            c_val = get_system_accent_color() if color == "System" else THEME_COLORS[color][0]
+            border = f"2px solid {'black' if is_light else 'white'}" if self.parent.accent_color_name == color else "none"
+            btn.setStyleSheet(f"background-color: {c_val}; border-radius: 6px; border: {border};")
+
+    def _change_mode(self, mode):
+        self.parent.appearance_mode = mode
+        self.parent.apply_theme()
+        self.update_styles()
+        self.parent.save_config()
+
+    def _change_accent(self, color):
+        self.parent.accent_color_name = color
+        self.parent.apply_theme()
+        self.update_styles()
+        self.parent.save_config()
+        
+    def _toggle_args(self, state):
+        self.parent.use_custom_args = state
+        self.args_edit.setEnabled(state)
+        self.parent.save_config()
+        
+    def _update_args(self, text):
+        self.parent.custom_args = text
+        self.parent.save_config()
+        
+    def _toggle_tray(self, state):
+        self.parent.minimize_to_tray = state
+        self.parent.save_config()
+        
+    def _toggle_session(self, state):
+        self.parent.save_place = state
+        self.parent.save_config()
+        
+    def _reset_defaults(self):
+        if QMessageBox.question(self, "Confirm Reset", "This will wipe your config and recent data. Continue?") == QMessageBox.Yes:
+            self.parent.reset_to_defaults()
+            self.accept()
 
 class PlaylistDialog(QDialog):
     def __init__(self, parent=None):
@@ -168,6 +316,7 @@ class MainApp(QMainWindow):
         self.minimize_to_tray = False
         self.save_place = False
         self.last_session = {}
+        self.last_search = ""
         
         # Player Flags
         self.is_playing = False
@@ -231,6 +380,13 @@ class MainApp(QMainWindow):
                     self.minimize_to_tray = c.get('minimize_to_tray', False)
                     self.recent_playlists = c.get('recent_playlists', [])
                     self.splitter_sizes = c.get('splitter_sizes', [300, 800, 300])
+                    self.use_custom_args = c.get('use_custom_args', False)
+                    self.custom_args = c.get('custom_args', '')
+                    self.appearance_mode = c.get('mode', 'Dark')
+                    self.last_search = c.get('last_search', '')
+                    self.save_place = c.get('save_place', False)
+                    if self.save_place:
+                        self.session_data = c.get('session_data', {})
         except Exception: pass
         if not self.recent_folders:
             self.recent_folders = [default_dl]; self.download_path = default_dl
@@ -250,7 +406,16 @@ class MainApp(QMainWindow):
             'use_custom_args': self.use_custom_args,
             'custom_args': self.custom_args,
             'recent_playlists': self.recent_playlists,
-            'splitter_sizes': self.splitter.sizes() if hasattr(self, 'splitter') else self.splitter_sizes
+            'splitter_sizes': self.splitter.sizes() if hasattr(self, 'splitter') else self.splitter_sizes,
+            'last_search': self.search_entry.text() if hasattr(self, 'search_entry') else self.last_search,
+            'save_place': self.save_place,
+            'session_data': {
+                'search_results': self.search_results,
+                'playback_index': self.playback_index,
+                'current_video_id': self.current_video_id,
+                'local_current_path': self.local_current_path,
+                'local_playback_index': getattr(self, 'local_playback_index', -1)
+            }
         }
         try:
             with open(self.config_path, 'w') as f: json.dump(c, f, indent=4)
@@ -294,6 +459,32 @@ class MainApp(QMainWindow):
         if self.vlc_player: self.vlc_player.stop()
         super().closeEvent(event)
 
+    def reset_to_defaults(self):
+        if os.path.exists(self.config_path):
+            try: os.remove(self.config_path)
+            except: pass
+        
+        # Reset variables
+        self.appearance_mode = "Dark"
+        self.accent_color_name = "Blue"
+        self.volume_val = 100
+        self.save_place = False
+        self.use_custom_args = False
+        self.custom_args = ""
+        self.last_search = ""
+        self.show_thumbnails = False
+        self.minimize_to_tray = False
+        self.splitter_sizes = [300, 800, 300]
+        
+        # Apply changes
+        self.apply_theme()
+        if hasattr(self, 'splitter'):
+            self.splitter.setSizes(self.splitter_sizes)
+        if hasattr(self, 'vol_slider'):
+            self.vol_slider.setValue(100)
+        self.save_config()
+        self._on_status_update("Settings reset to defaults.", False, "#3B8ED0")
+
     def setup_ui(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -301,7 +492,20 @@ class MainApp(QMainWindow):
         main_layout.setContentsMargins(10, 10, 10, 10)
         
         # Upper Splitter
-        self.splitter = QSplitter(Qt.Horizontal)
+        class ResetHandle(QSplitterHandle):
+            _last_click = 0
+            def mousePressEvent(self, e):
+                import time
+                now = time.time()
+                if now - ResetHandle._last_click < 0.35:
+                    self.splitter().setSizes([300, 800, 300])
+                    e.accept(); return
+                ResetHandle._last_click = now
+                super().mousePressEvent(e)
+        class ResetSplitter(QSplitter):
+            def createHandle(self):
+                return ResetHandle(self.orientation(), self)
+        self.splitter = ResetSplitter(Qt.Horizontal)
         main_layout.addWidget(self.splitter, 1)
         
         self._setup_local_pane()
@@ -327,7 +531,45 @@ class MainApp(QMainWindow):
         search_r.addWidget(self.search_entry, 1)
         search_r.addWidget(self.search_btn)
         search_r.addWidget(self.playlist_btn)
+        settings_btn = QPushButton("\uE713")
+        settings_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 16px; background-color: transparent; border: 1px solid #555;")
+        settings_btn.clicked.connect(self.open_settings_dialog)
+        search_r.addWidget(settings_btn)
         c_layout.addLayout(search_r)
+        
+        # Restore last search
+        if getattr(self, 'last_search', ''):
+            self.search_entry.setText(self.last_search)
+        
+        # Restore session
+        if self.save_place and hasattr(self, 'session_data'):
+            sd = self.session_data
+            if sd.get('search_results'):
+                self._on_search_results(sd['search_results'], False)
+                self.playback_index = sd.get('playback_index', -1)
+                # If we have a stored index, we might want to load it (paused)
+                if self.playback_index >= 0 and self.playback_index < len(self.search_results):
+                    # We'll implement a 'load_only' flag for play_result or just trigger the start logic
+                    # but set position to 0 and pause immediately.
+                    # For now just set the index.
+                    pass
+            
+            if sd.get('current_video_id') == "local" and sd.get('local_current_path'):
+                self.local_playback_index = sd.get('local_playback_index', -1)
+                # Display will be handled by standard local folder load
+            
+            # Restore playback state if item exists
+            v_id = sd.get('current_video_id')
+            if v_id and v_id != "local":
+                # Find the video object in results if possible
+                results = sd.get('search_results', [])
+                idx = sd.get('playback_index', -1)
+                if 0 <= idx < len(results):
+                    video = results[idx]
+                    self.play_result(video)
+                    # Use a timer to ensure we pause after it starts loading
+                    QTimer.singleShot(100, lambda: self.vlc_player.pause() if self.vlc_player else None)
+                    QTimer.singleShot(150, lambda: self.vlc_player.set_position(0) if self.vlc_player else None)
         
         set_r = QHBoxLayout()
         set_r.addWidget(QLabel("Format:"))
@@ -354,9 +596,10 @@ class MainApp(QMainWindow):
         
         self.browse_btn = QPushButton("\uE8B7")
         self.browse_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 16px; padding: 0px;")
-        self.browse_btn.setFixedSize(30, 30)
+        self.browse_btn.setFixedSize(36, 30)
         self.browse_btn.clicked.connect(self.browse_folder)
         set_r.addWidget(self.browse_btn)
+        set_r.addSpacing(6)
         
         self.dl_btn = QPushButton("Download All")
         self.dl_btn.clicked.connect(self.start_batch_download)
@@ -394,19 +637,22 @@ class MainApp(QMainWindow):
         c.addWidget(self.vol_pct)
         
         c.addStretch(1)
+        _btn_ss = "background: transparent; color: white; font-family: 'Segoe MDL2 Assets'; font-size: 14px; border-radius: 4px; padding: 2px 4px;"
+        _btn_ss_hover = "background: transparent; color: white; font-family: 'Segoe MDL2 Assets'; font-size: 14px; border-radius: 4px; padding: 2px 4px;" + " /* hover set via stylesheet */"
+        
         self.prev_btn = QPushButton("\uE892")
         self.prev_btn.clicked.connect(self.play_previous)
-        self.prev_btn.setStyleSheet("background: transparent; color: white; font-family: 'Segoe MDL2 Assets'; font-size: 14px;")
+        self.prev_btn.setStyleSheet("QPushButton { background: transparent; color: white; font-family: 'Segoe MDL2 Assets'; font-size: 14px; border-radius: 4px; padding: 2px 6px; } QPushButton:hover { background: rgba(255,255,255,30); }")
         c.addWidget(self.prev_btn)
         
         self.play_btn = QPushButton("\uE768")
         self.play_btn.clicked.connect(self.toggle_playback)
-        self.play_btn.setStyleSheet("background: transparent; color: white; font-family: 'Segoe MDL2 Assets'; font-size: 28px;")
+        self.play_btn.setStyleSheet("QPushButton { background: transparent; color: white; font-family: 'Segoe MDL2 Assets'; font-size: 28px; border-radius: 6px; padding: 2px 6px; } QPushButton:hover { background: rgba(255,255,255,30); }")
         c.addWidget(self.play_btn)
         
         self.next_btn = QPushButton("\uE893")
         self.next_btn.clicked.connect(self.play_next)
-        self.next_btn.setStyleSheet("background: transparent; color: white; font-family: 'Segoe MDL2 Assets'; font-size: 14px;")
+        self.next_btn.setStyleSheet("QPushButton { background: transparent; color: white; font-family: 'Segoe MDL2 Assets'; font-size: 14px; border-radius: 4px; padding: 2px 6px; } QPushButton:hover { background: rgba(255,255,255,30); }")
         c.addWidget(self.next_btn)
         c.addStretch(1)
         
@@ -428,9 +674,12 @@ class MainApp(QMainWindow):
         self.local_path_combo = QComboBox()
         self.local_path_combo.addItems(self.local_folders)
         h.addWidget(self.local_path_combo, 1)
-        btn = QPushButton("Browse")
-        btn.clicked.connect(lambda: self.load_local_folder(QFileDialog.getExistingDirectory(self)))
-        h.addWidget(btn)
+        local_browse_btn = QPushButton("\uE8B7")
+        local_browse_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 16px; padding: 0px;")
+        local_browse_btn.setFixedSize(36, 30)
+        local_browse_btn.clicked.connect(lambda: self.load_local_folder(QFileDialog.getExistingDirectory(self)))
+        h.addWidget(local_browse_btn)
+        h.addSpacing(6)
         l.addLayout(h)
         
         self.local_list = QScrollArea()
@@ -451,6 +700,7 @@ class MainApp(QMainWindow):
         self.show_thumb_cb = QCheckBox("Show Thumbnails")
         self.show_thumb_cb.setChecked(self.show_thumbnails)
         self.show_thumb_cb.stateChanged.connect(self.toggle_thumbnails)
+        self.show_thumb_cb.setContentsMargins(0, 0, 8, 0)
         h.addWidget(self.show_thumb_cb)
         l.addLayout(h)
         
@@ -485,34 +735,65 @@ class MainApp(QMainWindow):
         self.splitter.addWidget(w)
 
     def apply_theme(self):
+        mode = self.appearance_mode
+        if mode == "System": mode = get_system_appearance_mode()
+        
         accent = get_accent_color(self.accent_color_name)
-        self.setStyleSheet("""
-            QMainWindow { background-color: #1e1e1e; }
-            QWidget { color: #ffffff; font-family: 'Segoe UI'; font-size: 13px; }
-            QLabel { color: #ffffff; }
-            QPushButton { 
-                background-color: %s; 
+        
+        if mode == "Light":
+            bg = "#f3f3f3"
+            fg = "#1a1a1a"
+            frame_bg = "#ffffff"
+            input_bg = "#e8e8e8"
+            input_border = "#ccc"
+            scroll_bg = "#fafafa"
+            splitter_handle = "#ddd"
+            slider_bg = "#ddd"
+            hover_bg = "#000000"
+            hover_fg = "#ffffff"
+        else:
+            bg = "#1e1e1e"
+            fg = "#ffffff"
+            frame_bg = "#2a2a2a"
+            input_bg = "#333333"
+            input_border = "#555"
+            scroll_bg = "#1a1a1a"
+            splitter_handle = "#333333"
+            slider_bg = "#333"
+            hover_bg = "#dddddd"
+            hover_fg = "#1a1a1a"
+
+        self.setStyleSheet(f"""
+            QMainWindow {{ background-color: {bg}; }}
+            QWidget {{ color: {fg}; font-family: 'Segoe UI'; font-size: 13px; }}
+            QLabel {{ color: {fg}; }}
+            QPushButton {{ 
+                background-color: {accent}; 
                 color: white; border: none; padding: 6px 12px; border-radius: 4px; font-weight: bold;
-            }
-            QPushButton:hover { background-color: #dddddd; color: #1a1a1a; }
-            QPushButton:disabled { background-color: #555555; color: #888888; }
-            QLineEdit, QComboBox { 
-                background-color: #333333; color: white; border: 1px solid #555; padding: 6px; border-radius: 4px;
-            }
-            QScrollArea { border: none; background-color: #1a1a1a; border-radius: 6px;}
-            QFrame { background-color: #2a2a2a; border-radius: 6px; padding: 5px;}
-            QSplitter::handle { background-color: #333333; width: 4px; margin: 0px 4px; }
-            QSlider::groove:horizontal { border: none; height: 3px; background: #333; border-radius: 1px; }
-            QSlider::sub-page:horizontal { background: %s; border-radius: 1px; }
-            QSlider::handle:horizontal { background: %s; width: 14px; height: 14px; margin-top: -6px; margin-bottom: -5px; border-radius: 7px; }
-            QSlider#volSlider[volume_state="normal"]::sub-page:horizontal { background: %s; }
-            QSlider#volSlider[volume_state="normal"]::handle:horizontal { background: %s; }
-            QSlider#volSlider[volume_state="orange"]::sub-page:horizontal { background: #FF8C00; }
-            QSlider#volSlider[volume_state="orange"]::handle:horizontal { background: #FF8C00; }
-            QSlider#volSlider[volume_state="red"]::sub-page:horizontal { background: #E31E24; }
-            QSlider#volSlider[volume_state="red"]::handle:horizontal { background: #E31E24; }
-            QSlider#volSlider::sub-page:horizontal { border-radius: 1px; }
-        """ % (accent, accent, accent, accent, accent))
+            }}
+            QPushButton:hover {{ background-color: {hover_bg}; color: {hover_fg}; }}
+            QPushButton:disabled {{ background-color: #555555; color: #888888; }}
+            QLineEdit, QComboBox {{ 
+                background-color: {input_bg}; color: {fg}; border: 1px solid {input_border}; padding: 6px; border-radius: 4px;
+            }}
+            QScrollArea {{ border: none; background-color: {scroll_bg}; border-radius: 6px;}}
+            QFrame {{ background-color: {frame_bg}; border-radius: 6px; padding: 5px;}}
+            QSplitter::handle {{ background-color: {splitter_handle}; width: 6px; margin: 0px 2px; }}
+            QSlider::groove:horizontal {{ border: none; height: 3px; background: {slider_bg}; border-radius: 1px; }}
+            QSlider::sub-page:horizontal {{ background: {accent}; border-radius: 1px; }}
+            QSlider::handle:horizontal {{ background: {accent}; width: 14px; height: 14px; margin-top: -6px; margin-bottom: -5px; border-radius: 7px; }}
+            QSlider#volSlider[volume_state="normal"]::sub-page:horizontal {{ background: {accent}; }}
+            QSlider#volSlider[volume_state="normal"]::handle:horizontal {{ background: {accent}; }}
+            QSlider#volSlider[volume_state="orange"]::sub-page:horizontal {{ background: #FF8C00; }}
+            QSlider#volSlider[volume_state="orange"]::handle:horizontal {{ background: #FF8C00; }}
+            QSlider#volSlider[volume_state="red"]::sub-page:horizontal {{ background: #E31E24; }}
+            QSlider#volSlider[volume_state="red"]::handle:horizontal {{ background: #E31E24; }}
+            QSlider#volSlider::sub-page:horizontal {{ border-radius: 1px; }}
+            
+            QCheckBox {{ color: {fg}; spacing: 8px; }}
+            QCheckBox::indicator {{ width: 18px; height: 18px; border: 1px solid {accent}; border-radius: 3px; background: {frame_bg}; }}
+            QCheckBox::indicator:checked {{ background: {accent}; image: url(none); }}
+        """)
 
     # --- Local Folder Logic ---
     def load_local_folder(self, path):
@@ -585,6 +866,10 @@ class MainApp(QMainWindow):
         self.save_config()
         if self.search_results:
             self._on_search_results(self.search_results, False)
+
+    def open_settings_dialog(self):
+        d = SettingsDialog(self)
+        d.exec()
 
     def open_playlist_dialog(self):
         d = PlaylistDialog(self)
@@ -863,7 +1148,9 @@ class MainApp(QMainWindow):
     def on_volume_changed(self, val):
         self.volume_val = val
         if self.vlc_player:
-            self.vlc_player.audio_set_volume(val)
+            # VLC uses 0-200 (100=normal). Map slider 0-100 → vlc 0-100, 101-150 → vlc 101-200
+            vlc_vol = val if val <= 100 else int(100 + (val - 100) * 2)
+            self.vlc_player.audio_set_volume(vlc_vol)
         if hasattr(self, 'vol_pct'):
             self.vol_pct.setText(f"{val}%")
             if val > 115:
@@ -877,7 +1164,6 @@ class MainApp(QMainWindow):
                 self.vol_slider.setProperty("volume_state", "normal")
             self.vol_slider.style().unpolish(self.vol_slider)
             self.vol_slider.style().polish(self.vol_slider)
-        self.save_config()
 
     def update_player_ui(self):
         if not self.vlc_player or not self.current_video_id: return
