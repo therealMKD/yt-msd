@@ -112,7 +112,7 @@ class PlaylistDialog(QDialog):
         if parent and hasattr(parent, 'recent_playlists'):
             display_values = []
             for p in parent.recent_playlists:
-                if isinstance(p, dict): display_values.append(p.get("url", "")) # we could show name but url is simpler for combo
+                if isinstance(p, dict): display_values.append(p.get("name", "Unknown Playlist"))
                 else: display_values.append(str(p))
             self.url_cb.addItems(display_values)
         l.addWidget(self.url_cb)
@@ -228,6 +228,7 @@ class MainApp(QMainWindow):
                     self.local_current_path = c.get('local_current_path', "")
                     self.show_thumbnails = c.get('show_thumbnails', False)
                     self.minimize_to_tray = c.get('minimize_to_tray', False)
+                    self.recent_playlists = c.get('recent_playlists', [])
         except Exception: pass
         if not self.recent_folders:
             self.recent_folders = [default_dl]; self.download_path = default_dl
@@ -245,7 +246,8 @@ class MainApp(QMainWindow):
             'show_thumbnails': self.show_thumbnails,
             'minimize_to_tray': self.minimize_to_tray,
             'use_custom_args': self.use_custom_args,
-            'custom_args': self.custom_args
+            'custom_args': self.custom_args,
+            'recent_playlists': self.recent_playlists
         }
         try:
             with open(self.config_path, 'w') as f: json.dump(c, f, indent=4)
@@ -526,7 +528,7 @@ class MainApp(QMainWindow):
         items.sort(key=lambda x: (not x['is_dir'], x['name'].lower()))
         for item in items:
             btn = QPushButton(f"{'📁' if item['is_dir'] else '🎵'}  {item['name']}")
-            btn.setStyleSheet("text-align: left; background-color: transparent; padding: 4px; font-weight: normal; border-radius: 0px;")
+            btn.setStyleSheet("QPushButton { text-align: left; background-color: transparent; color: white; padding: 4px; font-weight: normal; border-radius: 0px; } QPushButton:hover { background-color: #555555; color: white; }")
             btn.clicked.connect(lambda checked=False, i=item: self._on_local_click(i))
             self.local_vbox.addWidget(btn)
 
@@ -534,12 +536,13 @@ class MainApp(QMainWindow):
         if item['is_dir']: 
             self.load_local_folder(item['path'])
         else:
-            self._update_status(f"Playing Local: {item['name']}", False, "#3B8ED0")
-            url = item['path']
-            media = self.vlc_instance.media_new_path(url)
+            self._on_status_update(f"Playing Local: {item['name']}", False, "#3B8ED0")
+            url = item['path'].replace("\\", "/")
+            if not url.startswith("file:///"): url = "file:///" + url
+            self.current_video_id = "local"
+            media = self.vlc_instance.media_new(url)
             self.vlc_player.set_media(media)
             self.vlc_player.play()
-            self.current_video_id = "local"
             self.playback_started_signal.emit(item['name'], "local")
 
     def toggle_thumbnails(self, state):
@@ -551,7 +554,13 @@ class MainApp(QMainWindow):
     def open_playlist_dialog(self):
         d = PlaylistDialog(self)
         if d.exec() == QDialog.Accepted and d.url_cb.currentText():
-            self.search_entry.setText(d.url_cb.currentText())
+            val = d.url_cb.currentText()
+            url = val
+            for p in self.recent_playlists:
+                if isinstance(p, dict) and p.get("name") == val:
+                    url = p.get("url")
+                    break
+            self.search_entry.setText(url)
             self.perform_search(is_playlist=True)
 
     def perform_search(self, is_playlist=False):
@@ -570,6 +579,21 @@ class MainApp(QMainWindow):
                     else:
                         info = ydl.extract_info(f"ytsearch15:{query}", download=False)
                         res = [e for e in info['entries'] if e.get('id')]
+                        
+                if is_playlist and ('youtube.com' in query or 'youtu.be' in query):
+                    title = info.get('title', query) if isinstance(info, dict) else query
+                    updated = False
+                    for i, rp in enumerate(self.recent_playlists):
+                        if isinstance(rp, dict) and rp.get("url") == query:
+                            self.recent_playlists[i]["name"] = title
+                            updated = True; break
+                        elif rp == query:
+                            self.recent_playlists[i] = {"name": title, "url": query}
+                            updated = True; break
+                    if not updated:
+                        self.recent_playlists.insert(0, {"name": title, "url": query})
+                        self.recent_playlists = self.recent_playlists[:5]
+                    
                 self.search_results_signal.emit(res, False)
             except Exception:
                 self.search_failed_signal.emit()
@@ -643,14 +667,15 @@ class MainApp(QMainWindow):
             l = QHBoxLayout(w)
             l.setContentsMargins(5,5,5,5)
             
-            st = "✅ " if q['status'] == "Finished" else ("⬇️ " if q['status'] == "Downloading" else "⏳ ")
+            st = "\uE73E " if q['status'] == "Finished" else ("\uE896 " if q['status'] == "Downloading" else "")
             t = q['video'].get('title', 'Unknown')
             if len(t) > 40: t = t[:37] + "..."
             
-            l.addWidget(QLabel(f"{st}{t}"), 1)
+            l.addWidget(QLabel(f"<span style='font-family: \"Segoe MDL2 Assets\";'>{st}</span> {t}"), 1)
             
-            rm_btn = QPushButton("❌")
-            rm_btn.setFixedWidth(30)
+            rm_btn = QPushButton("\uE711")
+            rm_btn.setStyleSheet("background: transparent; color: white; font-family: 'Segoe MDL2 Assets'; font-size: 14px; padding: 0px;")
+            rm_btn.setFixedSize(26, 26)
             rm_btn.clicked.connect(lambda checked=False, i=idx: self.remove_from_queue(i))
             l.addWidget(rm_btn)
             
