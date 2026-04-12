@@ -150,6 +150,7 @@ class MainApp(QMainWindow):
         self.local_folders = []
         self.recent_folders = []
         self.recent_playlists = []
+        self.splitter_sizes = [300, 800, 300]
         self.thumbnail_cache = {}
         self.thumbnail_cache_size = 0
         
@@ -205,7 +206,7 @@ class MainApp(QMainWindow):
         
         self.player_timer = QTimer(self)
         self.player_timer.timeout.connect(self.update_player_ui)
-        self.player_timer.start(100)
+        self.player_timer.start(16)
         
         self.setup_tray()
         if self.local_current_path:
@@ -229,6 +230,7 @@ class MainApp(QMainWindow):
                     self.show_thumbnails = c.get('show_thumbnails', False)
                     self.minimize_to_tray = c.get('minimize_to_tray', False)
                     self.recent_playlists = c.get('recent_playlists', [])
+                    self.splitter_sizes = c.get('splitter_sizes', [300, 800, 300])
         except Exception: pass
         if not self.recent_folders:
             self.recent_folders = [default_dl]; self.download_path = default_dl
@@ -247,7 +249,8 @@ class MainApp(QMainWindow):
             'minimize_to_tray': self.minimize_to_tray,
             'use_custom_args': self.use_custom_args,
             'custom_args': self.custom_args,
-            'recent_playlists': self.recent_playlists
+            'recent_playlists': self.recent_playlists,
+            'splitter_sizes': self.splitter.sizes() if hasattr(self, 'splitter') else self.splitter_sizes
         }
         try:
             with open(self.config_path, 'w') as f: json.dump(c, f, indent=4)
@@ -304,7 +307,7 @@ class MainApp(QMainWindow):
         self._setup_local_pane()
         self._setup_results_pane()
         self._setup_queue_pane()
-        self.splitter.setSizes([300, 800, 300])
+        self.splitter.setSizes(getattr(self, 'splitter_sizes', [300, 800, 300]))
 
         # Controls UI
         controls_frame = QFrame()
@@ -347,9 +350,11 @@ class MainApp(QMainWindow):
         if self.download_path not in self.recent_folders:
             self.path_combo.addItem(self.download_path)
             self.path_combo.setCurrentText(self.download_path)
-        set_r.addWidget(self.path_combo)
+        set_r.addWidget(self.path_combo, 1)
         
-        self.browse_btn = QPushButton("Browse")
+        self.browse_btn = QPushButton("\uE8B7")
+        self.browse_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 16px; padding: 0px;")
+        self.browse_btn.setFixedSize(30, 30)
         self.browse_btn.clicked.connect(self.browse_folder)
         set_r.addWidget(self.browse_btn)
         
@@ -368,11 +373,25 @@ class MainApp(QMainWindow):
         
         c = QHBoxLayout()
         c.addWidget(QLabel("Volume"))
-        self.vol_slider = QSlider(Qt.Horizontal)
+        
+        class VolSlider(QSlider):
+            def mouseDoubleClickEvent(self, e):
+                self.setValue(100)
+                e.accept()
+                
+        self.vol_slider = VolSlider(Qt.Horizontal)
+        self.vol_slider.setObjectName("volSlider")
+        _init_state = "red" if self.volume_val > 115 else ("orange" if self.volume_val > 100 else "normal")
+        self.vol_slider.setProperty("volume_state", _init_state)
         self.vol_slider.setRange(0, 150); self.vol_slider.setValue(self.volume_val)
         self.vol_slider.setFixedWidth(100)
         self.vol_slider.valueChanged.connect(self.on_volume_changed)
         c.addWidget(self.vol_slider)
+        
+        self.vol_pct = QLabel(f"{self.volume_val}%")
+        self.vol_pct.setFixedWidth(50)
+        if self.volume_val > 100: self.vol_pct.setStyleSheet("color: #E31E24; font-weight: bold;")
+        c.addWidget(self.vol_pct)
         
         c.addStretch(1)
         self.prev_btn = QPushButton("\uE892")
@@ -396,7 +415,7 @@ class MainApp(QMainWindow):
         p_layout.addLayout(c)
         
         self.progress_slider = QSlider(Qt.Horizontal)
-        self.progress_slider.setRange(0, 100)
+        self.progress_slider.setRange(0, 10000)
         self.progress_slider.valueChanged.connect(self.on_seek)
         p_layout.addWidget(self.progress_slider)
 
@@ -483,9 +502,17 @@ class MainApp(QMainWindow):
             QScrollArea { border: none; background-color: #1a1a1a; border-radius: 6px;}
             QFrame { background-color: #2a2a2a; border-radius: 6px; padding: 5px;}
             QSplitter::handle { background-color: #333333; width: 4px; margin: 0px 4px; }
-            QSlider::groove:horizontal { border: 1px solid #444; height: 4px; background: #333; border-radius: 2px; }
-            QSlider::handle:horizontal { background: %s; width: 10px; margin-top: -3px; margin-bottom: -3px; border-radius: 5px; }
-        """ % (accent, accent))
+            QSlider::groove:horizontal { border: none; height: 3px; background: #333; border-radius: 1px; }
+            QSlider::sub-page:horizontal { background: %s; border-radius: 1px; }
+            QSlider::handle:horizontal { background: %s; width: 14px; height: 14px; margin-top: -6px; margin-bottom: -5px; border-radius: 7px; }
+            QSlider#volSlider[volume_state="normal"]::sub-page:horizontal { background: %s; }
+            QSlider#volSlider[volume_state="normal"]::handle:horizontal { background: %s; }
+            QSlider#volSlider[volume_state="orange"]::sub-page:horizontal { background: #FF8C00; }
+            QSlider#volSlider[volume_state="orange"]::handle:horizontal { background: #FF8C00; }
+            QSlider#volSlider[volume_state="red"]::sub-page:horizontal { background: #E31E24; }
+            QSlider#volSlider[volume_state="red"]::handle:horizontal { background: #E31E24; }
+            QSlider#volSlider::sub-page:horizontal { border-radius: 1px; }
+        """ % (accent, accent, accent, accent, accent))
 
     # --- Local Folder Logic ---
     def load_local_folder(self, path):
@@ -526,6 +553,7 @@ class MainApp(QMainWindow):
         except: pass
         
         items.sort(key=lambda x: (not x['is_dir'], x['name'].lower()))
+        self.current_local_items = items
         for item in items:
             btn = QPushButton(f"{'📁' if item['is_dir'] else '🎵'}  {item['name']}")
             btn.setStyleSheet("QPushButton { text-align: left; background-color: transparent; color: white; padding: 4px; font-weight: normal; border-radius: 0px; } QPushButton:hover { background-color: #555555; color: white; }")
@@ -540,6 +568,13 @@ class MainApp(QMainWindow):
             url = item['path'].replace("\\", "/")
             if not url.startswith("file:///"): url = "file:///" + url
             self.current_video_id = "local"
+            
+            audio_files = [x for x in getattr(self, 'current_local_items', []) if x.get('is_dir') is False]
+            for i, af in enumerate(audio_files):
+                if af.get('path') == item.get('path'):
+                    self.local_playback_index = i
+                    break
+                    
             media = self.vlc_instance.media_new(url)
             self.vlc_player.set_media(media)
             self.vlc_player.play()
@@ -796,11 +831,25 @@ class MainApp(QMainWindow):
             self.is_playing = True
             
     def play_previous(self):
+        if self.current_video_id == "local" and hasattr(self, 'local_playback_index'):
+            audio_files = [x for x in getattr(self, 'current_local_items', []) if x.get('is_dir') is False]
+            if self.local_playback_index > 0:
+                self.local_playback_index -= 1
+                self._on_local_click(audio_files[self.local_playback_index])
+            return
+            
         if self.playback_index > 0:
             self.playback_index -= 1
             self.play_result(self.search_results[self.playback_index])
             
     def play_next(self):
+        if self.current_video_id == "local" and hasattr(self, 'local_playback_index'):
+            audio_files = [x for x in getattr(self, 'current_local_items', []) if x.get('is_dir') is False]
+            if self.local_playback_index + 1 < len(audio_files):
+                self.local_playback_index += 1
+                self._on_local_click(audio_files[self.local_playback_index])
+            return
+            
         if self.playback_index + 1 < len(self.search_results):
             self.playback_index += 1
             self.play_result(self.search_results[self.playback_index])
@@ -809,12 +858,25 @@ class MainApp(QMainWindow):
         # Ignore programmatic updates triggering seek
         if not self.progress_slider.isSliderDown(): return
         if self.vlc_player:
-            self.vlc_player.set_position(float(val)/100.0)
+            self.vlc_player.set_position(float(val)/10000.0)
 
     def on_volume_changed(self, val):
         self.volume_val = val
         if self.vlc_player:
             self.vlc_player.audio_set_volume(val)
+        if hasattr(self, 'vol_pct'):
+            self.vol_pct.setText(f"{val}%")
+            if val > 115:
+                self.vol_pct.setStyleSheet("color: #E31E24; font-weight: bold;")
+                self.vol_slider.setProperty("volume_state", "red")
+            elif val > 100:
+                self.vol_pct.setStyleSheet("color: #FF8C00; font-weight: bold;")
+                self.vol_slider.setProperty("volume_state", "orange")
+            else:
+                self.vol_pct.setStyleSheet("color: white; font-weight: normal;")
+                self.vol_slider.setProperty("volume_state", "normal")
+            self.vol_slider.style().unpolish(self.vol_slider)
+            self.vol_slider.style().polish(self.vol_slider)
         self.save_config()
 
     def update_player_ui(self):
@@ -828,7 +890,7 @@ class MainApp(QMainWindow):
         else:
             self._ended_trigger = False
             
-        pos = self.vlc_player.get_position() * 100
+        pos = self.vlc_player.get_position() * 10000
         ms = self.vlc_player.get_time()
         total_ms = self.vlc_player.get_length()
         if total_ms > 0:
