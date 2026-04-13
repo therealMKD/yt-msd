@@ -1,4 +1,4 @@
-- Migrate to Pyside 6 (Next up)
+- Migrate to Pyside 6 - Partially completed
 - Finish up local file support
 - Local playlist support
 - Audio file metadata reading/editing
