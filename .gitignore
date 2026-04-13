@@ -25,3 +25,8 @@ __pycache__/
 # Python build residues
 *.spec
 ffmpeg.zip
+
+# Icon Files
+*.pxo
+*.bmp
+*.png
