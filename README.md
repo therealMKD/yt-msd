@@ -22,7 +22,7 @@ There are 3 versions of the CLI: The python version, which requires python to be
 
 **If your system says that the exe is unsafe, ignore it! It is a false positive-you can safely click "run anyway"**
 
-[VirusTotal Scan](https://www.virustotal.com/gui/file/cb981f81650fef81f7cf2e21eac775f2dac844d2eaeb132fca3e5140ecee31ee)
+[VirusTotal Scan](https://www.virustotal.com/gui/file/d5e6979b279b04e55a5f4472091e91d6007f5aae9000561ea98b93b59e59e152)
 
 ### By default the "config.json" file will generate like this:
 
