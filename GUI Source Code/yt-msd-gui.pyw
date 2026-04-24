@@ -406,7 +406,7 @@ class MainApp(QMainWindow):
             'use_custom_args': self.use_custom_args,
             'custom_args': self.custom_args,
             'recent_playlists': self.recent_playlists,
-            'splitter_sizes': self.splitter.sizes() if hasattr(self, 'splitter') else self.splitter_sizes,
+            'splitter_sizes': [self.main_splitter.sizes()[0]] + self.content_splitter.sizes() if hasattr(self, 'main_splitter') else self.splitter_sizes,
             'last_search': self.search_entry.text() if hasattr(self, 'search_entry') else self.last_search,
             'save_place': self.save_place,
             'session_data': {
@@ -488,35 +488,67 @@ class MainApp(QMainWindow):
     def setup_ui(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(10, 10, 10, 10)
         
-        # Upper Splitter
+        # Main Layout (Horizontal)
+        self.main_layout = QHBoxLayout(central_widget)
+        self.main_layout.setContentsMargins(10, 10, 10, 10)
+        self.main_layout.setSpacing(0)
+        
+        # Splitter Logic
         class ResetHandle(QSplitterHandle):
             _last_click = 0
             def mousePressEvent(self, e):
                 import time
                 now = time.time()
                 if now - ResetHandle._last_click < 0.35:
-                    self.splitter().setSizes([300, 800, 300])
+                    if self.splitter().orientation() == Qt.Horizontal:
+                        if self.splitter() == getattr(self.window(), 'main_splitter', None):
+                            self.splitter().setSizes([300, 1340])
+                        else:
+                            self.splitter().setSizes([1000, 300])
                     e.accept(); return
                 ResetHandle._last_click = now
                 super().mousePressEvent(e)
+
         class ResetSplitter(QSplitter):
             def createHandle(self):
                 return ResetHandle(self.orientation(), self)
-        self.splitter = ResetSplitter(Qt.Horizontal)
-        main_layout.addWidget(self.splitter, 1)
+
+        # Main Splitter (Horizontal: Local | Content)
+        self.main_splitter = ResetSplitter(Qt.Horizontal)
+        self.main_layout.addWidget(self.main_splitter, 1)
         
         self._setup_local_pane()
+        
+        # Right Content Area
+        self.right_content = QWidget()
+        self.right_layout = QVBoxLayout(self.right_content)
+        self.right_layout.setContentsMargins(5, 0, 0, 0)
+        self.right_layout.setSpacing(5)
+        self.main_splitter.addWidget(self.right_content)
+        
+        # Content Splitter (Horizontal: Results | Queue)
+        self.content_splitter = ResetSplitter(Qt.Horizontal)
+        self.right_layout.addWidget(self.content_splitter, 1)
+        
         self._setup_results_pane()
         self._setup_queue_pane()
-        self.splitter.setSizes(getattr(self, 'splitter_sizes', [300, 800, 300]))
+        
+        # Initial Sizes
+        sz = getattr(self, 'splitter_sizes', [300, 800, 300])
+        if len(sz) == 3:
+            self.main_splitter.setSizes([sz[0], sz[1] + sz[2]])
+            self.content_splitter.setSizes([sz[1], sz[2]])
+        else:
+            self.main_splitter.setSizes([300, 1340])
+            self.content_splitter.setSizes([1000, 300])
 
         # Controls UI
         controls_frame = QFrame()
         c_layout = QVBoxLayout(controls_frame)
-        main_layout.addWidget(controls_frame)
+        c_layout.setContentsMargins(5, 5, 5, 5)
+        c_layout.setSpacing(5)
+        self.right_layout.addWidget(controls_frame)
         
         search_r = QHBoxLayout()
         self.search_entry = QLineEdit()
@@ -573,12 +605,15 @@ class MainApp(QMainWindow):
         c_layout.addLayout(set_r)
         
         self.status_label = QLabel("Ready")
+        self.status_label.setStyleSheet("font-size: 11px; margin-top: -2px;")
         c_layout.addWidget(self.status_label)
 
         # Bottom Player
         player_frame = QFrame()
         p_layout = QVBoxLayout(player_frame)
-        main_layout.addWidget(player_frame)
+        p_layout.setContentsMargins(8, 4, 8, 4)
+        p_layout.setSpacing(0)
+        self.right_layout.addWidget(player_frame)
         
         c = QHBoxLayout()
         c.addWidget(QLabel("Volume"))
@@ -608,25 +643,27 @@ class MainApp(QMainWindow):
         
         self.prev_btn = QPushButton("\uE892")
         self.prev_btn.clicked.connect(self.play_previous)
-        self.prev_btn.setStyleSheet("QPushButton { background: transparent; color: white; font-family: 'Segoe MDL2 Assets'; font-size: 14px; border-radius: 4px; padding: 2px 6px; } QPushButton:hover { background: rgba(255,255,255,30); }")
+        self.prev_btn.setStyleSheet("QPushButton { background: transparent; color: white; font-family: 'Segoe MDL2 Assets'; font-size: 13px; border-radius: 4px; padding: 0px 4px; } QPushButton:hover { background: rgba(255,255,255,30); }")
         c.addWidget(self.prev_btn)
         
         self.play_btn = QPushButton("\uE768")
         self.play_btn.clicked.connect(self.toggle_playback)
-        self.play_btn.setStyleSheet("QPushButton { background: transparent; color: white; font-family: 'Segoe MDL2 Assets'; font-size: 28px; border-radius: 6px; padding: 2px 6px; } QPushButton:hover { background: rgba(255,255,255,30); }")
+        self.play_btn.setStyleSheet("QPushButton { background: transparent; color: white; font-family: 'Segoe MDL2 Assets'; font-size: 24px; border-radius: 6px; padding: 0px 4px; } QPushButton:hover { background: rgba(255,255,255,30); }")
         c.addWidget(self.play_btn)
         
         self.next_btn = QPushButton("\uE893")
         self.next_btn.clicked.connect(self.play_next)
-        self.next_btn.setStyleSheet("QPushButton { background: transparent; color: white; font-family: 'Segoe MDL2 Assets'; font-size: 14px; border-radius: 4px; padding: 2px 6px; } QPushButton:hover { background: rgba(255,255,255,30); }")
+        self.next_btn.setStyleSheet("QPushButton { background: transparent; color: white; font-family: 'Segoe MDL2 Assets'; font-size: 13px; border-radius: 4px; padding: 0px 4px; } QPushButton:hover { background: rgba(255,255,255,30); }")
         c.addWidget(self.next_btn)
         c.addStretch(1)
         
         self.time_label = QLabel("0:00 / 0:00")
+        self.time_label.setStyleSheet("font-size: 11px;")
         c.addWidget(self.time_label)
         p_layout.addLayout(c)
         
         self.progress_slider = QSlider(Qt.Horizontal)
+        self.progress_slider.setFixedHeight(12)
         self.progress_slider.setRange(0, 10000)
         self.progress_slider.valueChanged.connect(self.on_seek)
         p_layout.addWidget(self.progress_slider)
@@ -690,7 +727,7 @@ class MainApp(QMainWindow):
         self.local_vbox.setAlignment(Qt.AlignTop)
         self.local_list.setWidget(self.local_content)
         l.addWidget(self.local_list, 1)
-        self.splitter.addWidget(w)
+        self.main_splitter.addWidget(w)
 
     def _setup_results_pane(self):
         w = QWidget()
@@ -712,7 +749,7 @@ class MainApp(QMainWindow):
         self.results_vbox.setAlignment(Qt.AlignTop)
         self.results_area.setWidget(self.results_content)
         l.addWidget(self.results_area, 1)
-        self.splitter.addWidget(w)
+        self.content_splitter.addWidget(w)
         
     def _setup_queue_pane(self):
         w = QWidget()
@@ -733,7 +770,7 @@ class MainApp(QMainWindow):
         self.queue_vbox.setAlignment(Qt.AlignTop)
         self.queue_area.setWidget(self.queue_content)
         l.addWidget(self.queue_area, 1)
-        self.splitter.addWidget(w)
+        self.content_splitter.addWidget(w)
 
     def apply_theme(self):
         mode = self.appearance_mode
@@ -793,7 +830,10 @@ class MainApp(QMainWindow):
             
             QCheckBox {{ color: {fg}; spacing: 8px; }}
             QCheckBox::indicator {{ width: 18px; height: 18px; border: 1px solid {accent}; border-radius: 3px; background: {frame_bg}; }}
-            QCheckBox::indicator:checked {{ background: {accent}; image: url(none); }}
+            QCheckBox::indicator:checked {{ 
+                background: {accent}; 
+                image: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0id2hpdGUiIGQ9Ik05IDE2LjE3TDQuODMgMTJsLTEuNDIgMS40MUw5IDE5TDIxIDdsLTEuNDEtMS40MXoiLz48L3N2Zz4=");
+            }}
         """)
 
     # --- Local Folder Logic ---
