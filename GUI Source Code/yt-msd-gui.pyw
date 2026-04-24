@@ -778,6 +778,16 @@ class MainApp(QMainWindow):
         
         accent = get_accent_color(self.accent_color_name)
         
+        # Write checkmark SVG to a temp file
+        import tempfile, os as _os
+        checkmark_svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>'
+        if not hasattr(self, '_checkmark_svg_path') or not _os.path.exists(self._checkmark_svg_path):
+            tmp = tempfile.NamedTemporaryFile(suffix='.svg', delete=False, mode='w', encoding='utf-8')
+            tmp.write(checkmark_svg)
+            tmp.close()
+            self._checkmark_svg_path = tmp.name.replace('\\', '/')
+        checkmark_path = self._checkmark_svg_path
+        
         if mode == "Light":
             bg = "#f3f3f3"
             fg = "#1a1a1a"
@@ -801,7 +811,7 @@ class MainApp(QMainWindow):
             hover_bg = "#dddddd"
             hover_fg = "#1a1a1a"
 
-        self.setStyleSheet(f"""
+        self.setStyleSheet("""
             QMainWindow {{ background-color: {bg}; }}
             QWidget {{ color: {fg}; font-family: 'Segoe UI'; font-size: 13px; }}
             QLabel {{ color: {fg}; }}
@@ -830,11 +840,12 @@ class MainApp(QMainWindow):
             
             QCheckBox {{ color: {fg}; spacing: 8px; }}
             QCheckBox::indicator {{ width: 16px; height: 16px; border: 1px solid {accent}; border-radius: 3px; background: {frame_bg}; }}
-            QCheckBox::indicator:checked {{ 
-                background: {accent}; 
-                image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>');
-            }}
-        """)
+            QCheckBox::indicator:checked {{ background: {accent}; image: url("{checkmark_path}"); }}
+        """.format(
+            bg=bg, fg=fg, frame_bg=frame_bg, input_bg=input_bg, input_border=input_border,
+            scroll_bg=scroll_bg, splitter_handle=splitter_handle, slider_bg=slider_bg,
+            hover_bg=hover_bg, hover_fg=hover_fg, accent=accent, checkmark_path=checkmark_path
+        ))
 
     # --- Local Folder Logic ---
     def load_local_folder(self, path):
