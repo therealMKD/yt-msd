@@ -10,7 +10,8 @@ I don't want to deal with spotify's ads, and youtube playlist's don't have worki
 **NOTE:** As of 4/12/2026, this is rapidly becoming a more and more full-featured music player. We'll see where this takes us, but Musicbee will still be able to do much more. I might possibly make this into a Musicbee plugin, but those are written in VB or C#, and this program is in python, so it might be a bit hacky.
 
 As of now, the only release is the CLI version. This will search youtube with yt-dlp, and fetch the videos. You can select one, choose the format, and the bitrate, as well as the destination. The program will remember the last 3 destinations used, and you can use the config.json file to force certain settings.
-The pre-release of the GUI edition is also now out, but it is python only. The conversion to Pyside 6 is largely completed, so next week will see new features, and not just pairity changes. It will still be another week before a finished build of the GUI version in Pyside 6 will be done though
+The pre-release of the GUI edition is also now out, but it is python only. The conversion to Pyside 6 is largely completed, so next week will see new features, and not just pairity changes. It will still be another week before a finished build of the GUI version in Pyside 6 will be done though.
+4/24/2026: I've largely got the conversion complete, despite skipping a week. The first actual release of the GUI version will *probably* be done this weekend. I've still got some more features planned though, so no exe for now.
 
 # GUI Version Readme
 
