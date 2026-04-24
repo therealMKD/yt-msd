@@ -537,40 +537,6 @@ class MainApp(QMainWindow):
         search_r.addWidget(settings_btn)
         c_layout.addLayout(search_r)
         
-        # Restore last search
-        if getattr(self, 'last_search', ''):
-            self.search_entry.setText(self.last_search)
-        
-        # Restore session
-        if self.save_place and hasattr(self, 'session_data'):
-            sd = self.session_data
-            if sd.get('search_results'):
-                self._on_search_results(sd['search_results'], False)
-                self.playback_index = sd.get('playback_index', -1)
-                # If we have a stored index, we might want to load it (paused)
-                if self.playback_index >= 0 and self.playback_index < len(self.search_results):
-                    # We'll implement a 'load_only' flag for play_result or just trigger the start logic
-                    # but set position to 0 and pause immediately.
-                    # For now just set the index.
-                    pass
-            
-            if sd.get('current_video_id') == "local" and sd.get('local_current_path'):
-                self.local_playback_index = sd.get('local_playback_index', -1)
-                # Display will be handled by standard local folder load
-            
-            # Restore playback state if item exists
-            v_id = sd.get('current_video_id')
-            if v_id and v_id != "local":
-                # Find the video object in results if possible
-                results = sd.get('search_results', [])
-                idx = sd.get('playback_index', -1)
-                if 0 <= idx < len(results):
-                    video = results[idx]
-                    self.play_result(video)
-                    # Use a timer to ensure we pause after it starts loading
-                    QTimer.singleShot(100, lambda: self.vlc_player.pause() if self.vlc_player else None)
-                    QTimer.singleShot(150, lambda: self.vlc_player.set_position(0) if self.vlc_player else None)
-        
         set_r = QHBoxLayout()
         set_r.addWidget(QLabel("Format:"))
         self.format_combo = QComboBox()
@@ -664,6 +630,41 @@ class MainApp(QMainWindow):
         self.progress_slider.setRange(0, 10000)
         self.progress_slider.valueChanged.connect(self.on_seek)
         p_layout.addWidget(self.progress_slider)
+
+        # Restore last search
+        if getattr(self, 'last_search', ''):
+            self.search_entry.setText(self.last_search)
+        
+        # Restore session
+        if self.save_place and hasattr(self, 'session_data'):
+            sd = self.session_data
+            if sd.get('search_results'):
+                self._on_search_results(sd['search_results'], False)
+                self.playback_index = sd.get('playback_index', -1)
+                # If we have a stored index, we might want to load it (paused)
+                if self.playback_index >= 0 and self.playback_index < len(self.search_results):
+                    # We'll implement a 'load_only' flag for play_result or just trigger the start logic
+                    # but set position to 0 and pause immediately.
+                    # For now just set the index.
+                    pass
+            
+            if sd.get('current_video_id') == "local" and sd.get('local_current_path'):
+                self.local_playback_index = sd.get('local_playback_index', -1)
+                # Display will be handled by standard local folder load
+            
+            # Restore playback state if item exists
+            v_id = sd.get('current_video_id')
+            if v_id and v_id != "local":
+                # Find the video object in results if possible
+                results = sd.get('search_results', [])
+                idx = sd.get('playback_index', -1)
+                if 0 <= idx < len(results):
+                    video = results[idx]
+                    self.play_result(video)
+                    # Use a timer to ensure we pause after it starts loading
+                    QTimer.singleShot(100, lambda: self.vlc_player.pause() if self.vlc_player else None)
+                    QTimer.singleShot(150, lambda: self.vlc_player.set_position(0) if self.vlc_player else None)
+
 
     def _setup_local_pane(self):
         w = QWidget()
