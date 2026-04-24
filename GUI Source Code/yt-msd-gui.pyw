@@ -598,10 +598,6 @@ class MainApp(QMainWindow):
         self.browse_btn.clicked.connect(self.browse_folder)
         set_r.addWidget(self.browse_btn)
         set_r.addSpacing(6)
-        
-        self.dl_btn = QPushButton("Download All")
-        self.dl_btn.clicked.connect(self.start_batch_download)
-        set_r.addWidget(self.dl_btn)
         c_layout.addLayout(set_r)
         
         self.status_label = QLabel("Ready")
@@ -740,6 +736,13 @@ class MainApp(QMainWindow):
         self.show_thumb_cb.setChecked(self.show_thumbnails)
         self.show_thumb_cb.stateChanged.connect(self.toggle_thumbnails)
         h.addWidget(self.show_thumb_cb)
+        
+        self.open_yt_btn = QPushButton("")
+        self.open_yt_btn.setToolTip("Open search / playlist on YouTube")
+        self.open_yt_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 14px; background: transparent; border: 1px solid #555; padding: 2px 6px;")
+        self.open_yt_btn.setFixedSize(30, 26)
+        self.open_yt_btn.clicked.connect(self.open_search_on_youtube)
+        h.addWidget(self.open_yt_btn)
         l.addLayout(h)
         
         self.results_area = QScrollArea()
@@ -758,6 +761,9 @@ class MainApp(QMainWindow):
         self.queue_label = QLabel("Download Queue (0)")
         h.addWidget(self.queue_label)
         h.addStretch()
+        self.dl_btn = QPushButton("Download All")
+        self.dl_btn.clicked.connect(self.start_batch_download)
+        h.addWidget(self.dl_btn)
         cb = QPushButton("Clear")
         cb.clicked.connect(self.clear_completed)
         h.addWidget(cb)
@@ -1010,6 +1016,15 @@ class MainApp(QMainWindow):
             cb.stateChanged.connect(lambda state, v=video: self.toggle_queue(v, state))
             l.addWidget(cb, 1)
             
+            # Open on YouTube button
+            yt_btn = QPushButton("")
+            yt_btn.setToolTip("Open on YouTube")
+            yt_btn.setFixedSize(28, 28)
+            yt_btn.setStyleSheet("QPushButton { background: transparent; color: #aaa; font-family: 'Segoe MDL2 Assets'; font-size: 13px; border: none; padding: 0px; } QPushButton:hover { color: white; background: transparent; }")
+            vid_id = video.get('id', '')
+            yt_btn.clicked.connect(lambda checked=False, vid=vid_id: __import__('webbrowser').open(f'https://www.youtube.com/watch?v={vid}'))
+            l.addWidget(yt_btn)
+            
             self.results_vbox.addWidget(w)
             
         self._on_status_update(f"Found {len(res)} results.", False, "white")
@@ -1155,6 +1170,24 @@ class MainApp(QMainWindow):
         self.is_playing = True
         self.play_btn.setText("\uE769")
         self._on_status_update(f"Playing: {title}", True, "gray")
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Space:
+            fw = self.focusWidget()
+            if not isinstance(fw, QLineEdit):
+                self.toggle_playback()
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
+    def open_search_on_youtube(self):
+        import webbrowser, urllib.parse
+        query = self.search_entry.text().strip()
+        if not query: return
+        if 'youtube.com' in query or 'youtu.be' in query:
+            webbrowser.open(query)
+        else:
+            webbrowser.open(f'https://www.youtube.com/results?search_query={urllib.parse.quote(query)}')
 
     def toggle_playback(self):
         if not self.vlc_player: return
