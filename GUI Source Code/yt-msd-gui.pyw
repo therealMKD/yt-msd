@@ -733,12 +733,12 @@ class MainApp(QMainWindow):
         w = QWidget()
         l = QVBoxLayout(w); l.setContentsMargins(0,0,0,0)
         h = QHBoxLayout()
+        h.setContentsMargins(0, 0, 16, 0)
         h.addWidget(QLabel("Search Results"))
         h.addStretch()
         self.show_thumb_cb = QCheckBox("Show Thumbnails")
         self.show_thumb_cb.setChecked(self.show_thumbnails)
         self.show_thumb_cb.stateChanged.connect(self.toggle_thumbnails)
-        self.show_thumb_cb.setContentsMargins(0, 0, 8, 0)
         h.addWidget(self.show_thumb_cb)
         l.addLayout(h)
         
@@ -829,10 +829,10 @@ class MainApp(QMainWindow):
             QSlider#volSlider::sub-page:horizontal {{ border-radius: 1px; }}
             
             QCheckBox {{ color: {fg}; spacing: 8px; }}
-            QCheckBox::indicator {{ width: 18px; height: 18px; border: 1px solid {accent}; border-radius: 3px; background: {frame_bg}; }}
+            QCheckBox::indicator {{ width: 16px; height: 16px; border: 1px solid {accent}; border-radius: 3px; background: {frame_bg}; }}
             QCheckBox::indicator:checked {{ 
                 background: {accent}; 
-                image: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0id2hpdGUiIGQ9Ik05IDE2LjE3TDQuODMgMTJsLTEuNDIgMS40MUw5IDE5TDIxIDdsLTEuNDEtMS40MXoiLz48L3N2Zz4=");
+                image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>');
             }}
         """)
 
