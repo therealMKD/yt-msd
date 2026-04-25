@@ -292,7 +292,7 @@ class MainApp(QMainWindow):
     search_results_signal = Signal(list, bool)
     search_failed_signal = Signal()
     thumbnails_loaded_signal = Signal(str, QPixmap)
-    playback_started_signal = Signal(str, str)
+    playback_started_signal = Signal(str, str, bool)
     queue_update_signal = Signal()
     dl_progress_signal = Signal(str)
 
@@ -370,6 +370,16 @@ class MainApp(QMainWindow):
         self.setup_tray()
         if self.local_current_path:
             self.load_local_folder(self.local_current_path)
+            
+        if getattr(self, 'save_place', False) and hasattr(self, 'session_data'):
+            sd = self.session_data
+            if sd.get('current_video_id') == "local" and sd.get('local_current_path'):
+                idx = sd.get('local_playback_index', -1)
+                audio_files = [x for x in getattr(self, 'current_local_items', []) if x.get('is_dir') is False]
+                if 0 <= idx < len(audio_files):
+                    self._on_local_click(audio_files[idx], paused_at_start=True)
+
+        QApplication.instance().installEventFilter(self)
 
     def load_config(self):
         default_dl = os.path.join(os.path.expanduser("~"), "Downloads")
@@ -387,6 +397,7 @@ class MainApp(QMainWindow):
                     self.local_folders = c.get('local_folders', [])
                     self.local_current_path = c.get('local_current_path', "")
                     self.show_thumbnails = c.get('show_thumbnails', False)
+                    self.show_local_metadata = c.get('show_local_metadata', False)
                     self.minimize_to_tray = c.get('minimize_to_tray', False)
                     self.recent_playlists = c.get('recent_playlists', [])
                     self.splitter_sizes = c.get('splitter_sizes', [300, 800, 300])
@@ -412,6 +423,7 @@ class MainApp(QMainWindow):
             'local_current_path': self.local_current_path,
             'volume': self.volume_val,
             'show_thumbnails': self.show_thumbnails,
+            'show_local_metadata': getattr(self, 'show_local_metadata', False),
             'minimize_to_tray': self.minimize_to_tray,
             'use_custom_args': self.use_custom_args,
             'custom_args': self.custom_args,
@@ -511,11 +523,26 @@ class MainApp(QMainWindow):
                 import time
                 now = time.time()
                 if now - ResetHandle._last_click < 0.35:
-                    if self.splitter().orientation() == Qt.Horizontal:
-                        if self.splitter() == getattr(self.window(), 'main_splitter', None):
-                            self.splitter().setSizes([300, 1340])
+                    sp = self.splitter()
+                    if sp.orientation() == Qt.Horizontal:
+                        current_sizes = sp.sizes()
+                        is_main = (sp == getattr(self.window(), 'main_splitter', None))
+                        target_idx = 0 if is_main else 1
+                        
+                        if current_sizes[target_idx] > 0:
+                            sp._last_custom_sizes = current_sizes
+                            if is_main:
+                                sp.setSizes([0, sum(current_sizes)])
+                            else:
+                                sp.setSizes([sum(current_sizes), 0])
                         else:
-                            self.splitter().setSizes([1000, 300])
+                            if hasattr(sp, '_last_custom_sizes') and sp._last_custom_sizes and sp._last_custom_sizes[target_idx] > 0:
+                                sp.setSizes(sp._last_custom_sizes)
+                            else:
+                                if is_main:
+                                    sp.setSizes([300, max(0, sum(current_sizes)-300)])
+                                else:
+                                    sp.setSizes([max(0, sum(current_sizes)-300), 300])
                     e.accept(); return
                 ResetHandle._last_click = now
                 super().mousePressEvent(e)
@@ -561,6 +588,13 @@ class MainApp(QMainWindow):
         self.right_layout.addWidget(controls_frame)
         
         search_r = QHBoxLayout()
+        self.toggle_pane_btn = QPushButton("\uE8A0")
+        self.toggle_pane_btn.setObjectName("topIconBtn")
+        self.toggle_pane_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 16px;")
+        self.toggle_pane_btn.setToolTip("Toggle File Browser")
+        self.toggle_pane_btn.clicked.connect(self.toggle_local_pane)
+        search_r.addWidget(self.toggle_pane_btn)
+        
         self.search_entry = QLineEdit()
         self.search_entry.setPlaceholderText("Search YouTube or Paste a Video Link")
         self.search_entry.returnPressed.connect(self.perform_search)
@@ -635,8 +669,15 @@ class MainApp(QMainWindow):
         p_layout.setSpacing(0)
         self.right_layout.addWidget(player_frame)
         
+        class VolLabel(QLabel):
+            def mouseDoubleClickEvent(self, e):
+                win = self.window()
+                if hasattr(win, 'vol_slider'):
+                    win.vol_slider.setValue(100)
+                e.accept()
+
         c = QHBoxLayout()
-        c.addWidget(QLabel("Volume"))
+        c.addWidget(VolLabel("Volume"))
         
         class VolSlider(QSlider):
             def mouseDoubleClickEvent(self, e):
@@ -652,7 +693,7 @@ class MainApp(QMainWindow):
         self.vol_slider.valueChanged.connect(self.on_volume_changed)
         c.addWidget(self.vol_slider)
         
-        self.vol_pct = QLabel(f"{self.volume_val}%")
+        self.vol_pct = VolLabel(f"{self.volume_val}%")
         self.vol_pct.setFixedWidth(50)
         if self.volume_val > 115:
             self.vol_pct.setStyleSheet("color: #E31E24; font-weight: bold;")
@@ -704,16 +745,6 @@ class MainApp(QMainWindow):
             if sd.get('search_results'):
                 self._on_search_results(sd['search_results'], False)
                 self.playback_index = sd.get('playback_index', -1)
-                # If we have a stored index, we might want to load it (paused)
-                if self.playback_index >= 0 and self.playback_index < len(self.search_results):
-                    # We'll implement a 'load_only' flag for play_result or just trigger the start logic
-                    # but set position to 0 and pause immediately.
-                    # For now just set the index.
-                    pass
-            
-            if sd.get('current_video_id') == "local" and sd.get('local_current_path'):
-                self.local_playback_index = sd.get('local_playback_index', -1)
-                # Display will be handled by standard local folder load
             
             # Restore playback state if item exists
             v_id = sd.get('current_video_id')
@@ -723,11 +754,27 @@ class MainApp(QMainWindow):
                 idx = sd.get('playback_index', -1)
                 if 0 <= idx < len(results):
                     video = results[idx]
-                    self.play_result(video)
-                    # Use a timer to ensure we pause after it starts loading
-                    QTimer.singleShot(100, lambda: self.vlc_player.pause() if self.vlc_player else None)
-                    QTimer.singleShot(150, lambda: self.vlc_player.set_position(0) if self.vlc_player else None)
+                    self.play_result(video, paused_at_start=True)
 
+        # Re-search in background to update cache
+        if getattr(self, 'last_search', ''):
+            is_pl = False
+            for p in self.recent_playlists:
+                if isinstance(p, dict) and p.get("url") == self.last_search: is_pl = True; break
+                elif p == self.last_search: is_pl = True; break
+            self.perform_search(is_playlist=is_pl)
+
+
+    def toggle_local_pane(self):
+        sizes = self.main_splitter.sizes()
+        if sizes[0] > 0:
+            self.main_splitter._last_custom_sizes = sizes
+            self.main_splitter.setSizes([0, sizes[0] + sizes[1]])
+        else:
+            if hasattr(self.main_splitter, '_last_custom_sizes') and self.main_splitter._last_custom_sizes and self.main_splitter._last_custom_sizes[0] > 0:
+                self.main_splitter.setSizes(self.main_splitter._last_custom_sizes)
+            else:
+                self.main_splitter.setSizes([300, max(0, sum(sizes) - 300)])
 
     def _setup_local_pane(self):
         w = QWidget()
@@ -746,6 +793,11 @@ class MainApp(QMainWindow):
         h.addWidget(local_browse_btn)
         h.addSpacing(6)
         l.addLayout(h)
+        
+        self.local_meta_cb = QCheckBox("Show Metadata")
+        self.local_meta_cb.setChecked(getattr(self, 'show_local_metadata', False))
+        self.local_meta_cb.stateChanged.connect(self.toggle_local_metadata)
+        l.addWidget(self.local_meta_cb)
         
         self.local_list = QScrollArea()
         self.local_list.setWidgetResizable(True)
@@ -1017,6 +1069,11 @@ class MainApp(QMainWindow):
         self.save_config()
         self.refresh_local_list()
 
+    def toggle_local_metadata(self, state):
+        self.show_local_metadata = (state == Qt.Checked.value)
+        self.save_config()
+        self.refresh_local_list()
+
     def refresh_local_list(self):
         while self.local_vbox.count():
             item = self.local_vbox.takeAt(0)
@@ -1041,13 +1098,42 @@ class MainApp(QMainWindow):
         
         items.sort(key=lambda x: (not x['is_dir'], x['name'].lower()))
         self.current_local_items = items
+        
+        self.local_btns = []
         for item in items:
-            btn = QPushButton(f"{'📁' if item['is_dir'] else '🎵'}  {item['name']}")
+            text = f"{'📁' if item['is_dir'] else '🎵'}  {item.get('meta_name', item['name']) if getattr(self, 'show_local_metadata', False) else item['name']}"
+            btn = QPushButton(text)
             btn.setObjectName("transparentBtn")
             btn.clicked.connect(lambda checked=False, i=item: self._on_local_click(i))
             self.local_vbox.addWidget(btn)
+            if not item['is_dir']:
+                self.local_btns.append((btn, item))
+                
+        if getattr(self, 'show_local_metadata', False) and self.local_btns:
+            self._fetch_local_metadata_bg()
+            
+    def _fetch_local_metadata_bg(self):
+        btns_to_process = list(self.local_btns)
+        def bg_task():
+            for btn, item in btns_to_process:
+                if not getattr(self, 'show_local_metadata', False): break
+                if 'meta_name' not in item:
+                    try:
+                        media = self.vlc_instance.media_new(item['path'])
+                        media.parse()
+                        title = media.get_meta(vlc.Meta.Title)
+                        artist = media.get_meta(vlc.Meta.Artist)
+                        if title:
+                            item['meta_name'] = f"{artist} - {title}" if artist else title
+                        else:
+                            item['meta_name'] = item['name']
+                    except:
+                        item['meta_name'] = item['name']
+                # Update UI safely
+                QTimer.singleShot(0, lambda b=btn, i=item: b.setText(f"🎵  {i['meta_name']}"))
+        threading.Thread(target=bg_task, daemon=True).start()
 
-    def _on_local_click(self, item):
+    def _on_local_click(self, item, paused_at_start=False):
         if item['is_dir']: 
             self.load_local_folder(item['path'])
         else:
@@ -1064,8 +1150,17 @@ class MainApp(QMainWindow):
                     
             media = self.vlc_instance.media_new(url)
             self.vlc_player.set_media(media)
-            self.vlc_player.play()
-            self.playback_started_signal.emit(item['name'], "local")
+            if paused_at_start:
+                self.vlc_player.audio_set_mute(True)
+                self.vlc_player.play()
+                def delay_pause():
+                    self.vlc_player.set_pause(1)
+                    self.vlc_player.set_position(0)
+                    self.vlc_player.audio_set_mute(False)
+                QTimer.singleShot(250, delay_pause)
+            else:
+                self.vlc_player.play()
+            self.playback_started_signal.emit(item['name'], "local", paused_at_start)
 
     def toggle_thumbnails(self, state):
         self.show_thumbnails = state == Qt.Checked.value
@@ -1309,7 +1404,7 @@ class MainApp(QMainWindow):
             self.dl_progress_signal.emit("")
             self._on_batch_complete()
 
-    def play_result(self, video):
+    def play_result(self, video, paused_at_start=False):
         self._on_status_update(f"Fetching stream: {video.get('title', 'Unknown')}...", False, "#3B8ED0")
         
         # update index
@@ -1325,27 +1420,40 @@ class MainApp(QMainWindow):
                     url = info['url']
                     media = self.vlc_instance.media_new(url)
                     self.vlc_player.set_media(media)
-                    self.vlc_player.play()
-                    self.playback_started_signal.emit(video.get('title', 'Unknown'), video['id'])
+                    if paused_at_start:
+                        self.vlc_player.audio_set_mute(True)
+                        self.vlc_player.play()
+                        import time
+                        time.sleep(0.25)
+                        self.vlc_player.set_pause(1)
+                        self.vlc_player.set_position(0)
+                        self.vlc_player.audio_set_mute(False)
+                    else:
+                        self.vlc_player.play()
+                    self.playback_started_signal.emit(video.get('title', 'Unknown'), video['id'], paused_at_start)
             except Exception:
                 self.search_failed_signal.emit()
         threading.Thread(target=bg_fetch, daemon=True).start()
 
-    def _on_playback_started(self, title, vid_id):
+    def _on_playback_started(self, title, vid_id, paused_at_start=False):
         self.current_playing_title = title
         self.current_video_id = vid_id
-        self.is_playing = True
-        self.play_btn.setText("\uE769")
-        self._on_status_update(f"Playing: {title}", True, "gray")
+        if paused_at_start:
+            self.is_playing = False
+            self.play_btn.setText("\uE768")
+            self._on_status_update(f"Ready: {title}", False, "gray")
+        else:
+            self.is_playing = True
+            self.play_btn.setText("\uE769")
+            self._on_status_update(f"Playing: {title}", True, "gray")
 
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Space:
-            fw = self.focusWidget()
+    def eventFilter(self, obj, event):
+        if event.type() == event.Type.KeyPress and event.key() == Qt.Key_Space:
+            fw = QApplication.focusWidget()
             if not isinstance(fw, QLineEdit):
                 self.toggle_playback()
-                event.accept()
-                return
-        super().keyPressEvent(event)
+                return True
+        return super().eventFilter(obj, event)
 
     def open_search_on_youtube(self):
         import webbrowser, urllib.parse
