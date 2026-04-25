@@ -294,6 +294,7 @@ class MainApp(QMainWindow):
     thumbnails_loaded_signal = Signal(str, QPixmap)
     playback_started_signal = Signal(str, str)
     queue_update_signal = Signal()
+    dl_progress_signal = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -360,6 +361,7 @@ class MainApp(QMainWindow):
         self.playback_started_signal.connect(self._on_playback_started)
         self.queue_update_signal.connect(self._refresh_queue_display)
         self.thumbnails_loaded_signal.connect(self._on_thumbnail_loaded)
+        self.dl_progress_signal.connect(lambda txt: self.dl_progress_label.setText(txt))
         
         self.player_timer = QTimer(self)
         self.player_timer.timeout.connect(self.update_player_ui)
@@ -611,9 +613,20 @@ class MainApp(QMainWindow):
         set_r.addSpacing(6)
         c_layout.addLayout(set_r)
         
+        status_bar = QHBoxLayout()
+        self.playing_label = QLabel("")
+        self.playing_label.setStyleSheet("font-size: 11px; margin-top: -2px;")
         self.status_label = QLabel("Ready")
         self.status_label.setStyleSheet("font-size: 11px; margin-top: -2px;")
-        c_layout.addWidget(self.status_label)
+        self.dl_progress_label = QLabel("")
+        self.dl_progress_label.setStyleSheet("font-size: 11px; margin-top: -2px; color: #888;")
+        self.dl_progress_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        
+        status_bar.addWidget(self.playing_label)
+        status_bar.addWidget(self.status_label)
+        status_bar.addStretch()
+        status_bar.addWidget(self.dl_progress_label)
+        c_layout.addLayout(status_bar)
 
         # Bottom Player
         player_frame = QFrame()
@@ -1241,6 +1254,7 @@ class MainApp(QMainWindow):
                                 'preferredcodec': self.format_combo.currentText(),
                                 'preferredquality': self.bitrate_combo.currentText(),
                             }],
+                            'progress_hooks': [self._dl_progress_hook],
                             'quiet': True
                         }
                         if getattr(sys, 'frozen', False):
@@ -1273,14 +1287,26 @@ class MainApp(QMainWindow):
             self.path_combo.setCurrentText(folder)
             self.save_config()
 
+    def _dl_progress_hook(self, d):
+        if d['status'] == 'downloading':
+            p = d.get('_percent_str', '').strip()
+            if p:
+                self.dl_progress_signal.emit(f"Downloading: {p}")
+        elif d['status'] == 'finished':
+            self.dl_progress_signal.emit("Processing...")
+
     # --- Player Logic ---
     def _on_status_update(self, text, is_playing, color):
-        self.status_label.setText(text)
-        if color == "white":
-            self.status_label.setStyleSheet("font-size: 11px; margin-top: -2px;")
+        if is_playing:
+            self.playing_label.setText(text)
         else:
-            self.status_label.setStyleSheet(f"color: {color}; font-size: 11px; margin-top: -2px;")
+            self.status_label.setText(f"   |   {text}" if self.playing_label.text() else text)
+            if color == "white":
+                self.status_label.setStyleSheet("font-size: 11px; margin-top: -2px;")
+            else:
+                self.status_label.setStyleSheet(f"color: {color}; font-size: 11px; margin-top: -2px;")
         if "Batch complete" in text:
+            self.dl_progress_signal.emit("")
             self._on_batch_complete()
 
     def play_result(self, video):
