@@ -12,11 +12,13 @@ wheels/
 build_dir/
 build_dir_gui/
 ffmpeg_extracted/
+dist/
 
 # Python artifacts
 __pycache__/
 *.py[cod]
 *$py.class
+*.bak
 
 # Executables
 *.exe
