@@ -162,7 +162,7 @@ class SettingsDialog(QDialog):
         self.args_edit.textChanged.connect(self._update_args)
         arg_h.addWidget(self.args_edit, 1)
         self.layout.addLayout(arg_h)
-        self.layout.addWidget(QLabel("\uE946 Manual override ignores GUI bitrate/format settings.", font=QFont("Segoe UI", 8)))
+        self.layout.addWidget(QLabel("Manual override ignores GUI bitrate/format settings.", font=QFont("Segoe UI", 8)))
         
         # OPTIONS
         self.tray_cb = QCheckBox("Minimize to System Tray")
@@ -179,7 +179,7 @@ class SettingsDialog(QDialog):
         
         # RESET
         self.reset_btn = QPushButton("Reset to Default Config")
-        self.reset_btn.setStyleSheet("background-color: transparent; border: 1px solid #555; font-weight: normal;")
+        self.reset_btn.setObjectName("topIconBtn")
         self.reset_btn.clicked.connect(self._reset_defaults)
         self.layout.addWidget(self.reset_btn)
         
@@ -200,9 +200,15 @@ class SettingsDialog(QDialog):
         if mode == "System": mode = get_system_appearance_mode()
         is_light = mode == "Light"
         
+        r = int(accent[1:3], 16)
+        g = int(accent[3:5], 16)
+        b = int(accent[5:7], 16)
+        brightness = (r * 299 + g * 587 + b * 114) / 1000
+        accent_fg = "black" if brightness > 150 else "white"
+        
         for m, b in self.mode_btns.items():
             if m == self.parent.appearance_mode:
-                b.setStyleSheet(f"background-color: {accent}; color: white; border-radius: 4px;")
+                b.setStyleSheet(f"background-color: {accent}; color: {accent_fg}; border-radius: 4px;")
             else:
                 b.setStyleSheet(f"background-color: {'#ddd' if is_light else '#444'}; color: {'black' if is_light else 'white'}; border-radius: 4px;")
         
@@ -273,7 +279,9 @@ class PlaylistDialog(QDialog):
         open_btn.clicked.connect(self.accept)
         # Assuming app aesthetic injection
         accent = get_accent_color(parent.accent_color_name if parent else "Blue")
-        open_btn.setStyleSheet(f"background-color: {accent}; color: white; border-radius: 4px; padding: 6px 12px; font-weight: bold;")
+        r = int(accent[1:3], 16); g = int(accent[3:5], 16); b = int(accent[5:7], 16)
+        accent_fg = "black" if (r * 299 + g * 587 + b * 114) / 1000 > 150 else "white"
+        open_btn.setStyleSheet(f"background-color: {accent}; color: {accent_fg}; border-radius: 4px; padding: 6px 12px; font-weight: bold;")
         cancel_btn.setStyleSheet("background-color: #555555; color: white; border-radius: 4px; padding: 6px 12px; font-weight: bold;")
         h.addWidget(cancel_btn)
         h.addWidget(open_btn)
@@ -557,14 +565,16 @@ class MainApp(QMainWindow):
         self.search_btn = QPushButton("Search")
         self.search_btn.clicked.connect(self.perform_search)
         self.playlist_btn = QPushButton("\uE142")
-        self.playlist_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 16px; background-color: transparent; border: 1px solid #555;")
+        self.playlist_btn.setObjectName("topIconBtn")
+        self.playlist_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 16px;")
         self.playlist_btn.clicked.connect(self.open_playlist_dialog)
         
         search_r.addWidget(self.search_entry, 1)
         search_r.addWidget(self.search_btn)
         search_r.addWidget(self.playlist_btn)
         settings_btn = QPushButton("\uE713")
-        settings_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 16px; background-color: transparent; border: 1px solid #555;")
+        settings_btn.setObjectName("topIconBtn")
+        settings_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 16px;")
         settings_btn.clicked.connect(self.open_settings_dialog)
         search_r.addWidget(settings_btn)
         c_layout.addLayout(search_r)
@@ -593,6 +603,7 @@ class MainApp(QMainWindow):
         set_r.addWidget(self.path_combo, 1)
         
         self.browse_btn = QPushButton("\uE8B7")
+        self.browse_btn.setObjectName("topIconBtn")
         self.browse_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 16px; padding: 0px;")
         self.browse_btn.setFixedSize(36, 30)
         self.browse_btn.clicked.connect(self.browse_folder)
@@ -630,7 +641,10 @@ class MainApp(QMainWindow):
         
         self.vol_pct = QLabel(f"{self.volume_val}%")
         self.vol_pct.setFixedWidth(50)
-        if self.volume_val > 100: self.vol_pct.setStyleSheet("color: #E31E24; font-weight: bold;")
+        if self.volume_val > 115:
+            self.vol_pct.setStyleSheet("color: #E31E24; font-weight: bold;")
+        elif self.volume_val > 100:
+            self.vol_pct.setStyleSheet("color: #FF8C00; font-weight: bold;")
         c.addWidget(self.vol_pct)
         
         c.addStretch(1)
@@ -638,18 +652,21 @@ class MainApp(QMainWindow):
         _btn_ss_hover = "background: transparent; color: white; font-family: 'Segoe MDL2 Assets'; font-size: 14px; border-radius: 4px; padding: 2px 4px;" + " /* hover set via stylesheet */"
         
         self.prev_btn = QPushButton("\uE892")
+        self.prev_btn.setObjectName("playerBtn")
         self.prev_btn.clicked.connect(self.play_previous)
-        self.prev_btn.setStyleSheet("QPushButton { background: transparent; color: white; font-family: 'Segoe MDL2 Assets'; font-size: 13px; border-radius: 4px; padding: 0px 4px; } QPushButton:hover { background: rgba(255,255,255,30); }")
+        self.prev_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 13px;")
         c.addWidget(self.prev_btn)
         
         self.play_btn = QPushButton("\uE768")
+        self.play_btn.setObjectName("playerPlayBtn")
         self.play_btn.clicked.connect(self.toggle_playback)
-        self.play_btn.setStyleSheet("QPushButton { background: transparent; color: white; font-family: 'Segoe MDL2 Assets'; font-size: 24px; border-radius: 6px; padding: 0px 4px; } QPushButton:hover { background: rgba(255,255,255,30); }")
+        self.play_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 24px;")
         c.addWidget(self.play_btn)
         
         self.next_btn = QPushButton("\uE893")
+        self.next_btn.setObjectName("playerBtn")
         self.next_btn.clicked.connect(self.play_next)
-        self.next_btn.setStyleSheet("QPushButton { background: transparent; color: white; font-family: 'Segoe MDL2 Assets'; font-size: 13px; border-radius: 4px; padding: 0px 4px; } QPushButton:hover { background: rgba(255,255,255,30); }")
+        self.next_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 13px;")
         c.addWidget(self.next_btn)
         c.addStretch(1)
         
@@ -709,6 +726,7 @@ class MainApp(QMainWindow):
         self.local_path_combo.addItems(self.local_folders)
         h.addWidget(self.local_path_combo, 1)
         local_browse_btn = QPushButton("\uE8B7")
+        local_browse_btn.setObjectName("topIconBtn")
         local_browse_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 16px; padding: 0px;")
         local_browse_btn.setFixedSize(36, 30)
         local_browse_btn.clicked.connect(lambda: self.load_local_folder(QFileDialog.getExistingDirectory(self)))
@@ -719,6 +737,7 @@ class MainApp(QMainWindow):
         self.local_list = QScrollArea()
         self.local_list.setWidgetResizable(True)
         self.local_content = QWidget()
+        self.local_content.setObjectName("scrollContent")
         self.local_vbox = QVBoxLayout(self.local_content)
         self.local_vbox.setAlignment(Qt.AlignTop)
         self.local_list.setWidget(self.local_content)
@@ -738,8 +757,9 @@ class MainApp(QMainWindow):
         h.addWidget(self.show_thumb_cb)
         
         self.open_yt_btn = QPushButton("")
+        self.open_yt_btn.setObjectName("topIconBtn")
         self.open_yt_btn.setToolTip("Open search / playlist on YouTube")
-        self.open_yt_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 14px; background: transparent; border: 1px solid #555; padding: 2px 6px;")
+        self.open_yt_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 14px; padding: 2px 6px;")
         self.open_yt_btn.setFixedSize(30, 26)
         self.open_yt_btn.clicked.connect(self.open_search_on_youtube)
         h.addWidget(self.open_yt_btn)
@@ -748,6 +768,7 @@ class MainApp(QMainWindow):
         self.results_area = QScrollArea()
         self.results_area.setWidgetResizable(True)
         self.results_content = QWidget()
+        self.results_content.setObjectName("scrollContent")
         self.results_vbox = QVBoxLayout(self.results_content)
         self.results_vbox.setAlignment(Qt.AlignTop)
         self.results_area.setWidget(self.results_content)
@@ -772,6 +793,7 @@ class MainApp(QMainWindow):
         self.queue_area = QScrollArea()
         self.queue_area.setWidgetResizable(True)
         self.queue_content = QWidget()
+        self.queue_content.setObjectName("scrollContent")
         self.queue_vbox = QVBoxLayout(self.queue_content)
         self.queue_vbox.setAlignment(Qt.AlignTop)
         self.queue_area.setWidget(self.queue_content)
@@ -784,15 +806,36 @@ class MainApp(QMainWindow):
         
         accent = get_accent_color(self.accent_color_name)
         
+        r = int(accent[1:3], 16)
+        g = int(accent[3:5], 16)
+        b = int(accent[5:7], 16)
+        brightness = (r * 299 + g * 587 + b * 114) / 1000
+        accent_fg = "#000000" if brightness > 150 else "#ffffff"
+        
         # Write checkmark SVG to a temp file
         import tempfile, os as _os
-        checkmark_svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>'
+        checkmark_svg = f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="{accent_fg}" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>'
         if not hasattr(self, '_checkmark_svg_path') or not _os.path.exists(self._checkmark_svg_path):
             tmp = tempfile.NamedTemporaryFile(suffix='.svg', delete=False, mode='w', encoding='utf-8')
             tmp.write(checkmark_svg)
             tmp.close()
             self._checkmark_svg_path = tmp.name.replace('\\', '/')
+        else:
+            with open(self._checkmark_svg_path, 'w', encoding='utf-8') as f:
+                f.write(checkmark_svg)
         checkmark_path = self._checkmark_svg_path
+        
+        # Write downarrow SVG to a temp file
+        downarrow_svg = f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="{accent_fg}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>'
+        if not hasattr(self, '_downarrow_svg_path') or not _os.path.exists(self._downarrow_svg_path):
+            tmp = tempfile.NamedTemporaryFile(suffix='.svg', delete=False, mode='w', encoding='utf-8')
+            tmp.write(downarrow_svg)
+            tmp.close()
+            self._downarrow_svg_path = tmp.name.replace('\\', '/')
+        else:
+            with open(self._downarrow_svg_path, 'w', encoding='utf-8') as f:
+                f.write(downarrow_svg)
+        downarrow_path = self._downarrow_svg_path
         
         if mode == "Light":
             bg = "#f3f3f3"
@@ -800,11 +843,18 @@ class MainApp(QMainWindow):
             frame_bg = "#ffffff"
             input_bg = "#e8e8e8"
             input_border = "#ccc"
-            scroll_bg = "#fafafa"
+            scroll_bg = "#ffffff"
             splitter_handle = "#ddd"
             slider_bg = "#ddd"
             hover_bg = "#000000"
             hover_fg = "#ffffff"
+            queue_item_bg = "#e8e8e8"
+            queue_item_bg_finished = "#ffffff"
+            btn_hover = "rgba(0, 0, 0, 0.1)"
+            if self.accent_color_name == "White" or accent.upper() == "#FFFFFF":
+                main_btn_border = "1px solid #ccc"
+            else:
+                main_btn_border = "none"
         else:
             bg = "#1e1e1e"
             fg = "#ffffff"
@@ -816,19 +866,49 @@ class MainApp(QMainWindow):
             slider_bg = "#333"
             hover_bg = "#dddddd"
             hover_fg = "#1a1a1a"
+            queue_item_bg = "#333333"
+            queue_item_bg_finished = "#1a1a1a"
+            btn_hover = "rgba(255, 255, 255, 0.1)"
+            main_btn_border = "none"
 
         self.setStyleSheet("""
-            QMainWindow {{ background-color: {bg}; }}
+            QMainWindow, QDialog {{ background-color: {bg}; }}
             QWidget {{ color: {fg}; font-family: 'Segoe UI'; font-size: 13px; }}
+            QWidget#scrollContent {{ background-color: {scroll_bg}; }}
+            QWidget#queueItemPending {{ background-color: {queue_item_bg}; border-radius: 4px; margin-bottom: 2px; }}
+            QWidget#queueItemFinished {{ background-color: {queue_item_bg_finished}; border-radius: 4px; margin-bottom: 2px; }}
             QLabel {{ color: {fg}; }}
             QPushButton {{ 
                 background-color: {accent}; 
-                color: white; border: none; padding: 6px 12px; border-radius: 4px; font-weight: bold;
+                color: {accent_fg}; border: {main_btn_border}; padding: 6px 12px; border-radius: 4px; font-weight: bold;
             }}
             QPushButton:hover {{ background-color: {hover_bg}; color: {hover_fg}; }}
             QPushButton:disabled {{ background-color: #555555; color: #888888; }}
-            QLineEdit, QComboBox {{ 
+            QLineEdit {{ 
                 background-color: {input_bg}; color: {fg}; border: 1px solid {input_border}; padding: 6px; border-radius: 4px;
+            }}
+            QComboBox {{ 
+                background-color: {input_bg}; color: {fg}; border: 1px solid {input_border}; padding: 6px; border-radius: 4px;
+            }}
+            QComboBox::drop-down {{
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 24px;
+                border-left: 1px solid {input_border};
+                background-color: {accent};
+                border-top-right-radius: 3px;
+                border-bottom-right-radius: 3px;
+            }}
+            QComboBox::down-arrow {{
+                image: url("{downarrow_path}");
+                width: 16px; height: 16px;
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: {input_bg};
+                color: {fg};
+                selection-background-color: {accent};
+                selection-color: {accent_fg};
+                border: 1px solid {input_border};
             }}
             QScrollArea {{ border: none; background-color: {scroll_bg}; border-radius: 6px;}}
             QFrame {{ background-color: {frame_bg}; border-radius: 6px; padding: 5px;}}
@@ -847,10 +927,65 @@ class MainApp(QMainWindow):
             QCheckBox {{ color: {fg}; spacing: 8px; }}
             QCheckBox::indicator {{ width: 16px; height: 16px; border: 1px solid {accent}; border-radius: 3px; background: {frame_bg}; }}
             QCheckBox::indicator:checked {{ background: {accent}; image: url("{checkmark_path}"); }}
+            
+            QPushButton#transparentBtn {{
+                background-color: transparent;
+                color: {fg};
+                font-weight: normal;
+                border-radius: 0px;
+                padding: 4px;
+                text-align: left;
+            }}
+            QPushButton#transparentBtn:hover {{
+                background-color: {btn_hover};
+            }}
+            QPushButton#iconBtn {{
+                background-color: transparent;
+                color: {fg};
+                font-weight: normal;
+                padding: 0px;
+            }}
+            QPushButton#iconBtn:hover {{
+                background-color: {btn_hover};
+            }}
+            QPushButton#topIconBtn {{
+                background-color: transparent;
+                color: {fg};
+                font-weight: normal;
+                border: 1px solid {input_border};
+                border-radius: 4px;
+                padding: 6px 12px;
+            }}
+            QPushButton#topIconBtn:hover {{
+                background-color: {btn_hover};
+            }}
+            QPushButton#playerBtn {{
+                background-color: transparent;
+                color: {fg};
+                font-weight: normal;
+                border-radius: 4px;
+                padding: 0px 4px;
+            }}
+            QPushButton#playerBtn:hover {{
+                background-color: {btn_hover};
+            }}
+            QPushButton#playerPlayBtn {{
+                background-color: transparent;
+                color: {fg};
+                font-weight: normal;
+                border-radius: 6px;
+                padding: 0px 4px;
+            }}
+            QPushButton#playerPlayBtn:hover {{
+                background-color: {btn_hover};
+            }}
         """.format(
             bg=bg, fg=fg, frame_bg=frame_bg, input_bg=input_bg, input_border=input_border,
             scroll_bg=scroll_bg, splitter_handle=splitter_handle, slider_bg=slider_bg,
-            hover_bg=hover_bg, hover_fg=hover_fg, accent=accent, checkmark_path=checkmark_path
+            hover_bg=hover_bg, hover_fg=hover_fg, accent=accent, accent_fg=accent_fg,
+            queue_item_bg=queue_item_bg, queue_item_bg_finished=queue_item_bg_finished,
+            btn_hover=btn_hover, checkmark_path=checkmark_path, downarrow_path=downarrow_path,
+            main_btn_border=main_btn_border
         ))
 
     # --- Local Folder Logic ---
@@ -895,7 +1030,7 @@ class MainApp(QMainWindow):
         self.current_local_items = items
         for item in items:
             btn = QPushButton(f"{'📁' if item['is_dir'] else '🎵'}  {item['name']}")
-            btn.setStyleSheet("QPushButton { text-align: left; background-color: transparent; color: white; padding: 4px; font-weight: normal; border-radius: 0px; } QPushButton:hover { background-color: #555555; color: white; }")
+            btn.setObjectName("transparentBtn")
             btn.clicked.connect(lambda checked=False, i=item: self._on_local_click(i))
             self.local_vbox.addWidget(btn)
 
@@ -1001,7 +1136,8 @@ class MainApp(QMainWindow):
             else:
                 pbtn = QPushButton("\uE768")
                 pbtn.setFixedWidth(40)
-                pbtn.setStyleSheet("background: transparent; color: white; font-family: 'Segoe MDL2 Assets'; font-size: 16px;")
+                pbtn.setObjectName("iconBtn")
+                pbtn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 16px;")
                 pbtn.clicked.connect(lambda checked=False, v=video: self.play_result(v))
                 l.addWidget(pbtn)
                 
@@ -1018,9 +1154,10 @@ class MainApp(QMainWindow):
             
             # Open on YouTube button
             yt_btn = QPushButton("")
+            yt_btn.setObjectName("iconBtn")
             yt_btn.setToolTip("Open on YouTube")
             yt_btn.setFixedSize(28, 28)
-            yt_btn.setStyleSheet("QPushButton { background: transparent; color: #aaa; font-family: 'Segoe MDL2 Assets'; font-size: 13px; border: none; padding: 0px; } QPushButton:hover { color: white; background: transparent; }")
+            yt_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 13px;")
             vid_id = video.get('id', '')
             yt_btn.clicked.connect(lambda checked=False, vid=vid_id: __import__('webbrowser').open(f'https://www.youtube.com/watch?v={vid}'))
             l.addWidget(yt_btn)
@@ -1061,12 +1198,13 @@ class MainApp(QMainWindow):
             l.addWidget(QLabel(f"<span style='font-family: \"Segoe MDL2 Assets\";'>{st}</span> {t}"), 1)
             
             rm_btn = QPushButton("\uE711")
-            rm_btn.setStyleSheet("background: transparent; color: white; font-family: 'Segoe MDL2 Assets'; font-size: 14px; padding: 0px;")
+            rm_btn.setObjectName("iconBtn")
+            rm_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 14px;")
             rm_btn.setFixedSize(26, 26)
             rm_btn.clicked.connect(lambda checked=False, i=idx: self.remove_from_queue(i))
             l.addWidget(rm_btn)
             
-            w.setStyleSheet("QWidget { background-color: #333333; border-radius: 4px; margin-bottom: 2px;}" if q['status'] != "Finished" else "QWidget { background-color: #1a1a1a; border-radius: 4px; margin-bottom: 2px;}")
+            w.setObjectName("queueItemFinished" if q['status'] == "Finished" else "queueItemPending")
             self.queue_vbox.addWidget(w)
 
     def remove_from_queue(self, idx):
@@ -1138,7 +1276,10 @@ class MainApp(QMainWindow):
     # --- Player Logic ---
     def _on_status_update(self, text, is_playing, color):
         self.status_label.setText(text)
-        self.status_label.setStyleSheet(f"color: {color};")
+        if color == "white":
+            self.status_label.setStyleSheet("font-size: 11px; margin-top: -2px;")
+        else:
+            self.status_label.setStyleSheet(f"color: {color}; font-size: 11px; margin-top: -2px;")
         if "Batch complete" in text:
             self._on_batch_complete()
 
@@ -1245,7 +1386,7 @@ class MainApp(QMainWindow):
                 self.vol_pct.setStyleSheet("color: #FF8C00; font-weight: bold;")
                 self.vol_slider.setProperty("volume_state", "orange")
             else:
-                self.vol_pct.setStyleSheet("color: white; font-weight: normal;")
+                self.vol_pct.setStyleSheet("")
                 self.vol_slider.setProperty("volume_state", "normal")
             self.vol_slider.style().unpolish(self.vol_slider)
             self.vol_slider.style().polish(self.vol_slider)
