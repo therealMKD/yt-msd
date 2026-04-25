@@ -1113,31 +1113,56 @@ class MainApp(QMainWindow):
             self._fetch_local_metadata_bg()
             
     def _fetch_local_metadata_bg(self):
+        from PySide6.QtCore import QObject, Signal
+        class MetaWorker(QObject):
+            meta_done = Signal(object, object)
+            
+        self._meta_worker = MetaWorker()
+        self._meta_worker.meta_done.connect(lambda b, i: b.setText(f"🎵  {i['meta_name']}"))
+        
         btns_to_process = list(self.local_btns)
+        
+        import sys, os, subprocess, json
+        ffprobe_path = 'ffprobe'
+        if getattr(sys, 'frozen', False):
+            base_dir = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
+            ff_exe = os.path.join(base_dir, 'ffprobe.exe')
+            if os.path.exists(ff_exe):
+                ffprobe_path = ff_exe
+                
         def bg_task():
             for btn, item in btns_to_process:
                 if not getattr(self, 'show_local_metadata', False): break
                 if 'meta_name' not in item:
                     try:
-                        media = self.vlc_instance.media_new(item['path'])
-                        media.parse()
-                        title = media.get_meta(vlc.Meta.Title)
-                        artist = media.get_meta(vlc.Meta.Artist)
-                        if title:
-                            item['meta_name'] = f"{artist} - {title}" if artist else title
+                        cmd = [ffprobe_path, '-v', 'quiet', '-print_format', 'json', '-show_format', item['path']]
+                        # 0x08000000 is CREATE_NO_WINDOW on Windows
+                        result = subprocess.run(cmd, capture_output=True, text=True, creationflags=0x08000000)
+                        if result.stdout:
+                            data = json.loads(result.stdout)
+                            tags = data.get('format', {}).get('tags', {})
+                            
+                            title = tags.get('title') or tags.get('TITLE')
+                            artist = tags.get('artist') or tags.get('ARTIST')
+                            
+                            if title:
+                                item['meta_name'] = f"{artist} - {title}" if artist else title
+                            else:
+                                item['meta_name'] = item['name']
                         else:
                             item['meta_name'] = item['name']
-                    except:
+                    except Exception:
                         item['meta_name'] = item['name']
                 # Update UI safely
-                QTimer.singleShot(0, lambda b=btn, i=item: b.setText(f"🎵  {i['meta_name']}"))
+                self._meta_worker.meta_done.emit(btn, item)
         threading.Thread(target=bg_task, daemon=True).start()
 
     def _on_local_click(self, item, paused_at_start=False):
         if item['is_dir']: 
             self.load_local_folder(item['path'])
         else:
-            self._on_status_update(f"Playing Local: {item['name']}", False, "#3B8ED0")
+            display_name = item.get('meta_name', item['name']) if getattr(self, 'show_local_metadata', False) else item['name']
+            self._on_status_update(f"Playing Local: {display_name}", False, "#3B8ED0")
             url = item['path'].replace("\\", "/")
             if not url.startswith("file:///"): url = "file:///" + url
             self.current_video_id = "local"
@@ -1160,7 +1185,7 @@ class MainApp(QMainWindow):
                 QTimer.singleShot(250, delay_pause)
             else:
                 self.vlc_player.play()
-            self.playback_started_signal.emit(item['name'], "local", paused_at_start)
+            self.playback_started_signal.emit(display_name, "local", paused_at_start)
 
     def toggle_thumbnails(self, state):
         self.show_thumbnails = state == Qt.Checked.value
@@ -1441,7 +1466,7 @@ class MainApp(QMainWindow):
         if paused_at_start:
             self.is_playing = False
             self.play_btn.setText("\uE768")
-            self._on_status_update(f"Ready: {title}", False, "gray")
+            self._on_status_update(f"Ready: {title}", True, "gray")
         else:
             self.is_playing = True
             self.play_btn.setText("\uE769")
