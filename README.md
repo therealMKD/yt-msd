@@ -7,15 +7,14 @@
 
 I don't want to deal with spotify's ads (Or pay for premium), and youtube playlists don't have working shuffle features, so I started downloading the mp3s of my playlist with yt-dlp, but it is still annoying to do, so I created this tool to make it faster. This program WILL function as a bare bones music player, but I would highly recommend using a dedicated program (I use MusicBee) that has more options. However, if you just want to have your music in a folder and listen to it, this will do it for you.
 
-**NOTE:** As of 4/12/2026, this is rapidly becoming a more and more full-featured music player. We'll see where this takes us, but Musicbee will still be able to do much more. I might possibly make this into a Musicbee plugin, but those are written in VB or C#, and this program is in python, so it might be a bit hacky.
-
-As of now, the only release is the CLI version. This will search youtube with yt-dlp, and fetch the videos. You can select one, choose the format, and the bitrate, as well as the destination. The program will remember the last 3 destinations used, and you can use the config.json file to force certain settings.
-The pre-release of the GUI edition is also now out, but it is python only. The conversion to Pyside 6 is largely completed, so next week will see new features, and not just pairity changes. It will still be another week before a finished build of the GUI version in Pyside 6 will be done though.
-4/24/2026: I've largely got the conversion complete, despite skipping a week. The first actual release of the GUI version will *probably* be done this weekend. I've still got some more features planned though, so no exe for now.
-
 # GUI Version Readme
 
-Coming soon<sup>TM</sup> once I finish up the GUI version.
+The GUI version is complete, but further feature updates are still coming, and I'm not going to complete this until they are finished. 
+
+### Support for other operating systems
+**MacOS**: Exe files don't run on MacOS, but you can still use the python file and install the dependencies. Unfortunately due to the migration to Pyside6, I can no longer make a pex file properly (At least in my windows development environment). You could also use WINE to emulate windows functionality with the exe. I don't plan on releasing any additional files supporting MacOS, both because I don't have a Mac to test on, and also because MacOS is not a superior operating system.
+
+**Linux**: Support is coming for linux, in the form of an appimage file, but that will not be created until the final feature update. For now, you can do the same things as MacOS: Either the python file, or WINE.
 
 # CLI Version Readme
 
