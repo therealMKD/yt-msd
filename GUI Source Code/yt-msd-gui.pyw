@@ -816,6 +816,16 @@ class MainApp(QMainWindow):
         h.setContentsMargins(0, 0, 16, 0)
         h.addWidget(QLabel("Search Results"))
         h.addStretch()
+        
+        self.queue_all_cb = QCheckBox("Queue All")
+        self.queue_all_cb.setChecked(False)
+        self.queue_all_cb.stateChanged.connect(self.toggle_queue_all)
+        h.addWidget(self.queue_all_cb)
+        
+        self.header_divider = QLabel("  |  ")
+        self.header_divider.setStyleSheet("color: #888888; font-weight: bold;")
+        h.addWidget(self.header_divider)
+        
         self.show_thumb_cb = QCheckBox("Show Thumbnails")
         self.show_thumb_cb.setChecked(self.show_thumbnails)
         self.show_thumb_cb.stateChanged.connect(self.toggle_thumbnails)
@@ -837,6 +847,7 @@ class MainApp(QMainWindow):
         self.results_vbox = QVBoxLayout(self.results_content)
         self.results_vbox.setAlignment(Qt.AlignTop)
         self.results_area.setWidget(self.results_content)
+        self.results_area.verticalScrollBar().valueChanged.connect(self.lazy_load_visible_results)
         l.addWidget(self.results_area, 1)
         self.content_splitter.addWidget(w)
         
@@ -862,6 +873,7 @@ class MainApp(QMainWindow):
         self.queue_vbox = QVBoxLayout(self.queue_content)
         self.queue_vbox.setAlignment(Qt.AlignTop)
         self.queue_area.setWidget(self.queue_content)
+        self.queue_area.verticalScrollBar().valueChanged.connect(self.lazy_load_visible_queue)
         l.addWidget(self.queue_area, 1)
         self.content_splitter.addWidget(w)
 
@@ -1256,48 +1268,17 @@ class MainApp(QMainWindow):
             item = self.results_vbox.takeAt(0)
             if item.widget(): item.widget().deleteLater()
             
-        for video in res[:30]:
-            w = QWidget()
-            l = QHBoxLayout(w)
-            l.setContentsMargins(2,2,2,2)
-            
-            if self.show_thumbnails:
-                tw = ThumbnailWidget(video, self)
-                l.addWidget(tw)
-                self._thumbnail_labels[video['id']] = tw.thumb_label
-                threading.Thread(target=self._fetch_thumbnail, args=(video,), daemon=True).start()
-            else:
-                pbtn = QPushButton("\uE768")
-                pbtn.setFixedWidth(40)
-                pbtn.setObjectName("iconBtn")
-                pbtn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 16px;")
-                pbtn.clicked.connect(lambda checked=False, v=video: self.play_result(v))
-                l.addWidget(pbtn)
-                
-            title = video.get('title', 'Unknown')
-            if len(title) > 55: title = title[:52] + "..."
-            cb = QCheckBox(f"{title}")
-            
-            # Persist checked state
-            if any(q['video']['id'] == video['id'] for q in self.queue_items):
-                cb.setChecked(True)
-                
-            cb.stateChanged.connect(lambda state, v=video: self.toggle_queue(v, state))
-            l.addWidget(cb, 1)
-            
-            # Open on YouTube button
-            yt_btn = QPushButton("")
-            yt_btn.setObjectName("iconBtn")
-            yt_btn.setToolTip("Open on YouTube")
-            yt_btn.setFixedSize(28, 28)
-            yt_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 13px;")
-            vid_id = video.get('id', '')
-            yt_btn.clicked.connect(lambda checked=False, vid=vid_id: __import__('webbrowser').open(f'https://www.youtube.com/watch?v={vid}'))
-            l.addWidget(yt_btn)
-            
-            self.results_vbox.addWidget(w)
+        height = 54 if self.show_thumbnails else 34
+        for video in res:
+            placeholder = QWidget()
+            placeholder.setFixedHeight(height)
+            placeholder.setProperty("video", video)
+            placeholder.setProperty("has_ui", False)
+            self.results_vbox.addWidget(placeholder)
             
         self._on_status_update(f"Found {len(res)} results.", False, "white")
+        QTimer.singleShot(0, self.lazy_load_visible_results)
+        self.update_queue_all_checkbox_state()
 
     def _on_search_failed(self):
         self.search_btn.setEnabled(True)
@@ -1312,6 +1293,224 @@ class MainApp(QMainWindow):
             self.queue_items = [q for q in self.queue_items if q['video']['id'] != video['id']]
         self.queue_update_signal.emit()
 
+    def toggle_queue_all(self, state):
+        checked = state == Qt.Checked.value
+        if not self.search_results:
+            return
+            
+        # Quick set for O(1) membership lookups to check if search results already exist in queue
+        search_ids = {v['id'] for v in self.search_results if 'id' in v}
+        
+        # Modify queue in-place in bulk
+        if checked:
+            existing_queue_ids = {q['video']['id'] for q in self.queue_items if 'video' in q and 'id' in q['video']}
+            new_items = []
+            for video in self.search_results:
+                if 'id' in video and video['id'] not in existing_queue_ids:
+                    new_items.append({'video': video, 'status': 'Pending'})
+            if new_items:
+                self.queue_items.extend(new_items)
+        else:
+            self.queue_items = [q for q in self.queue_items if 'video' not in q or q['video'].get('id') not in search_ids]
+            
+        # Bulk-update checking of all currently visible result checkboxes to avoid individual trigger overhead
+        for i in range(self.results_vbox.count()):
+            layout_item = self.results_vbox.itemAt(i)
+            if layout_item and layout_item.widget():
+                widget = layout_item.widget()
+                checkboxes = widget.findChildren(QCheckBox)
+                for cb in checkboxes:
+                    cb.blockSignals(True)
+                    cb.setChecked(checked)
+                    cb.blockSignals(False)
+                    
+        self.queue_update_signal.emit()
+
+    def update_queue_all_checkbox_state(self):
+        if not hasattr(self, 'queue_all_cb') or not self.search_results:
+            return
+            
+        # Highly-optimized O(N + M) set-based comparison to prevent slowness/lag
+        queue_ids = {q['video']['id'] for q in self.queue_items if 'video' in q and 'id' in q['video']}
+        all_in_queue = True
+        for video in self.search_results:
+            if 'id' in video:
+                if video['id'] not in queue_ids:
+                    all_in_queue = False
+                    break
+                    
+        self.queue_all_cb.blockSignals(True)
+        self.queue_all_cb.setChecked(all_in_queue)
+        self.queue_all_cb.blockSignals(False)
+
+    def build_result_ui(self, placeholder, video, queue_ids):
+        l = QHBoxLayout(placeholder)
+        l.setContentsMargins(2,2,2,2)
+        
+        if self.show_thumbnails:
+            tw = ThumbnailWidget(video, self)
+            l.addWidget(tw)
+            self._thumbnail_labels[video['id']] = tw.thumb_label
+            threading.Thread(target=self._fetch_thumbnail, args=(video,), daemon=True).start()
+        else:
+            pbtn = QPushButton("\uE768")
+            pbtn.setFixedWidth(40)
+            pbtn.setObjectName("iconBtn")
+            pbtn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 16px;")
+            pbtn.clicked.connect(lambda checked=False, v=video: self.play_result(v))
+            l.addWidget(pbtn)
+            
+        title = video.get('title', 'Unknown')
+        if len(title) > 55: title = title[:52] + "..."
+        cb = QCheckBox(f"{title}")
+        cb.setProperty("video_id", video.get('id', ''))
+        
+        # Persist checked state
+        cb.setChecked(video.get('id') in queue_ids)
+            
+        cb.stateChanged.connect(lambda state, v=video: self.toggle_queue(v, state))
+        l.addWidget(cb, 1)
+        
+        # Open on YouTube button
+        yt_btn = QPushButton("")
+        yt_btn.setObjectName("iconBtn")
+        yt_btn.setToolTip("Open on YouTube")
+        yt_btn.setFixedSize(28, 28)
+        yt_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 13px;")
+        vid_id = video.get('id', '')
+        yt_btn.clicked.connect(lambda checked=False, vid=vid_id: __import__('webbrowser').open(f'https://www.youtube.com/watch?v={vid}'))
+        l.addWidget(yt_btn)
+        
+        placeholder.setProperty("has_ui", True)
+
+    def clear_result_ui(self, placeholder):
+        video = placeholder.property("video")
+        if video and 'id' in video and video['id'] in self._thumbnail_labels:
+            try:
+                del self._thumbnail_labels[video['id']]
+            except KeyError:
+                pass
+            
+        layout = placeholder.layout()
+        if layout:
+            while layout.count():
+                item = layout.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+            placeholder.setLayout(None)
+            layout.deleteLater()
+            
+        placeholder.setProperty("has_ui", False)
+
+    def lazy_load_visible_results(self):
+        if not self.search_results or not hasattr(self, 'results_area'):
+            return
+            
+        scrollbar = self.results_area.verticalScrollBar()
+        scroll_val = scrollbar.value()
+        viewport_height = self.results_area.viewport().height()
+        
+        # Buffer of 200px to ensure smooth scrolling
+        buffer = 200
+        load_top = scroll_val - buffer
+        load_bottom = scroll_val + viewport_height + buffer
+        
+        queue_ids = {q['video']['id'] for q in self.queue_items if 'video' in q and 'id' in q['video']}
+        
+        for i in range(self.results_vbox.count()):
+            layout_item = self.results_vbox.itemAt(i)
+            if layout_item and layout_item.widget():
+                placeholder = layout_item.widget()
+                video = placeholder.property("video")
+                if not video:
+                    continue
+                    
+                y = placeholder.y()
+                h = placeholder.height()
+                
+                is_visible = (y + h >= load_top and y <= load_bottom)
+                has_ui = placeholder.property("has_ui")
+                
+                if is_visible:
+                    if not has_ui:
+                        self.build_result_ui(placeholder, video, queue_ids)
+                else:
+                    if has_ui:
+                        self.clear_result_ui(placeholder)
+
+    def build_queue_item_ui(self, placeholder, q, idx):
+        l = QHBoxLayout(placeholder)
+        l.setContentsMargins(5,5,5,5)
+        
+        st = "\uE73E " if q['status'] == "Finished" else ("\uE896 " if q['status'] == "Downloading" else "")
+        t = q['video'].get('title', 'Unknown')
+        if len(t) > 40: t = t[:37] + "..."
+        
+        l.addWidget(QLabel(f"<span style='font-family: \"Segoe MDL2 Assets\";'>{st}</span> {t}"), 1)
+        
+        rm_btn = QPushButton("\uE711")
+        rm_btn.setObjectName("iconBtn")
+        rm_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 14px;")
+        rm_btn.setFixedSize(26, 26)
+        rm_btn.clicked.connect(lambda checked=False, i=idx: self.remove_from_queue(i))
+        l.addWidget(rm_btn)
+        
+        placeholder.setObjectName("queueItemFinished" if q['status'] == "Finished" else "queueItemPending")
+        placeholder.style().unpolish(placeholder)
+        placeholder.style().polish(placeholder)
+        
+        placeholder.setProperty("has_ui", True)
+
+    def clear_queue_item_ui(self, placeholder):
+        layout = placeholder.layout()
+        if layout:
+            while layout.count():
+                item = layout.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+            placeholder.setLayout(None)
+            layout.deleteLater()
+        placeholder.setProperty("has_ui", False)
+
+    def lazy_load_visible_queue(self):
+        if not self.queue_items or not hasattr(self, 'queue_area'):
+            return
+            
+        scrollbar = self.queue_area.verticalScrollBar()
+        scroll_val = scrollbar.value()
+        viewport_height = self.queue_area.viewport().height()
+        
+        buffer = 200
+        load_top = scroll_val - buffer
+        load_bottom = scroll_val + viewport_height + buffer
+        
+        for i in range(self.queue_vbox.count()):
+            layout_item = self.queue_vbox.itemAt(i)
+            if layout_item and layout_item.widget():
+                placeholder = layout_item.widget()
+                q = placeholder.property("queue_item")
+                idx = placeholder.property("queue_index")
+                if q is None or idx is None:
+                    continue
+                    
+                y = placeholder.y()
+                h = placeholder.height()
+                
+                is_visible = (y + h >= load_top and y <= load_bottom)
+                has_ui = placeholder.property("has_ui")
+                
+                if is_visible:
+                    if not has_ui:
+                        self.build_queue_item_ui(placeholder, q, idx)
+                else:
+                    if has_ui:
+                        self.clear_queue_item_ui(placeholder)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        QTimer.singleShot(0, self.lazy_load_visible_results)
+        QTimer.singleShot(0, self.lazy_load_visible_queue)
+
     def _refresh_queue_display(self):
         while self.queue_vbox.count():
             item = self.queue_vbox.takeAt(0)
@@ -1320,25 +1519,30 @@ class MainApp(QMainWindow):
         self.queue_label.setText(f"Download Queue ({len(self.queue_items)})")
         
         for idx, q in enumerate(self.queue_items):
-            w = QWidget()
-            l = QHBoxLayout(w)
-            l.setContentsMargins(5,5,5,5)
+            placeholder = QWidget()
+            placeholder.setFixedHeight(36)
+            placeholder.setProperty("queue_item", q)
+            placeholder.setProperty("queue_index", idx)
+            placeholder.setProperty("has_ui", False)
+            self.queue_vbox.addWidget(placeholder)
             
-            st = "\uE73E " if q['status'] == "Finished" else ("\uE896 " if q['status'] == "Downloading" else "")
-            t = q['video'].get('title', 'Unknown')
-            if len(t) > 40: t = t[:37] + "..."
+        QTimer.singleShot(0, self.lazy_load_visible_queue)
             
-            l.addWidget(QLabel(f"<span style='font-family: \"Segoe MDL2 Assets\";'>{st}</span> {t}"), 1)
-            
-            rm_btn = QPushButton("\uE711")
-            rm_btn.setObjectName("iconBtn")
-            rm_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 14px;")
-            rm_btn.setFixedSize(26, 26)
-            rm_btn.clicked.connect(lambda checked=False, i=idx: self.remove_from_queue(i))
-            l.addWidget(rm_btn)
-            
-            w.setObjectName("queueItemFinished" if q['status'] == "Finished" else "queueItemPending")
-            self.queue_vbox.addWidget(w)
+        # Synchronize search result checkboxes with current queue state in a highly-optimized manner
+        queue_ids = {q['video']['id'] for q in self.queue_items if 'video' in q and 'id' in q['video']}
+        for i in range(self.results_vbox.count()):
+            layout_item = self.results_vbox.itemAt(i)
+            if layout_item and layout_item.widget():
+                widget = layout_item.widget()
+                checkboxes = widget.findChildren(QCheckBox)
+                for cb in checkboxes:
+                    vid_id = cb.property("video_id")
+                    if vid_id:
+                        cb.blockSignals(True)
+                        cb.setChecked(vid_id in queue_ids)
+                        cb.blockSignals(False)
+                        
+        self.update_queue_all_checkbox_state()
 
     def remove_from_queue(self, idx):
         if idx < len(self.queue_items):
