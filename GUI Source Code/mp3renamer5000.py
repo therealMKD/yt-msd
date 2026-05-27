@@ -30,6 +30,8 @@ def safe_print(msg):
     with print_lock:
         print(msg)
 
+available_threads = os.cpu_count()
+
 # ==========================================
 # LOUDNESS NORMALIZATION SETTINGS (For Music)
 # ==========================================
@@ -37,7 +39,7 @@ TARGET_LUFS = "-16"       # Balanced loudness target for music listening
 TRUE_PEAK = "-1.5"        # Prevents clipping
 LOUDNESS_RANGE = "11"     # LRA of 11 preserves dynamics (not squishing music range)
 BITRATE = "320k"          # High quality output bitrate
-MAX_WORKERS = 20          # Leveraging high thread-count CPUs (like the i9-13900K)
+MAX_WORKERS = available_threads // 2  # Auto-adjusts to half of available threads
 # ==========================================
 
 # Attempt to load mutagen for ID3 (MP3) and MP4 (M4A) tagging support
@@ -60,6 +62,8 @@ def print_banner():
     print(banner)
     print(f"{Colors.BOLD}Interactive MP3/M4A Renamer, Tagger & Loudness Normalizer{Colors.END}")
     print(f"{Colors.DIM}Converted from Rename-MP3s.ps1 • Powered by Python & FFmpeg{Colors.END}\n")
+    print(f"{Colors.BOLD}Available CPU Threads: {available_threads}{Colors.END}\n")
+    print(f"{Colors.BOLD}Using {MAX_WORKERS} CPU Threads for Processing{Colors.END}\n")
 
     if MUTAGEN_AVAILABLE:
         print(f"{Colors.GREEN}[✓] Mutagen library active. Automatic metadata tagging is enabled.{Colors.END}\n")
