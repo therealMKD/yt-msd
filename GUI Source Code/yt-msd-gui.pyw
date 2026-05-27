@@ -294,6 +294,7 @@ class MainApp(QMainWindow):
     thumbnails_loaded_signal = Signal(str, QPixmap)
     playback_started_signal = Signal(str, str, bool)
     queue_update_signal = Signal()
+    queue_status_changed_signal = Signal(int)
     dl_progress_signal = Signal(str)
 
     def __init__(self):
@@ -362,6 +363,7 @@ class MainApp(QMainWindow):
         self.search_failed_signal.connect(self._on_search_failed)
         self.playback_started_signal.connect(self._on_playback_started)
         self.queue_update_signal.connect(self._refresh_queue_display)
+        self.queue_status_changed_signal.connect(self._on_queue_status_changed)
         self.thumbnails_loaded_signal.connect(self._on_thumbnail_loaded)
         self.dl_progress_signal.connect(lambda txt: self.dl_progress_label.setText(txt))
         
@@ -1482,6 +1484,31 @@ class MainApp(QMainWindow):
         
         placeholder.setProperty("has_ui", True)
 
+    def _on_queue_status_changed(self, idx):
+        """Update only the status icon/color of a single queue item in-place, no full rebuild."""
+        if idx >= len(self.queue_items) or idx >= self.queue_vbox.count():
+            return
+        layout_item = self.queue_vbox.itemAt(idx)
+        if not layout_item or not layout_item.widget():
+            return
+        placeholder = layout_item.widget()
+        q = self.queue_items[idx]
+        # Keep the stored property up to date
+        placeholder.setProperty("queue_item", q)
+        # If widget is already rendered, patch its label in-place
+        if placeholder.property("has_ui"):
+            labels = placeholder.findChildren(QLabel)
+            if labels:
+                st = "\uE73E " if q['status'] == "Finished" else ("\uE896 " if q['status'] == "Downloading" else "")
+                t = q['video'].get('title', 'Unknown')
+                if len(t) > 40: t = t[:37] + "..."
+                labels[0].setText(f"<span style='font-family: \"Segoe MDL2 Assets\";'>{st}</span> {t}")
+            new_name = "queueItemFinished" if q['status'] == "Finished" else "queueItemPending"
+            if placeholder.objectName() != new_name:
+                placeholder.setObjectName(new_name)
+                placeholder.style().unpolish(placeholder)
+                placeholder.style().polish(placeholder)
+
     def clear_queue_item_ui(self, placeholder):
         layout = placeholder.layout()
         if layout:
@@ -1586,10 +1613,10 @@ class MainApp(QMainWindow):
         folder = self.path_combo.currentText()
         
         def bg_download():
-            for q in self.queue_items:
+            for idx, q in enumerate(self.queue_items):
                 if q['status'] == "Pending":
                     q['status'] = "Downloading"
-                    self.queue_update_signal.emit()
+                    self.queue_status_changed_signal.emit(idx)
                     try:
                         ydl_opts = {
                             'format': 'bestaudio/best',
@@ -1609,7 +1636,7 @@ class MainApp(QMainWindow):
                             ydl.download([f"https://www.youtube.com/watch?v={q['video']['id']}"])
                     except Exception: pass
                     q['status'] = "Finished"
-                    self.queue_update_signal.emit()
+                    self.queue_status_changed_signal.emit(idx)
             
             # Hacky callback to main thread
             self.status_signal.emit("Batch complete!", False, "#1abd33")
