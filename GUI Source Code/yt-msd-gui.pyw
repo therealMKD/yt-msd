@@ -326,6 +326,8 @@ class MainApp(QMainWindow):
         self.save_place = False
         self.last_session = {}
         self.last_search = ""
+        self.run_renamer = False
+        self.renamer_path = ""
         
         # Player Flags
         self.is_playing = False
@@ -406,6 +408,8 @@ class MainApp(QMainWindow):
                     self.appearance_mode = c.get('mode', 'Dark')
                     self.last_search = c.get('last_search', '')
                     self.save_place = c.get('save_place', False)
+                    self.run_renamer = c.get('run_renamer', False)
+                    self.renamer_path = c.get('renamer_path', '')
                     if self.save_place:
                         self.session_data = c.get('session_data', {})
         except Exception: pass
@@ -431,6 +435,8 @@ class MainApp(QMainWindow):
             'splitter_sizes': [self.main_splitter.sizes()[0]] + self.content_splitter.sizes() if hasattr(self, 'main_splitter') else self.splitter_sizes,
             'last_search': self.search_entry.text() if hasattr(self, 'search_entry') else self.last_search,
             'save_place': self.save_place,
+            'run_renamer': self.run_renamer_cb.isChecked() if hasattr(self, 'run_renamer_cb') else self.run_renamer,
+            'renamer_path': getattr(self, 'renamer_path', ''),
             'session_data': {
                 'search_results': self.search_results,
                 'playback_index': self.playback_index,
@@ -496,6 +502,12 @@ class MainApp(QMainWindow):
         self.last_search = ""
         self.show_thumbnails = False
         self.minimize_to_tray = False
+        self.run_renamer = False
+        self.renamer_path = ""
+        if hasattr(self, 'run_renamer_cb'):
+            self.run_renamer_cb.blockSignals(True)
+            self.run_renamer_cb.setChecked(False)
+            self.run_renamer_cb.blockSignals(False)
         self.splitter_sizes = [300, 800, 300]
         
         # Apply changes
@@ -635,7 +647,8 @@ class MainApp(QMainWindow):
         self.path_combo.addItems(self.recent_folders)
         if self.download_path not in self.recent_folders:
             self.path_combo.addItem(self.download_path)
-            self.path_combo.setCurrentText(self.download_path)
+        self.path_combo.setCurrentText(self.download_path)
+        self.path_combo.currentTextChanged.connect(self.on_path_changed)
         set_r.addWidget(self.path_combo, 1)
         
         self.browse_btn = QPushButton("\uE8B7")
@@ -646,6 +659,14 @@ class MainApp(QMainWindow):
         set_r.addWidget(self.browse_btn)
         set_r.addSpacing(6)
         c_layout.addLayout(set_r)
+        
+        option_r = QHBoxLayout()
+        self.run_renamer_cb = QCheckBox("Run MP3 Renamer after download")
+        self.run_renamer_cb.setChecked(self.run_renamer)
+        self.run_renamer_cb.toggled.connect(self.on_run_renamer_toggled)
+        option_r.addWidget(self.run_renamer_cb)
+        option_r.addStretch()
+        c_layout.addLayout(option_r)
         
         status_bar = QHBoxLayout()
         self.playing_label = QLabel("")
@@ -1149,7 +1170,7 @@ class MainApp(QMainWindow):
                     try:
                         cmd = [ffprobe_path, '-v', 'quiet', '-print_format', 'json', '-show_format', item['path']]
                         # 0x08000000 is CREATE_NO_WINDOW on Windows
-                        result = subprocess.run(cmd, capture_output=True, text=True, creationflags=0x08000000)
+                        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='ignore', creationflags=0x08000000)
                         if result.stdout:
                             data = json.loads(result.stdout)
                             tags = data.get('format', {}).get('tags', {})
@@ -1599,6 +1620,87 @@ class MainApp(QMainWindow):
         self.is_downloading = False
         self.dl_btn.setEnabled(True)
         self.dl_btn.setText("Download All")
+        if hasattr(self, 'run_renamer_cb') and self.run_renamer_cb.isChecked():
+            self.run_mp3_renamer()
+
+    def copy_download_path_to_clipboard(self):
+        path = self.path_combo.currentText()
+        if path:
+            QApplication.clipboard().setText(path)
+            self._on_status_update(f"Copied download path to clipboard: {path}", False, "#3B8ED0")
+
+    def on_run_renamer_toggled(self, checked):
+        self.run_renamer = checked
+        self.save_config()
+        if checked:
+            self.copy_download_path_to_clipboard()
+
+    def on_path_changed(self, path):
+        self.download_path = path
+        self.save_config()
+        if hasattr(self, 'run_renamer_cb') and self.run_renamer_cb.isChecked():
+            self.copy_download_path_to_clipboard()
+
+    def run_mp3_renamer(self):
+        import shutil
+        import subprocess
+        
+        self.copy_download_path_to_clipboard()
+        
+        script_name = "mp3renamer5000.py"
+        script_path = ""
+        
+        # Check first if we already have a saved path and it exists
+        if getattr(self, 'renamer_path', '') and os.path.exists(self.renamer_path):
+            script_path = self.renamer_path
+            
+        # Try to find mp3renamer5000.py in PATH
+        if not script_path:
+            script_path = shutil.which(script_name) or shutil.which("mp3renamer5000")
+        
+        # Fallback to the same folder as this python file
+        if not script_path:
+            same_folder_path = os.path.join(self.config_dir, script_name)
+            if os.path.exists(same_folder_path):
+                script_path = same_folder_path
+                
+        # Fallback to the discovered location if not in PATH or same folder
+        if not script_path:
+            desktop_paths = [
+                os.path.expanduser(r"~\OneDrive\Desktop\Code\mp3renamer5000.py"),
+                os.path.expanduser(r"~\Desktop\Code\mp3renamer5000.py")
+            ]
+            for dp in desktop_paths:
+                if os.path.exists(dp):
+                    script_path = dp
+                    break
+                    
+        # If all searches fail, prompt the user to locate the file
+        if not script_path:
+            selected_file, _ = QFileDialog.getOpenFileName(
+                self, 
+                "Locate MP3 Renamer Script (mp3renamer5000.py)", 
+                self.config_dir or "", 
+                "Python Files (*.py)"
+            )
+            if selected_file:
+                script_path = selected_file
+                self.renamer_path = selected_file
+                self.save_config()
+                self._on_status_update(f"Renamer path saved: {selected_file}", False, "#3B8ED0")
+                
+        if script_path:
+            try:
+                if os.path.isabs(script_path):
+                    # Launch interactive console script in a new window
+                    subprocess.Popen(f'start python "{script_path}"', shell=True)
+                else:
+                    subprocess.Popen(f'start {script_path}', shell=True)
+                self._on_status_update("Launched MP3 Renamer in a new window.", False, "#1abd33")
+            except Exception as e:
+                self._on_status_update(f"Failed to launch MP3 Renamer: {str(e)}", False, "red")
+        else:
+            self._on_status_update("No MP3 Renamer file selected.", False, "red")
 
     def browse_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Download Folder", self.path_combo.currentText() or "")
