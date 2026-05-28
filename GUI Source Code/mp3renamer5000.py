@@ -61,7 +61,6 @@ def print_banner():
 {Colors.END}"""
     print(banner)
     print(f"{Colors.BOLD}Interactive MP3/M4A Renamer, Tagger & Loudness Normalizer{Colors.END}")
-    print(f"{Colors.DIM}Converted from Rename-MP3s.ps1 • Powered by Python & FFmpeg{Colors.END}\n")
     print(f"{Colors.BOLD}Available CPU Threads: {available_threads}{Colors.END}\n")
     print(f"{Colors.BOLD}Using {MAX_WORKERS} CPU Threads for Processing{Colors.END}\n")
 
