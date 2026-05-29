@@ -498,12 +498,23 @@ def normalize_file(index, total, filepath):
     except Exception as e:
         return False, filepath.name, f"Failed to create temp file: {e}"
         
-    # 4. Assemble FFmpeg Command for static volume adjustment
+    # 4. Assemble FFmpeg Command: silence-trim front & back, then static volume adjustment
+    # silenceremove trims leading silence; the areverse/silenceremove/areverse trick trims trailing silence.
+    # SILENCE_THRESHOLD is -50 dB (near-total silence), 0.5s minimum duration to avoid clipping musical content.
+    SILENCE_THRESHOLD = "-50dB"
+    SILENCE_DURATION = "0.5"
+    af_chain = (
+        f"silenceremove=start_periods=1:start_duration={SILENCE_DURATION}:start_threshold={SILENCE_THRESHOLD},"
+        f"areverse,"
+        f"silenceremove=start_periods=1:start_duration={SILENCE_DURATION}:start_threshold={SILENCE_THRESHOLD},"
+        f"areverse,"
+        f"volume={final_gain:.2f}dB"
+    )
     command = [
         "ffmpeg",
         "-y",
         "-i", str(filepath),
-        "-af", f"volume={final_gain:.2f}dB"
+        "-af", af_chain
     ]
     
     # Dynamic Suffix Bitrate & Codec matching
