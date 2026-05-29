@@ -119,16 +119,9 @@ def clean_youtube_title(filename):
         "vertical video", "behind the scenes", "making of", "teaser", "trailer", "studio version"
     ]
     
-    # Regex to find parenthesized or bracketed blocks
-    bracket_pattern = r'(\([^\)]*\)|\[[^\]]*\])'
-    
-    def replace_bracket(match):
-        content = match.group(0).lower()
-        if any(kw in content for kw in junk_keywords):
-            return ""
-        return match.group(0)  # Keep it (e.g. "(feat. Guest)")
-        
-    title = re.sub(bracket_pattern, replace_bracket, title)
+    # Regex to find parenthesized, bracketed, or braced blocks
+    bracket_pattern = r'(\([^\)]*\)|\[[^\]]*\]|\{[^\}]*\})'
+    title = re.sub(bracket_pattern, "", title)
     
     # 2. Split and remove junk suffixes separated by symbols like |, //
     # e.g., "Artist - Title | Official Music Video"
