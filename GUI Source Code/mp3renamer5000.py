@@ -563,7 +563,19 @@ def main():
     print_banner()
     folder = select_folder()
     clean_and_tag_files(folder)
-    run_loudness_normalization(folder)
+    
+    # Prompt user for loudness normalization / volume adjustment
+    print(f"{Colors.BOLD}Volume Adjustment / Loudness Normalization{Colors.END}")
+    try:
+        choice = input(f"Do you want to run the volume adjustment pass? ({Colors.GREEN}y{Colors.END}/{Colors.RED}n{Colors.END}): ").strip().lower()
+        if choice in ('y', 'yes'):
+            run_loudness_normalization(folder)
+        else:
+            print(f"\n{Colors.YELLOW}Skipping volume adjustment pass.{Colors.END}\n")
+    except KeyboardInterrupt:
+        print(f"\n\n{Colors.RED}Process interrupted by user. Exiting.{Colors.END}")
+        sys.exit(0)
+        
     print(f"{Colors.CYAN}{Colors.BOLD}Done! All processes complete.{Colors.END}")
 
 if __name__ == "__main__":
