@@ -14,7 +14,7 @@ I don't want to deal with spotify's ads (Or pay for premium), and youtube playli
 The GUI version is currently "complete" at v1.0, but further feature updates are still coming, and I'm not going to complete this until they are finished.
 
 **Upcoming features in GUI v2.0**
-- Built-in support for renaming and metadata tagging downloaded files
+- Built-in support for renaming and metadata tagging downloaded files - and a much more improved algorithm compared to the current beta version, based on me downloading my massive playlists and using the script
 - Normalization option for files
 - Local file playlist logic (Saved filename lists to organize files that are in one big folder)
 - Import/Export logic for settings, music files, etc.
