@@ -354,31 +354,96 @@ def check_ffmpeg_available():
     except Exception:
         return False
 
+def measure_loudness(filepath):
+    """
+    Runs a fast first pass with FFmpeg loudnorm in print_format=json mode
+    to measure the file's integrated loudness (LUFS) and True Peak (dB).
+    Returns (input_i, input_tp, error_message) as (float, float, str).
+    """
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i", str(filepath),
+        "-af", f"loudnorm=I={TARGET_LUFS}:TP={TRUE_PEAK}:print_format=json",
+        "-f", "null",
+        "-"
+    ]
+    try:
+        startupinfo = None
+        if sys.platform == "win32":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding='utf-8',
+            errors='ignore',
+            startupinfo=startupinfo
+        )
+        if result.returncode != 0:
+            return None, None, f"FFmpeg exited with code {result.returncode}"
+            
+        stderr_output = result.stderr
+        json_match = re.search(r'\{\s*"input_i".*?\}', stderr_output, re.DOTALL)
+        if json_match:
+            import json
+            data = json.loads(json_match.group(0))
+            input_i = float(data.get("input_i", TARGET_LUFS))
+            input_tp = float(data.get("input_tp", TRUE_PEAK))
+            return input_i, input_tp, None
+        else:
+            return None, None, "Could not find loudnorm JSON block in FFmpeg output"
+    except Exception as e:
+        return None, None, str(e)
+
 def normalize_file(index, total, filepath):
     """
-    Runs FFmpeg loudnorm on a single file.
+    Applies static whole-track volume adjustment based on measured LUFS.
     Safeguards mutagen tags by backing them up and restoring them post-write.
     """
-    safe_print(f"[{index}/{total}] {Colors.CYAN}Normalizing:{Colors.END} {filepath.name}...")
-    
     suffix = filepath.suffix.lower()
     
     # 1. Back up existing Mutagen tags to prevent any tag loss during FFmpeg processing
     artist, title = read_metadata_tags(filepath)
     
-    # 2. Create temporary file
+    # 2. First Pass: Measure loudness & peaks
+    input_i, input_tp, err = measure_loudness(filepath)
+    if err:
+        return False, filepath.name, f"Loudness measurement failed: {err}"
+        
+    target_lufs = float(TARGET_LUFS)
+    true_peak_limit = float(TRUE_PEAK)
+    
+    # Calculate volume adjustment in dB
+    gain = target_lufs - input_i
+    
+    # Bound to avoid clipping beyond True Peak limit
+    max_gain = true_peak_limit - input_tp
+    final_gain = min(gain, max_gain)
+    
+    limit_str = " (Peak Limited)" if final_gain < gain else ""
+    safe_print(
+        f"[{index}/{total}] {Colors.CYAN}Processing:{Colors.END} {filepath.name}...\n"
+        f"  ├─ Measured: {input_i:+.2f} LUFS | True Peak: {input_tp:+.2f} dB\n"
+        f"  └─ Applying Whole-Track Gain: {final_gain:+.2f} dB{limit_str} (Target: {target_lufs} LUFS)"
+    )
+    
+    # 3. Create temporary file
     try:
         temp_fd, temp_path = tempfile.mkstemp(suffix=suffix)
         os.close(temp_fd)
     except Exception as e:
         return False, filepath.name, f"Failed to create temp file: {e}"
         
-    # 3. Assemble FFmpeg Command
+    # 4. Assemble FFmpeg Command for static volume adjustment
     command = [
         "ffmpeg",
         "-y",
         "-i", str(filepath),
-        "-af", f"loudnorm=I={TARGET_LUFS}:TP={TRUE_PEAK}:LRA={LOUDNESS_RANGE}"
+        "-af", f"volume={final_gain:.2f}dB"
     ]
     
     # Dynamic Suffix Bitrate & Codec matching
@@ -408,13 +473,19 @@ def normalize_file(index, total, filepath):
         
     command.append(temp_path)
     
-    # 4. Run FFmpeg
+    # 5. Run FFmpeg to write the static adjusted file
     try:
+        startupinfo = None
+        if sys.platform == "win32":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            
         result = subprocess.run(
             command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True
+            text=True,
+            startupinfo=startupinfo
         )
     except Exception as e:
         try:
@@ -430,13 +501,13 @@ def normalize_file(index, total, filepath):
             pass
         return False, filepath.name, result.stderr
         
-    # 5. Overwrite the original file with the normalized version
+    # 6. Overwrite the original file with the statically gain-adjusted version
     try:
         os.replace(temp_path, str(filepath))
     except Exception as e:
         return False, filepath.name, f"Failed to replace original file with temp: {e}"
         
-    # 6. Restore backed up Mutagen tags on the newly normalized file
+    # 7. Restore backed up Mutagen tags on the new file
     if (artist or title) and MUTAGEN_AVAILABLE:
         write_metadata_tags(filepath, artist, title)
         
@@ -444,14 +515,14 @@ def normalize_file(index, total, filepath):
 
 def run_loudness_normalization(folder_path):
     print(f"\n{Colors.CYAN}{Colors.BOLD}========================================{Colors.END}")
-    print(f"{Colors.CYAN}{Colors.BOLD}=== LOUDNESS NORMALIZATION PASS ========{Colors.END}")
+    print(f"{Colors.CYAN}{Colors.BOLD}=== TWO-PASS VOLUME ADJUSTMENT PASS ===={Colors.END}")
     print(f"{Colors.CYAN}{Colors.BOLD}========================================{Colors.END}\n")
     
     # Check if FFmpeg is installed
     if not check_ffmpeg_available():
         print(f"{Colors.YELLOW}[!] FFmpeg was not found in your system's PATH.{Colors.END}")
         print(f"{Colors.DIM}    Loudness normalization requires FFmpeg to process files.{Colors.END}")
-        print(f"{Colors.DIM}    Skipping normalization pass.{Colors.END}\n")
+        print(f"{Colors.DIM}    Skipping volume adjustment pass.{Colors.END}\n")
         return
         
     extensions = {".mp3", ".m4a"}
@@ -459,11 +530,11 @@ def run_loudness_normalization(folder_path):
     files = sorted([f for f in folder_path.iterdir() if f.is_file() and f.suffix.lower() in extensions])
     
     if not files:
-        print(f"{Colors.YELLOW}No MP3 or M4A files found to normalize.{Colors.END}\n")
+        print(f"{Colors.YELLOW}No MP3 or M4A files found to adjust.{Colors.END}\n")
         return
         
-    print(f"{Colors.GREEN}Starting normalization on {len(files)} files with {MAX_WORKERS} worker threads...{Colors.END}")
-    print(f"{Colors.DIM}Settings: Target={TARGET_LUFS} LUFS | Range={LOUDNESS_RANGE} LRA (Preserved Music Dynamics) | Peak={TRUE_PEAK} dB | Bitrate={BITRATE}{Colors.END}\n")
+    print(f"{Colors.GREEN}Starting static volume adjustment on {len(files)} files with {MAX_WORKERS} worker threads...{Colors.END}")
+    print(f"{Colors.DIM}Settings: Target Loudness={TARGET_LUFS} LUFS | Max Peak={TRUE_PEAK} dB | Output Bitrate={BITRATE}{Colors.END}\n")
     
     completed = 0
     failed = 0
@@ -477,13 +548,13 @@ def run_loudness_normalization(folder_path):
             success, filename, error = future.result()
             if success:
                 completed += 1
-                safe_print(f"  {Colors.GREEN}✔ Normalized:{Colors.END} {filename}")
+                safe_print(f"  {Colors.GREEN}✔ Adjusted Volume:{Colors.END} {filename}\n")
             else:
                 failed += 1
-                safe_print(f"\n  {Colors.RED}✘ Failed to normalize {filename}:{Colors.END}")
+                safe_print(f"\n  {Colors.RED}✘ Failed to adjust volume {filename}:{Colors.END}")
                 safe_print(f"{Colors.DIM}{error}{Colors.END}\n")
                 
-    print(f"\n{Colors.CYAN}{Colors.BOLD}Normalization Pass Complete!{Colors.END}")
+    print(f"\n{Colors.CYAN}{Colors.BOLD}Volume Adjustment Complete!{Colors.END}")
     print(f"  {Colors.GREEN}Success: {completed}{Colors.END} | {Colors.RED}Failed: {failed}{Colors.END}\n")
 
 # ==========================================
