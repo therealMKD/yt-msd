@@ -272,6 +272,68 @@ def clean_and_tag_files(folder_path):
             print(f"  {Colors.DIM}Tags found: [None/Missing]{Colors.END}")
             
         try:
+            # Smart artist-only mode: if predicted name has no ' - ' divider, it's title-only
+            if " - " not in predicted_name and predicted_name:
+                artist_prompt = (
+                    f"\n  {Colors.CYAN}No artist found.{Colors.END} Predicted title: {Colors.BOLD}{predicted_name}{Colors.END}\n"
+                    f"  Type the {Colors.GREEN}artist name{Colors.END} to build '{Colors.BOLD}Artist - {predicted_name}{Colors.END}',\n"
+                    f"  {Colors.YELLOW}'n'{Colors.END} to enter a full name manually, or {Colors.YELLOW}'s'{Colors.END} to skip:\n  > "
+                )
+                artist_input = input(artist_prompt).strip()
+                
+                if artist_input.lower() == 's':
+                    print(f"  {Colors.YELLOW}Skipped.{Colors.END}\n")
+                    continue
+                elif artist_input.lower() == 'n' or not artist_input:
+                    # Fall through to normal full-title prompt below
+                    pass
+                else:
+                    # Build "Artist - Title" from artist input + predicted title
+                    user_input = f"{artist_input} - {predicted_name}"
+                    # Clean and finalize
+                    final_name = clean_youtube_title(user_input)
+                    if not final_name:
+                        print(f"  {Colors.RED}Invalid name. Skipped.{Colors.END}\n")
+                        continue
+                    # Jump directly to rename/tag phase
+                    new_filename = f"{final_name}{suffix}"
+                    new_filepath = folder_path / new_filename
+                    renamed = False
+                    active_filepath = file
+                    if final_name != stem:
+                        if new_filepath.exists():
+                            print(f"  {Colors.RED}Error: A file named '{new_filename}' already exists. Skipping rename.{Colors.END}\n")
+                            continue
+                        try:
+                            file.rename(new_filepath)
+                            print(f"  {Colors.GREEN}Renamed to:{Colors.END} {new_filename}")
+                            active_filepath = new_filepath
+                            renamed = True
+                        except Exception as e:
+                            print(f"  {Colors.RED}Rename failed: {e}{Colors.END}\n")
+                            continue
+                    artist, title = None, None
+                    if " - " in final_name:
+                        parts = final_name.split(" - ", 1)
+                        artist = parts[0].strip()
+                        title = parts[1].strip()
+                    if artist and title:
+                        if MUTAGEN_AVAILABLE:
+                            success = write_metadata_tags(active_filepath, artist, title)
+                            if success:
+                                tag_status = "Renamed & Tagged" if renamed else "Tagged"
+                                print(f"  {Colors.GREEN}✔ {tag_status} successfully:{Colors.END} Artist='{artist}', Title='{title}'")
+                            else:
+                                print(f"  {Colors.YELLOW}Renamed, but failed to write metadata tags.{Colors.END}")
+                        else:
+                            if renamed:
+                                print(f"  {Colors.YELLOW}Renamed, but skipped tagging (Mutagen not available).{Colors.END}")
+                    else:
+                        print(f"  {Colors.YELLOW}Could not parse 'Artist - Title' format. Skipping metadata tagging.{Colors.END}")
+                    print()
+                    continue
+                    
+            # Normal full-title prompt (also reached when user typed 'n' in artist-only mode)
             prompt = f"\n  {Colors.BOLD}Accept predicted name?{Colors.END}\n  {Colors.CYAN}[ENTER]{Colors.END} to accept, type a new {Colors.BOLD}Artist - Title{Colors.END}, or type {Colors.YELLOW}'s'{Colors.END} to skip:\n  > "
             user_input = input(prompt).strip()
         except KeyboardInterrupt:
@@ -291,6 +353,7 @@ def clean_and_tag_files(folder_path):
         if not final_name:
             print(f"  {Colors.RED}Invalid name. Skipped.{Colors.END}\n")
             continue
+
             
         new_filename = f"{final_name}{suffix}"
         new_filepath = folder_path / new_filename
