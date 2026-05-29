@@ -630,19 +630,144 @@ def run_loudness_normalization(folder_path):
 
 # ==========================================
 
+def trim_silence_file(index, total, filepath):
+    """
+    Trims silence from the front and back of an audio file without any volume change.
+    Uses the same areverse trick as normalize_file but with a volume=0dB no-op.
+    """
+    safe_print(f"[{index}/{total}] {Colors.CYAN}Trimming silence:{Colors.END} {filepath.name}...")
+    
+    suffix = filepath.suffix.lower()
+    
+    # Back up tags
+    artist, title = read_metadata_tags(filepath)
+    
+    # Create temp file
+    try:
+        temp_fd, temp_path = tempfile.mkstemp(suffix=suffix)
+        os.close(temp_fd)
+    except Exception as e:
+        return False, filepath.name, f"Failed to create temp file: {e}"
+    
+    SILENCE_THRESHOLD = "-50dB"
+    SILENCE_DURATION = "0.5"
+    af_chain = (
+        f"silenceremove=start_periods=1:start_duration={SILENCE_DURATION}:start_threshold={SILENCE_THRESHOLD},"
+        f"areverse,"
+        f"silenceremove=start_periods=1:start_duration={SILENCE_DURATION}:start_threshold={SILENCE_THRESHOLD},"
+        f"areverse"
+    )
+    command = ["ffmpeg", "-y", "-i", str(filepath), "-af", af_chain]
+    
+    if suffix == ".mp3":
+        command += ["-codec:a", "libmp3lame", "-b:a", BITRATE]
+    elif suffix == ".m4a":
+        command += ["-codec:a", "aac", "-b:a", BITRATE]
+    else:
+        command += ["-b:a", BITRATE]
+    
+    command += ["-map_metadata", "0"]
+    if suffix == ".m4a":
+        command += ["-movflags", "+faststart"]
+    command.append(temp_path)
+    
+    try:
+        startupinfo = None
+        if sys.platform == "win32":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            startupinfo=startupinfo
+        )
+    except Exception as e:
+        try:
+            os.remove(temp_path)
+        except:
+            pass
+        return False, filepath.name, f"FFmpeg execution failed: {e}"
+    
+    if result.returncode != 0:
+        try:
+            os.remove(temp_path)
+        except:
+            pass
+        return False, filepath.name, result.stderr
+    
+    try:
+        os.replace(temp_path, str(filepath))
+    except Exception as e:
+        return False, filepath.name, f"Failed to replace original file with temp: {e}"
+    
+    if (artist or title) and MUTAGEN_AVAILABLE:
+        write_metadata_tags(filepath, artist, title)
+    
+    return True, filepath.name, None
+
+def run_silence_trim(folder_path):
+    print(f"\n{Colors.CYAN}{Colors.BOLD}====================================={Colors.END}")
+    print(f"{Colors.CYAN}{Colors.BOLD}=== SILENCE TRIM PASS ==============={Colors.END}")
+    print(f"{Colors.CYAN}{Colors.BOLD}====================================={Colors.END}\n")
+    
+    if not check_ffmpeg_available():
+        print(f"{Colors.YELLOW}[!] FFmpeg was not found in your system's PATH.{Colors.END}")
+        print(f"{Colors.DIM}    Skipping silence trim pass.{Colors.END}\n")
+        return
+    
+    extensions = {".mp3", ".m4a"}
+    files = sorted([f for f in folder_path.iterdir() if f.is_file() and f.suffix.lower() in extensions])
+    
+    if not files:
+        print(f"{Colors.YELLOW}No MP3 or M4A files found to trim.{Colors.END}\n")
+        return
+    
+    print(f"{Colors.GREEN}Trimming silence on {len(files)} files with {MAX_WORKERS} worker threads...{Colors.END}")
+    print(f"{Colors.DIM}Threshold: -50 dB | Min silence duration: 0.5s{Colors.END}\n")
+    
+    completed = 0
+    failed = 0
+    
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [executor.submit(trim_silence_file, idx, len(files), file)
+                   for idx, file in enumerate(files, 1)]
+        for future in as_completed(futures):
+            success, filename, error = future.result()
+            if success:
+                completed += 1
+                safe_print(f"  {Colors.GREEN}✔ Trimmed:{Colors.END} {filename}")
+            else:
+                failed += 1
+                safe_print(f"\n  {Colors.RED}✘ Failed to trim {filename}:{Colors.END}")
+                safe_print(f"{Colors.DIM}{error}{Colors.END}\n")
+    
+    print(f"\n{Colors.CYAN}{Colors.BOLD}Silence Trim Complete!{Colors.END}")
+    print(f"  {Colors.GREEN}Success: {completed}{Colors.END} | {Colors.RED}Failed: {failed}{Colors.END}\n")
+
+# ==========================================
+
 def main():
     print_banner()
     folder = select_folder()
     clean_and_tag_files(folder)
     
-    # Prompt user for loudness normalization / volume adjustment
-    print(f"{Colors.BOLD}Volume Adjustment / Loudness Normalization{Colors.END}")
     try:
+        # Prompt user for loudness normalization / volume adjustment
+        print(f"{Colors.BOLD}Volume Adjustment / Loudness Normalization{Colors.END}")
         choice = input(f"Do you want to run the volume adjustment pass? ({Colors.GREEN}y{Colors.END}/{Colors.RED}n{Colors.END}): ").strip().lower()
         if choice in ('y', 'yes'):
             run_loudness_normalization(folder)
         else:
             print(f"\n{Colors.YELLOW}Skipping volume adjustment pass.{Colors.END}\n")
+            # Offer standalone silence trimming since normalization was skipped
+            print(f"{Colors.BOLD}Silence Trimming{Colors.END}")
+            trim_choice = input(f"Do you want to trim silence from the front and back of each file? ({Colors.GREEN}y{Colors.END}/{Colors.RED}n{Colors.END}): ").strip().lower()
+            if trim_choice in ('y', 'yes'):
+                run_silence_trim(folder)
+            else:
+                print(f"\n{Colors.YELLOW}Skipping silence trim pass.{Colors.END}\n")
     except KeyboardInterrupt:
         print(f"\n\n{Colors.RED}Process interrupted by user. Exiting.{Colors.END}")
         sys.exit(0)
