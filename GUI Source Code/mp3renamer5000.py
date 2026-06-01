@@ -33,13 +33,15 @@ def safe_print(msg):
 available_threads = os.cpu_count()
 
 # ==========================================
-# LOUDNESS NORMALIZATION SETTINGS (For Music)
+# LOUDNESS NORMALIZATION & TRIM SETTINGS
 # ==========================================
 TARGET_LUFS = "-16"       # Balanced loudness target for music listening
 TRUE_PEAK = "-1.5"        # Prevents clipping
 LOUDNESS_RANGE = "11"     # LRA of 11 preserves dynamics (not squishing music range)
 BITRATE = "320k"          # High quality output bitrate
 MAX_WORKERS = available_threads // 2  # Auto-adjusts to half of available threads
+SILENCE_THRESHOLD = "-60dB" # Sensitive threshold to prevent cutting quiet outros
+SILENCE_DURATION = "0.5"
 # ==========================================
 
 # Attempt to load mutagen for ID3 (MP3) and MP4 (M4A) tagging support
@@ -106,11 +108,42 @@ def select_folder():
 
 def clean_youtube_title(filename):
     """
-    Predicts a clean 'Artist - Title' filename by stripping YouTube junk patterns.
+    Predicts a clean 'Artist - Title' filename by stripping YouTube junk patterns
+    and applying custom parsing logic rules.
     """
     title = filename
     
-    # 1. Parenthesized or bracketed parts containing common YouTube video tags
+    # 1. Convert em dashes, en dashes, or multiple hyphens to standard hyphens
+    title = re.sub(r'[—–]+', '-', title)
+    title = re.sub(r'-+', '-', title)
+
+    # 2. Handle Pipe symbols (|)
+    if "|" in title:
+        if "-" not in title:
+            # If there is a pipe but no dash separator, turn the pipe into a separator
+            title = title.replace("|", " - ")
+        else:
+            # Remove anything after a "|" symbol and any spaces before it
+            title = title.split("|")[0].rstrip()
+
+    # 3. Handle features "ft.", "feat.", "featuring" (case-insensitive)
+    title = re.compile(r'\b(ft|feat|featuring)\b\.?', re.IGNORECASE).split(title)[0]
+
+    # 4. Remove anything directly connected to a # symbol (hashtags)
+    title = re.sub(r'#\S+', '', title)
+
+    # 5. Remove all single and double quotes (keep the text inside them)
+    title = title.replace('"', '').replace("'", "")
+
+    # 6. Remove all emojis and miscellaneous symbols
+    try:
+        # Filter using regex matching outside typical text ranges (covers emoticons, symbols, pictographs)
+        emoji_pattern = re.compile(r'[\U00010000-\U0010ffff\u2600-\u27bf]', flags=re.UNICODE)
+        title = emoji_pattern.sub('', title)
+    except re.error:
+        pass
+
+    # 7. Parenthesized or bracketed parts containing common YouTube video tags
     junk_keywords = [
         "official", "video", "audio", "lyric", "lyrics", "hq", "hd", "4k", "1080p", "720p",
         "visualizer", "music video", "clip", "full song", "remaster", "remastered",
@@ -119,40 +152,46 @@ def clean_youtube_title(filename):
         "vertical video", "behind the scenes", "making of", "teaser", "trailer", "studio version"
     ]
     
-    # Regex to find parenthesized, bracketed, or braced blocks
     bracket_pattern = r'(\([^\)]*\)|\[[^\]]*\]|\{[^\}]*\})'
     title = re.sub(bracket_pattern, "", title)
     
-    # 2. Split and remove junk suffixes separated by symbols like |, //
-    # e.g., "Artist - Title | Official Music Video"
-    for sep in ["|", "//", "///"]:
+    # 8. Split and remove junk suffixes separated by symbols like //
+    for sep in ["//", "///"]:
         if sep in title:
             parts = title.split(sep)
             new_parts = []
             for i, part in enumerate(parts):
                 part_strip = part.strip()
                 part_lower = part_strip.lower()
-                # If it's a following part and contains junk OR is empty, strip it
                 if i > 0 and (any(kw in part_lower for kw in junk_keywords) or len(part_strip) == 0):
                     continue
                 new_parts.append(part)
             if new_parts:
                 title = sep.join(new_parts)
-                
-    # 3. Clean up extra whitespaces and dangling hyphens
-    title = re.sub(r'\s+', ' ', title)  # Collapse multiple spaces
-    title = title.strip()
+
+    # 9. Clean up multiple whitespaces and ensure uniform formatting around separators
+    title = re.sub(r'\s+', ' ', title).strip()
     
-    title = re.sub(r'\s*-\s*$', '', title)  # Remove trailing hyphen
-    title = re.sub(r'^\s*-\s*', '', title)  # Remove leading hyphen
-    title = title.strip()
+    # Handle spacing / formatting around standard separators safely
+    if " - " in title:
+        parts = title.split(" - ", 1)
+        artist_part = parts[0].strip()
+        title_part = parts[1].strip()
+
+        # If the artist area has a comma, assume it is a second artist and remove everything after it
+        if "," in artist_part:
+            artist_part = artist_part.split(",")[0].strip()
+
+        title = f"{artist_part} - {title_part}"
+    else:
+        # If no explicit separator, fix edge-case dangling dashes or trailing spaces
+        title = re.sub(r'\s*-\s*$', '', title)
+        title = re.sub(r'^\s*-\s*', '', title)
+        title = title.strip()
     
-    # 4. Clean invalid Windows filename characters
-    # Invalid: \ / : * ? " < > |
+    # 10. Clean invalid Windows filename characters
     invalid_chars = r'[\\/:*?"<>|]'
     title = re.sub(invalid_chars, '_', title)
-    
-    # Double check space collapse after replace
     title = re.sub(r'\s+', ' ', title).strip()
     
     return title
@@ -213,7 +252,6 @@ def write_metadata_tags(filepath, artist, title):
             try:
                 tags = EasyMP4(filepath)
             except Exception:
-                # Fallback / create empty tags structure
                 tags = EasyMP4(filepath)
             tags["artist"] = artist
             tags["title"] = title
@@ -225,7 +263,6 @@ def write_metadata_tags(filepath, artist, title):
     return False
 
 def clean_and_tag_files(folder_path):
-    # Find all .mp3 and .m4a files, sorted by name
     extensions = {".mp3", ".m4a"}
     files = sorted([f for f in folder_path.iterdir() if f.is_file() and f.suffix.lower() in extensions])
     
@@ -235,32 +272,23 @@ def clean_and_tag_files(folder_path):
         
     print(f"{Colors.GREEN}Found {len(files)} audio files for renaming.{Colors.END}\n")
     
-    for idx, file in enumerate(files, 1):
+    idx = 1
+    while idx <= len(files):
+        file = files[idx - 1]
         stem = file.stem
         suffix = file.suffix.lower()
         
-        # 1. Predict clean name
         predicted_name = clean_youtube_title(stem)
-        
-        # 2. Extract components
-        predicted_artist, predicted_title = None, None
-        if " - " in predicted_name:
-            parts = predicted_name.split(" - ", 1)
-            predicted_artist = parts[0].strip()
-            predicted_title = parts[1].strip()
-            
-        # 3. Check existing metadata
         existing_artist, existing_title = read_metadata_tags(file)
         
-        # Check if the file is already formatted correctly on disk AND has metadata tags
         filename_is_correct = (predicted_name == stem and " - " in stem)
         has_valid_tags = bool(existing_artist and existing_title)
         
         if filename_is_correct and has_valid_tags:
             print(f"{Colors.DIM}[{idx}/{len(files)}] {Colors.GREEN}✔ Already formatted and tagged: {Colors.END}{file.name}")
+            idx += 1
             continue
             
-        # 4. User Interaction Prompt
         print(f"{Colors.DIM}─" * 60)
         print(f"{Colors.BOLD}[{idx}/{len(files)}] File: {Colors.END}{file.name}")
         print(f"  {Colors.YELLOW}Original  :{Colors.END} {stem}")
@@ -272,7 +300,6 @@ def clean_and_tag_files(folder_path):
             print(f"  {Colors.DIM}Tags found: [None/Missing]{Colors.END}")
             
         try:
-            # Smart artist-only mode: if predicted name has no ' - ' divider, it's title-only
             if " - " not in predicted_name and predicted_name:
                 artist_prompt = (
                     f"\n  {Colors.CYAN}No artist found.{Colors.END} Predicted title: {Colors.BOLD}{predicted_name}{Colors.END}\n"
@@ -283,19 +310,18 @@ def clean_and_tag_files(folder_path):
                 
                 if artist_input.lower() == 's':
                     print(f"  {Colors.YELLOW}Skipped.{Colors.END}\n")
+                    idx += 1
                     continue
                 elif artist_input.lower() == 'n' or not artist_input:
-                    # Fall through to normal full-title prompt below
                     pass
                 else:
-                    # Build "Artist - Title" from artist input + predicted title
                     user_input = f"{artist_input} - {predicted_name}"
-                    # Clean and finalize
                     final_name = clean_youtube_title(user_input)
                     if not final_name:
                         print(f"  {Colors.RED}Invalid name. Skipped.{Colors.END}\n")
+                        idx += 1
                         continue
-                    # Jump directly to rename/tag phase
+                    
                     new_filename = f"{final_name}{suffix}"
                     new_filepath = folder_path / new_filename
                     renamed = False
@@ -303,6 +329,7 @@ def clean_and_tag_files(folder_path):
                     if final_name != stem:
                         if new_filepath.exists():
                             print(f"  {Colors.RED}Error: A file named '{new_filename}' already exists. Skipping rename.{Colors.END}\n")
+                            idx += 1
                             continue
                         try:
                             file.rename(new_filepath)
@@ -311,6 +338,7 @@ def clean_and_tag_files(folder_path):
                             renamed = True
                         except Exception as e:
                             print(f"  {Colors.RED}Rename failed: {e}{Colors.END}\n")
+                            idx += 1
                             continue
                     artist, title = None, None
                     if " - " in final_name:
@@ -331,10 +359,10 @@ def clean_and_tag_files(folder_path):
                     else:
                         print(f"  {Colors.YELLOW}Could not parse 'Artist - Title' format. Skipping metadata tagging.{Colors.END}")
                     print()
+                    idx += 1
                     continue
                     
-            # Normal full-title prompt (also reached when user typed 'n' in artist-only mode)
-            prompt = f"\n  {Colors.BOLD}Accept predicted name?{Colors.END}\n  {Colors.CYAN}[ENTER]{Colors.END} to accept, type a new {Colors.BOLD}Artist - Title{Colors.END}, or type {Colors.YELLOW}'s'{Colors.END} to skip:\n  > "
+            prompt = f"\n  {Colors.BOLD}Accept predicted name?{Colors.END}\n  {Colors.CYAN}[ENTER]{Colors.END} to accept, type {Colors.GREEN}'f'{Colors.END} to flip Artist/Title, type a new {Colors.BOLD}Artist - Title{Colors.END}, or {Colors.YELLOW}'s'{Colors.END} to skip:\n  > "
             user_input = input(prompt).strip()
         except KeyboardInterrupt:
             print(f"\n\n{Colors.RED}Process interrupted by user. Exiting.{Colors.END}")
@@ -342,29 +370,40 @@ def clean_and_tag_files(folder_path):
             
         if user_input.lower() == 's':
             print(f"  {Colors.YELLOW}Skipped.{Colors.END}\n")
+            idx += 1
             continue
+
+        if user_input.lower() == 'f':
+            # Flip the logic layout order of Artist and Title
+            if " - " in predicted_name:
+                parts = predicted_name.split(" - ", 1)
+                flipped_name = f"{parts[1]} - {parts[0]}"
+                predicted_name = clean_youtube_title(flipped_name)
+                print(f"  {Colors.CYAN}Flipped Layout Prediction to:{Colors.END} {predicted_name}")
+                # Loop back to let the user review/approve the flipped layout
+                continue
+            else:
+                print(f"  {Colors.RED}Cannot flip; no ' - ' separator detected!{Colors.END}")
+                continue
             
-        # Decide final name
         final_name = user_input if user_input else predicted_name
-        
-        # Clean final name in case the user typed invalid characters
         final_name = clean_youtube_title(final_name)
         
         if not final_name:
             print(f"  {Colors.RED}Invalid name. Skipped.{Colors.END}\n")
+            idx += 1
             continue
 
-            
         new_filename = f"{final_name}{suffix}"
         new_filepath = folder_path / new_filename
         
-        # 5. Rename file if name has changed
         renamed = False
         active_filepath = file
         
         if final_name != stem:
             if new_filepath.exists():
                 print(f"  {Colors.RED}Error: A file named '{new_filename}' already exists. Skipping rename.{Colors.END}\n")
+                idx += 1
                 continue
             try:
                 file.rename(new_filepath)
@@ -373,10 +412,9 @@ def clean_and_tag_files(folder_path):
                 renamed = True
             except Exception as e:
                 print(f"  {Colors.RED}Rename failed: {e}{Colors.END}\n")
+                idx += 1
                 continue
                 
-        # 6. Tag metadata
-        # Re-split final name for artist/title metadata tagging
         artist, title = None, None
         if " - " in final_name:
             parts = final_name.split(" - ", 1)
@@ -398,6 +436,7 @@ def clean_and_tag_files(folder_path):
             print(f"  {Colors.YELLOW}Could not parse 'Artist - Title' format. Skipping metadata tagging.{Colors.END}")
             
         print()
+        idx += 1
 
 # ==========================================
 # LOUDNESS NORMALIZATION IMPLEMENTATION
@@ -415,11 +454,6 @@ def check_ffmpeg_available():
         return False
 
 def measure_loudness(filepath):
-    """
-    Runs a fast first pass with FFmpeg loudnorm in print_format=json mode
-    to measure the file's integrated loudness (LUFS) and True Peak (dB).
-    Returns (input_i, input_tp, error_message) as (float, float, str).
-    """
     command = [
         "ffmpeg",
         "-y",
@@ -460,16 +494,9 @@ def measure_loudness(filepath):
         return None, None, str(e)
 
 def normalize_file(index, total, filepath):
-    """
-    Applies static whole-track volume adjustment based on measured LUFS.
-    Safeguards mutagen tags by backing them up and restoring them post-write.
-    """
     suffix = filepath.suffix.lower()
-    
-    # 1. Back up existing Mutagen tags to prevent any tag loss during FFmpeg processing
     artist, title = read_metadata_tags(filepath)
     
-    # 2. First Pass: Measure loudness & peaks
     input_i, input_tp, err = measure_loudness(filepath)
     if err:
         return False, filepath.name, f"Loudness measurement failed: {err}"
@@ -477,10 +504,7 @@ def normalize_file(index, total, filepath):
     target_lufs = float(TARGET_LUFS)
     true_peak_limit = float(TRUE_PEAK)
     
-    # Calculate volume adjustment in dB
     gain = target_lufs - input_i
-    
-    # Bound to avoid clipping beyond True Peak limit
     max_gain = true_peak_limit - input_tp
     final_gain = min(gain, max_gain)
     
@@ -491,18 +515,12 @@ def normalize_file(index, total, filepath):
         f"  └─ Applying Whole-Track Gain: {final_gain:+.2f} dB{limit_str} (Target: {target_lufs} LUFS)"
     )
     
-    # 3. Create temporary file
     try:
         temp_fd, temp_path = tempfile.mkstemp(suffix=suffix)
         os.close(temp_fd)
     except Exception as e:
         return False, filepath.name, f"Failed to create temp file: {e}"
         
-    # 4. Assemble FFmpeg Command: silence-trim front & back, then static volume adjustment
-    # silenceremove trims leading silence; the areverse/silenceremove/areverse trick trims trailing silence.
-    # SILENCE_THRESHOLD is -50 dB (near-total silence), 0.5s minimum duration to avoid clipping musical content.
-    SILENCE_THRESHOLD = "-50dB"
-    SILENCE_DURATION = "0.5"
     af_chain = (
         f"silenceremove=start_periods=1:start_duration={SILENCE_DURATION}:start_threshold={SILENCE_THRESHOLD},"
         f"areverse,"
@@ -517,34 +535,19 @@ def normalize_file(index, total, filepath):
         "-af", af_chain
     ]
     
-    # Dynamic Suffix Bitrate & Codec matching
     if suffix == ".mp3":
-        command += [
-            "-codec:a", "libmp3lame",
-            "-b:a", BITRATE,
-        ]
+        command += ["-codec:a", "libmp3lame", "-b:a", BITRATE]
     elif suffix == ".m4a":
-        command += [
-            "-codec:a", "aac",
-            "-b:a", BITRATE,
-        ]
+        command += ["-codec:a", "aac", "-b:a", BITRATE]
     else:
-        command += [
-            "-b:a", BITRATE,
-        ]
+        command += ["-b:a", BITRATE]
         
-    # Keep metadata map and apply faststart only for M4A containers
-    command += [
-        "-map_metadata", "0",
-    ]
+    command += ["-map_metadata", "0"]
     if suffix == ".m4a":
-        command += [
-            "-movflags", "+faststart",
-        ]
+        command += ["-movflags", "+faststart"]
         
     command.append(temp_path)
     
-    # 5. Run FFmpeg to write the static adjusted file
     try:
         startupinfo = None
         if sys.platform == "win32":
@@ -572,13 +575,11 @@ def normalize_file(index, total, filepath):
             pass
         return False, filepath.name, result.stderr
         
-    # 6. Overwrite the original file with the statically gain-adjusted version
     try:
         os.replace(temp_path, str(filepath))
     except Exception as e:
         return False, filepath.name, f"Failed to replace original file with temp: {e}"
         
-    # 7. Restore backed up Mutagen tags on the new file
     if (artist or title) and MUTAGEN_AVAILABLE:
         write_metadata_tags(filepath, artist, title)
         
@@ -589,7 +590,6 @@ def run_loudness_normalization(folder_path):
     print(f"{Colors.CYAN}{Colors.BOLD}=== TWO-PASS VOLUME ADJUSTMENT PASS ===={Colors.END}")
     print(f"{Colors.CYAN}{Colors.BOLD}========================================{Colors.END}\n")
     
-    # Check if FFmpeg is installed
     if not check_ffmpeg_available():
         print(f"{Colors.YELLOW}[!] FFmpeg was not found in your system's PATH.{Colors.END}")
         print(f"{Colors.DIM}    Loudness normalization requires FFmpeg to process files.{Colors.END}")
@@ -597,7 +597,6 @@ def run_loudness_normalization(folder_path):
         return
         
     extensions = {".mp3", ".m4a"}
-    # Scan folder again to grab all audio files (renamed or not)
     files = sorted([f for f in folder_path.iterdir() if f.is_file() and f.suffix.lower() in extensions])
     
     if not files:
@@ -632,25 +631,19 @@ def run_loudness_normalization(folder_path):
 
 def trim_silence_file(index, total, filepath):
     """
-    Trims silence from the front and back of an audio file without any volume change.
-    Uses the same areverse trick as normalize_file but with a volume=0dB no-op.
+    Trims silence from the front and back of an audio file safely using areverse.
     """
     safe_print(f"[{index}/{total}] {Colors.CYAN}Trimming silence:{Colors.END} {filepath.name}...")
     
     suffix = filepath.suffix.lower()
-    
-    # Back up tags
     artist, title = read_metadata_tags(filepath)
     
-    # Create temp file
     try:
         temp_fd, temp_path = tempfile.mkstemp(suffix=suffix)
         os.close(temp_fd)
     except Exception as e:
         return False, filepath.name, f"Failed to create temp file: {e}"
     
-    SILENCE_THRESHOLD = "-50dB"
-    SILENCE_DURATION = "0.5"
     af_chain = (
         f"silenceremove=start_periods=1:start_duration={SILENCE_DURATION}:start_threshold={SILENCE_THRESHOLD},"
         f"areverse,"
@@ -725,7 +718,7 @@ def run_silence_trim(folder_path):
         return
     
     print(f"{Colors.GREEN}Trimming silence on {len(files)} files with {MAX_WORKERS} worker threads...{Colors.END}")
-    print(f"{Colors.DIM}Threshold: -50 dB | Min silence duration: 0.5s{Colors.END}\n")
+    print(f"{Colors.DIM}Threshold: {SILENCE_THRESHOLD} | Min silence duration: {SILENCE_DURATION}s{Colors.END}\n")
     
     completed = 0
     failed = 0
@@ -754,14 +747,12 @@ def main():
     clean_and_tag_files(folder)
     
     try:
-        # Prompt user for loudness normalization / volume adjustment
         print(f"{Colors.BOLD}Volume Adjustment / Loudness Normalization{Colors.END}")
         choice = input(f"Do you want to run the volume adjustment pass? ({Colors.GREEN}y{Colors.END}/{Colors.RED}n{Colors.END}): ").strip().lower()
         if choice in ('y', 'yes'):
             run_loudness_normalization(folder)
         else:
             print(f"\n{Colors.YELLOW}Skipping volume adjustment pass.{Colors.END}\n")
-            # Offer standalone silence trimming since normalization was skipped
             print(f"{Colors.BOLD}Silence Trimming{Colors.END}")
             trim_choice = input(f"Do you want to trim silence from the front and back of each file? ({Colors.GREEN}y{Colors.END}/{Colors.RED}n{Colors.END}): ").strip().lower()
             if trim_choice in ('y', 'yes'):
