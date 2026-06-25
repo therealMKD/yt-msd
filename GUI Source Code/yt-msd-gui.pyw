@@ -1252,12 +1252,42 @@ class MainApp(QMainWindow):
         
         def bg_search():
             try:
-                with yt_dlp.YoutubeDL({'quiet': True, 'extract_flat': True}) as ydl:
-                    if "youtube.com" in query or "youtu.be" in query or "http" in query:
+                if "youtube.com" in query or "youtu.be" in query or "http" in query:
+                    ydl_opts = {
+                        'quiet': True,
+                        'extract_flat': True,
+                        'playlist_items': '1-100'
+                    }
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                         info = ydl.extract_info(query, download=False)
-                        if 'entries' in info: res = info['entries']
-                        else: res = [info]
+                    
+                    if info and 'entries' in info:
+                        res = [e for e in info['entries'] if e]
+                        if len(info['entries']) >= 100:
+                            start_idx = 101
+                            chunk_size = 100
+                            while True:
+                                self.status_signal.emit(f"Searching... (Retrieved {len(res)} items)", False, "#3B8ED0")
+                                ydl_opts_chunk = {
+                                    'quiet': True,
+                                    'extract_flat': True,
+                                    'playlist_items': f"{start_idx}-{start_idx + chunk_size - 1}"
+                                }
+                                with yt_dlp.YoutubeDL(ydl_opts_chunk) as ydl_chunk:
+                                    chunk_info = ydl_chunk.extract_info(query, download=False)
+                                    if not chunk_info or 'entries' not in chunk_info:
+                                        break
+                                    entries = [e for e in chunk_info['entries'] if e]
+                                    if not entries:
+                                        break
+                                    res.extend(entries)
+                                    if len(chunk_info['entries']) < chunk_size:
+                                        break
+                                    start_idx += chunk_size
                     else:
+                        res = [info] if info else []
+                else:
+                    with yt_dlp.YoutubeDL({'quiet': True, 'extract_flat': True}) as ydl:
                         info = ydl.extract_info(f"ytsearch15:{query}", download=False)
                         res = [e for e in info['entries'] if e.get('id')]
                         
