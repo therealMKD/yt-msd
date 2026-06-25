@@ -1,5 +1,6 @@
 # Open Source Software under the Apache License, Version 2.0
 # PySide6 version of yt-msd
+# Programmed with Antigravity, if you don't like it, don't use it.
 
 import os
 import sys
