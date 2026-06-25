@@ -1,5 +1,0 @@
-- Migrate to Pyside 6 - Partially completed
-- Finish up local file support
-- Local playlist support
-- Audio file metadata reading/editing
-- Import/Export logic (Config, songs, playlists)
