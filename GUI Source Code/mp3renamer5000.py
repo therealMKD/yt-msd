@@ -106,6 +106,14 @@ def select_folder():
         
     return path
 
+def is_romanized(text):
+    # Check if the text contains non-romanized scripts (CJK, Cyrillic, Greek, Arabic)
+    non_roman = re.search(
+        r'[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af\u0400-\u04ff\u0370-\u03ff\u0600-\u06ff]',
+        text
+    )
+    return non_roman is None
+
 def clean_youtube_title(filename):
     """
     Predicts a clean 'Artist - Title' filename by stripping YouTube junk patterns
@@ -113,11 +121,23 @@ def clean_youtube_title(filename):
     """
     title = filename
     
-    # 1. Convert em dashes, en dashes, or multiple hyphens to standard hyphens
-    title = re.sub(r'[—–]+', '-', title)
+    # 1. Convert fancy characters to standard ones
+    # Fancy hyphens
+    title = re.sub(r'[\u2010-\u2015—–‐‑‒―]+', '-', title)
     title = re.sub(r'-+', '-', title)
+    # Fancy vertical bars
+    title = re.sub(r'[｜│┃ǀ]+', '|', title)
+    # Fancy colons
+    title = title.replace('：', ':')
+    # Fancy single quotes
+    title = title.replace('’', "'").replace('‘', "'").replace('`', "'").replace('´', "'")
+    # Fancy double quotes
+    title = title.replace('“', '"').replace('”', '"')
 
-    # 2. Handle Pipe symbols (|)
+    # 2. Turn colons ' : ' into separators
+    title = re.sub(r'\s*:\s*', ' - ', title)
+
+    # 3. Handle Pipe symbols (|)
     if "|" in title:
         if "-" not in title:
             # If there is a pipe but no dash separator, turn the pipe into a separator
@@ -126,24 +146,46 @@ def clean_youtube_title(filename):
             # Remove anything after a "|" symbol and any spaces before it
             title = title.split("|")[0].rstrip()
 
-    # 3. Handle features "ft.", "feat.", "featuring" (case-insensitive)
-    title = re.compile(r'\b(ft|feat|featuring)\b\.?', re.IGNORECASE).split(title)[0]
+    # 4. Standardize spacing around ' - '
+    title = re.sub(r'\s*-\s*', ' - ', title)
 
-    # 4. Remove anything directly connected to a # symbol (hashtags)
-    title = re.sub(r'#\S+', '', title)
+    # 5. Remove anything after a second ' - ' separator
+    parts = title.split(" - ")
+    if len(parts) > 2:
+        title = " - ".join(parts[:2])
 
-    # 5. Remove all single and double quotes (keep the text inside them)
-    title = title.replace('"', '').replace("'", "")
+    # 6. If the title is not romanized, look for anything in parenthesis or brackets and set that to the title.
+    # Do this BEFORE removing the brackets and parenthesis.
+    if " - " in title:
+        parts = title.split(" - ", 1)
+        artist_part = parts[0].strip()
+        title_part = parts[1].strip()
+        
+        if not is_romanized(title_part):
+            m = re.search(r'[\(\[\{]([^\)\}\]]+)[\)\]\}]', title_part)
+            if m:
+                title_part = m.group(1).strip()
+        
+        title = f"{artist_part} - {title_part}"
+    else:
+        if not is_romanized(title):
+            m = re.search(r'[\(\[\{]([^\)\}\]]+)[\)\]\}]', title)
+            if m:
+                title = m.group(1).strip()
 
-    # 6. Remove all emojis and miscellaneous symbols
-    try:
-        # Filter using regex matching outside typical text ranges (covers emoticons, symbols, pictographs)
-        emoji_pattern = re.compile(r'[\U00010000-\U0010ffff\u2600-\u27bf]', flags=re.UNICODE)
-        title = emoji_pattern.sub('', title)
-    except re.error:
-        pass
+    # 7. Treat anything after '&' OR ' x ' (x with spaces on both sides) like a second artist, and remove it.
+    # ONLY if it appears before the divider (which is the separator).
+    if " - " in title:
+        parts = title.split(" - ", 1)
+        artist_part = parts[0].strip()
+        title_part = parts[1].strip()
+        
+        # Split by & (optional spaces) or ' x ' / ' X ' (spaces required)
+        artist_part = re.split(r'\s*&\s*|\s+[xX]\s+', artist_part)[0].strip()
+        
+        title = f"{artist_part} - {title_part}"
 
-    # 7. Parenthesized or bracketed parts containing common YouTube video tags
+    # 8. Parenthesized or bracketed parts containing common YouTube video tags
     junk_keywords = [
         "official", "video", "audio", "lyric", "lyrics", "hq", "hd", "4k", "1080p", "720p",
         "visualizer", "music video", "clip", "full song", "remaster", "remastered",
@@ -151,45 +193,55 @@ def clean_youtube_title(filename):
         "sub", "subbed", "subs", "subtitles", "karaoke", "live", "concert", "performance",
         "vertical video", "behind the scenes", "making of", "teaser", "trailer", "studio version"
     ]
+    # Remove complete bracket pairs containing junk keywords (case-insensitive)
+    def clean_junk_brackets(m):
+        content = m.group(1).lower()
+        if any(kw in content for kw in junk_keywords):
+            return ""
+        return m.group(0)
     
-    bracket_pattern = r'(\([^\)]*\)|\[[^\]]*\]|\{[^\}]*\})'
-    title = re.sub(bracket_pattern, "", title)
-    
-    # 8. Split and remove junk suffixes separated by symbols like //
-    for sep in ["//", "///"]:
-        if sep in title:
-            parts = title.split(sep)
-            new_parts = []
-            for i, part in enumerate(parts):
-                part_strip = part.strip()
-                part_lower = part_strip.lower()
-                if i > 0 and (any(kw in part_lower for kw in junk_keywords) or len(part_strip) == 0):
-                    continue
-                new_parts.append(part)
-            if new_parts:
-                title = sep.join(new_parts)
+    title = re.sub(r'(\([^\)]*\)|\[[^\]]*\]|\{[^\}]*\})', clean_junk_brackets, title)
 
-    # 9. Clean up multiple whitespaces and ensure uniform formatting around separators
+    # 9. Remove ALL remaining parenthesis, brackets, and braces characters themselves
+    title = re.sub(r'[\(\)\[\]\{\}]', '', title)
+
+    # 10. Handle features "ft.", "feat.", "featuring" (case-insensitive)
+    title = re.compile(r'\b(ft|feat|featuring)\b\.?', re.IGNORECASE).split(title)[0]
+
+    # 11. Remove anything directly connected to a # symbol (hashtags)
+    title = re.sub(r'#\S+', '', title)
+
+    # 12. Don't remove single quotes with letters on both sides (e.g. her's, don't)
+    title = title.replace('"', '')
+    title = re.sub(r"(?<![a-zA-Z])'|'(?![a-zA-Z])", "", title)
+
+    # 13. Remove all emojis and miscellaneous symbols
+    try:
+        emoji_pattern = re.compile(r'[\U00010000-\U0010ffff\u2600-\u27bf]', flags=re.UNICODE)
+        title = emoji_pattern.sub('', title)
+    except re.error:
+        pass
+
+    # 14. Clean up multiple whitespaces and ensure uniform formatting around separators
     title = re.sub(r'\s+', ' ', title).strip()
     
-    # Handle spacing / formatting around standard separators safely
+    # Final cleanup of separator spacing
     if " - " in title:
         parts = title.split(" - ", 1)
         artist_part = parts[0].strip()
         title_part = parts[1].strip()
-
+        
         # If the artist area has a comma, assume it is a second artist and remove everything after it
         if "," in artist_part:
             artist_part = artist_part.split(",")[0].strip()
-
+            
         title = f"{artist_part} - {title_part}"
     else:
-        # If no explicit separator, fix edge-case dangling dashes or trailing spaces
         title = re.sub(r'\s*-\s*$', '', title)
         title = re.sub(r'^\s*-\s*', '', title)
         title = title.strip()
     
-    # 10. Clean invalid Windows filename characters
+    # 15. Clean invalid Windows filename characters
     invalid_chars = r'[\\/:*?"<>|]'
     title = re.sub(invalid_chars, '_', title)
     title = re.sub(r'\s+', ' ', title).strip()
@@ -268,175 +320,224 @@ def clean_and_tag_files(folder_path):
     
     if not files:
         print(f"{Colors.YELLOW}No MP3 or M4A files found in this folder.{Colors.END}")
-        return
+        return 0, 0, 0, 0
         
     print(f"{Colors.GREEN}Found {len(files)} audio files for renaming.{Colors.END}\n")
     
-    idx = 1
-    while idx <= len(files):
-        file = files[idx - 1]
-        stem = file.stem
-        suffix = file.suffix.lower()
+    renamed_count = 0
+    tagged_count = 0
+    skipped_count = 0
+    already_formatted_count = 0
+    
+    def run_renaming_pass(file_list, is_manual_skipped_pass=False):
+        nonlocal renamed_count, tagged_count, skipped_count, already_formatted_count
         
-        predicted_name = clean_youtube_title(stem)
-        existing_artist, existing_title = read_metadata_tags(file)
+        auto_mode = False
+        skipped_files = []
         
-        filename_is_correct = (predicted_name == stem and " - " in stem)
-        has_valid_tags = bool(existing_artist and existing_title)
-        
-        if filename_is_correct and has_valid_tags:
-            print(f"{Colors.DIM}[{idx}/{len(files)}] {Colors.GREEN}✔ Already formatted and tagged: {Colors.END}{file.name}")
-            idx += 1
-            continue
+        idx = 1
+        while idx <= len(file_list):
+            file = file_list[idx - 1]
+            stem = file.stem
+            suffix = file.suffix.lower()
             
-        print(f"{Colors.DIM}─" * 60)
-        print(f"{Colors.BOLD}[{idx}/{len(files)}] File: {Colors.END}{file.name}")
-        print(f"  {Colors.YELLOW}Original  :{Colors.END} {stem}")
-        print(f"  {Colors.GREEN}Predicted :{Colors.END} {predicted_name}")
-        
-        if has_valid_tags:
-            print(f"  {Colors.CYAN}Tags found:{Colors.END} Artist='{existing_artist}', Title='{existing_title}'")
-        else:
-            print(f"  {Colors.DIM}Tags found: [None/Missing]{Colors.END}")
+            current_suggestion = clean_youtube_title(stem)
+            existing_artist, existing_title = read_metadata_tags(file)
             
-        try:
-            if " - " not in predicted_name and predicted_name:
-                artist_prompt = (
-                    f"\n  {Colors.CYAN}No artist found.{Colors.END} Predicted title: {Colors.BOLD}{predicted_name}{Colors.END}\n"
-                    f"  Type the {Colors.GREEN}artist name{Colors.END} to build '{Colors.BOLD}Artist - {predicted_name}{Colors.END}',\n"
-                    f"  {Colors.YELLOW}'n'{Colors.END} to enter a full name manually, or {Colors.YELLOW}'s'{Colors.END} to skip:\n  > "
-                )
-                artist_input = input(artist_prompt).strip()
+            filename_is_correct = (current_suggestion == stem and " - " in stem)
+            has_valid_tags = bool(existing_artist and existing_title)
+            
+            if not is_manual_skipped_pass and filename_is_correct and has_valid_tags:
+                print(f"{Colors.DIM}[{idx}/{len(file_list)}] {Colors.GREEN}✔ Already formatted and tagged: {Colors.END}{file.name}")
+                already_formatted_count += 1
+                idx += 1
+                continue
+            
+            if auto_mode:
+                has_artist_sep = " - " in current_suggestion
+                artist_name = ""
+                title_name = ""
+                if has_artist_sep:
+                    parts = current_suggestion.split(" - ", 1)
+                    artist_name = parts[0].strip()
+                    title_name = parts[1].strip()
                 
-                if artist_input.lower() == 's':
-                    print(f"  {Colors.YELLOW}Skipped.{Colors.END}\n")
+                if not has_artist_sep or not artist_name or not title_name:
+                    skipped_files.append(file)
+                    skipped_count += 1
                     idx += 1
                     continue
-                elif artist_input.lower() == 'n' or not artist_input:
-                    pass
                 else:
-                    user_input = f"{artist_input} - {predicted_name}"
-                    final_name = clean_youtube_title(user_input)
-                    if not final_name:
-                        print(f"  {Colors.RED}Invalid name. Skipped.{Colors.END}\n")
-                        idx += 1
-                        continue
+                    final_name = current_suggestion
+            else:
+                final_name = None
+                skip_file = False
+                while True:
+                    print(f"{Colors.DIM}─" * 60)
+                    print(f"{Colors.BOLD}[{idx}/{len(file_list)}] File: {Colors.END}{file.name}")
+                    print(f"  {Colors.YELLOW}Original  :{Colors.END} {stem}")
+                    print(f"  {Colors.GREEN}Predicted :{Colors.END} {current_suggestion}")
                     
-                    new_filename = f"{final_name}{suffix}"
-                    new_filepath = folder_path / new_filename
-                    renamed = False
-                    active_filepath = file
-                    if final_name != stem:
-                        if new_filepath.exists():
-                            print(f"  {Colors.RED}Error: A file named '{new_filename}' already exists. Skipping rename.{Colors.END}\n")
-                            idx += 1
-                            continue
-                        try:
-                            file.rename(new_filepath)
-                            print(f"  {Colors.GREEN}Renamed to:{Colors.END} {new_filename}")
-                            active_filepath = new_filepath
-                            renamed = True
-                        except Exception as e:
-                            print(f"  {Colors.RED}Rename failed: {e}{Colors.END}\n")
-                            idx += 1
-                            continue
-                    artist, title = None, None
-                    if " - " in final_name:
-                        parts = final_name.split(" - ", 1)
-                        artist = parts[0].strip()
-                        title = parts[1].strip()
-                    if artist and title:
-                        if MUTAGEN_AVAILABLE:
-                            success = write_metadata_tags(active_filepath, artist, title)
-                            if success:
-                                tag_status = "Renamed & Tagged" if renamed else "Tagged"
-                                print(f"  {Colors.GREEN}✔ {tag_status} successfully:{Colors.END} Artist='{artist}', Title='{title}'")
-                            else:
-                                print(f"  {Colors.YELLOW}Renamed, but failed to write metadata tags.{Colors.END}")
-                        else:
-                            if renamed:
-                                print(f"  {Colors.YELLOW}Renamed, but skipped tagging (Mutagen not available).{Colors.END}")
+                    if has_valid_tags:
+                        print(f"  {Colors.CYAN}Tags found:{Colors.END} Artist='{existing_artist}', Title='{existing_title}'")
                     else:
-                        print(f"  {Colors.YELLOW}Could not parse 'Artist - Title' format. Skipping metadata tagging.{Colors.END}")
-                    print()
+                        print(f"  {Colors.DIM}Tags found: [None/Missing]{Colors.END}")
+                        
+                    has_artist_sep = " - " in current_suggestion
+                    artist_name = ""
+                    title_name = ""
+                    if has_artist_sep:
+                        parts = current_suggestion.split(" - ", 1)
+                        artist_name = parts[0].strip()
+                        title_name = parts[1].strip()
+                        
+                    if not has_artist_sep or not artist_name or not title_name:
+                        artist_prompt = (
+                            f"\n  {Colors.CYAN}No artist found.{Colors.END} Predicted title: {Colors.BOLD}{current_suggestion}{Colors.END}\n"
+                            f"  Type the {Colors.GREEN}artist name{Colors.END} to build '{Colors.BOLD}Artist - {current_suggestion}{Colors.END}',\n"
+                            f"  {Colors.YELLOW}'n'{Colors.END} to enter a full name manually, {Colors.YELLOW}'s'{Colors.END} to skip, or type {Colors.YELLOW}'AUTO'{Colors.END} to switch to auto-mode:\n  > "
+                        )
+                        user_input = input(artist_prompt).strip()
+                        
+                        if user_input.upper() == 'AUTO':
+                            auto_mode = True
+                            break
+                        elif user_input.lower() == 's':
+                            print(f"  {Colors.YELLOW}Skipped.{Colors.END}\n")
+                            skipped_count += 1
+                            skipped_files.append(file)
+                            skip_file = True
+                            break
+                        elif user_input.lower() == 'n' or not user_input:
+                            prompt = f"\n  Type custom {Colors.BOLD}Artist - Title{Colors.END} name, or {Colors.YELLOW}'s'{Colors.END} to skip:\n  > "
+                            custom_input = input(prompt).strip()
+                            if custom_input.lower() == 's':
+                                print(f"  {Colors.YELLOW}Skipped.{Colors.END}\n")
+                                skipped_count += 1
+                                skipped_files.append(file)
+                                skip_file = True
+                                break
+                            elif custom_input.upper() == 'AUTO':
+                                auto_mode = True
+                                break
+                            elif custom_input:
+                                current_suggestion = clean_youtube_title(custom_input)
+                                continue
+                            else:
+                                print(f"  {Colors.YELLOW}Skipped.{Colors.END}\n")
+                                skipped_count += 1
+                                skipped_files.append(file)
+                                skip_file = True
+                                break
+                        else:
+                            combined = f"{user_input} - {current_suggestion}"
+                            current_suggestion = clean_youtube_title(combined)
+                            continue
+                    else:
+                        prompt = f"\n  {Colors.BOLD}Accept predicted name?{Colors.END}\n  {Colors.CYAN}[ENTER]{Colors.END} to accept, type {Colors.GREEN}'f'{Colors.END} to flip Artist/Title, type a new {Colors.BOLD}Artist - Title{Colors.END}, {Colors.YELLOW}'s'{Colors.END} to skip, or {Colors.YELLOW}'AUTO'{Colors.END} to auto-process remaining:\n  > "
+                        user_input = input(prompt).strip()
+                        
+                        if user_input.upper() == 'AUTO':
+                            auto_mode = True
+                            break
+                        elif user_input.lower() == 's':
+                            print(f"  {Colors.YELLOW}Skipped.{Colors.END}\n")
+                            skipped_count += 1
+                            skipped_files.append(file)
+                            skip_file = True
+                            break
+                        elif user_input.lower() == 'f':
+                            parts = current_suggestion.split(" - ", 1)
+                            flipped_name = f"{parts[1]} - {parts[0]}"
+                            current_suggestion = clean_youtube_title(flipped_name)
+                            print(f"  {Colors.CYAN}Flipped Layout Prediction to:{Colors.END} {current_suggestion}")
+                            continue
+                        else:
+                            final_name = user_input if user_input else current_suggestion
+                            break
+                
+                if auto_mode:
+                    continue
+                if skip_file:
                     idx += 1
                     continue
-                    
-            prompt = f"\n  {Colors.BOLD}Accept predicted name?{Colors.END}\n  {Colors.CYAN}[ENTER]{Colors.END} to accept, type {Colors.GREEN}'f'{Colors.END} to flip Artist/Title, type a new {Colors.BOLD}Artist - Title{Colors.END}, or {Colors.YELLOW}'s'{Colors.END} to skip:\n  > "
-            user_input = input(prompt).strip()
+            
+            final_name = clean_youtube_title(final_name)
+            if not final_name:
+                print(f"  {Colors.RED}Invalid name. Skipped.{Colors.END}\n")
+                skipped_count += 1
+                skipped_files.append(file)
+                idx += 1
+                continue
+                
+            new_filename = f"{final_name}{suffix}"
+            new_filepath = folder_path / new_filename
+            
+            renamed = False
+            active_filepath = file
+            
+            if final_name != stem:
+                if new_filepath.exists():
+                    print(f"  {Colors.RED}Error: A file named '{new_filename}' already exists. Skipping rename.{Colors.END}\n")
+                    skipped_count += 1
+                    skipped_files.append(file)
+                    idx += 1
+                    continue
+                try:
+                    file.rename(new_filepath)
+                    print(f"  {Colors.GREEN}Renamed to:{Colors.END} {new_filename}")
+                    active_filepath = new_filepath
+                    renamed_count += 1
+                    renamed = True
+                except Exception as e:
+                    print(f"  {Colors.RED}Rename failed: {e}{Colors.END}\n")
+                    skipped_count += 1
+                    skipped_files.append(file)
+                    idx += 1
+                    continue
+            
+            artist, title = None, None
+            if " - " in final_name:
+                parts = final_name.split(" - ", 1)
+                artist = parts[0].strip()
+                title = parts[1].strip()
+                
+            if artist and title:
+                if MUTAGEN_AVAILABLE:
+                    success = write_metadata_tags(active_filepath, artist, title)
+                    if success:
+                        tagged_count += 1
+                        tag_status = "Renamed & Tagged" if renamed else "Tagged"
+                        print(f"  {Colors.GREEN}✔ {tag_status} successfully:{Colors.END} Artist='{artist}', Title='{title}'")
+                    else:
+                        print(f"  {Colors.YELLOW}Renamed, but failed to write metadata tags.{Colors.END}")
+                else:
+                    if renamed:
+                        print(f"  {Colors.YELLOW}Renamed, but skipped tagging (Mutagen not available).{Colors.END}")
+            else:
+                print(f"  {Colors.YELLOW}Could not parse 'Artist - Title' format. Skipping metadata tagging.{Colors.END}")
+                
+            print()
+            idx += 1
+            
+        return skipped_files
+    
+    skipped_files = run_renaming_pass(files, is_manual_skipped_pass=False)
+    
+    if skipped_files:
+        print(f"{Colors.DIM}─" * 60)
+        print(f"\n{Colors.BOLD}Auto-mode / Renaming Pass Complete.{Colors.END}")
+        print(f"There are {len(skipped_files)} files that were skipped or did not match the naming pattern.")
+        try:
+            choice = input(f"Do you want to manually go over the skipped ones? ({Colors.GREEN}y{Colors.END}/{Colors.RED}n{Colors.END}): ").strip().lower()
+            if choice in ('y', 'yes'):
+                skipped_count -= len(skipped_files)
+                run_renaming_pass(skipped_files, is_manual_skipped_pass=True)
         except KeyboardInterrupt:
             print(f"\n\n{Colors.RED}Process interrupted by user. Exiting.{Colors.END}")
             sys.exit(0)
             
-        if user_input.lower() == 's':
-            print(f"  {Colors.YELLOW}Skipped.{Colors.END}\n")
-            idx += 1
-            continue
-
-        if user_input.lower() == 'f':
-            # Flip the logic layout order of Artist and Title
-            if " - " in predicted_name:
-                parts = predicted_name.split(" - ", 1)
-                flipped_name = f"{parts[1]} - {parts[0]}"
-                predicted_name = clean_youtube_title(flipped_name)
-                print(f"  {Colors.CYAN}Flipped Layout Prediction to:{Colors.END} {predicted_name}")
-                # Loop back to let the user review/approve the flipped layout
-                continue
-            else:
-                print(f"  {Colors.RED}Cannot flip; no ' - ' separator detected!{Colors.END}")
-                continue
-            
-        final_name = user_input if user_input else predicted_name
-        final_name = clean_youtube_title(final_name)
-        
-        if not final_name:
-            print(f"  {Colors.RED}Invalid name. Skipped.{Colors.END}\n")
-            idx += 1
-            continue
-
-        new_filename = f"{final_name}{suffix}"
-        new_filepath = folder_path / new_filename
-        
-        renamed = False
-        active_filepath = file
-        
-        if final_name != stem:
-            if new_filepath.exists():
-                print(f"  {Colors.RED}Error: A file named '{new_filename}' already exists. Skipping rename.{Colors.END}\n")
-                idx += 1
-                continue
-            try:
-                file.rename(new_filepath)
-                print(f"  {Colors.GREEN}Renamed to:{Colors.END} {new_filename}")
-                active_filepath = new_filepath
-                renamed = True
-            except Exception as e:
-                print(f"  {Colors.RED}Rename failed: {e}{Colors.END}\n")
-                idx += 1
-                continue
-                
-        artist, title = None, None
-        if " - " in final_name:
-            parts = final_name.split(" - ", 1)
-            artist = parts[0].strip()
-            title = parts[1].strip()
-            
-        if artist and title:
-            if MUTAGEN_AVAILABLE:
-                success = write_metadata_tags(active_filepath, artist, title)
-                if success:
-                    tag_status = "Renamed & Tagged" if renamed else "Tagged"
-                    print(f"  {Colors.GREEN}✔ {tag_status} successfully:{Colors.END} Artist='{artist}', Title='{title}'")
-                else:
-                    print(f"  {Colors.YELLOW}Renamed, but failed to write metadata tags.{Colors.END}")
-            else:
-                if renamed:
-                    print(f"  {Colors.YELLOW}Renamed, but skipped tagging (Mutagen not available).{Colors.END}")
-        else:
-            print(f"  {Colors.YELLOW}Could not parse 'Artist - Title' format. Skipping metadata tagging.{Colors.END}")
-            
-        print()
-        idx += 1
+    return renamed_count, tagged_count, skipped_count, already_formatted_count
 
 # ==========================================
 # LOUDNESS NORMALIZATION IMPLEMENTATION
@@ -594,14 +695,14 @@ def run_loudness_normalization(folder_path):
         print(f"{Colors.YELLOW}[!] FFmpeg was not found in your system's PATH.{Colors.END}")
         print(f"{Colors.DIM}    Loudness normalization requires FFmpeg to process files.{Colors.END}")
         print(f"{Colors.DIM}    Skipping volume adjustment pass.{Colors.END}\n")
-        return
+        return 0, 0
         
     extensions = {".mp3", ".m4a"}
     files = sorted([f for f in folder_path.iterdir() if f.is_file() and f.suffix.lower() in extensions])
     
     if not files:
         print(f"{Colors.YELLOW}No MP3 or M4A files found to adjust.{Colors.END}\n")
-        return
+        return 0, 0
         
     print(f"{Colors.GREEN}Starting static volume adjustment on {len(files)} files with {MAX_WORKERS} worker threads...{Colors.END}")
     print(f"{Colors.DIM}Settings: Target Loudness={TARGET_LUFS} LUFS | Max Peak={TRUE_PEAK} dB | Output Bitrate={BITRATE}{Colors.END}\n")
@@ -626,6 +727,7 @@ def run_loudness_normalization(folder_path):
                 
     print(f"\n{Colors.CYAN}{Colors.BOLD}Volume Adjustment Complete!{Colors.END}")
     print(f"  {Colors.GREEN}Success: {completed}{Colors.END} | {Colors.RED}Failed: {failed}{Colors.END}\n")
+    return completed, failed
 
 # ==========================================
 
@@ -708,14 +810,14 @@ def run_silence_trim(folder_path):
     if not check_ffmpeg_available():
         print(f"{Colors.YELLOW}[!] FFmpeg was not found in your system's PATH.{Colors.END}")
         print(f"{Colors.DIM}    Skipping silence trim pass.{Colors.END}\n")
-        return
+        return 0, 0
     
     extensions = {".mp3", ".m4a"}
     files = sorted([f for f in folder_path.iterdir() if f.is_file() and f.suffix.lower() in extensions])
     
     if not files:
         print(f"{Colors.YELLOW}No MP3 or M4A files found to trim.{Colors.END}\n")
-        return
+        return 0, 0
     
     print(f"{Colors.GREEN}Trimming silence on {len(files)} files with {MAX_WORKERS} worker threads...{Colors.END}")
     print(f"{Colors.DIM}Threshold: {SILENCE_THRESHOLD} | Min silence duration: {SILENCE_DURATION}s{Colors.END}\n")
@@ -738,32 +840,56 @@ def run_silence_trim(folder_path):
     
     print(f"\n{Colors.CYAN}{Colors.BOLD}Silence Trim Complete!{Colors.END}")
     print(f"  {Colors.GREEN}Success: {completed}{Colors.END} | {Colors.RED}Failed: {failed}{Colors.END}\n")
+    return completed, failed
 
 # ==========================================
 
 def main():
     print_banner()
     folder = select_folder()
-    clean_and_tag_files(folder)
+    renamed_count, tagged_count, skipped_count, already_formatted_count = clean_and_tag_files(folder)
+    
+    norm_completed, norm_failed = 0, 0
+    trim_completed, trim_failed = 0, 0
     
     try:
         print(f"{Colors.BOLD}Volume Adjustment / Loudness Normalization{Colors.END}")
         choice = input(f"Do you want to run the volume adjustment pass? ({Colors.GREEN}y{Colors.END}/{Colors.RED}n{Colors.END}): ").strip().lower()
         if choice in ('y', 'yes'):
-            run_loudness_normalization(folder)
+            norm_completed, norm_failed = run_loudness_normalization(folder)
         else:
             print(f"\n{Colors.YELLOW}Skipping volume adjustment pass.{Colors.END}\n")
             print(f"{Colors.BOLD}Silence Trimming{Colors.END}")
             trim_choice = input(f"Do you want to trim silence from the front and back of each file? ({Colors.GREEN}y{Colors.END}/{Colors.RED}n{Colors.END}): ").strip().lower()
             if trim_choice in ('y', 'yes'):
-                run_silence_trim(folder)
+                trim_completed, trim_failed = run_silence_trim(folder)
             else:
                 print(f"\n{Colors.YELLOW}Skipping silence trim pass.{Colors.END}\n")
     except KeyboardInterrupt:
         print(f"\n\n{Colors.RED}Process interrupted by user. Exiting.{Colors.END}")
         sys.exit(0)
-        
-    print(f"{Colors.CYAN}{Colors.BOLD}Done! All processes complete.{Colors.END}")
+
+    # ── Summary ─────────────────────────────────────────────────────────────
+    print(f"\n{Colors.CYAN}{Colors.BOLD}{'═' * 50}{Colors.END}")
+    print(f"{Colors.CYAN}{Colors.BOLD}  SESSION SUMMARY{Colors.END}")
+    print(f"{Colors.CYAN}{Colors.BOLD}{'═' * 50}{Colors.END}")
+    print(f"  {Colors.GREEN}Already formatted / skipped:{Colors.END} {already_formatted_count}")
+    print(f"  {Colors.GREEN}Renamed:                    {Colors.END} {renamed_count}")
+    print(f"  {Colors.GREEN}Tagged:                     {Colors.END} {tagged_count}")
+    print(f"  {Colors.YELLOW}Skipped (user / no artist): {Colors.END} {skipped_count}")
+    if norm_completed or norm_failed:
+        print(f"  {Colors.GREEN}Volume-equalized:           {Colors.END} {norm_completed}  "
+              f"{Colors.RED}(failed: {norm_failed}){Colors.END}")
+    if trim_completed or trim_failed:
+        print(f"  {Colors.GREEN}Silence-trimmed:            {Colors.END} {trim_completed}  "
+              f"{Colors.RED}(failed: {trim_failed}){Colors.END}")
+    print(f"{Colors.CYAN}{Colors.BOLD}{'═' * 50}{Colors.END}")
+    print(f"\n{Colors.CYAN}{Colors.BOLD}All processes complete.{Colors.END}")
+
+    try:
+        input(f"\n{Colors.DIM}Press ENTER to exit...{Colors.END}")
+    except (KeyboardInterrupt, EOFError):
+        pass
 
 if __name__ == "__main__":
     main()
