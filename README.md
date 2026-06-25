@@ -33,7 +33,7 @@ The GUI version is currently "complete" at v1.0, but further feature updates are
 
 There are 3 versions of the CLI: The python version, which requires python to be installed, as well as yt-dlp `pip install yt-dlp` and ffmpeg `pip install ffpmeg`, the pex version, which only requires python, and the exe version. This will run as a standalone program, and everything you need will be bundled with it. This can also be added to the system's PATH, so that you can run yt-msd from anywhere by just initializing it with `yt-msd` in the terminal. All versions will generate a config.json file in their root directory. 
 
-**NOTE: As of 6/24/2026, the CLI version is depreciated. I will no longer be updating it to newer yt-dlp versions, or rebuilding the exe for updates. It is as-is now. I've made this decision because it is essentially a wrapper for yt-dlp, and there are plenty of other simple wrappers if you want an updated version. The GUI version is the unique one, and the one that I will continue updating and supporting.
+**NOTE: As of 6/24/2026, the CLI version is depreciated. I will no longer be updating it to newer yt-dlp versions, or rebuilding the exe for updates. It is as-is now. I've made this decision because it is essentially a wrapper for yt-dlp, and there are plenty of other simple wrappers if you want an updated version. The GUI version is the unique one, and the one that I will continue updating and supporting.**
 
 **If your system says that the exe is unsafe, ignore it! It is a false positive-you can safely click "run anyway"**
 
