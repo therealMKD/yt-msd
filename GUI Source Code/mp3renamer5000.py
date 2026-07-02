@@ -132,6 +132,47 @@ def clean_youtube_title(filename):
     # Fancy double quotes
     title = title.replace('“', '"').replace('”', '"')
 
+    # 1b. Mask separators inside parentheses/brackets so Steps 2-5 don't treat them as separators.
+    # Replace ' - ', '|', and ':' inside any bracket group with placeholders.
+    MASK_HYPHEN = "\x00HYPHEN\x00"
+    MASK_PIPE   = "\x00PIPE\x00"
+    MASK_COLON  = "\x00COLON\x00"
+
+    def mask_separators_in_brackets(text):
+        result = []
+        depth = 0
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch in '([{':
+                depth += 1
+                result.append(ch)
+                i += 1
+            elif ch in ')]}':
+                depth -= 1
+                result.append(ch)
+                i += 1
+            elif depth > 0:
+                # Inside brackets: check for separators to mask
+                if text[i:i+3] == ' - ':
+                    result.append(MASK_HYPHEN)
+                    i += 3
+                elif text[i] == '|':
+                    result.append(MASK_PIPE)
+                    i += 1
+                elif text[i] == ':':
+                    result.append(MASK_COLON)
+                    i += 1
+                else:
+                    result.append(ch)
+                    i += 1
+            else:
+                result.append(ch)
+                i += 1
+        return ''.join(result)
+
+    title = mask_separators_in_brackets(title)
+
     # 2. Turn colons ' : ' into separators
     title = re.sub(r'\s*:\s*', ' - ', title)
 
@@ -151,6 +192,11 @@ def clean_youtube_title(filename):
     parts = title.split(" - ")
     if len(parts) > 2:
         title = " - ".join(parts[:2])
+
+    # 5b. Restore masked separators back to their original forms
+    title = title.replace(MASK_HYPHEN, ' - ')
+    title = title.replace(MASK_PIPE, '|')
+    title = title.replace(MASK_COLON, ':')
 
     # 6. If the title is not romanized, look for anything in parenthesis or brackets and set that to the title.
     # ONLY if that parenthesized text contains a non-English character.
