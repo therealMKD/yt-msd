@@ -144,8 +144,8 @@ def clean_youtube_title(filename):
             # Remove anything after a "|" symbol and any spaces before it
             title = title.split("|")[0].rstrip()
 
-    # 4. Standardize spacing around ' - '
-    title = re.sub(r'\s*-\s*', ' - ', title)
+    # 4. Standardize spacing around ' - ' (only if there are spaces on both sides)
+    title = re.sub(r'\s+-\s+', ' - ', title)
 
     # 5. Remove anything after a second ' - ' separator
     parts = title.split(" - ")
@@ -153,6 +153,7 @@ def clean_youtube_title(filename):
         title = " - ".join(parts[:2])
 
     # 6. If the title is not romanized, look for anything in parenthesis or brackets and set that to the title.
+    # ONLY if that parenthesized text contains a non-English character.
     # Do this BEFORE removing the brackets and parenthesis.
     if " - " in title:
         parts = title.split(" - ", 1)
@@ -162,14 +163,18 @@ def clean_youtube_title(filename):
         if not is_romanized(title_part):
             m = re.search(r'[\(\[\{]([^\)\}\]]+)[\)\]\}]', title_part)
             if m:
-                title_part = m.group(1).strip()
+                inside = m.group(1).strip()
+                if not is_romanized(inside):
+                    title_part = inside
         
         title = f"{artist_part} - {title_part}"
     else:
         if not is_romanized(title):
             m = re.search(r'[\(\[\{]([^\)\}\]]+)[\)\]\}]', title)
             if m:
-                title = m.group(1).strip()
+                inside = m.group(1).strip()
+                if not is_romanized(inside):
+                    title = inside
 
     # 7. Treat anything after '&' OR ' x ' (x with spaces on both sides) like a second artist, and remove it.
     # ONLY if it appears before the divider (which is the separator).
@@ -183,25 +188,30 @@ def clean_youtube_title(filename):
         
         title = f"{artist_part} - {title_part}"
 
-    # 8. Parenthesized or bracketed parts containing common YouTube video tags
-    junk_keywords = [
-        "official", "video", "audio", "lyric", "lyrics", "hq", "hd", "4k", "1080p", "720p",
-        "visualizer", "music video", "clip", "full song", "remaster", "remastered",
-        "videoclip", "officialvideo", "officially", "mv", "m/v", "hdtv", "bluray", "rip",
-        "sub", "subbed", "subs", "subtitles", "karaoke", "live", "concert", "performance",
-        "vertical video", "behind the scenes", "making of", "teaser", "trailer", "studio version"
-    ]
-    # Remove complete bracket pairs containing junk keywords (case-insensitive)
-    def clean_junk_brackets(m):
-        content = m.group(1).lower()
-        if any(kw in content for kw in junk_keywords):
-            return ""
-        return m.group(0)
+    # 8. Process parentheses, brackets, and braces:
+    # Only keep the contents inside if a non-English character is used.
+    # Otherwise, discard the parenthesis block entirely.
+    def process_brackets(match):
+        inside = match.group(2)
+        if not is_romanized(inside):
+            return inside
+        return ""
     
-    title = re.sub(r'(\([^\)]*\)|\[[^\]]*\]|\{[^\}]*\})', clean_junk_brackets, title)
+    # Run replacement on matched bracket/parenthesis/brace pairs (innermost first)
+    bracket_pair_pattern = r'(\(|\[|\{)([^\(\)\[\]\{\}]*)(\)|\]|\})'
+    old_title = ""
+    while old_title != title:
+        old_title = title
+        title = re.sub(bracket_pair_pattern, process_brackets, title)
 
     # 9. Remove ALL remaining parenthesis, brackets, and braces characters themselves
+    # (e.g. hanging/unbalanced brackets)
     title = re.sub(r'[\(\)\[\]\{\}]', '', title)
+
+    # 9b. Remove specific junk words (case-insensitive, on word boundaries)
+    # Target words: HD, Version, Original, Official, 4K, UHD, Upgraded, Upscaled, Remastered
+    junk_words_pattern = r'\b(hd|version|original|official|4k|uhd|upgraded|upscaled|remastered)\b'
+    title = re.sub(junk_words_pattern, '', title, flags=re.IGNORECASE)
 
     # 10. Handle features "ft.", "feat.", "featuring" (case-insensitive)
     title = re.compile(r'\b(ft|feat|featuring)\b\.?', re.IGNORECASE).split(title)[0]
@@ -351,6 +361,7 @@ def clean_and_tag_files(folder_path):
                 idx += 1
                 continue
             
+            is_manually_inputted = False
             if auto_mode:
                 has_artist_sep = " - " in current_suggestion
                 artist_name = ""
@@ -419,8 +430,9 @@ def clean_and_tag_files(folder_path):
                                 auto_mode = True
                                 break
                             elif custom_input:
-                                current_suggestion = clean_youtube_title(custom_input)
-                                continue
+                                final_name = custom_input
+                                is_manually_inputted = True
+                                break
                             else:
                                 print(f"  {Colors.YELLOW}Skipped.{Colors.END}\n")
                                 skipped_count += 1
@@ -428,9 +440,9 @@ def clean_and_tag_files(folder_path):
                                 skip_file = True
                                 break
                         else:
-                            combined = f"{user_input} - {current_suggestion}"
-                            current_suggestion = clean_youtube_title(combined)
-                            continue
+                            final_name = f"{user_input} - {current_suggestion}"
+                            is_manually_inputted = True
+                            break
                     else:
                         prompt = f"\n  {Colors.BOLD}Accept predicted name?{Colors.END}\n  {Colors.CYAN}[ENTER]{Colors.END} to accept, type {Colors.GREEN}'f'{Colors.END} to flip Artist/Title, type a new {Colors.BOLD}Artist - Title{Colors.END}, {Colors.YELLOW}'s'{Colors.END} to skip, or {Colors.YELLOW}'AUTO'{Colors.END} to auto-process remaining:\n  > "
                         user_input = input(prompt).strip()
@@ -451,7 +463,12 @@ def clean_and_tag_files(folder_path):
                             print(f"  {Colors.CYAN}Flipped Layout Prediction to:{Colors.END} {current_suggestion}")
                             continue
                         else:
-                            final_name = user_input if user_input else current_suggestion
+                            if user_input:
+                                final_name = user_input
+                                is_manually_inputted = True
+                            else:
+                                final_name = current_suggestion
+                                is_manually_inputted = False
                             break
                 
                 if auto_mode:
@@ -460,7 +477,8 @@ def clean_and_tag_files(folder_path):
                     idx += 1
                     continue
             
-            final_name = clean_youtube_title(final_name)
+            if not is_manually_inputted:
+                final_name = clean_youtube_title(final_name)
             if not final_name:
                 print(f"  {Colors.RED}Invalid name. Skipped.{Colors.END}\n")
                 skipped_count += 1
