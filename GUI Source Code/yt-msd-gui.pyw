@@ -334,6 +334,7 @@ class MainApp(QMainWindow):
         # Player Flags
         self.is_playing = False
         self.is_downloading = False
+        self.cancel_download = False
         self.current_video_id = None
         self.current_playing_title = ""
         self.playback_index = -1
@@ -885,9 +886,13 @@ class MainApp(QMainWindow):
         self.dl_btn = QPushButton("Download All")
         self.dl_btn.clicked.connect(self.start_batch_download)
         h.addWidget(self.dl_btn)
-        cb = QPushButton("Clear")
-        cb.clicked.connect(self.clear_completed)
-        h.addWidget(cb)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.clicked.connect(self.cancel_batch_download)
+        self.cancel_btn.setVisible(False)
+        h.addWidget(self.cancel_btn)
+        self.clear_btn = QPushButton("Clear")
+        self.clear_btn.clicked.connect(self.clear_completed)
+        h.addWidget(self.clear_btn)
         l.addLayout(h)
         
         self.queue_area = QScrollArea()
@@ -1629,8 +1634,20 @@ class MainApp(QMainWindow):
             self.queue_update_signal.emit()
 
     def clear_completed(self, checked=False):
-        self.queue_items = [q for q in self.queue_items if q['status'] != "Finished"]
-        self.queue_update_signal.emit()
+        has_finished = any(q['status'] == "Finished" for q in self.queue_items)
+        if has_finished:
+            # Default: remove only finished items
+            self.queue_items = [q for q in self.queue_items if q['status'] != "Finished"]
+        else:
+            # No finished items — remove all pending (un-downloaded) items
+            self.queue_items = [q for q in self.queue_items if q['status'] not in ("Pending",)]
+        # Defer the expensive layout rebuild to avoid UI freeze while download thread is active
+        QTimer.singleShot(0, self._refresh_queue_display)
+
+    def cancel_batch_download(self, checked=False):
+        self.cancel_download = True
+        self.cancel_btn.setText("Cancelling...")
+        self.cancel_btn.setEnabled(False)
 
     def start_batch_download(self):
         if self.is_downloading: return
@@ -1638,13 +1655,19 @@ class MainApp(QMainWindow):
         if not pending: return
         
         self.is_downloading = True
+        self.cancel_download = False
         self.dl_btn.setEnabled(False)
         self.dl_btn.setText("Downloading...")
+        self.cancel_btn.setText("Cancel")
+        self.cancel_btn.setEnabled(True)
+        self.cancel_btn.setVisible(True)
         self.save_config()
         folder = self.path_combo.currentText()
         
         def bg_download():
             for idx, q in enumerate(self.queue_items):
+                if self.cancel_download:
+                    break
                 if q['status'] == "Pending":
                     q['status'] = "Downloading"
                     self.queue_status_changed_signal.emit(idx)
@@ -1669,15 +1692,18 @@ class MainApp(QMainWindow):
                     q['status'] = "Finished"
                     self.queue_status_changed_signal.emit(idx)
             
-            # Hacky callback to main thread
             self.status_signal.emit("Batch complete!", False, "#1abd33")
             
         threading.Thread(target=bg_download, daemon=True).start()
         
     def _on_batch_complete(self):
         self.is_downloading = False
+        self.cancel_download = False
         self.dl_btn.setEnabled(True)
         self.dl_btn.setText("Download All")
+        self.cancel_btn.setVisible(False)
+        self.cancel_btn.setText("Cancel")
+        self.cancel_btn.setEnabled(True)
         if hasattr(self, 'run_renamer_cb') and self.run_renamer_cb.isChecked():
             self.run_mp3_renamer()
 
