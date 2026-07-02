@@ -33,15 +33,13 @@ def safe_print(msg):
 available_threads = os.cpu_count()
 
 # ==========================================
-# LOUDNESS NORMALIZATION & TRIM SETTINGS
+# LOUDNESS NORMALIZATION SETTINGS (For Music)
 # ==========================================
 TARGET_LUFS = "-16"       # Balanced loudness target for music listening
 TRUE_PEAK = "-1.5"        # Prevents clipping
 LOUDNESS_RANGE = "11"     # LRA of 11 preserves dynamics (not squishing music range)
 BITRATE = "320k"          # High quality output bitrate
 MAX_WORKERS = available_threads // 2  # Auto-adjusts to half of available threads
-SILENCE_THRESHOLD = "-60dB" # Sensitive threshold to prevent cutting quiet outros
-SILENCE_DURATION = "0.5"
 # ==========================================
 
 # Attempt to load mutagen for ID3 (MP3) and MP4 (M4A) tagging support
@@ -555,6 +553,11 @@ def check_ffmpeg_available():
         return False
 
 def measure_loudness(filepath):
+    """
+    Runs a fast first pass with FFmpeg loudnorm in print_format=json mode
+    to measure the file's integrated loudness (LUFS) and True Peak (dB).
+    Returns (input_i, input_tp, error_message) as (float, float, str).
+    """
     command = [
         "ffmpeg",
         "-y",
@@ -595,9 +598,16 @@ def measure_loudness(filepath):
         return None, None, str(e)
 
 def normalize_file(index, total, filepath):
+    """
+    Applies static whole-track volume adjustment based on measured LUFS.
+    Safeguards mutagen tags by backing them up and restoring them post-write.
+    """
     suffix = filepath.suffix.lower()
+    
+    # 1. Back up existing Mutagen tags to prevent any tag loss during FFmpeg processing
     artist, title = read_metadata_tags(filepath)
     
+    # 2. First Pass: Measure loudness & peaks
     input_i, input_tp, err = measure_loudness(filepath)
     if err:
         return False, filepath.name, f"Loudness measurement failed: {err}"
@@ -605,7 +615,10 @@ def normalize_file(index, total, filepath):
     target_lufs = float(TARGET_LUFS)
     true_peak_limit = float(TRUE_PEAK)
     
+    # Calculate volume adjustment in dB
     gain = target_lufs - input_i
+    
+    # Bound to avoid clipping beyond True Peak limit
     max_gain = true_peak_limit - input_tp
     final_gain = min(gain, max_gain)
     
@@ -616,12 +629,18 @@ def normalize_file(index, total, filepath):
         f"  └─ Applying Whole-Track Gain: {final_gain:+.2f} dB{limit_str} (Target: {target_lufs} LUFS)"
     )
     
+    # 3. Create temporary file
     try:
         temp_fd, temp_path = tempfile.mkstemp(suffix=suffix)
         os.close(temp_fd)
     except Exception as e:
         return False, filepath.name, f"Failed to create temp file: {e}"
         
+    # 4. Assemble FFmpeg Command: silence-trim front & back, then static volume adjustment
+    # silenceremove trims leading silence; the areverse/silenceremove/areverse trick trims trailing silence.
+    # SILENCE_THRESHOLD is -50 dB (near-total silence), 0.5s minimum duration to avoid clipping musical content.
+    SILENCE_THRESHOLD = "-50dB"
+    SILENCE_DURATION = "0.5"
     af_chain = (
         f"silenceremove=start_periods=1:start_duration={SILENCE_DURATION}:start_threshold={SILENCE_THRESHOLD},"
         f"areverse,"
@@ -636,19 +655,34 @@ def normalize_file(index, total, filepath):
         "-af", af_chain
     ]
     
+    # Dynamic Suffix Bitrate & Codec matching
     if suffix == ".mp3":
-        command += ["-codec:a", "libmp3lame", "-b:a", BITRATE]
+        command += [
+            "-codec:a", "libmp3lame",
+            "-b:a", BITRATE,
+        ]
     elif suffix == ".m4a":
-        command += ["-codec:a", "aac", "-b:a", BITRATE]
+        command += [
+            "-codec:a", "aac",
+            "-b:a", BITRATE,
+        ]
     else:
-        command += ["-b:a", BITRATE]
+        command += [
+            "-b:a", BITRATE,
+        ]
         
-    command += ["-map_metadata", "0"]
+    # Keep metadata map and apply faststart only for M4A containers
+    command += [
+        "-map_metadata", "0",
+    ]
     if suffix == ".m4a":
-        command += ["-movflags", "+faststart"]
+        command += [
+            "-movflags", "+faststart",
+        ]
         
     command.append(temp_path)
     
+    # 5. Run FFmpeg to write the static adjusted file
     try:
         startupinfo = None
         if sys.platform == "win32":
@@ -676,11 +710,13 @@ def normalize_file(index, total, filepath):
             pass
         return False, filepath.name, result.stderr
         
+    # 6. Overwrite the original file with the statically gain-adjusted version
     try:
         os.replace(temp_path, str(filepath))
     except Exception as e:
         return False, filepath.name, f"Failed to replace original file with temp: {e}"
         
+    # 7. Restore backed up Mutagen tags on the new file
     if (artist or title) and MUTAGEN_AVAILABLE:
         write_metadata_tags(filepath, artist, title)
         
@@ -733,19 +769,25 @@ def run_loudness_normalization(folder_path):
 
 def trim_silence_file(index, total, filepath):
     """
-    Trims silence from the front and back of an audio file safely using areverse.
+    Trims silence from the front and back of an audio file without any volume change.
+    Uses the same areverse trick as normalize_file but with a volume=0dB no-op.
     """
     safe_print(f"[{index}/{total}] {Colors.CYAN}Trimming silence:{Colors.END} {filepath.name}...")
     
     suffix = filepath.suffix.lower()
+    
+    # Back up tags
     artist, title = read_metadata_tags(filepath)
     
+    # Create temp file
     try:
         temp_fd, temp_path = tempfile.mkstemp(suffix=suffix)
         os.close(temp_fd)
     except Exception as e:
         return False, filepath.name, f"Failed to create temp file: {e}"
     
+    SILENCE_THRESHOLD = "-50dB"
+    SILENCE_DURATION = "0.5"
     af_chain = (
         f"silenceremove=start_periods=1:start_duration={SILENCE_DURATION}:start_threshold={SILENCE_THRESHOLD},"
         f"areverse,"
@@ -820,7 +862,7 @@ def run_silence_trim(folder_path):
         return 0, 0
     
     print(f"{Colors.GREEN}Trimming silence on {len(files)} files with {MAX_WORKERS} worker threads...{Colors.END}")
-    print(f"{Colors.DIM}Threshold: {SILENCE_THRESHOLD} | Min silence duration: {SILENCE_DURATION}s{Colors.END}\n")
+    print(f"{Colors.DIM}Threshold: -50 dB | Min silence duration: 0.5s{Colors.END}\n")
     
     completed = 0
     failed = 0

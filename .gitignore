@@ -32,3 +32,6 @@ ffmpeg.zip
 *.pxo
 *.bmp
 *.png
+
+# Test Files
+mp3renamer5000legacy.py
