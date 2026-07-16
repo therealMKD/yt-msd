@@ -1833,6 +1833,7 @@ class MainApp(QMainWindow):
         """Launches mp3renamer5000.py in a new terminal window with the download folder
         and all GUI settings pre-injected as CLI arguments."""
         import shutil
+        import subprocess
 
         script_name = "mp3renamer5000.py"
 
@@ -1851,21 +1852,18 @@ class MainApp(QMainWindow):
 
         folder = self.path_combo.currentText()
 
-        # Build the argument list
-        cmd_parts = [f'"{sys.executable}"', f'"{script_path}"', f'"{folder}"']
-        cmd_parts.append(f'--norm={self.normalization_mode}')
+        # Build the argument list (without manual quoting, subprocess.Popen handles spaces)
+        args = [sys.executable, script_path, folder]
+        args.append(f'--norm={self.normalization_mode}')
         if self.auto_rename:
-            cmd_parts.append('--auto')
-        cmd_parts.append(f'--silence-pad={self.silence_pad_dur}')
+            args.append('--auto')
+        args.append(f'--silence-pad={str(self.silence_pad_dur)}')
         if self.use_custom_eq and self.custom_eq_string.strip():
-            # Escape any inner quotes in the EQ string
-            eq = self.custom_eq_string.strip().replace('"', '\\"')
-            cmd_parts.append(f'--eq="{eq}"')
+            args.append(f'--eq={self.custom_eq_string.strip()}')
 
-        cmd = 'start cmd /k ' + ' '.join(cmd_parts)
         try:
-            import subprocess
-            subprocess.Popen(cmd, shell=True)
+            # 0x00000010 (CREATE_NEW_CONSOLE) starts the process in a new console window
+            subprocess.Popen(args, creationflags=subprocess.CREATE_NEW_CONSOLE)
             self._on_status_update("Launched MP3 Renamer in a new window.", False, "#1abd33")
         except Exception as e:
             self._on_status_update(f"Failed to launch MP3 Renamer: {str(e)}", False, "red")
