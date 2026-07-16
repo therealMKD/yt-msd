@@ -40,6 +40,8 @@ TRUE_PEAK = "-1.5"        # Prevents clipping
 LOUDNESS_RANGE = "11"     # LRA of 11 preserves dynamics (not squishing music range)
 BITRATE = "320k"          # High quality output bitrate
 MAX_WORKERS = available_threads // 2  # Auto-adjusts to half of available threads
+SILENCE_PAD_DUR = 2    # Seconds of silence padded at the end of normalized files (overridable via --silence-pad)
+CUSTOM_EQ_STRING = ""  # Optional extra ffmpeg -af filter fragment appended after the main chain (overridable via --eq)
 # ==========================================
 
 # Attempt to load mutagen for ID3 (MP3) and MP4 (M4A) tagging support
@@ -368,7 +370,7 @@ def write_metadata_tags(filepath, artist, title):
         
     return False
 
-def clean_and_tag_files(folder_path):
+def clean_and_tag_files(folder_path, start_auto=False):
     extensions = {".mp3", ".m4a"}
     files = sorted([f for f in folder_path.iterdir() if f.is_file() and f.suffix.lower() in extensions])
     
@@ -386,7 +388,9 @@ def clean_and_tag_files(folder_path):
     def run_renaming_pass(file_list, is_manual_skipped_pass=False):
         nonlocal renamed_count, tagged_count, skipped_count, already_formatted_count
         
-        auto_mode = False
+        # In auto mode (triggered by --auto flag or user typing AUTO), accept all predictions silently.
+        # The second pass for manually skipped files always stays interactive.
+        auto_mode = start_auto if not is_manual_skipped_pass else False
         skipped_files = []
         
         idx = 1
@@ -601,7 +605,7 @@ def clean_and_tag_files(folder_path):
         return skipped_files
     
     skipped_files = run_renaming_pass(files, is_manual_skipped_pass=False)
-    
+
     if skipped_files:
         print(f"{Colors.DIM}─" * 60)
         print(f"\n{Colors.BOLD}Auto-mode / Renaming Pass Complete.{Colors.END}")
@@ -727,8 +731,10 @@ def normalize_file(index, total, filepath):
         f"silenceremove=start_periods=1:start_duration={SILENCE_DURATION}:start_threshold={SILENCE_THRESHOLD},"
         f"areverse,"
         f"volume={final_gain:.2f}dB,"
-        f"apad=pad_dur=2"
+        f"apad=pad_dur={SILENCE_PAD_DUR}"
     )
+    if CUSTOM_EQ_STRING:
+        af_chain += f",{CUSTOM_EQ_STRING}"
     command = [
         "ffmpeg",
         "-y",
@@ -968,34 +974,74 @@ def run_silence_trim(folder_path):
 # ==========================================
 
 def main():
+    # ── Parse CLI arguments (injected by yt-msd-gui when launched automatically) ──
+    import argparse
+    parser = argparse.ArgumentParser(description="MP3 Renamer 5000", add_help=False)
+    parser.add_argument('folder', nargs='?', default=None,
+                        help="Target folder path. If omitted or invalid, a dialog/prompt will appear.")
+    parser.add_argument('--norm', choices=['on', 'off', 'ask'], default='ask',
+                        help="Normalization: on=always run, off=always skip, ask=prompt (default)")
+    parser.add_argument('--auto', action='store_true',
+                        help="Auto-accept all rename predictions without user prompts")
+    parser.add_argument('--silence-pad', type=float, default=None,
+                        help="Seconds of silence to append at end of each normalized file")
+    parser.add_argument('--eq', default=None,
+                        help="Extra ffmpeg -af filter string appended after the main chain")
+    args, _ = parser.parse_known_args()
+
+    # Apply any overrides to module-level constants (algorithms are untouched)
+    global SILENCE_PAD_DUR, CUSTOM_EQ_STRING
+    if args.silence_pad is not None:
+        SILENCE_PAD_DUR = args.silence_pad
+    if args.eq:
+        CUSTOM_EQ_STRING = args.eq
+
+    norm_mode = args.norm
+    start_auto = args.auto
+
     print_banner()
-    folder = select_folder()
-    renamed_count, tagged_count, skipped_count, already_formatted_count = clean_and_tag_files(folder)
-    
+
+    # Folder: use CLI arg if valid, otherwise fall back to dialog / prompt
+    if args.folder and Path(args.folder).is_dir():
+        folder = Path(args.folder)
+        print(f"{Colors.GREEN}[\u2713] Using folder: {folder}{Colors.END}\n")
+    else:
+        folder = select_folder()
+
+    renamed_count, tagged_count, skipped_count, already_formatted_count = clean_and_tag_files(folder, start_auto=start_auto)
+
     norm_completed, norm_failed = 0, 0
     trim_completed, trim_failed = 0, 0
-    
+
     try:
-        print(f"{Colors.BOLD}Volume Adjustment / Loudness Normalization{Colors.END}")
-        choice = input(f"Do you want to run the volume adjustment pass? ({Colors.GREEN}y{Colors.END}/{Colors.RED}n{Colors.END}): ").strip().lower()
-        if choice in ('y', 'yes'):
+        if norm_mode == 'on':
+            # GUI setting: always run normalization without asking
             norm_completed, norm_failed = run_loudness_normalization(folder)
+        elif norm_mode == 'off':
+            # GUI setting: always skip normalization without asking
+            print(f"\n{Colors.YELLOW}Skipping volume adjustment (disabled in settings).{Colors.END}\n")
         else:
-            print(f"\n{Colors.YELLOW}Skipping volume adjustment pass.{Colors.END}\n")
-            print(f"{Colors.BOLD}Silence Trimming{Colors.END}")
-            trim_choice = input(f"Do you want to trim silence from the front and back of each file? ({Colors.GREEN}y{Colors.END}/{Colors.RED}n{Colors.END}): ").strip().lower()
-            if trim_choice in ('y', 'yes'):
-                trim_completed, trim_failed = run_silence_trim(folder)
+            # 'ask' — original interactive behavior preserved exactly
+            print(f"{Colors.BOLD}Volume Adjustment / Loudness Normalization{Colors.END}")
+            choice = input(f"Do you want to run the volume adjustment pass? ({Colors.GREEN}y{Colors.END}/{Colors.RED}n{Colors.END}): ").strip().lower()
+            if choice in ('y', 'yes'):
+                norm_completed, norm_failed = run_loudness_normalization(folder)
             else:
-                print(f"\n{Colors.YELLOW}Skipping silence trim pass.{Colors.END}\n")
+                print(f"\n{Colors.YELLOW}Skipping volume adjustment pass.{Colors.END}\n")
+                print(f"{Colors.BOLD}Silence Trimming{Colors.END}")
+                trim_choice = input(f"Do you want to trim silence from the front and back of each file? ({Colors.GREEN}y{Colors.END}/{Colors.RED}n{Colors.END}): ").strip().lower()
+                if trim_choice in ('y', 'yes'):
+                    trim_completed, trim_failed = run_silence_trim(folder)
+                else:
+                    print(f"\n{Colors.YELLOW}Skipping silence trim pass.{Colors.END}\n")
     except KeyboardInterrupt:
         print(f"\n\n{Colors.RED}Process interrupted by user. Exiting.{Colors.END}")
         sys.exit(0)
 
     # ── Summary ─────────────────────────────────────────────────────────────
-    print(f"\n{Colors.CYAN}{Colors.BOLD}{'═' * 50}{Colors.END}")
+    print(f"\n{Colors.CYAN}{Colors.BOLD}{'\u2550' * 50}{Colors.END}")
     print(f"{Colors.CYAN}{Colors.BOLD}  SESSION SUMMARY{Colors.END}")
-    print(f"{Colors.CYAN}{Colors.BOLD}{'═' * 50}{Colors.END}")
+    print(f"{Colors.CYAN}{Colors.BOLD}{'\u2550' * 50}{Colors.END}")
     print(f"  {Colors.GREEN}Already formatted / skipped:{Colors.END} {already_formatted_count}")
     print(f"  {Colors.GREEN}Renamed:                    {Colors.END} {renamed_count}")
     print(f"  {Colors.GREEN}Tagged:                     {Colors.END} {tagged_count}")
@@ -1006,7 +1052,7 @@ def main():
     if trim_completed or trim_failed:
         print(f"  {Colors.GREEN}Silence-trimmed:            {Colors.END} {trim_completed}  "
               f"{Colors.RED}(failed: {trim_failed}){Colors.END}")
-    print(f"{Colors.CYAN}{Colors.BOLD}{'═' * 50}{Colors.END}")
+    print(f"{Colors.CYAN}{Colors.BOLD}{'\u2550' * 50}{Colors.END}")
     print(f"\n{Colors.CYAN}{Colors.BOLD}All processes complete.{Colors.END}")
 
     try:

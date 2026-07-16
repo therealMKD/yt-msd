@@ -176,6 +176,58 @@ class SettingsDialog(QDialog):
         self.session_cb.toggled.connect(self._toggle_session)
         self.layout.addWidget(self.session_cb)
         
+        # MP3 RENAMER
+        self.layout.addWidget(QLabel("MP3 RENAMER", font=QFont("Segoe UI Semibold", 10)))
+
+        # Normalization mode
+        norm_h = QHBoxLayout()
+        norm_h.addWidget(QLabel("Normalization after download:"))
+        self.norm_btns = {}
+        for mode, label in [("on", "ON"), ("off", "OFF"), ("ask", "ASK")]:
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setChecked(parent.normalization_mode == mode)
+            btn.clicked.connect(lambda checked=False, m=mode: self._set_norm_mode(m))
+            norm_h.addWidget(btn)
+            self.norm_btns[mode] = btn
+        norm_h.addStretch()
+        self.layout.addLayout(norm_h)
+        self.layout.addWidget(QLabel("ON = always normalize  |  OFF = always skip  |  ASK = prompt each time",
+                                     font=QFont("Segoe UI", 8)))
+
+        # Auto-rename
+        self.auto_rename_cb = QCheckBox("Auto-rename without prompts (auto-accept all predictions)")
+        self.auto_rename_cb.setChecked(parent.auto_rename)
+        self.auto_rename_cb.toggled.connect(self._toggle_auto_rename)
+        self.layout.addWidget(self.auto_rename_cb)
+
+        # Silence pad duration
+        pad_h = QHBoxLayout()
+        pad_h.addWidget(QLabel("Silence padded at end of each file (seconds):"))
+        self.silence_pad_edit = QLineEdit(str(parent.silence_pad_dur))
+        self.silence_pad_edit.setFixedWidth(70)
+        self.silence_pad_edit.setPlaceholderText("e.g. 2.0")
+        self.silence_pad_edit.textChanged.connect(self._update_silence_pad)
+        pad_h.addWidget(self.silence_pad_edit)
+        pad_h.addStretch()
+        self.layout.addLayout(pad_h)
+
+        # Custom EQ string (mirrors custom yt-dlp args section)
+        self.layout.addWidget(QLabel("CUSTOM FFMPEG EQ FILTER (ADVANCED)", font=QFont("Segoe UI Semibold", 10)))
+        eq_h = QHBoxLayout()
+        self.eq_cb = QCheckBox()
+        self.eq_cb.setChecked(parent.use_custom_eq)
+        self.eq_cb.toggled.connect(self._toggle_eq)
+        eq_h.addWidget(self.eq_cb)
+        self.eq_edit = QLineEdit(parent.custom_eq_string)
+        self.eq_edit.setPlaceholderText("e.g. equalizer=f=100:width_type=o:width=2:g=-10")
+        self.eq_edit.setEnabled(parent.use_custom_eq)
+        self.eq_edit.textChanged.connect(self._update_eq)
+        eq_h.addWidget(self.eq_edit, 1)
+        self.layout.addLayout(eq_h)
+        self.layout.addWidget(QLabel("Appended to the ffmpeg filter chain during normalization.",
+                                     font=QFont("Segoe UI", 8)))
+
         self.layout.addStretch()
         
         # RESET
@@ -218,6 +270,12 @@ class SettingsDialog(QDialog):
             border = f"2px solid {'black' if is_light else 'white'}" if self.parent.accent_color_name == color else "none"
             btn.setStyleSheet(f"background-color: {c_val}; border-radius: 6px; border: {border};")
 
+        for m, btn in self.norm_btns.items():
+            if m == self.parent.normalization_mode:
+                btn.setStyleSheet(f"background-color: {accent}; color: {accent_fg}; border-radius: 4px;")
+            else:
+                btn.setStyleSheet(f"background-color: {'#ddd' if is_light else '#444'}; color: {'black' if is_light else 'white'}; border-radius: 4px;")
+
     def _change_mode(self, mode):
         self.parent.appearance_mode = mode
         self.parent.apply_theme()
@@ -245,6 +303,36 @@ class SettingsDialog(QDialog):
         
     def _toggle_session(self, state):
         self.parent.save_place = state
+        self.parent.save_config()
+
+    # --- MP3 Renamer settings ---
+    def _set_norm_mode(self, mode):
+        self.parent.normalization_mode = mode
+        for m, btn in self.norm_btns.items():
+            btn.setChecked(m == mode)
+        self.parent.save_config()
+        self.update_styles()
+
+    def _toggle_auto_rename(self, state):
+        self.parent.auto_rename = state
+        self.parent.save_config()
+
+    def _update_silence_pad(self, text):
+        try:
+            val = float(text)
+            if val >= 0:
+                self.parent.silence_pad_dur = val
+                self.parent.save_config()
+        except ValueError:
+            pass
+
+    def _toggle_eq(self, state):
+        self.parent.use_custom_eq = state
+        self.eq_edit.setEnabled(state)
+        self.parent.save_config()
+
+    def _update_eq(self, text):
+        self.parent.custom_eq_string = text
         self.parent.save_config()
         
     def _reset_defaults(self):
@@ -330,6 +418,11 @@ class MainApp(QMainWindow):
         self.last_search = ""
         self.run_renamer = False
         self.renamer_path = ""
+        self.normalization_mode = "ask"  # "on" | "off" | "ask"
+        self.auto_rename = False
+        self.silence_pad_dur = 2.0
+        self.use_custom_eq = False
+        self.custom_eq_string = ""
         
         # Player Flags
         self.is_playing = False
@@ -414,6 +507,11 @@ class MainApp(QMainWindow):
                     self.save_place = c.get('save_place', False)
                     self.run_renamer = c.get('run_renamer', False)
                     self.renamer_path = c.get('renamer_path', '')
+                    self.normalization_mode = c.get('normalization_mode', 'ask')
+                    self.auto_rename = c.get('auto_rename', False)
+                    self.silence_pad_dur = c.get('silence_pad_dur', 2.0)
+                    self.use_custom_eq = c.get('use_custom_eq', False)
+                    self.custom_eq_string = c.get('custom_eq_string', '')
                     if self.save_place:
                         self.session_data = c.get('session_data', {})
         except Exception: pass
@@ -441,6 +539,11 @@ class MainApp(QMainWindow):
             'save_place': self.save_place,
             'run_renamer': self.run_renamer_cb.isChecked() if hasattr(self, 'run_renamer_cb') else self.run_renamer,
             'renamer_path': getattr(self, 'renamer_path', ''),
+            'normalization_mode': self.normalization_mode,
+            'auto_rename': self.auto_rename,
+            'silence_pad_dur': self.silence_pad_dur,
+            'use_custom_eq': self.use_custom_eq,
+            'custom_eq_string': self.custom_eq_string,
             'session_data': {
                 'search_results': self.search_results,
                 'playback_index': self.playback_index,
@@ -508,6 +611,11 @@ class MainApp(QMainWindow):
         self.minimize_to_tray = False
         self.run_renamer = False
         self.renamer_path = ""
+        self.normalization_mode = "ask"
+        self.auto_rename = False
+        self.silence_pad_dur = 2.0
+        self.use_custom_eq = False
+        self.custom_eq_string = ""
         if hasattr(self, 'run_renamer_cb'):
             self.run_renamer_cb.blockSignals(True)
             self.run_renamer_cb.setChecked(False)
@@ -1716,75 +1824,51 @@ class MainApp(QMainWindow):
     def on_run_renamer_toggled(self, checked):
         self.run_renamer = checked
         self.save_config()
-        if checked:
-            self.copy_download_path_to_clipboard()
 
     def on_path_changed(self, path):
         self.download_path = path
         self.save_config()
-        if hasattr(self, 'run_renamer_cb') and self.run_renamer_cb.isChecked():
-            self.copy_download_path_to_clipboard()
 
     def run_mp3_renamer(self):
+        """Launches mp3renamer5000.py in a new terminal window with the download folder
+        and all GUI settings pre-injected as CLI arguments."""
         import shutil
-        import subprocess
-        
-        self.copy_download_path_to_clipboard()
-        
+
         script_name = "mp3renamer5000.py"
-        script_path = ""
-        
-        # Check first if we already have a saved path and it exists
-        if getattr(self, 'renamer_path', '') and os.path.exists(self.renamer_path):
-            script_path = self.renamer_path
-            
-        # Try to find mp3renamer5000.py in PATH
-        if not script_path:
-            script_path = shutil.which(script_name) or shutil.which("mp3renamer5000")
-        
-        # Fallback to the same folder as this python file
-        if not script_path:
-            same_folder_path = os.path.join(self.config_dir, script_name)
-            if os.path.exists(same_folder_path):
-                script_path = same_folder_path
-                
-        # Fallback to the discovered location if not in PATH or same folder
-        if not script_path:
-            desktop_paths = [
-                os.path.expanduser(r"~\OneDrive\Desktop\Code\mp3renamer5000.py"),
-                os.path.expanduser(r"~\Desktop\Code\mp3renamer5000.py")
-            ]
-            for dp in desktop_paths:
-                if os.path.exists(dp):
-                    script_path = dp
-                    break
-                    
-        # If all searches fail, prompt the user to locate the file
-        if not script_path:
-            selected_file, _ = QFileDialog.getOpenFileName(
-                self, 
-                "Locate MP3 Renamer Script (mp3renamer5000.py)", 
-                self.config_dir or "", 
-                "Python Files (*.py)"
+
+        # Resolve script: same folder as the GUI first, then PATH
+        script_path = os.path.join(self.config_dir, script_name)
+        if not os.path.exists(script_path):
+            found = shutil.which(script_name)
+            script_path = found if found else ""
+
+        if not script_path or not os.path.exists(script_path):
+            self._on_status_update(
+                "mp3renamer5000.py not found. Place it in the same folder as yt-msd.",
+                False, "red"
             )
-            if selected_file:
-                script_path = selected_file
-                self.renamer_path = selected_file
-                self.save_config()
-                self._on_status_update(f"Renamer path saved: {selected_file}", False, "#3B8ED0")
-                
-        if script_path:
-            try:
-                if os.path.isabs(script_path):
-                    # Launch interactive console script in a new window
-                    subprocess.Popen(f'start python "{script_path}"', shell=True)
-                else:
-                    subprocess.Popen(f'start {script_path}', shell=True)
-                self._on_status_update("Launched MP3 Renamer in a new window.", False, "#1abd33")
-            except Exception as e:
-                self._on_status_update(f"Failed to launch MP3 Renamer: {str(e)}", False, "red")
-        else:
-            self._on_status_update("No MP3 Renamer file selected.", False, "red")
+            return
+
+        folder = self.path_combo.currentText()
+
+        # Build the argument list
+        cmd_parts = [f'"{sys.executable}"', f'"{script_path}"', f'"{folder}"']
+        cmd_parts.append(f'--norm={self.normalization_mode}')
+        if self.auto_rename:
+            cmd_parts.append('--auto')
+        cmd_parts.append(f'--silence-pad={self.silence_pad_dur}')
+        if self.use_custom_eq and self.custom_eq_string.strip():
+            # Escape any inner quotes in the EQ string
+            eq = self.custom_eq_string.strip().replace('"', '\\"')
+            cmd_parts.append(f'--eq="{eq}"')
+
+        cmd = 'start cmd /k ' + ' '.join(cmd_parts)
+        try:
+            import subprocess
+            subprocess.Popen(cmd, shell=True)
+            self._on_status_update("Launched MP3 Renamer in a new window.", False, "#1abd33")
+        except Exception as e:
+            self._on_status_update(f"Failed to launch MP3 Renamer: {str(e)}", False, "red")
 
     def browse_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Download Folder", self.path_combo.currentText() or "")
