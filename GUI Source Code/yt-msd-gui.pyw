@@ -1870,8 +1870,17 @@ class MainApp(QMainWindow):
 
         folder = self.path_combo.currentText()
 
+        # Resolve Python executable to ensure we use the console version (python.exe) instead of windowed (pythonw.exe)
+        executable = sys.executable
+        if getattr(sys, 'frozen', False):
+            executable = "python"
+        else:
+            idx = executable.lower().rfind("pythonw")
+            if idx != -1:
+                executable = executable[:idx] + "python" + executable[idx+7:]
+
         # Build the argument list (without manual quoting, subprocess.Popen handles spaces)
-        args = [sys.executable, script_path, folder]
+        args = [executable, script_path, folder]
         args.append(f'--norm={self.normalization_mode}')
         if self.auto_rename:
             args.append('--auto')
@@ -1880,8 +1889,9 @@ class MainApp(QMainWindow):
             args.append(f'--eq={self.custom_eq_string.strip()}')
 
         try:
-            # 0x00000010 (CREATE_NEW_CONSOLE) starts the process in a new console window
-            subprocess.Popen(args, creationflags=subprocess.CREATE_NEW_CONSOLE)
+            # 0x00000010 (CREATE_NEW_CONSOLE) starts the process in a new console window on Windows
+            creationflags = 0x00000010 if sys.platform == "win32" else 0
+            subprocess.Popen(args, creationflags=creationflags)
             self._on_status_update("Launched MP3 Renamer in a new window.", False, "#1abd33")
         except Exception as e:
             self._on_status_update(f"Failed to launch MP3 Renamer: {str(e)}", False, "red")
