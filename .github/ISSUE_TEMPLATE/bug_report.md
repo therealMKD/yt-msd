@@ -7,6 +7,10 @@ assignees: therealMKD
 
 ---
 
+By creating a bug report, I acknowledge that I have already completed ALL of the following troubleshooting steps:
+- Downloaded LATEST release
+- Updated ALL dependencies (If using a non-exe version)
+
 **Describe the bug**
 A clear and concise description of what the bug is.
 
