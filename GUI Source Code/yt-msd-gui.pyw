@@ -755,6 +755,15 @@ class MainApp(QMainWindow):
         set_r.addWidget(self.bitrate_combo)
         
         set_r.addWidget(QLabel("Save to:"))
+        
+        self.open_folder_btn = QPushButton("\uE8DA")
+        self.open_folder_btn.setObjectName("topIconBtn")
+        self.open_folder_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 16px; padding: 0px;")
+        self.open_folder_btn.setFixedSize(36, 30)
+        self.open_folder_btn.setToolTip("Open Folder in File Explorer")
+        self.open_folder_btn.clicked.connect(self.open_current_download_folder)
+        set_r.addWidget(self.open_folder_btn)
+        
         self.path_combo = QComboBox()
         self.path_combo.addItems(self.recent_folders)
         if self.download_path not in self.recent_folders:
@@ -915,6 +924,15 @@ class MainApp(QMainWindow):
         l.addWidget(QLabel("Local Folder"))
         
         h = QHBoxLayout()
+        
+        self.open_local_folder_btn = QPushButton("\uE8DA")
+        self.open_local_folder_btn.setObjectName("topIconBtn")
+        self.open_local_folder_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 16px; padding: 0px;")
+        self.open_local_folder_btn.setFixedSize(36, 30)
+        self.open_local_folder_btn.setToolTip("Open Local Folder in File Explorer")
+        self.open_local_folder_btn.clicked.connect(self.open_current_local_folder)
+        h.addWidget(self.open_local_folder_btn)
+        
         self.local_path_combo = QComboBox()
         self.local_path_combo.addItems(self.local_folders)
         h.addWidget(self.local_path_combo, 1)
@@ -1878,6 +1896,20 @@ class MainApp(QMainWindow):
                 self.path_combo.addItems(self.recent_folders)
             self.path_combo.setCurrentText(folder)
             self.save_config()
+
+    def open_current_download_folder(self):
+        path = self.path_combo.currentText()
+        if path and os.path.exists(path):
+            os.startfile(path)
+        else:
+            self._on_status_update("Download folder path does not exist.", False, "red")
+
+    def open_current_local_folder(self):
+        path = self.local_path_combo.currentText()
+        if path and os.path.exists(path):
+            os.startfile(path)
+        else:
+            self._on_status_update("Local folder path does not exist.", False, "red")
 
     def _dl_progress_hook(self, d):
         if d['status'] == 'downloading':
