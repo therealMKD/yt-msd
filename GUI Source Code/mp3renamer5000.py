@@ -265,9 +265,9 @@ def clean_youtube_title(filename):
     # 11. Remove anything directly connected to a # symbol (hashtags)
     title = re.sub(r'#\S+', '', title)
 
-    # 12. Don't remove single quotes with letters on both sides (e.g. her's, don't)
+    # 12. Don't remove single quotes attached to ANY letters on either side (e.g. her's, don't, wavin')
     title = title.replace('"', '')
-    title = re.sub(r"(?<![a-zA-Z])'|'(?![a-zA-Z])", "", title)
+    title = re.sub(r"(?<![a-zA-Z])'(?![a-zA-Z])", "", title)
 
     # 13. Remove all emojis and miscellaneous symbols
     try:
@@ -427,6 +427,7 @@ def clean_and_tag_files(folder_path):
             else:
                 final_name = None
                 skip_file = False
+                go_prev = False
                 while True:
                     print(f"{Colors.DIM}─" * 60)
                     print(f"{Colors.BOLD}[{idx}/{len(file_list)}] File: {Colors.END}{file.name}")
@@ -450,12 +451,18 @@ def clean_and_tag_files(folder_path):
                         artist_prompt = (
                             f"\n  {Colors.CYAN}No artist found.{Colors.END} Predicted title: {Colors.BOLD}{current_suggestion}{Colors.END}\n"
                             f"  Type the {Colors.GREEN}artist name{Colors.END} to build '{Colors.BOLD}Artist - {current_suggestion}{Colors.END}',\n"
-                            f"  {Colors.YELLOW}'n'{Colors.END} to enter a full name manually, {Colors.YELLOW}'s'{Colors.END} to skip, or type {Colors.YELLOW}'AUTO'{Colors.END} to switch to auto-mode:\n  > "
+                            f"  {Colors.YELLOW}'n'{Colors.END} to enter a full name manually, {Colors.YELLOW}'s'{Colors.END} to skip, {Colors.YELLOW}'prev'{Colors.END} to redo previous, or type {Colors.YELLOW}'AUTO'{Colors.END} to switch to auto-mode:\n  > "
                         )
                         user_input = input(artist_prompt).strip()
                         
                         if user_input.upper() == 'AUTO':
                             auto_mode = True
+                            break
+                        elif user_input.lower() == 'prev':
+                            if idx > 1:
+                                go_prev = True
+                            else:
+                                print(f"  {Colors.YELLOW}Already at the first file.{Colors.END}")
                             break
                         elif user_input.lower() == 's':
                             print(f"  {Colors.YELLOW}Skipped.{Colors.END}\n")
@@ -490,11 +497,17 @@ def clean_and_tag_files(folder_path):
                             is_manually_inputted = True
                             break
                     else:
-                        prompt = f"\n  {Colors.BOLD}Accept predicted name?{Colors.END}\n  {Colors.CYAN}[ENTER]{Colors.END} to accept, type {Colors.GREEN}'f'{Colors.END} to flip Artist/Title, type a new {Colors.BOLD}Artist - Title{Colors.END}, {Colors.YELLOW}'s'{Colors.END} to skip, or {Colors.YELLOW}'AUTO'{Colors.END} to auto-process remaining:\n  > "
+                        prompt = f"\n  {Colors.BOLD}Accept predicted name?{Colors.END}\n  {Colors.CYAN}[ENTER]{Colors.END} to accept, type {Colors.GREEN}'f'{Colors.END} to flip Artist/Title, type a new {Colors.BOLD}Artist - Title{Colors.END}, {Colors.YELLOW}'s'{Colors.END} to skip, {Colors.YELLOW}'prev'{Colors.END} to redo previous, or {Colors.YELLOW}'AUTO'{Colors.END} to auto-process remaining:\n  > "
                         user_input = input(prompt).strip()
                         
                         if user_input.upper() == 'AUTO':
                             auto_mode = True
+                            break
+                        elif user_input.lower() == 'prev':
+                            if idx > 1:
+                                go_prev = True
+                            else:
+                                print(f"  {Colors.YELLOW}Already at the first file.{Colors.END}")
                             break
                         elif user_input.lower() == 's':
                             print(f"  {Colors.YELLOW}Skipped.{Colors.END}\n")
@@ -518,6 +531,9 @@ def clean_and_tag_files(folder_path):
                             break
                 
                 if auto_mode:
+                    continue
+                if go_prev:
+                    idx -= 1
                     continue
                 if skip_file:
                     idx += 1
@@ -710,7 +726,8 @@ def normalize_file(index, total, filepath):
         f"areverse,"
         f"silenceremove=start_periods=1:start_duration={SILENCE_DURATION}:start_threshold={SILENCE_THRESHOLD},"
         f"areverse,"
-        f"volume={final_gain:.2f}dB"
+        f"volume={final_gain:.2f}dB,"
+        f"apad=pad_dur=2"
     )
     command = [
         "ffmpeg",
