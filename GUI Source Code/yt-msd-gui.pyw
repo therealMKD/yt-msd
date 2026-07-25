@@ -434,6 +434,8 @@ class MainApp(QMainWindow):
         self.is_shuffled = False
         self.shuffle_order = []
         self.is_muted = False
+        self.active_downloads = {}
+        self.active_downloads_lock = threading.Lock()
         
         if getattr(sys, 'frozen', False):
             self.config_dir = os.path.dirname(os.path.abspath(sys.executable))
@@ -1791,32 +1793,59 @@ class MainApp(QMainWindow):
         folder = self.path_combo.currentText()
         
         def bg_download():
-            for idx, q in enumerate(self.queue_items):
-                if self.cancel_download:
-                    break
-                if q['status'] == "Pending":
-                    q['status'] = "Downloading"
+            from concurrent.futures import ThreadPoolExecutor
+            
+            with self.active_downloads_lock:
+                self.active_downloads.clear()
+                
+            pending_items = [(idx, q) for idx, q in enumerate(self.queue_items) if q['status'] == "Pending"]
+            
+            def download_single(item):
+                idx, q = item
+                if getattr(self, 'cancel_download', False):
+                    q['status'] = "Pending"
                     self.queue_status_changed_signal.emit(idx)
-                    try:
-                        ydl_opts = {
-                            'format': 'bestaudio/best',
-                            'outtmpl': f"{folder}/%(title)s.%(ext)s",
-                            'postprocessors': [{
-                                'key': 'FFmpegExtractAudio',
-                                'preferredcodec': self.format_combo.currentText(),
-                                'preferredquality': self.bitrate_combo.currentText(),
-                            }],
-                            'progress_hooks': [self._dl_progress_hook],
-                            'quiet': True
-                        }
-                        if getattr(sys, 'frozen', False):
-                            ydl_opts['ffmpeg_location'] = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
-                            
-                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                            ydl.download([f"https://www.youtube.com/watch?v={q['video']['id']}"])
-                    except Exception: pass
-                    q['status'] = "Finished"
-                    self.queue_status_changed_signal.emit(idx)
+                    return
+                q['status'] = "Downloading"
+                self.queue_status_changed_signal.emit(idx)
+                
+                success = False
+                try:
+                    ydl_opts = {
+                        'format': 'bestaudio/best',
+                        'outtmpl': f"{folder}/%(title)s.%(ext)s",
+                        'postprocessors': [{
+                            'key': 'FFmpegExtractAudio',
+                            'preferredcodec': self.format_combo.currentText(),
+                            'preferredquality': self.bitrate_combo.currentText(),
+                        }],
+                        'progress_hooks': [self._dl_progress_hook],
+                        'quiet': True
+                    }
+                    if getattr(sys, 'frozen', False):
+                        ydl_opts['ffmpeg_location'] = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
+                        
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        ydl.download([f"https://www.youtube.com/watch?v={q['video']['id']}"])
+                    success = True
+                except Exception:
+                    pass
+                
+                if getattr(self, 'cancel_download', False):
+                    q['status'] = "Pending"
+                else:
+                    q['status'] = "Finished" if success else "Pending"
+                self.queue_status_changed_signal.emit(idx)
+                
+            max_workers = min(3, len(pending_items)) if pending_items else 1
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = []
+                for item in pending_items:
+                    if getattr(self, 'cancel_download', False):
+                        break
+                    futures.append(executor.submit(download_single, item))
+                for fut in futures:
+                    fut.result()
             
             self.status_signal.emit("Batch complete!", False, "#1abd33")
             
@@ -1922,12 +1951,32 @@ class MainApp(QMainWindow):
             self._on_status_update("Local folder path does not exist.", False, "red")
 
     def _dl_progress_hook(self, d):
+        if getattr(self, 'cancel_download', False):
+            raise Exception("Download cancelled by user")
+            
+        info = d.get('info_dict', {})
+        vid_id = info.get('id')
+        if not vid_id:
+            return
+            
         if d['status'] == 'downloading':
             p = d.get('_percent_str', '').strip()
+            import re
+            p = re.sub(r'\x1b\[[0-9;]*m', '', p)
             if p:
-                self.dl_progress_signal.emit(f"Downloading: {p}")
+                with self.active_downloads_lock:
+                    self.active_downloads[vid_id] = p
+                    progress_strs = [f"{self.active_downloads[vid]}" for vid in list(self.active_downloads.keys())]
+                    self.dl_progress_signal.emit(f"Downloading: {', '.join(progress_strs)}")
         elif d['status'] == 'finished':
-            self.dl_progress_signal.emit("Processing...")
+            with self.active_downloads_lock:
+                if vid_id in self.active_downloads:
+                    del self.active_downloads[vid_id]
+                if self.active_downloads:
+                    progress_strs = [f"{self.active_downloads[vid]}" for vid in list(self.active_downloads.keys())]
+                    self.dl_progress_signal.emit(f"Downloading: {', '.join(progress_strs)}")
+                else:
+                    self.dl_progress_signal.emit("Processing...")
 
     # --- Player Logic ---
     def _on_status_update(self, text, is_playing, color):
