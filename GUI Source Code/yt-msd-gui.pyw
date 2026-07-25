@@ -176,6 +176,19 @@ class SettingsDialog(QDialog):
         self.session_cb.toggled.connect(self._toggle_session)
         self.layout.addWidget(self.session_cb)
         
+        # Parallel downloads option
+        dl_threads_h = QHBoxLayout()
+        dl_threads_h.addWidget(QLabel("Parallel download threads:"))
+        self.dl_threads_edit = QLineEdit(str(parent.download_threads))
+        self.dl_threads_edit.setFixedWidth(50)
+        self.dl_threads_edit.setPlaceholderText("e.g. 3")
+        self.dl_threads_edit.textChanged.connect(self._update_dl_threads)
+        dl_threads_h.addWidget(self.dl_threads_edit)
+        dl_threads_h.addStretch()
+        self.layout.addLayout(dl_threads_h)
+        
+        self.layout.addWidget(QLabel("Disclaimer: If too many run at once, your internet might not keep up,\nand you could get flagged by YouTube and throttled.", font=QFont("Segoe UI", 8)))
+        
         # MP3 RENAMER
         self.layout.addWidget(QLabel("MP3 RENAMER", font=QFont("Segoe UI Semibold", 10)))
 
@@ -211,6 +224,18 @@ class SettingsDialog(QDialog):
         pad_h.addWidget(self.silence_pad_edit)
         pad_h.addStretch()
         self.layout.addLayout(pad_h)
+        
+        # Normalization threads
+        from PySide6.QtWidgets import QSpinBox
+        norm_threads_h = QHBoxLayout()
+        norm_threads_h.addWidget(QLabel("Normalization threads:"))
+        self.norm_threads_spin = QSpinBox()
+        self.norm_threads_spin.setRange(1, max(1, os.cpu_count() - 1))
+        self.norm_threads_spin.setValue(parent.normalization_threads)
+        self.norm_threads_spin.valueChanged.connect(self._update_norm_threads)
+        norm_threads_h.addWidget(self.norm_threads_spin)
+        norm_threads_h.addStretch()
+        self.layout.addLayout(norm_threads_h)
 
         # Custom EQ string (mirrors custom yt-dlp args section)
         self.layout.addWidget(QLabel("CUSTOM FFMPEG EQ FILTER (ADVANCED)", font=QFont("Segoe UI Semibold", 10)))
@@ -423,6 +448,8 @@ class MainApp(QMainWindow):
         self.silence_pad_dur = 2.0
         self.use_custom_eq = False
         self.custom_eq_string = ""
+        self.download_threads = 3
+        self.normalization_threads = max(1, os.cpu_count() // 2)
         
         # Player Flags
         self.is_playing = False
@@ -514,6 +541,8 @@ class MainApp(QMainWindow):
                     self.silence_pad_dur = c.get('silence_pad_dur', 2.0)
                     self.use_custom_eq = c.get('use_custom_eq', False)
                     self.custom_eq_string = c.get('custom_eq_string', '')
+                    self.download_threads = c.get('download_threads', 3)
+                    self.normalization_threads = c.get('normalization_threads', max(1, os.cpu_count() // 2))
                     if self.save_place:
                         self.session_data = c.get('session_data', {})
         except Exception: pass
@@ -546,6 +575,8 @@ class MainApp(QMainWindow):
             'silence_pad_dur': self.silence_pad_dur,
             'use_custom_eq': self.use_custom_eq,
             'custom_eq_string': self.custom_eq_string,
+            'download_threads': self.download_threads,
+            'normalization_threads': self.normalization_threads,
             'session_data': {
                 'search_results': self.search_results,
                 'playback_index': self.playback_index,
@@ -618,6 +649,8 @@ class MainApp(QMainWindow):
         self.silence_pad_dur = 2.0
         self.use_custom_eq = False
         self.custom_eq_string = ""
+        self.download_threads = 3
+        self.normalization_threads = max(1, os.cpu_count() // 2)
         if hasattr(self, 'run_renamer_cb'):
             self.run_renamer_cb.blockSignals(True)
             self.run_renamer_cb.setChecked(False)
@@ -1914,6 +1947,7 @@ class MainApp(QMainWindow):
         if self.auto_rename:
             args.append('--auto')
         args.append(f'--silence-pad={str(self.silence_pad_dur)}')
+        args.append(f'--norm-threads={self.normalization_threads}')
         if self.use_custom_eq and self.custom_eq_string.strip():
             args.append(f'--eq={self.custom_eq_string.strip()}')
 
