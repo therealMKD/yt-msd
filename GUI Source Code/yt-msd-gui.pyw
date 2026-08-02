@@ -3,9 +3,14 @@
 # Programmed with Antigravity, if you don't like it, don't use it.
 
 import os
+import re
 import sys
 import json
 import threading
+import tempfile
+import subprocess
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 try:
     import winreg
 except ImportError:
@@ -29,6 +34,373 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PySide6.QtCore import Qt, Signal, QTimer, Slot, QPoint, QRect, QMargins
 from PySide6.QtGui import QIcon, QPixmap, QImage, QAction, QColor, QPalette, QPainter, QBrush, QFont
 
+# ============================================================
+# INTEGRATED RENAMER / NORMALIZER (ported from mp3renamer5000)
+# ============================================================
+
+# Loudness normalization settings
+_TARGET_LUFS    = "-16"
+_TRUE_PEAK      = "-1.5"
+_BITRATE        = "320k"
+
+# Mutagen: optional, enables metadata tagging
+_MUTAGEN_AVAILABLE = False
+try:
+    from mutagen.easyid3 import EasyID3
+    from mutagen.id3 import ID3NoHeaderError
+    from mutagen.easymp4 import EasyMP4
+    _MUTAGEN_AVAILABLE = True
+except ImportError:
+    pass
+
+def _is_romanized(text):
+    """Return True if text contains only romanised (Latin/ASCII-like) characters."""
+    return re.search(
+        r'[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff'
+        r'\uac00-\ud7af\u0400-\u04ff\u0370-\u03ff\u0600-\u06ff]',
+        text
+    ) is None
+
+def _clean_youtube_title(filename):
+    """Strip YouTube junk patterns and return a clean 'Artist - Title' string."""
+    title = filename
+
+    # 1. Normalise fancy punctuation
+    title = re.sub(r'[\u2010-\u2015\u2212\u2014\u2013]+', '-', title)
+    title = re.sub(r'-+', '-', title)
+    title = re.sub(r'[\u2502\u2503\u2758]+', '|', title)
+    title = title.replace('\uff1a', ':')
+    title = title.replace('\u2019', "'").replace('\u2018', "'").replace('`', "'").replace('\u00b4', "'")
+    title = title.replace('\u201c', '"').replace('\u201d', '"')
+
+    # 1b. Mask separators inside brackets so they are not treated as split points
+    MASK_HYPHEN = "\x00HYPHEN\x00"
+    MASK_PIPE   = "\x00PIPE\x00"
+    MASK_COLON  = "\x00COLON\x00"
+
+    def _mask_in_brackets(text):
+        result, depth, i = [], 0, 0
+        while i < len(text):
+            ch = text[i]
+            if ch in '([{':
+                depth += 1; result.append(ch); i += 1
+            elif ch in ')]}':
+                depth -= 1; result.append(ch); i += 1
+            elif depth > 0:
+                if text[i:i+3] == ' - ':
+                    result.append(MASK_HYPHEN); i += 3
+                elif text[i] == '|':
+                    result.append(MASK_PIPE); i += 1
+                elif text[i] == ':':
+                    result.append(MASK_COLON); i += 1
+                else:
+                    result.append(ch); i += 1
+            else:
+                result.append(ch); i += 1
+        return ''.join(result)
+
+    title = _mask_in_brackets(title)
+
+    # 2. Colons -> separator
+    title = re.sub(r'\s*:\s*', ' - ', title)
+
+    # 3. Pipe symbols
+    if '|' in title:
+        if '-' not in title:
+            title = title.replace('|', ' - ')
+        else:
+            title = title.split('|')[0].rstrip()
+
+    # 4. Standardise spacing around separator
+    title = re.sub(r'\s+-\s+', ' - ', title)
+
+    # 5. Keep only first two parts
+    parts = title.split(' - ')
+    if len(parts) > 2:
+        title = ' - '.join(parts[:2])
+
+    # 5b. Restore masked separators
+    title = title.replace(MASK_HYPHEN, ' - ').replace(MASK_PIPE, '|').replace(MASK_COLON, ':')
+
+    # 6. Non-romanised: prefer content inside brackets
+    if ' - ' in title:
+        p = title.split(' - ', 1)
+        artist_p, title_p = p[0].strip(), p[1].strip()
+        if not _is_romanized(title_p):
+            m = re.search(r'[\(\[\{]([^\)\}\]]+)[\)\]\}]', title_p)
+            if m:
+                inside = m.group(1).strip()
+                if not _is_romanized(inside):
+                    title_p = inside
+        title = f"{artist_p} - {title_p}"
+    else:
+        if not _is_romanized(title):
+            m = re.search(r'[\(\[\{]([^\)\}\]]+)[\)\]\}]', title)
+            if m:
+                inside = m.group(1).strip()
+                if not _is_romanized(inside):
+                    title = inside
+
+    # 7. Strip secondary artists from artist half
+    if ' - ' in title:
+        p = title.split(' - ', 1)
+        artist_p = re.split(r'\s*&\s*|\s+[xX]\s+', p[0].strip())[0].strip()
+        title = f"{artist_p} - {p[1].strip()}"
+
+    # 8. Remove parentheses / brackets (keep contents only if non-romanised)
+    def _proc_brackets(match):
+        inside = match.group(2)
+        return inside if not _is_romanized(inside) else ''
+
+    bracket_pat = r'(\(|\[|\{)([^\(\)\[\]\{\}]*)(\)|\]|\})'
+    old = ''
+    while old != title:
+        old = title
+        title = re.sub(bracket_pat, _proc_brackets, title)
+
+    # 9. Remove hanging bracket characters and junk words
+    title = re.sub(r'[\(\)\[\]\{\}]', '', title)
+    title = re.sub(r'\b(hd|version|original|official|4k|uhd|upgraded|upscaled|remastered)\b',
+                   '', title, flags=re.IGNORECASE)
+
+    # 10. Remove feature credits
+    title = re.compile(r'\b(ft|feat|featuring)\b\.?', re.IGNORECASE).split(title)[0]
+
+    # 11. Remove hashtags
+    title = re.sub(r'#\S+', '', title)
+
+    # 12. Single-quote handling:
+    #     KEEP   if the quote is between letters (e.g. don't) or trailing a word (e.g. wavin')
+    #     REMOVE if it is part of a balanced enclosing pair (e.g. 'some phrase')
+    #     REMOVE if it is floating / not adjacent to any letter on either side
+    title = title.replace('"', '')
+    # Step A: strip balanced enclosing pairs  'word word'
+    title = re.sub(r"'([^']+)'", r'\1', title)
+    # Step B: strip any remaining quote that is NOT preceded OR followed by a letter
+    title = re.sub(r"(?<![a-zA-Z])'(?![a-zA-Z])", '', title)
+
+    # 13. Remove emojis / misc symbols
+    try:
+        title = re.sub(r'[\U00010000-\U0010ffff\u2600-\u27bf]', '', title, flags=re.UNICODE)
+    except re.error:
+        pass
+
+    # 14. Clean whitespace
+    title = re.sub(r'\s+', ' ', title).strip()
+    if ' - ' in title:
+        p = title.split(' - ', 1)
+        artist_p, title_p = p[0].strip(), p[1].strip()
+        if ',' in artist_p:
+            artist_p = artist_p.split(',')[0].strip()
+        title = f"{artist_p} - {title_p}"
+    else:
+        title = re.sub(r'\s*-\s*$', '', title)
+        title = re.sub(r'^\s*-\s*', '', title)
+        title = title.strip()
+
+    # 15. Sanitise Windows filename characters
+    title = re.sub(r'[\\/:*?"<>|]', '_', title)
+    title = re.sub(r'\s+', ' ', title).strip()
+    return title
+
+def _read_metadata_tags(filepath):
+    """Return (artist, title) from file tags, or (None, None)."""
+    if not _MUTAGEN_AVAILABLE:
+        return None, None
+    suffix = filepath.suffix.lower()
+    try:
+        if suffix == '.mp3':
+            try:
+                tags = EasyID3(filepath)
+                return tags.get('artist', [None])[0], tags.get('title', [None])[0]
+            except ID3NoHeaderError:
+                return None, None
+        elif suffix == '.m4a':
+            tags = EasyMP4(filepath)
+            return tags.get('artist', [None])[0], tags.get('title', [None])[0]
+    except Exception:
+        pass
+    return None, None
+
+def _write_metadata_tags(filepath, artist, title):
+    """Write artist/title tags to file. Returns True on success."""
+    if not _MUTAGEN_AVAILABLE:
+        return False
+    suffix = filepath.suffix.lower()
+    try:
+        if suffix == '.mp3':
+            try:
+                tags = EasyID3(filepath)
+            except ID3NoHeaderError:
+                tags = EasyID3()
+                tags.save(filepath)
+                tags = EasyID3(filepath)
+            tags['artist'] = artist
+            tags['title'] = title
+            tags.save()
+            return True
+        elif suffix == '.m4a':
+            tags = EasyMP4(filepath)
+            tags['artist'] = artist
+            tags['title'] = title
+            tags.save()
+            return True
+    except Exception:
+        pass
+    return False
+
+def _check_ffmpeg():
+    """Return True if ffmpeg is on PATH."""
+    try:
+        si = None
+        if sys.platform == 'win32':
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        subprocess.run(['ffmpeg', '-version'], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, check=True, startupinfo=si)
+        return True
+    except Exception:
+        return False
+
+def _measure_loudness(filepath):
+    """First-pass loudnorm measurement. Returns (input_i, input_tp, error)."""
+    import json as _json
+    cmd = ['ffmpeg', '-y', '-i', str(filepath),
+           '-af', f'loudnorm=I={_TARGET_LUFS}:TP={_TRUE_PEAK}:print_format=json',
+           '-f', 'null', '-']
+    try:
+        si = None
+        if sys.platform == 'win32':
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           text=True, encoding='utf-8', errors='ignore', startupinfo=si)
+        if r.returncode != 0:
+            return None, None, f'FFmpeg exited {r.returncode}'
+        m = re.search(r'\{\s*"input_i".*?\}', r.stderr, re.DOTALL)
+        if m:
+            data = _json.loads(m.group(0))
+            return float(data.get('input_i', _TARGET_LUFS)), float(data.get('input_tp', _TRUE_PEAK)), None
+        return None, None, 'No loudnorm JSON in FFmpeg output'
+    except Exception as e:
+        return None, None, str(e)
+
+def _normalize_file(index, total, filepath, silence_pad_dur, custom_eq_string, log_fn):
+    """Apply static whole-track gain normalization. log_fn(str) for progress."""
+    suffix = filepath.suffix.lower()
+    artist, title = _read_metadata_tags(filepath)
+    input_i, input_tp, err = _measure_loudness(filepath)
+    if err:
+        return False, filepath.name, f'Loudness measurement failed: {err}'
+    target_lufs  = float(_TARGET_LUFS)
+    true_peak    = float(_TRUE_PEAK)
+    gain         = target_lufs - input_i
+    max_gain     = true_peak - input_tp
+    final_gain   = min(gain, max_gain)
+    limit_note   = ' (Peak Limited)' if final_gain < gain else ''
+    log_fn(f'[{index}/{total}] Processing: {filepath.name}\n'
+           f'  Measured: {input_i:+.2f} LUFS | Peak: {input_tp:+.2f} dB\n'
+           f'  Applying gain: {final_gain:+.2f} dB{limit_note}')
+    try:
+        temp_fd, temp_path = tempfile.mkstemp(suffix=suffix)
+        os.close(temp_fd)
+    except Exception as e:
+        return False, filepath.name, f'Temp file error: {e}'
+    SILENCE_THR = '-50dB'
+    SILENCE_DUR = '0.5'
+    af = (f'silenceremove=start_periods=1:start_duration={SILENCE_DUR}:start_threshold={SILENCE_THR},'
+          f'areverse,'
+          f'silenceremove=start_periods=1:start_duration={SILENCE_DUR}:start_threshold={SILENCE_THR},'
+          f'areverse,'
+          f'volume={final_gain:.2f}dB,'
+          f'apad=pad_dur={silence_pad_dur}')
+    if custom_eq_string:
+        af += f',{custom_eq_string}'
+    cmd = ['ffmpeg', '-y', '-i', str(filepath), '-af', af]
+    if suffix == '.mp3':
+        cmd += ['-codec:a', 'libmp3lame', '-b:a', _BITRATE]
+    elif suffix == '.m4a':
+        cmd += ['-codec:a', 'aac', '-b:a', _BITRATE]
+    else:
+        cmd += ['-b:a', _BITRATE]
+    cmd += ['-map_metadata', '0']
+    if suffix == '.m4a':
+        cmd += ['-movflags', '+faststart']
+    cmd.append(temp_path)
+    try:
+        si = None
+        if sys.platform == 'win32':
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           text=True, startupinfo=si)
+    except Exception as e:
+        try: os.remove(temp_path)
+        except: pass
+        return False, filepath.name, f'FFmpeg error: {e}'
+    if r.returncode != 0:
+        try: os.remove(temp_path)
+        except: pass
+        return False, filepath.name, r.stderr
+    try:
+        os.replace(temp_path, str(filepath))
+    except Exception as e:
+        return False, filepath.name, f'Replace failed: {e}'
+    if (artist or title) and _MUTAGEN_AVAILABLE:
+        _write_metadata_tags(filepath, artist, title)
+    return True, filepath.name, None
+
+def _trim_silence_file(index, total, filepath, log_fn):
+    """Trim silence from front and back without volume change."""
+    log_fn(f'[{index}/{total}] Trimming silence: {filepath.name}...')
+    suffix = filepath.suffix.lower()
+    artist, title = _read_metadata_tags(filepath)
+    try:
+        temp_fd, temp_path = tempfile.mkstemp(suffix=suffix)
+        os.close(temp_fd)
+    except Exception as e:
+        return False, filepath.name, f'Temp file error: {e}'
+    SILENCE_THR = '-50dB'
+    SILENCE_DUR = '0.5'
+    af = (f'silenceremove=start_periods=1:start_duration={SILENCE_DUR}:start_threshold={SILENCE_THR},'
+          f'areverse,'
+          f'silenceremove=start_periods=1:start_duration={SILENCE_DUR}:start_threshold={SILENCE_THR},'
+          f'areverse')
+    cmd = ['ffmpeg', '-y', '-i', str(filepath), '-af', af]
+    if suffix == '.mp3':
+        cmd += ['-codec:a', 'libmp3lame', '-b:a', _BITRATE]
+    elif suffix == '.m4a':
+        cmd += ['-codec:a', 'aac', '-b:a', _BITRATE]
+    else:
+        cmd += ['-b:a', _BITRATE]
+    cmd += ['-map_metadata', '0']
+    if suffix == '.m4a':
+        cmd += ['-movflags', '+faststart']
+    cmd.append(temp_path)
+    try:
+        si = None
+        if sys.platform == 'win32':
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           text=True, startupinfo=si)
+    except Exception as e:
+        try: os.remove(temp_path)
+        except: pass
+        return False, filepath.name, f'FFmpeg error: {e}'
+    if r.returncode != 0:
+        try: os.remove(temp_path)
+        except: pass
+        return False, filepath.name, r.stderr
+    try:
+        os.replace(temp_path, str(filepath))
+    except Exception as e:
+        return False, filepath.name, f'Replace failed: {e}'
+    if (artist or title) and _MUTAGEN_AVAILABLE:
+        _write_metadata_tags(filepath, artist, title)
+    return True, filepath.name, None
+
+# ============================================================
 # Theme Mapping for custom colors
 THEME_COLORS = {
     "Blue": ("#3B8ED0", "#1F6AA5"),
@@ -1870,7 +2242,7 @@ class MainApp(QMainWindow):
                     q['status'] = "Finished" if success else "Pending"
                 self.queue_status_changed_signal.emit(idx)
                 
-            max_workers = min(3, len(pending_items)) if pending_items else 1
+            max_workers = min(getattr(self, 'download_threads', 3), len(pending_items)) if pending_items else 1
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = []
                 for item in pending_items:
@@ -1910,54 +2282,149 @@ class MainApp(QMainWindow):
         self.save_config()
 
     def run_mp3_renamer(self):
-        """Launches mp3renamer5000.py in a new terminal window with the download folder
-        and all GUI settings pre-injected as CLI arguments."""
-        import shutil
-        import subprocess
-
-        script_name = "mp3renamer5000.py"
-
-        # Resolve script: same folder as the GUI first, then PATH
-        script_path = os.path.join(self.config_dir, script_name)
-        if not os.path.exists(script_path):
-            found = shutil.which(script_name)
-            script_path = found if found else ""
-
-        if not script_path or not os.path.exists(script_path):
-            self._on_status_update(
-                "mp3renamer5000.py not found. Place it in the same folder as yt-msd.",
-                False, "red"
-            )
+        """Runs the integrated renamer/normalizer in a live-output dialog window."""
+        from PySide6.QtCore import Q_ARG
+        folder_str = self.path_combo.currentText()
+        if not folder_str or not os.path.exists(folder_str):
+            self._on_status_update('Renamer: download folder does not exist.', False, 'red')
             return
 
-        folder = self.path_combo.currentText()
+        folder       = Path(folder_str)
+        norm_mode    = self.normalization_mode
+        auto_rename  = self.auto_rename
+        silence_pad  = self.silence_pad_dur
+        norm_threads = self.normalization_threads
+        custom_eq    = self.custom_eq_string.strip() if self.use_custom_eq else ''
 
-        # Resolve Python executable to ensure we use the console version (python.exe) instead of windowed (pythonw.exe)
-        executable = sys.executable
-        if getattr(sys, 'frozen', False):
-            executable = "python"
-        else:
-            idx = executable.lower().rfind("pythonw")
-            if idx != -1:
-                executable = executable[:idx] + "python" + executable[idx+7:]
+        # ── Build the output dialog ─────────────────────────────────────────
+        from PySide6.QtWidgets import QTextEdit
+        dlg = QDialog(self)
+        dlg.setWindowTitle('MP3 Renamer & Normalizer')
+        dlg.resize(780, 520)
+        dlg.setWindowFlags(dlg.windowFlags() | Qt.Tool)
+        dlg_layout = QVBoxLayout(dlg)
+        dlg_layout.setContentsMargins(12, 12, 12, 12)
 
-        # Build the argument list (without manual quoting, subprocess.Popen handles spaces)
-        args = [executable, script_path, folder]
-        args.append(f'--norm={self.normalization_mode}')
-        if self.auto_rename:
-            args.append('--auto')
-        args.append(f'--silence-pad={str(self.silence_pad_dur)}')
-        args.append(f'--norm-threads={self.normalization_threads}')
-        if self.use_custom_eq and self.custom_eq_string.strip():
-            args.append(f'--eq={self.custom_eq_string.strip()}')
+        log_box = QTextEdit()
+        log_box.setReadOnly(True)
+        log_box.setStyleSheet('font-family: Consolas, monospace; font-size: 11px;')
+        dlg_layout.addWidget(log_box, 1)
 
-        try:
-            # 0x00000010 (CREATE_NEW_CONSOLE) starts the process in a new console window on Windows
-            creationflags = 0x00000010 if sys.platform == "win32" else 0
-            subprocess.Popen(args, creationflags=creationflags)
-            self._on_status_update("Launched MP3 Renamer in a new window.", False, "#1abd33")
-        except Exception as e:
-            self._on_status_update(f"Failed to launch MP3 Renamer: {str(e)}", False, "red")
+        close_btn = QPushButton('Close')
+        close_btn.setEnabled(False)
+        close_btn.clicked.connect(dlg.accept)
+        dlg_layout.addWidget(close_btn)
+
+        def _log(msg):
+            from PySide6.QtCore import QMetaObject, Qt as _Qt
+            QMetaObject.invokeMethod(
+                log_box, 'append', _Qt.QueuedConnection, Q_ARG(str, str(msg))
+            )
+
+        def _worker():
+            try:
+                # ── RENAME PASS ─────────────────────────────────────────────
+                extensions = {'.mp3', '.m4a'}
+                files = sorted([f for f in folder.iterdir()
+                                if f.is_file() and f.suffix.lower() in extensions])
+                if not files:
+                    _log('No MP3 or M4A files found in the folder.')
+                else:
+                    _log(f'Found {len(files)} audio file(s). Running rename pass...')
+                    renamed_count = 0
+                    tagged_count  = 0
+                    skipped_count = 0
+                    for file in files:
+                        stem       = file.stem
+                        suffix_ext = file.suffix.lower()
+                        suggestion = _clean_youtube_title(stem)
+                        existing_artist, existing_title = _read_metadata_tags(file)
+                        filename_ok = (suggestion == stem and ' - ' in stem)
+                        has_tags    = bool(existing_artist and existing_title)
+                        if filename_ok and has_tags:
+                            _log(f'  \u2713 Already OK: {file.name}')
+                            continue
+                        # In auto mode only rename if a clean "Artist - Title" is found
+                        if ' - ' not in suggestion:
+                            _log(f'  ~ Skipped (no clear artist/title): {file.name}')
+                            skipped_count += 1
+                            continue
+                        parts_s = suggestion.split(' - ', 1)
+                        if not parts_s[0].strip() or not parts_s[1].strip():
+                            _log(f'  ~ Skipped (empty artist or title): {file.name}')
+                            skipped_count += 1
+                            continue
+                        final_name = suggestion
+                        new_path   = folder / f'{final_name}{suffix_ext}'
+                        if final_name != stem:
+                            if new_path.exists():
+                                _log(f'  ! Conflict – skipped rename: {file.name}')
+                                skipped_count += 1
+                                continue
+                            try:
+                                file.rename(new_path)
+                                _log(f'  \u2192 Renamed: {file.name}  \u2192  {new_path.name}')
+                                renamed_count += 1
+                                file = new_path
+                            except Exception as e:
+                                _log(f'  ! Rename failed: {e}')
+                                skipped_count += 1
+                                continue
+                        # Write metadata tags
+                        if _MUTAGEN_AVAILABLE and ' - ' in final_name:
+                            p2 = final_name.split(' - ', 1)
+                            if _write_metadata_tags(file, p2[0].strip(), p2[1].strip()):
+                                tagged_count += 1
+                                _log(f'    Tagged: artist="{p2[0].strip()}" title="{p2[1].strip()}"')
+                    _log(f'\nRename pass done \u2014 renamed: {renamed_count}, '
+                         f'tagged: {tagged_count}, skipped: {skipped_count}\n')
+
+                # ── NORMALIZATION PASS ──────────────────────────────────────
+                if norm_mode == 'off':
+                    _log('Normalization disabled in settings \u2014 skipping.')
+                else:
+                    if not _check_ffmpeg():
+                        _log('FFmpeg not found in PATH \u2014 skipping normalization.')
+                    else:
+                        audio_files = sorted([f for f in folder.iterdir()
+                                              if f.is_file() and f.suffix.lower() in {'.mp3', '.m4a'}])
+                        if not audio_files:
+                            _log('No files found for normalization.')
+                        else:
+                            _log(f'Starting normalization on {len(audio_files)} file(s) '
+                                 f'using {norm_threads} thread(s)...')
+                            n_ok = 0
+                            n_fail = 0
+                            norm_lock = threading.Lock()
+                            with ThreadPoolExecutor(max_workers=norm_threads) as ex:
+                                futs = {
+                                    ex.submit(
+                                        _normalize_file, idx, len(audio_files), fp,
+                                        silence_pad, custom_eq, _log
+                                    ): fp
+                                    for idx, fp in enumerate(audio_files, 1)
+                                }
+                                for fut in as_completed(futs):
+                                    ok, fname, err = fut.result()
+                                    with norm_lock:
+                                        if ok:
+                                            n_ok += 1
+                                            _log(f'  \u2713 Normalized: {fname}')
+                                        else:
+                                            n_fail += 1
+                                            _log(f'  \u2717 Failed:     {fname}\n    {err}')
+                            _log(f'\nNormalization done \u2014 OK: {n_ok}, failed: {n_fail}\n')
+            except Exception as e:
+                _log(f'\n[Error] {e}')
+            finally:
+                from PySide6.QtCore import QMetaObject, Qt as _Qt
+                QMetaObject.invokeMethod(close_btn, 'setEnabled', _Qt.QueuedConnection,
+                                        Q_ARG(bool, True))
+                _log('\n\u2500\u2500 All done \u2500\u2500')
+
+        threading.Thread(target=_worker, daemon=True).start()
+        self._on_status_update('Running integrated renamer...', False, '#3B8ED0')
+        dlg.exec()
 
     def browse_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Download Folder", self.path_combo.currentText() or "")
@@ -1995,20 +2462,27 @@ class MainApp(QMainWindow):
             
         if d['status'] == 'downloading':
             p = d.get('_percent_str', '').strip()
-            import re
             p = re.sub(r'\x1b\[[0-9;]*m', '', p)
             if p:
                 with self.active_downloads_lock:
                     self.active_downloads[vid_id] = p
-                    progress_strs = [f"{self.active_downloads[vid]}" for vid in list(self.active_downloads.keys())]
-                    self.dl_progress_signal.emit(f"Downloading: {', '.join(progress_strs)}")
+                    vals = list(self.active_downloads.values())
+                    if len(vals) > 5:
+                        self.dl_progress_signal.emit(
+                            f"Downloading: {', '.join(vals[:5])} (+{len(vals)-5} more)")
+                    else:
+                        self.dl_progress_signal.emit(f"Downloading: {', '.join(vals)}")
         elif d['status'] == 'finished':
             with self.active_downloads_lock:
                 if vid_id in self.active_downloads:
                     del self.active_downloads[vid_id]
                 if self.active_downloads:
-                    progress_strs = [f"{self.active_downloads[vid]}" for vid in list(self.active_downloads.keys())]
-                    self.dl_progress_signal.emit(f"Downloading: {', '.join(progress_strs)}")
+                    vals = list(self.active_downloads.values())
+                    if len(vals) > 5:
+                        self.dl_progress_signal.emit(
+                            f"Downloading: {', '.join(vals[:5])} (+{len(vals)-5} more)")
+                    else:
+                        self.dl_progress_signal.emit(f"Downloading: {', '.join(vals)}")
                 else:
                     self.dl_progress_signal.emit("Processing...")
 
