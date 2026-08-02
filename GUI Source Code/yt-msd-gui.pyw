@@ -35,15 +35,36 @@ from PySide6.QtCore import Qt, Signal, QTimer, Slot, QPoint, QRect, QMargins
 from PySide6.QtGui import QIcon, QPixmap, QImage, QAction, QColor, QPalette, QPainter, QBrush, QFont
 
 # ============================================================
-# INTEGRATED RENAMER / NORMALIZER (ported from mp3renamer5000)
+# INTEGRATED MP3 RENAMER, TAGGER & LOUDNESS NORMALIZER
+# (Ported from mp3renamer5000.py — interactive CLI mode & algorithms)
 # ============================================================
 
-# Loudness normalization settings
-_TARGET_LUFS    = "-16"
-_TRUE_PEAK      = "-1.5"
-_BITRATE        = "320k"
+class Colors:
+    HEADER = '\033[95m'
+    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    END = '\033[0m'
+    BOLD = '\033[1m'
+    DIM = '\033[90m'
 
-# Mutagen: optional, enables metadata tagging
+_print_lock = threading.Lock()
+
+def _safe_print(msg):
+    with _print_lock:
+        print(msg)
+
+_available_threads = os.cpu_count() or 4
+TARGET_LUFS = "-16"
+TRUE_PEAK = "-1.5"
+LOUDNESS_RANGE = "11"
+BITRATE = "320k"
+MAX_WORKERS = max(1, _available_threads // 2)
+SILENCE_PAD_DUR = 2.0
+CUSTOM_EQ_STRING = ""
+
 _MUTAGEN_AVAILABLE = False
 try:
     from mutagen.easyid3 import EasyID3
@@ -53,32 +74,69 @@ try:
 except ImportError:
     pass
 
+def _print_renamer_banner():
+    banner = rf"""{Colors.CYAN}{Colors.BOLD}                                                  
+ _____ _____ ___    _____                           
+|     |  _  |_  |  | __  |___ ___ ___ _____ ___ ___ 
+| | | |   __|_  |  |    -| -_|   | .'|     | -_|  _|
+|_|_|_|__|  |___|  |__|__|___|_|_|__,|_|_|_|___|_|  
+{Colors.END}"""
+    print(banner)
+    print(f"{Colors.BOLD}Interactive MP3/M4A Renamer, Tagger & Loudness Normalizer{Colors.END}")
+    print(f"{Colors.BOLD}Available CPU Threads: {_available_threads}{Colors.END}\n")
+    print(f"{Colors.BOLD}Using {MAX_WORKERS} CPU Threads for Processing{Colors.END}\n")
+
+    if _MUTAGEN_AVAILABLE:
+        print(f"{Colors.GREEN}[✓] Mutagen library active. Automatic metadata tagging is enabled.{Colors.END}\n")
+    else:
+        print(f"{Colors.YELLOW}[!] Mutagen library not found. Metadata tagging will be disabled.{Colors.END}")
+        print(f"{Colors.DIM}    Run 'pip install mutagen' in your terminal to enable tagging.{Colors.END}")
+        print(f"{Colors.DIM}    Continuing in Rename-Only mode.{Colors.END}\n")
+
+def _select_renamer_folder():
+    print(f"{Colors.BLUE}Please select the folder containing your audio files...{Colors.END}")
+    folder_path = ""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.focus_force()
+        folder_path = filedialog.askdirectory(title="Select Audio Folder (MP3/M4A)")
+        root.destroy()
+    except Exception:
+        pass
+    if not folder_path:
+        folder_path = input(f"{Colors.BOLD}Enter the folder path containing MP3/M4A files:{Colors.END}\n").strip()
+    if not folder_path:
+        print(f"{Colors.RED}No folder selected. Exiting.{Colors.END}")
+        sys.exit(0)
+    path = Path(folder_path)
+    if not path.exists() or not path.is_dir():
+        print(f"{Colors.RED}The folder '{folder_path}' does not exist or is not a directory.{Colors.END}")
+        sys.exit(1)
+    return path
+
 def _is_romanized(text):
-    """Return True if text contains only romanised (Latin/ASCII-like) characters."""
     return re.search(
-        r'[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff'
-        r'\uac00-\ud7af\u0400-\u04ff\u0370-\u03ff\u0600-\u06ff]',
+        r'[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af\u0400-\u04ff\u0370-\u03ff\u0600-\u06ff]',
         text
     ) is None
 
-def _clean_youtube_title(filename):
-    """Strip YouTube junk patterns and return a clean 'Artist - Title' string."""
+def clean_youtube_title(filename):
     title = filename
-
-    # 1. Normalise fancy punctuation
-    title = re.sub(r'[\u2010-\u2015\u2212\u2014\u2013]+', '-', title)
+    title = re.sub(r'[\u2010-\u2015—–‐‑‒―]+', '-', title)
     title = re.sub(r'-+', '-', title)
-    title = re.sub(r'[\u2502\u2503\u2758]+', '|', title)
-    title = title.replace('\uff1a', ':')
-    title = title.replace('\u2019', "'").replace('\u2018', "'").replace('`', "'").replace('\u00b4', "'")
-    title = title.replace('\u201c', '"').replace('\u201d', '"')
+    title = re.sub(r'[｜│┃ǀ]+', '|', title)
+    title = title.replace('：', ':')
+    title = title.replace('’', "'").replace('‘', "'").replace('`', "'").replace('´', "'")
+    title = title.replace('“', '"').replace('”', '"')
 
-    # 1b. Mask separators inside brackets so they are not treated as split points
     MASK_HYPHEN = "\x00HYPHEN\x00"
     MASK_PIPE   = "\x00PIPE\x00"
     MASK_COLON  = "\x00COLON\x00"
 
-    def _mask_in_brackets(text):
+    def mask_separators_in_brackets(text):
         result, depth, i = [], 0, 0
         while i < len(text):
             ch = text[i]
@@ -99,40 +157,33 @@ def _clean_youtube_title(filename):
                 result.append(ch); i += 1
         return ''.join(result)
 
-    title = _mask_in_brackets(title)
-
-    # 2. Colons -> separator
+    title = mask_separators_in_brackets(title)
     title = re.sub(r'\s*:\s*', ' - ', title)
 
-    # 3. Pipe symbols
-    if '|' in title:
-        if '-' not in title:
-            title = title.replace('|', ' - ')
+    if "|" in title:
+        if "-" not in title:
+            title = title.replace("|", " - ")
         else:
-            title = title.split('|')[0].rstrip()
+            title = title.split("|")[0].rstrip()
 
-    # 4. Standardise spacing around separator
     title = re.sub(r'\s+-\s+', ' - ', title)
 
-    # 5. Keep only first two parts
-    parts = title.split(' - ')
+    parts = title.split(" - ")
     if len(parts) > 2:
-        title = ' - '.join(parts[:2])
+        title = " - ".join(parts[:2])
 
-    # 5b. Restore masked separators
     title = title.replace(MASK_HYPHEN, ' - ').replace(MASK_PIPE, '|').replace(MASK_COLON, ':')
 
-    # 6. Non-romanised: prefer content inside brackets
-    if ' - ' in title:
-        p = title.split(' - ', 1)
-        artist_p, title_p = p[0].strip(), p[1].strip()
-        if not _is_romanized(title_p):
-            m = re.search(r'[\(\[\{]([^\)\}\]]+)[\)\]\}]', title_p)
+    if " - " in title:
+        parts = title.split(" - ", 1)
+        artist_part, title_part = parts[0].strip(), parts[1].strip()
+        if not _is_romanized(title_part):
+            m = re.search(r'[\(\[\{]([^\)\}\]]+)[\)\]\}]', title_part)
             if m:
                 inside = m.group(1).strip()
                 if not _is_romanized(inside):
-                    title_p = inside
-        title = f"{artist_p} - {title_p}"
+                    title_part = inside
+        title = f"{artist_part} - {title_part}"
     else:
         if not _is_romanized(title):
             m = re.search(r'[\(\[\{]([^\)\}\]]+)[\)\]\}]', title)
@@ -141,264 +192,731 @@ def _clean_youtube_title(filename):
                 if not _is_romanized(inside):
                     title = inside
 
-    # 7. Strip secondary artists from artist half
-    if ' - ' in title:
-        p = title.split(' - ', 1)
-        artist_p = re.split(r'\s*&\s*|\s+[xX]\s+', p[0].strip())[0].strip()
-        title = f"{artist_p} - {p[1].strip()}"
+    if " - " in title:
+        parts = title.split(" - ", 1)
+        artist_part = re.split(r'\s*&\s*|\s+[xX]\s+', parts[0].strip())[0].strip()
+        title = f"{artist_part} - {parts[1].strip()}"
 
-    # 8. Remove parentheses / brackets (keep contents only if non-romanised)
-    def _proc_brackets(match):
+    def process_brackets(match):
         inside = match.group(2)
-        return inside if not _is_romanized(inside) else ''
+        if not _is_romanized(inside):
+            return inside
+        return ""
 
-    bracket_pat = r'(\(|\[|\{)([^\(\)\[\]\{\}]*)(\)|\]|\})'
-    old = ''
-    while old != title:
-        old = title
-        title = re.sub(bracket_pat, _proc_brackets, title)
+    bracket_pair_pattern = r'(\(|\[|\{)([^\(\)\[\]\{\}]*)(\)|\]|\})'
+    old_title = ""
+    while old_title != title:
+        old_title = title
+        title = re.sub(bracket_pair_pattern, process_brackets, title)
 
-    # 9. Remove hanging bracket characters and junk words
-    title = re.sub(r'[\(\)\[\]\{\}]', '', title)
-    title = re.sub(r'\b(hd|version|original|official|4k|uhd|upgraded|upscaled|remastered)\b',
-                   '', title, flags=re.IGNORECASE)
-
-    # 10. Remove feature credits
+    title = re.sub(r'[\(\)\{\}\[\]]', '', title)
+    title = re.sub(r'\b(hd|version|original|official|4k|uhd|upgraded|upscaled|remastered)\b', '', title, flags=re.IGNORECASE)
     title = re.compile(r'\b(ft|feat|featuring)\b\.?', re.IGNORECASE).split(title)[0]
-
-    # 11. Remove hashtags
     title = re.sub(r'#\S+', '', title)
 
-    # 12. Single-quote handling:
-    #     KEEP   if the quote is between letters (e.g. don't) or trailing a word (e.g. wavin')
-    #     REMOVE if it is part of a balanced enclosing pair (e.g. 'some phrase')
-    #     REMOVE if it is floating / not adjacent to any letter on either side
     title = title.replace('"', '')
-    # Step A: strip balanced enclosing pairs  'word word'
     title = re.sub(r"'([^']+)'", r'\1', title)
-    # Step B: strip any remaining quote that is NOT preceded OR followed by a letter
-    title = re.sub(r"(?<![a-zA-Z])'(?![a-zA-Z])", '', title)
+    title = re.sub(r"(?<![a-zA-Z])'(?![a-zA-Z])", "", title)
 
-    # 13. Remove emojis / misc symbols
     try:
         title = re.sub(r'[\U00010000-\U0010ffff\u2600-\u27bf]', '', title, flags=re.UNICODE)
     except re.error:
         pass
 
-    # 14. Clean whitespace
     title = re.sub(r'\s+', ' ', title).strip()
-    if ' - ' in title:
-        p = title.split(' - ', 1)
-        artist_p, title_p = p[0].strip(), p[1].strip()
-        if ',' in artist_p:
-            artist_p = artist_p.split(',')[0].strip()
-        title = f"{artist_p} - {title_p}"
+
+    if " - " in title:
+        parts = title.split(" - ", 1)
+        artist_part = parts[0].strip()
+        title_part = parts[1].strip()
+        if "," in artist_part:
+            artist_part = artist_part.split(",")[0].strip()
+        title = f"{artist_part} - {title_part}"
     else:
         title = re.sub(r'\s*-\s*$', '', title)
         title = re.sub(r'^\s*-\s*', '', title)
         title = title.strip()
 
-    # 15. Sanitise Windows filename characters
-    title = re.sub(r'[\\/:*?"<>|]', '_', title)
+    invalid_chars = r'[\\/:*?"<>|]'
+    title = re.sub(invalid_chars, '_', title)
     title = re.sub(r'\s+', ' ', title).strip()
+
     return title
 
-def _read_metadata_tags(filepath):
-    """Return (artist, title) from file tags, or (None, None)."""
+def read_metadata_tags(filepath):
     if not _MUTAGEN_AVAILABLE:
         return None, None
     suffix = filepath.suffix.lower()
     try:
-        if suffix == '.mp3':
+        if suffix == ".mp3":
             try:
                 tags = EasyID3(filepath)
-                return tags.get('artist', [None])[0], tags.get('title', [None])[0]
+                return tags.get("artist", [None])[0], tags.get("title", [None])[0]
             except ID3NoHeaderError:
                 return None, None
-        elif suffix == '.m4a':
-            tags = EasyMP4(filepath)
-            return tags.get('artist', [None])[0], tags.get('title', [None])[0]
+        elif suffix == ".m4a":
+            try:
+                tags = EasyMP4(filepath)
+                return tags.get("artist", [None])[0], tags.get("title", [None])[0]
+            except Exception:
+                return None, None
     except Exception:
         pass
     return None, None
 
-def _write_metadata_tags(filepath, artist, title):
-    """Write artist/title tags to file. Returns True on success."""
+def write_metadata_tags(filepath, artist, title):
     if not _MUTAGEN_AVAILABLE:
         return False
     suffix = filepath.suffix.lower()
     try:
-        if suffix == '.mp3':
+        if suffix == ".mp3":
             try:
                 tags = EasyID3(filepath)
             except ID3NoHeaderError:
                 tags = EasyID3()
                 tags.save(filepath)
                 tags = EasyID3(filepath)
-            tags['artist'] = artist
-            tags['title'] = title
+            tags["artist"] = artist
+            tags["title"] = title
             tags.save()
             return True
-        elif suffix == '.m4a':
-            tags = EasyMP4(filepath)
-            tags['artist'] = artist
-            tags['title'] = title
+        elif suffix == ".m4a":
+            try:
+                tags = EasyMP4(filepath)
+            except Exception:
+                tags = EasyMP4(filepath)
+            tags["artist"] = artist
+            tags["title"] = title
             tags.save()
             return True
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"{Colors.RED}Error writing tags to {filepath.name}: {e}{Colors.END}")
     return False
 
-def _check_ffmpeg():
-    """Return True if ffmpeg is on PATH."""
+def clean_and_tag_files(folder_path, start_auto=False):
+    extensions = {".mp3", ".m4a"}
+    files = sorted([f for f in folder_path.iterdir() if f.is_file() and f.suffix.lower() in extensions])
+    
+    if not files:
+        print(f"{Colors.YELLOW}No MP3 or M4A files found in this folder.{Colors.END}")
+        return 0, 0, 0, 0
+        
+    print(f"{Colors.GREEN}Found {len(files)} audio files for renaming.{Colors.END}\n")
+    
+    renamed_count = 0
+    tagged_count = 0
+    skipped_count = 0
+    already_formatted_count = 0
+    
+    def run_renaming_pass(file_list, is_manual_skipped_pass=False):
+        nonlocal renamed_count, tagged_count, skipped_count, already_formatted_count
+        
+        auto_mode = start_auto if not is_manual_skipped_pass else False
+        skipped_files = []
+        
+        idx = 1
+        while idx <= len(file_list):
+            file = file_list[idx - 1]
+            stem = file.stem
+            suffix = file.suffix.lower()
+            
+            current_suggestion = clean_youtube_title(stem)
+            existing_artist, existing_title = read_metadata_tags(file)
+            
+            filename_is_correct = (current_suggestion == stem and " - " in stem)
+            has_valid_tags = bool(existing_artist and existing_title)
+            
+            if not is_manual_skipped_pass and filename_is_correct and has_valid_tags:
+                print(f"{Colors.DIM}[{idx}/{len(file_list)}] {Colors.GREEN}✔ Already formatted and tagged: {Colors.END}{file.name}")
+                already_formatted_count += 1
+                idx += 1
+                continue
+            
+            is_manually_inputted = False
+            if auto_mode:
+                has_artist_sep = " - " in current_suggestion
+                artist_name = ""
+                title_name = ""
+                if has_artist_sep:
+                    parts = current_suggestion.split(" - ", 1)
+                    artist_name = parts[0].strip()
+                    title_name = parts[1].strip()
+                
+                if not has_artist_sep or not artist_name or not title_name:
+                    skipped_files.append(file)
+                    skipped_count += 1
+                    idx += 1
+                    continue
+                else:
+                    final_name = current_suggestion
+            else:
+                final_name = None
+                skip_file = False
+                go_prev = False
+                while True:
+                    print(f"{Colors.DIM}─" * 60)
+                    print(f"{Colors.BOLD}[{idx}/{len(file_list)}] File: {Colors.END}{file.name}")
+                    print(f"  {Colors.YELLOW}Original  :{Colors.END} {stem}")
+                    print(f"  {Colors.GREEN}Predicted :{Colors.END} {current_suggestion}")
+                    
+                    if has_valid_tags:
+                        print(f"  {Colors.CYAN}Tags found:{Colors.END} Artist='{existing_artist}', Title='{existing_title}'")
+                    else:
+                        print(f"  {Colors.DIM}Tags found: [None/Missing]{Colors.END}")
+                        
+                    has_artist_sep = " - " in current_suggestion
+                    artist_name = ""
+                    title_name = ""
+                    if has_artist_sep:
+                        parts = current_suggestion.split(" - ", 1)
+                        artist_name = parts[0].strip()
+                        title_name = parts[1].strip()
+                        
+                    if not has_artist_sep or not artist_name or not title_name:
+                        artist_prompt = (
+                            f"\n  {Colors.CYAN}No artist found.{Colors.END} Predicted title: {Colors.BOLD}{current_suggestion}{Colors.END}\n"
+                            f"  Type the {Colors.GREEN}artist name{Colors.END} to build '{Colors.BOLD}Artist - {current_suggestion}{Colors.END}',\n"
+                            f"  {Colors.YELLOW}'n'{Colors.END} to enter a full name manually, {Colors.YELLOW}'s'{Colors.END} to skip, {Colors.YELLOW}'prev'{Colors.END} to redo previous, or type {Colors.YELLOW}'AUTO'{Colors.END} to switch to auto-mode:\n  > "
+                        )
+                        user_input = input(artist_prompt).strip()
+                        
+                        if user_input.upper() == 'AUTO':
+                            auto_mode = True
+                            break
+                        elif user_input.lower() == 'prev':
+                            if idx > 1:
+                                go_prev = True
+                            else:
+                                print(f"  {Colors.YELLOW}Already at the first file.{Colors.END}")
+                            break
+                        elif user_input.lower() == 's':
+                            print(f"  {Colors.YELLOW}Skipped.{Colors.END}\n")
+                            skipped_count += 1
+                            skipped_files.append(file)
+                            skip_file = True
+                            break
+                        elif user_input.lower() == 'n' or not user_input:
+                            prompt = f"\n  Type custom {Colors.BOLD}Artist - Title{Colors.END} name, or {Colors.YELLOW}'s'{Colors.END} to skip:\n  > "
+                            custom_input = input(prompt).strip()
+                            if custom_input.lower() == 's':
+                                print(f"  {Colors.YELLOW}Skipped.{Colors.END}\n")
+                                skipped_count += 1
+                                skipped_files.append(file)
+                                skip_file = True
+                                break
+                            elif custom_input.upper() == 'AUTO':
+                                auto_mode = True
+                                break
+                            elif custom_input:
+                                final_name = custom_input
+                                is_manually_inputted = True
+                                break
+                            else:
+                                print(f"  {Colors.YELLOW}Skipped.{Colors.END}\n")
+                                skipped_count += 1
+                                skipped_files.append(file)
+                                skip_file = True
+                                break
+                        else:
+                            final_name = f"{user_input} - {current_suggestion}"
+                            is_manually_inputted = True
+                            break
+                    else:
+                        prompt = f"\n  {Colors.BOLD}Accept predicted name?{Colors.END}\n  {Colors.CYAN}[ENTER]{Colors.END} to accept, type {Colors.GREEN}'f'{Colors.END} to flip Artist/Title, type a new {Colors.BOLD}Artist - Title{Colors.END}, {Colors.YELLOW}'s'{Colors.END} to skip, {Colors.YELLOW}'prev'{Colors.END} to redo previous, or {Colors.YELLOW}'AUTO'{Colors.END} to auto-process remaining:\n  > "
+                        user_input = input(prompt).strip()
+                        
+                        if user_input.upper() == 'AUTO':
+                            auto_mode = True
+                            break
+                        elif user_input.lower() == 'prev':
+                            if idx > 1:
+                                go_prev = True
+                            else:
+                                print(f"  {Colors.YELLOW}Already at the first file.{Colors.END}")
+                            break
+                        elif user_input.lower() == 's':
+                            print(f"  {Colors.YELLOW}Skipped.{Colors.END}\n")
+                            skipped_count += 1
+                            skipped_files.append(file)
+                            skip_file = True
+                            break
+                        elif user_input.lower() == 'f':
+                            parts = current_suggestion.split(" - ", 1)
+                            flipped_name = f"{parts[1]} - {parts[0]}"
+                            current_suggestion = clean_youtube_title(flipped_name)
+                            print(f"  {Colors.CYAN}Flipped Layout Prediction to:{Colors.END} {current_suggestion}")
+                            continue
+                        else:
+                            if user_input:
+                                final_name = user_input
+                                is_manually_inputted = True
+                            else:
+                                final_name = current_suggestion
+                                is_manually_inputted = False
+                            break
+                
+                if auto_mode:
+                    continue
+                if go_prev:
+                    idx -= 1
+                    continue
+                if skip_file:
+                    idx += 1
+                    continue
+            
+            if not is_manually_inputted:
+                final_name = clean_youtube_title(final_name)
+            if not final_name:
+                print(f"  {Colors.RED}Invalid name. Skipped.{Colors.END}\n")
+                skipped_count += 1
+                skipped_files.append(file)
+                idx += 1
+                continue
+                
+            new_filename = f"{final_name}{suffix}"
+            new_filepath = folder_path / new_filename
+            
+            renamed = False
+            active_filepath = file
+            
+            if final_name != stem:
+                if new_filepath.exists():
+                    print(f"  {Colors.RED}Error: A file named '{new_filename}' already exists. Skipping rename.{Colors.END}\n")
+                    skipped_count += 1
+                    skipped_files.append(file)
+                    idx += 1
+                    continue
+                try:
+                    file.rename(new_filepath)
+                    print(f"  {Colors.GREEN}Renamed to:{Colors.END} {new_filename}")
+                    active_filepath = new_filepath
+                    renamed_count += 1
+                    renamed = True
+                except Exception as e:
+                    print(f"  {Colors.RED}Rename failed: {e}{Colors.END}\n")
+                    skipped_count += 1
+                    skipped_files.append(file)
+                    idx += 1
+                    continue
+            
+            artist, title = None, None
+            if " - " in final_name:
+                parts = final_name.split(" - ", 1)
+                artist = parts[0].strip()
+                title = parts[1].strip()
+                
+            if artist and title:
+                if _MUTAGEN_AVAILABLE:
+                    success = write_metadata_tags(active_filepath, artist, title)
+                    if success:
+                        tagged_count += 1
+                        tag_status = "Renamed & Tagged" if renamed else "Tagged"
+                        print(f"  {Colors.GREEN}✔ {tag_status} successfully:{Colors.END} Artist='{artist}', Title='{title}'")
+                    else:
+                        print(f"  {Colors.YELLOW}Renamed, but failed to write metadata tags.{Colors.END}")
+                else:
+                    if renamed:
+                        print(f"  {Colors.YELLOW}Renamed, but skipped tagging (Mutagen not available).{Colors.END}")
+            else:
+                print(f"  {Colors.YELLOW}Could not parse 'Artist - Title' format. Skipping metadata tagging.{Colors.END}")
+                
+            print()
+            idx += 1
+            
+        return skipped_files
+    
+    skipped_files = run_renaming_pass(files, is_manual_skipped_pass=False)
+    
+    if skipped_files:
+        print(f"{Colors.DIM}─" * 60)
+        print(f"\n{Colors.BOLD}Auto-mode / Renaming Pass Complete.{Colors.END}")
+        print(f"There are {len(skipped_files)} files that were skipped or did not match the naming pattern.")
+        try:
+            choice = input(f"Do you want to manually go over the skipped ones? ({Colors.GREEN}y{Colors.END}/{Colors.RED}n{Colors.END}): ").strip().lower()
+            if choice in ('y', 'yes'):
+                skipped_count -= len(skipped_files)
+                run_renaming_pass(skipped_files, is_manual_skipped_pass=True)
+        except KeyboardInterrupt:
+            print(f"\n\n{Colors.RED}Process interrupted by user. Exiting.{Colors.END}")
+            sys.exit(0)
+            
+    return renamed_count, tagged_count, skipped_count, already_formatted_count
+
+def check_ffmpeg_available():
     try:
-        si = None
-        if sys.platform == 'win32':
-            si = subprocess.STARTUPINFO()
-            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        subprocess.run(['ffmpeg', '-version'], stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL, check=True, startupinfo=si)
+        startupinfo = None
+        if sys.platform == "win32":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, startupinfo=startupinfo)
         return True
     except Exception:
         return False
 
-def _measure_loudness(filepath):
-    """First-pass loudnorm measurement. Returns (input_i, input_tp, error)."""
-    import json as _json
-    cmd = ['ffmpeg', '-y', '-i', str(filepath),
-           '-af', f'loudnorm=I={_TARGET_LUFS}:TP={_TRUE_PEAK}:print_format=json',
-           '-f', 'null', '-']
+def measure_loudness(filepath):
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i", str(filepath),
+        "-af", f"loudnorm=I={TARGET_LUFS}:TP={TRUE_PEAK}:print_format=json",
+        "-f", "null",
+        "-"
+    ]
     try:
-        si = None
-        if sys.platform == 'win32':
-            si = subprocess.STARTUPINFO()
-            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           text=True, encoding='utf-8', errors='ignore', startupinfo=si)
-        if r.returncode != 0:
-            return None, None, f'FFmpeg exited {r.returncode}'
-        m = re.search(r'\{\s*"input_i".*?\}', r.stderr, re.DOTALL)
-        if m:
-            data = _json.loads(m.group(0))
-            return float(data.get('input_i', _TARGET_LUFS)), float(data.get('input_tp', _TRUE_PEAK)), None
-        return None, None, 'No loudnorm JSON in FFmpeg output'
+        startupinfo = None
+        if sys.platform == "win32":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding='utf-8',
+            errors='ignore',
+            startupinfo=startupinfo
+        )
+        if result.returncode != 0:
+            return None, None, f"FFmpeg exited with code {result.returncode}"
+            
+        stderr_output = result.stderr
+        json_match = re.search(r'\{\s*"input_i".*?\}', stderr_output, re.DOTALL)
+        if json_match:
+            import json
+            data = json.loads(json_match.group(0))
+            input_i = float(data.get("input_i", TARGET_LUFS))
+            input_tp = float(data.get("input_tp", TRUE_PEAK))
+            return input_i, input_tp, None
+        else:
+            return None, None, "Could not find loudnorm JSON block in FFmpeg output"
     except Exception as e:
         return None, None, str(e)
 
-def _normalize_file(index, total, filepath, silence_pad_dur, custom_eq_string, log_fn):
-    """Apply static whole-track gain normalization. log_fn(str) for progress."""
+def normalize_file(index, total, filepath):
     suffix = filepath.suffix.lower()
-    artist, title = _read_metadata_tags(filepath)
-    input_i, input_tp, err = _measure_loudness(filepath)
+    artist, title = read_metadata_tags(filepath)
+    
+    input_i, input_tp, err = measure_loudness(filepath)
     if err:
-        return False, filepath.name, f'Loudness measurement failed: {err}'
-    target_lufs  = float(_TARGET_LUFS)
-    true_peak    = float(_TRUE_PEAK)
-    gain         = target_lufs - input_i
-    max_gain     = true_peak - input_tp
-    final_gain   = min(gain, max_gain)
-    limit_note   = ' (Peak Limited)' if final_gain < gain else ''
-    log_fn(f'[{index}/{total}] Processing: {filepath.name}\n'
-           f'  Measured: {input_i:+.2f} LUFS | Peak: {input_tp:+.2f} dB\n'
-           f'  Applying gain: {final_gain:+.2f} dB{limit_note}')
+        return False, filepath.name, f"Loudness measurement failed: {err}"
+        
+    target_lufs = float(TARGET_LUFS)
+    true_peak_limit = float(TRUE_PEAK)
+    
+    gain = target_lufs - input_i
+    max_gain = true_peak_limit - input_tp
+    final_gain = min(gain, max_gain)
+    
+    limit_str = " (Peak Limited)" if final_gain < gain else ""
+    _safe_print(
+        f"[{index}/{total}] {Colors.CYAN}Processing:{Colors.END} {filepath.name}...\n"
+        f"  ├─ Measured: {input_i:+.2f} LUFS | True Peak: {input_tp:+.2f} dB\n"
+        f"  └─ Applying Whole-Track Gain: {final_gain:+.2f} dB{limit_str} (Target: {target_lufs} LUFS)"
+    )
+    
     try:
         temp_fd, temp_path = tempfile.mkstemp(suffix=suffix)
         os.close(temp_fd)
     except Exception as e:
-        return False, filepath.name, f'Temp file error: {e}'
-    SILENCE_THR = '-50dB'
-    SILENCE_DUR = '0.5'
-    af = (f'silenceremove=start_periods=1:start_duration={SILENCE_DUR}:start_threshold={SILENCE_THR},'
-          f'areverse,'
-          f'silenceremove=start_periods=1:start_duration={SILENCE_DUR}:start_threshold={SILENCE_THR},'
-          f'areverse,'
-          f'volume={final_gain:.2f}dB,'
-          f'apad=pad_dur={silence_pad_dur}')
-    if custom_eq_string:
-        af += f',{custom_eq_string}'
-    cmd = ['ffmpeg', '-y', '-i', str(filepath), '-af', af]
-    if suffix == '.mp3':
-        cmd += ['-codec:a', 'libmp3lame', '-b:a', _BITRATE]
-    elif suffix == '.m4a':
-        cmd += ['-codec:a', 'aac', '-b:a', _BITRATE]
+        return False, filepath.name, f"Failed to create temp file: {e}"
+        
+    SILENCE_THRESHOLD = "-50dB"
+    SILENCE_DURATION = "0.5"
+    af_chain = (
+        f"silenceremove=start_periods=1:start_duration={SILENCE_DURATION}:start_threshold={SILENCE_THRESHOLD},"
+        f"areverse,"
+        f"silenceremove=start_periods=1:start_duration={SILENCE_DURATION}:start_threshold={SILENCE_THRESHOLD},"
+        f"areverse,"
+        f"volume={final_gain:.2f}dB"
+    )
+    if SILENCE_PAD_DUR > 0:
+        af_chain += f",apad=pad_dur={SILENCE_PAD_DUR}"
+    if CUSTOM_EQ_STRING:
+        af_chain += f",{CUSTOM_EQ_STRING}"
+
+    command = ["ffmpeg", "-y", "-i", str(filepath), "-af", af_chain]
+    
+    if suffix == ".mp3":
+        command += ["-codec:a", "libmp3lame", "-b:a", BITRATE]
+    elif suffix == ".m4a":
+        command += ["-codec:a", "aac", "-b:a", BITRATE]
     else:
-        cmd += ['-b:a', _BITRATE]
-    cmd += ['-map_metadata', '0']
-    if suffix == '.m4a':
-        cmd += ['-movflags', '+faststart']
-    cmd.append(temp_path)
+        command += ["-b:a", BITRATE]
+        
+    command += ["-map_metadata", "0"]
+    if suffix == ".m4a":
+        command += ["-movflags", "+faststart"]
+        
+    command.append(temp_path)
+    
     try:
-        si = None
-        if sys.platform == 'win32':
-            si = subprocess.STARTUPINFO()
-            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           text=True, startupinfo=si)
+        startupinfo = None
+        if sys.platform == "win32":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            startupinfo=startupinfo
+        )
     except Exception as e:
         try: os.remove(temp_path)
         except: pass
-        return False, filepath.name, f'FFmpeg error: {e}'
-    if r.returncode != 0:
+        return False, filepath.name, f"FFmpeg execution failed: {e}"
+        
+    if result.returncode != 0:
         try: os.remove(temp_path)
         except: pass
-        return False, filepath.name, r.stderr
+        return False, filepath.name, result.stderr
+        
     try:
         os.replace(temp_path, str(filepath))
     except Exception as e:
-        return False, filepath.name, f'Replace failed: {e}'
+        return False, filepath.name, f"Failed to replace original file with temp: {e}"
+        
     if (artist or title) and _MUTAGEN_AVAILABLE:
-        _write_metadata_tags(filepath, artist, title)
+        write_metadata_tags(filepath, artist, title)
+        
     return True, filepath.name, None
 
-def _trim_silence_file(index, total, filepath, log_fn):
-    """Trim silence from front and back without volume change."""
-    log_fn(f'[{index}/{total}] Trimming silence: {filepath.name}...')
+def run_loudness_normalization(folder_path):
+    print(f"\n{Colors.CYAN}{Colors.BOLD}========================================{Colors.END}")
+    print(f"{Colors.CYAN}{Colors.BOLD}=== TWO-PASS VOLUME ADJUSTMENT PASS ===={Colors.END}")
+    print(f"{Colors.CYAN}{Colors.BOLD}========================================{Colors.END}\n")
+    
+    if not check_ffmpeg_available():
+        print(f"{Colors.YELLOW}[!] FFmpeg was not found in your system's PATH.{Colors.END}")
+        print(f"{Colors.DIM}    Loudness normalization requires FFmpeg to process files.{Colors.END}")
+        print(f"{Colors.DIM}    Skipping volume adjustment pass.{Colors.END}\n")
+        return 0, 0
+        
+    extensions = {".mp3", ".m4a"}
+    files = sorted([f for f in folder_path.iterdir() if f.is_file() and f.suffix.lower() in extensions])
+    
+    if not files:
+        print(f"{Colors.YELLOW}No MP3 or M4A files found to adjust.{Colors.END}\n")
+        return 0, 0
+        
+    print(f"{Colors.GREEN}Starting static volume adjustment on {len(files)} files with {MAX_WORKERS} worker threads...{Colors.END}")
+    print(f"{Colors.DIM}Settings: Target Loudness={TARGET_LUFS} LUFS | Max Peak={TRUE_PEAK} dB | Output Bitrate={BITRATE}{Colors.END}\n")
+    
+    completed = 0
+    failed = 0
+    
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = []
+        for idx, file in enumerate(files, 1):
+            futures.append(executor.submit(normalize_file, idx, len(files), file))
+            
+        for future in as_completed(futures):
+            success, filename, error = future.result()
+            if success:
+                completed += 1
+                _safe_print(f"  {Colors.GREEN}✔ Adjusted Volume:{Colors.END} {filename}\n")
+            else:
+                failed += 1
+                _safe_print(f"\n  {Colors.RED}✘ Failed to adjust volume {filename}:{Colors.END}")
+                _safe_print(f"{Colors.DIM}{error}{Colors.END}\n")
+                
+    print(f"\n{Colors.CYAN}{Colors.BOLD}Volume Adjustment Complete!{Colors.END}")
+    print(f"  {Colors.GREEN}Success: {completed}{Colors.END} | {Colors.RED}Failed: {failed}{Colors.END}\n")
+    return completed, failed
+
+def trim_silence_file(index, total, filepath):
+    _safe_print(f"[{index}/{total}] {Colors.CYAN}Trimming silence:{Colors.END} {filepath.name}...")
     suffix = filepath.suffix.lower()
-    artist, title = _read_metadata_tags(filepath)
+    artist, title = read_metadata_tags(filepath)
+    
     try:
         temp_fd, temp_path = tempfile.mkstemp(suffix=suffix)
         os.close(temp_fd)
     except Exception as e:
-        return False, filepath.name, f'Temp file error: {e}'
-    SILENCE_THR = '-50dB'
-    SILENCE_DUR = '0.5'
-    af = (f'silenceremove=start_periods=1:start_duration={SILENCE_DUR}:start_threshold={SILENCE_THR},'
-          f'areverse,'
-          f'silenceremove=start_periods=1:start_duration={SILENCE_DUR}:start_threshold={SILENCE_THR},'
-          f'areverse')
-    cmd = ['ffmpeg', '-y', '-i', str(filepath), '-af', af]
-    if suffix == '.mp3':
-        cmd += ['-codec:a', 'libmp3lame', '-b:a', _BITRATE]
-    elif suffix == '.m4a':
-        cmd += ['-codec:a', 'aac', '-b:a', _BITRATE]
+        return False, filepath.name, f"Failed to create temp file: {e}"
+    
+    SILENCE_THRESHOLD = "-50dB"
+    SILENCE_DURATION = "0.5"
+    af_chain = (
+        f"silenceremove=start_periods=1:start_duration={SILENCE_DURATION}:start_threshold={SILENCE_THRESHOLD},"
+        f"areverse,"
+        f"silenceremove=start_periods=1:start_duration={SILENCE_DURATION}:start_threshold={SILENCE_THRESHOLD},"
+        f"areverse"
+    )
+    command = ["ffmpeg", "-y", "-i", str(filepath), "-af", af_chain]
+    
+    if suffix == ".mp3":
+        command += ["-codec:a", "libmp3lame", "-b:a", BITRATE]
+    elif suffix == ".m4a":
+        command += ["-codec:a", "aac", "-b:a", BITRATE]
     else:
-        cmd += ['-b:a', _BITRATE]
-    cmd += ['-map_metadata', '0']
-    if suffix == '.m4a':
-        cmd += ['-movflags', '+faststart']
-    cmd.append(temp_path)
+        command += ["-b:a", BITRATE]
+    
+    command += ["-map_metadata", "0"]
+    if suffix == ".m4a":
+        command += ["-movflags", "+faststart"]
+    command.append(temp_path)
+    
     try:
-        si = None
-        if sys.platform == 'win32':
-            si = subprocess.STARTUPINFO()
-            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           text=True, startupinfo=si)
+        startupinfo = None
+        if sys.platform == "win32":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            startupinfo=startupinfo
+        )
     except Exception as e:
         try: os.remove(temp_path)
         except: pass
-        return False, filepath.name, f'FFmpeg error: {e}'
-    if r.returncode != 0:
+        return False, filepath.name, f"FFmpeg execution failed: {e}"
+    
+    if result.returncode != 0:
         try: os.remove(temp_path)
         except: pass
-        return False, filepath.name, r.stderr
+        return False, filepath.name, result.stderr
+    
     try:
         os.replace(temp_path, str(filepath))
     except Exception as e:
-        return False, filepath.name, f'Replace failed: {e}'
+        return False, filepath.name, f"Failed to replace original file with temp: {e}"
+    
     if (artist or title) and _MUTAGEN_AVAILABLE:
-        _write_metadata_tags(filepath, artist, title)
+        write_metadata_tags(filepath, artist, title)
+    
     return True, filepath.name, None
+
+def run_silence_trim(folder_path):
+    print(f"\n{Colors.CYAN}{Colors.BOLD}====================================={Colors.END}")
+    print(f"{Colors.CYAN}{Colors.BOLD}=== SILENCE TRIM PASS ==============={Colors.END}")
+    print(f"{Colors.CYAN}{Colors.BOLD}====================================={Colors.END}\n")
+    
+    if not check_ffmpeg_available():
+        print(f"{Colors.YELLOW}[!] FFmpeg was not found in your system's PATH.{Colors.END}")
+        print(f"{Colors.DIM}    Skipping silence trim pass.{Colors.END}\n")
+        return 0, 0
+    
+    extensions = {".mp3", ".m4a"}
+    files = sorted([f for f in folder_path.iterdir() if f.is_file() and f.suffix.lower() in extensions])
+    
+    if not files:
+        print(f"{Colors.YELLOW}No MP3 or M4A files found to trim.{Colors.END}\n")
+        return 0, 0
+    
+    print(f"{Colors.GREEN}Trimming silence on {len(files)} files with {MAX_WORKERS} worker threads...{Colors.END}")
+    print(f"{Colors.DIM}Threshold: -50 dB | Min silence duration: 0.5s{Colors.END}\n")
+    
+    completed = 0
+    failed = 0
+    
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [executor.submit(trim_silence_file, idx, len(files), file)
+                   for idx, file in enumerate(files, 1)]
+        for future in as_completed(futures):
+            success, filename, error = future.result()
+            if success:
+                completed += 1
+                _safe_print(f"  {Colors.GREEN}✔ Trimmed:{Colors.END} {filename}")
+            else:
+                failed += 1
+                _safe_print(f"\n  {Colors.RED}✘ Failed to trim {filename}:{Colors.END}")
+                _safe_print(f"{Colors.DIM}{error}{Colors.END}\n")
+    
+    print(f"\n{Colors.CYAN}{Colors.BOLD}Silence Trim Complete!{Colors.END}")
+    print(f"  {Colors.GREEN}Success: {completed}{Colors.END} | {Colors.RED}Failed: {failed}{Colors.END}\n")
+    return completed, failed
+
+def run_integrated_renamer_cli():
+    if sys.platform == "win32":
+        os.system("")
+        
+    import argparse
+    parser = argparse.ArgumentParser(description="Integrated MP3 Renamer 5000", add_help=False)
+    parser.add_argument('folder', nargs='?', default=None,
+                        help="Target folder path. If omitted or invalid, a prompt will appear.")
+    parser.add_argument('--norm', choices=['on', 'off', 'ask'], default='ask',
+                        help="Normalization: on=always run, off=always skip, ask=prompt (default)")
+    parser.add_argument('--auto', action='store_true',
+                        help="Auto-accept all rename predictions without user prompts")
+    parser.add_argument('--silence-pad', type=float, default=None,
+                        help="Seconds of silence to append at end of each normalized file")
+    parser.add_argument('--norm-threads', type=int, default=None,
+                        help="Worker threads for normalization pass")
+    parser.add_argument('--eq', default=None,
+                        help="Extra ffmpeg -af filter string appended after the main chain")
+    args, _ = parser.parse_known_args()
+
+    global SILENCE_PAD_DUR, CUSTOM_EQ_STRING, MAX_WORKERS
+    if args.silence_pad is not None:
+        SILENCE_PAD_DUR = args.silence_pad
+    if args.eq:
+        CUSTOM_EQ_STRING = args.eq
+    if args.norm_threads is not None and args.norm_threads > 0:
+        MAX_WORKERS = args.norm_threads
+
+    norm_mode = args.norm
+    start_auto = args.auto
+
+    _print_renamer_banner()
+
+    if args.folder and Path(args.folder).is_dir():
+        folder = Path(args.folder)
+        print(f"{Colors.GREEN}[✓] Using folder: {folder}{Colors.END}\n")
+    else:
+        folder = _select_renamer_folder()
+
+    renamed_count, tagged_count, skipped_count, already_formatted_count = clean_and_tag_files(folder, start_auto=start_auto)
+
+    norm_completed, norm_failed = 0, 0
+    trim_completed, trim_failed = 0, 0
+
+    try:
+        if norm_mode == 'on':
+            norm_completed, norm_failed = run_loudness_normalization(folder)
+        elif norm_mode == 'off':
+            print(f"\n{Colors.YELLOW}Skipping volume adjustment (disabled in settings).{Colors.END}\n")
+        else:
+            print(f"{Colors.BOLD}Volume Adjustment / Loudness Normalization{Colors.END}")
+            choice = input(f"Do you want to run the volume adjustment pass? ({Colors.GREEN}y{Colors.END}/{Colors.RED}n{Colors.END}): ").strip().lower()
+            if choice in ('y', 'yes'):
+                norm_completed, norm_failed = run_loudness_normalization(folder)
+            else:
+                print(f"\n{Colors.YELLOW}Skipping volume adjustment pass.{Colors.END}\n")
+                print(f"{Colors.BOLD}Silence Trimming{Colors.END}")
+                trim_choice = input(f"Do you want to trim silence from the front and back of each file? ({Colors.GREEN}y{Colors.END}/{Colors.RED}n{Colors.END}): ").strip().lower()
+                if trim_choice in ('y', 'yes'):
+                    trim_completed, trim_failed = run_silence_trim(folder)
+                else:
+                    print(f"\n{Colors.YELLOW}Skipping silence trim pass.{Colors.END}\n")
+    except KeyboardInterrupt:
+        print(f"\n\n{Colors.RED}Process interrupted by user. Exiting.{Colors.END}")
+        sys.exit(0)
+
+    print(f"\n{Colors.CYAN}{Colors.BOLD}{'═' * 50}{Colors.END}")
+    print(f"{Colors.CYAN}{Colors.BOLD}  SESSION SUMMARY{Colors.END}")
+    print(f"{Colors.CYAN}{Colors.BOLD}{'═' * 50}{Colors.END}")
+    print(f"  {Colors.GREEN}Already formatted / skipped:{Colors.END} {already_formatted_count}")
+    print(f"  {Colors.GREEN}Renamed:                    {Colors.END} {renamed_count}")
+    print(f"  {Colors.GREEN}Tagged:                     {Colors.END} {tagged_count}")
+    print(f"  {Colors.YELLOW}Skipped (user / no artist): {Colors.END} {skipped_count}")
+    if norm_completed or norm_failed:
+        print(f"  {Colors.GREEN}Volume-equalized:           {Colors.END} {norm_completed}  "
+              f"{Colors.RED}(failed: {norm_failed}){Colors.END}")
+    if trim_completed or trim_failed:
+        print(f"  {Colors.GREEN}Silence-trimmed:            {Colors.END} {trim_completed}  "
+              f"{Colors.RED}(failed: {trim_failed}){Colors.END}")
+    print(f"{Colors.CYAN}{Colors.BOLD}{'═' * 50}{Colors.END}")
+    print(f"\n{Colors.CYAN}{Colors.BOLD}All processes complete.{Colors.END}")
+
+    try:
+        input(f"\n{Colors.DIM}Press ENTER to exit...{Colors.END}")
+    except (KeyboardInterrupt, EOFError):
+        pass
 
 # ============================================================
 # Theme Mapping for custom colors
@@ -2298,149 +2816,37 @@ class MainApp(QMainWindow):
         self.save_config()
 
     def run_mp3_renamer(self):
-        """Runs the integrated renamer/normalizer in a live-output dialog window."""
-        from PySide6.QtCore import Q_ARG
-        folder_str = self.path_combo.currentText()
-        if not folder_str or not os.path.exists(folder_str):
-            self._on_status_update('Renamer: download folder does not exist.', False, 'red')
+        """Launches the integrated MP3 renamer interactive CLI in a new console window."""
+        folder = self.path_combo.currentText()
+        if not folder or not os.path.exists(folder):
+            self._on_status_update("Renamer: Download folder path does not exist.", False, "red")
             return
 
-        folder       = Path(folder_str)
-        norm_mode    = self.normalization_mode
-        auto_rename  = self.auto_rename
-        silence_pad  = self.silence_pad_dur
-        norm_threads = self.normalization_threads
-        custom_eq    = self.custom_eq_string.strip() if self.use_custom_eq else ''
+        executable = sys.executable
+        if getattr(sys, 'frozen', False):
+            executable = "python"
+        else:
+            idx = executable.lower().rfind("pythonw")
+            if idx != -1:
+                executable = executable[:idx] + "python" + executable[idx+7:]
 
-        # ── Build the output dialog ─────────────────────────────────────────
-        from PySide6.QtWidgets import QTextEdit
-        dlg = QDialog(self)
-        dlg.setWindowTitle('MP3 Renamer & Normalizer')
-        dlg.resize(780, 520)
-        dlg.setWindowFlags(dlg.windowFlags() | Qt.Tool)
-        dlg_layout = QVBoxLayout(dlg)
-        dlg_layout.setContentsMargins(12, 12, 12, 12)
+        gui_script = os.path.abspath(__file__)
 
-        log_box = QTextEdit()
-        log_box.setReadOnly(True)
-        log_box.setStyleSheet('font-family: Consolas, monospace; font-size: 11px;')
-        dlg_layout.addWidget(log_box, 1)
+        args = [executable, gui_script, "--renamer", folder]
+        args.append(f'--norm={self.normalization_mode}')
+        if self.auto_rename:
+            args.append('--auto')
+        args.append(f'--silence-pad={str(self.silence_pad_dur)}')
+        args.append(f'--norm-threads={self.normalization_threads}')
+        if self.use_custom_eq and self.custom_eq_string.strip():
+            args.append(f'--eq={self.custom_eq_string.strip()}')
 
-        close_btn = QPushButton('Close')
-        close_btn.setEnabled(False)
-        close_btn.clicked.connect(dlg.accept)
-        dlg_layout.addWidget(close_btn)
-
-        def _log(msg):
-            from PySide6.QtCore import QMetaObject, Qt as _Qt
-            QMetaObject.invokeMethod(
-                log_box, 'append', _Qt.QueuedConnection, Q_ARG(str, str(msg))
-            )
-
-        def _worker():
-            try:
-                # ── RENAME PASS ─────────────────────────────────────────────
-                extensions = {'.mp3', '.m4a'}
-                files = sorted([f for f in folder.iterdir()
-                                if f.is_file() and f.suffix.lower() in extensions])
-                if not files:
-                    _log('No MP3 or M4A files found in the folder.')
-                else:
-                    _log(f'Found {len(files)} audio file(s). Running rename pass...')
-                    renamed_count = 0
-                    tagged_count  = 0
-                    skipped_count = 0
-                    for file in files:
-                        stem       = file.stem
-                        suffix_ext = file.suffix.lower()
-                        suggestion = _clean_youtube_title(stem)
-                        existing_artist, existing_title = _read_metadata_tags(file)
-                        filename_ok = (suggestion == stem and ' - ' in stem)
-                        has_tags    = bool(existing_artist and existing_title)
-                        if filename_ok and has_tags:
-                            _log(f'  \u2713 Already OK: {file.name}')
-                            continue
-                        # In auto mode only rename if a clean "Artist - Title" is found
-                        if ' - ' not in suggestion:
-                            _log(f'  ~ Skipped (no clear artist/title): {file.name}')
-                            skipped_count += 1
-                            continue
-                        parts_s = suggestion.split(' - ', 1)
-                        if not parts_s[0].strip() or not parts_s[1].strip():
-                            _log(f'  ~ Skipped (empty artist or title): {file.name}')
-                            skipped_count += 1
-                            continue
-                        final_name = suggestion
-                        new_path   = folder / f'{final_name}{suffix_ext}'
-                        if final_name != stem:
-                            if new_path.exists():
-                                _log(f'  ! Conflict – skipped rename: {file.name}')
-                                skipped_count += 1
-                                continue
-                            try:
-                                file.rename(new_path)
-                                _log(f'  \u2192 Renamed: {file.name}  \u2192  {new_path.name}')
-                                renamed_count += 1
-                                file = new_path
-                            except Exception as e:
-                                _log(f'  ! Rename failed: {e}')
-                                skipped_count += 1
-                                continue
-                        # Write metadata tags
-                        if _MUTAGEN_AVAILABLE and ' - ' in final_name:
-                            p2 = final_name.split(' - ', 1)
-                            if _write_metadata_tags(file, p2[0].strip(), p2[1].strip()):
-                                tagged_count += 1
-                                _log(f'    Tagged: artist="{p2[0].strip()}" title="{p2[1].strip()}"')
-                    _log(f'\nRename pass done \u2014 renamed: {renamed_count}, '
-                         f'tagged: {tagged_count}, skipped: {skipped_count}\n')
-
-                # ── NORMALIZATION PASS ──────────────────────────────────────
-                if norm_mode == 'off':
-                    _log('Normalization disabled in settings \u2014 skipping.')
-                else:
-                    if not _check_ffmpeg():
-                        _log('FFmpeg not found in PATH \u2014 skipping normalization.')
-                    else:
-                        audio_files = sorted([f for f in folder.iterdir()
-                                              if f.is_file() and f.suffix.lower() in {'.mp3', '.m4a'}])
-                        if not audio_files:
-                            _log('No files found for normalization.')
-                        else:
-                            _log(f'Starting normalization on {len(audio_files)} file(s) '
-                                 f'using {norm_threads} thread(s)...')
-                            n_ok = 0
-                            n_fail = 0
-                            norm_lock = threading.Lock()
-                            with ThreadPoolExecutor(max_workers=norm_threads) as ex:
-                                futs = {
-                                    ex.submit(
-                                        _normalize_file, idx, len(audio_files), fp,
-                                        silence_pad, custom_eq, _log
-                                    ): fp
-                                    for idx, fp in enumerate(audio_files, 1)
-                                }
-                                for fut in as_completed(futs):
-                                    ok, fname, err = fut.result()
-                                    with norm_lock:
-                                        if ok:
-                                            n_ok += 1
-                                            _log(f'  \u2713 Normalized: {fname}')
-                                        else:
-                                            n_fail += 1
-                                            _log(f'  \u2717 Failed:     {fname}\n    {err}')
-                            _log(f'\nNormalization done \u2014 OK: {n_ok}, failed: {n_fail}\n')
-            except Exception as e:
-                _log(f'\n[Error] {e}')
-            finally:
-                from PySide6.QtCore import QMetaObject, Qt as _Qt
-                QMetaObject.invokeMethod(close_btn, 'setEnabled', _Qt.QueuedConnection,
-                                        Q_ARG(bool, True))
-                _log('\n\u2500\u2500 All done \u2500\u2500')
-
-        threading.Thread(target=_worker, daemon=True).start()
-        self._on_status_update('Running integrated renamer...', False, '#3B8ED0')
-        dlg.exec()
+        try:
+            creationflags = 0x00000010 if sys.platform == "win32" else 0
+            subprocess.Popen(args, creationflags=creationflags)
+            self._on_status_update("Launched MP3 Renamer in a new console window.", False, "#1abd33")
+        except Exception as e:
+            self._on_status_update(f"Failed to launch MP3 Renamer: {str(e)}", False, "red")
 
     def browse_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Download Folder", self.path_combo.currentText() or "")
@@ -2688,9 +3094,12 @@ class MainApp(QMainWindow):
         except: pass
 
 if __name__ == "__main__":
-    QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
-    
-    app = QApplication(sys.argv)
-    window = MainApp()
-    window.show()
-    sys.exit(app.exec())
+    if len(sys.argv) > 1 and ("--renamer" in sys.argv or "-r" in sys.argv):
+        sys.argv = [a for a in sys.argv if a not in ("--renamer", "-r")]
+        run_integrated_renamer_cli()
+    else:
+        QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+        app = QApplication(sys.argv)
+        window = MainApp()
+        window.show()
+        sys.exit(app.exec())
