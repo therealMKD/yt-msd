@@ -40,8 +40,6 @@ TRUE_PEAK = "-1.5"        # Prevents clipping
 LOUDNESS_RANGE = "11"     # LRA of 11 preserves dynamics (not squishing music range)
 BITRATE = "320k"          # High quality output bitrate
 MAX_WORKERS = available_threads // 2  # Auto-adjusts to half of available threads
-SILENCE_PAD_DUR = 2    # Seconds of silence padded at the end of normalized files (overridable via --silence-pad)
-CUSTOM_EQ_STRING = ""  # Optional extra ffmpeg -af filter fragment appended after the main chain (overridable via --eq)
 # ==========================================
 
 # Attempt to load mutagen for ID3 (MP3) and MP4 (M4A) tagging support
@@ -267,9 +265,9 @@ def clean_youtube_title(filename):
     # 11. Remove anything directly connected to a # symbol (hashtags)
     title = re.sub(r'#\S+', '', title)
 
-    # 12. Don't remove single quotes attached to ANY letters on either side (e.g. her's, don't, wavin')
+    # 12. Don't remove single quotes with letters on both sides (e.g. her's, don't)
     title = title.replace('"', '')
-    title = re.sub(r"(?<![a-zA-Z])'(?![a-zA-Z])", "", title)
+    title = re.sub(r"(?<![a-zA-Z])'|'(?![a-zA-Z])", "", title)
 
     # 13. Remove all emojis and miscellaneous symbols
     try:
@@ -370,7 +368,7 @@ def write_metadata_tags(filepath, artist, title):
         
     return False
 
-def clean_and_tag_files(folder_path, start_auto=False):
+def clean_and_tag_files(folder_path):
     extensions = {".mp3", ".m4a"}
     files = sorted([f for f in folder_path.iterdir() if f.is_file() and f.suffix.lower() in extensions])
     
@@ -388,9 +386,7 @@ def clean_and_tag_files(folder_path, start_auto=False):
     def run_renaming_pass(file_list, is_manual_skipped_pass=False):
         nonlocal renamed_count, tagged_count, skipped_count, already_formatted_count
         
-        # In auto mode (triggered by --auto flag or user typing AUTO), accept all predictions silently.
-        # The second pass for manually skipped files always stays interactive.
-        auto_mode = start_auto if not is_manual_skipped_pass else False
+        auto_mode = False
         skipped_files = []
         
         idx = 1
@@ -431,7 +427,6 @@ def clean_and_tag_files(folder_path, start_auto=False):
             else:
                 final_name = None
                 skip_file = False
-                go_prev = False
                 while True:
                     print(f"{Colors.DIM}─" * 60)
                     print(f"{Colors.BOLD}[{idx}/{len(file_list)}] File: {Colors.END}{file.name}")
@@ -455,18 +450,12 @@ def clean_and_tag_files(folder_path, start_auto=False):
                         artist_prompt = (
                             f"\n  {Colors.CYAN}No artist found.{Colors.END} Predicted title: {Colors.BOLD}{current_suggestion}{Colors.END}\n"
                             f"  Type the {Colors.GREEN}artist name{Colors.END} to build '{Colors.BOLD}Artist - {current_suggestion}{Colors.END}',\n"
-                            f"  {Colors.YELLOW}'n'{Colors.END} to enter a full name manually, {Colors.YELLOW}'s'{Colors.END} to skip, {Colors.YELLOW}'prev'{Colors.END} to redo previous, or type {Colors.YELLOW}'AUTO'{Colors.END} to switch to auto-mode:\n  > "
+                            f"  {Colors.YELLOW}'n'{Colors.END} to enter a full name manually, {Colors.YELLOW}'s'{Colors.END} to skip, or type {Colors.YELLOW}'AUTO'{Colors.END} to switch to auto-mode:\n  > "
                         )
                         user_input = input(artist_prompt).strip()
                         
                         if user_input.upper() == 'AUTO':
                             auto_mode = True
-                            break
-                        elif user_input.lower() == 'prev':
-                            if idx > 1:
-                                go_prev = True
-                            else:
-                                print(f"  {Colors.YELLOW}Already at the first file.{Colors.END}")
                             break
                         elif user_input.lower() == 's':
                             print(f"  {Colors.YELLOW}Skipped.{Colors.END}\n")
@@ -501,17 +490,11 @@ def clean_and_tag_files(folder_path, start_auto=False):
                             is_manually_inputted = True
                             break
                     else:
-                        prompt = f"\n  {Colors.BOLD}Accept predicted name?{Colors.END}\n  {Colors.CYAN}[ENTER]{Colors.END} to accept, type {Colors.GREEN}'f'{Colors.END} to flip Artist/Title, type a new {Colors.BOLD}Artist - Title{Colors.END}, {Colors.YELLOW}'s'{Colors.END} to skip, {Colors.YELLOW}'prev'{Colors.END} to redo previous, or {Colors.YELLOW}'AUTO'{Colors.END} to auto-process remaining:\n  > "
+                        prompt = f"\n  {Colors.BOLD}Accept predicted name?{Colors.END}\n  {Colors.CYAN}[ENTER]{Colors.END} to accept, type {Colors.GREEN}'f'{Colors.END} to flip Artist/Title, type a new {Colors.BOLD}Artist - Title{Colors.END}, {Colors.YELLOW}'s'{Colors.END} to skip, or {Colors.YELLOW}'AUTO'{Colors.END} to auto-process remaining:\n  > "
                         user_input = input(prompt).strip()
                         
                         if user_input.upper() == 'AUTO':
                             auto_mode = True
-                            break
-                        elif user_input.lower() == 'prev':
-                            if idx > 1:
-                                go_prev = True
-                            else:
-                                print(f"  {Colors.YELLOW}Already at the first file.{Colors.END}")
                             break
                         elif user_input.lower() == 's':
                             print(f"  {Colors.YELLOW}Skipped.{Colors.END}\n")
@@ -535,9 +518,6 @@ def clean_and_tag_files(folder_path, start_auto=False):
                             break
                 
                 if auto_mode:
-                    continue
-                if go_prev:
-                    idx -= 1
                     continue
                 if skip_file:
                     idx += 1
@@ -605,7 +585,7 @@ def clean_and_tag_files(folder_path, start_auto=False):
         return skipped_files
     
     skipped_files = run_renaming_pass(files, is_manual_skipped_pass=False)
-
+    
     if skipped_files:
         print(f"{Colors.DIM}─" * 60)
         print(f"\n{Colors.BOLD}Auto-mode / Renaming Pass Complete.{Colors.END}")
@@ -730,11 +710,8 @@ def normalize_file(index, total, filepath):
         f"areverse,"
         f"silenceremove=start_periods=1:start_duration={SILENCE_DURATION}:start_threshold={SILENCE_THRESHOLD},"
         f"areverse,"
-        f"volume={final_gain:.2f}dB,"
-        f"apad=pad_dur={SILENCE_PAD_DUR}"
+        f"volume={final_gain:.2f}dB"
     )
-    if CUSTOM_EQ_STRING:
-        af_chain += f",{CUSTOM_EQ_STRING}"
     command = [
         "ffmpeg",
         "-y",
@@ -974,74 +951,34 @@ def run_silence_trim(folder_path):
 # ==========================================
 
 def main():
-    # ── Parse CLI arguments (injected by yt-msd-gui when launched automatically) ──
-    import argparse
-    parser = argparse.ArgumentParser(description="MP3 Renamer 5000", add_help=False)
-    parser.add_argument('folder', nargs='?', default=None,
-                        help="Target folder path. If omitted or invalid, a dialog/prompt will appear.")
-    parser.add_argument('--norm', choices=['on', 'off', 'ask'], default='ask',
-                        help="Normalization: on=always run, off=always skip, ask=prompt (default)")
-    parser.add_argument('--auto', action='store_true',
-                        help="Auto-accept all rename predictions without user prompts")
-    parser.add_argument('--silence-pad', type=float, default=None,
-                        help="Seconds of silence to append at end of each normalized file")
-    parser.add_argument('--eq', default=None,
-                        help="Extra ffmpeg -af filter string appended after the main chain")
-    args, _ = parser.parse_known_args()
-
-    # Apply any overrides to module-level constants (algorithms are untouched)
-    global SILENCE_PAD_DUR, CUSTOM_EQ_STRING
-    if args.silence_pad is not None:
-        SILENCE_PAD_DUR = args.silence_pad
-    if args.eq:
-        CUSTOM_EQ_STRING = args.eq
-
-    norm_mode = args.norm
-    start_auto = args.auto
-
     print_banner()
-
-    # Folder: use CLI arg if valid, otherwise fall back to dialog / prompt
-    if args.folder and Path(args.folder).is_dir():
-        folder = Path(args.folder)
-        print(f"{Colors.GREEN}[\u2713] Using folder: {folder}{Colors.END}\n")
-    else:
-        folder = select_folder()
-
-    renamed_count, tagged_count, skipped_count, already_formatted_count = clean_and_tag_files(folder, start_auto=start_auto)
-
+    folder = select_folder()
+    renamed_count, tagged_count, skipped_count, already_formatted_count = clean_and_tag_files(folder)
+    
     norm_completed, norm_failed = 0, 0
     trim_completed, trim_failed = 0, 0
-
+    
     try:
-        if norm_mode == 'on':
-            # GUI setting: always run normalization without asking
+        print(f"{Colors.BOLD}Volume Adjustment / Loudness Normalization{Colors.END}")
+        choice = input(f"Do you want to run the volume adjustment pass? ({Colors.GREEN}y{Colors.END}/{Colors.RED}n{Colors.END}): ").strip().lower()
+        if choice in ('y', 'yes'):
             norm_completed, norm_failed = run_loudness_normalization(folder)
-        elif norm_mode == 'off':
-            # GUI setting: always skip normalization without asking
-            print(f"\n{Colors.YELLOW}Skipping volume adjustment (disabled in settings).{Colors.END}\n")
         else:
-            # 'ask' — original interactive behavior preserved exactly
-            print(f"{Colors.BOLD}Volume Adjustment / Loudness Normalization{Colors.END}")
-            choice = input(f"Do you want to run the volume adjustment pass? ({Colors.GREEN}y{Colors.END}/{Colors.RED}n{Colors.END}): ").strip().lower()
-            if choice in ('y', 'yes'):
-                norm_completed, norm_failed = run_loudness_normalization(folder)
+            print(f"\n{Colors.YELLOW}Skipping volume adjustment pass.{Colors.END}\n")
+            print(f"{Colors.BOLD}Silence Trimming{Colors.END}")
+            trim_choice = input(f"Do you want to trim silence from the front and back of each file? ({Colors.GREEN}y{Colors.END}/{Colors.RED}n{Colors.END}): ").strip().lower()
+            if trim_choice in ('y', 'yes'):
+                trim_completed, trim_failed = run_silence_trim(folder)
             else:
-                print(f"\n{Colors.YELLOW}Skipping volume adjustment pass.{Colors.END}\n")
-                print(f"{Colors.BOLD}Silence Trimming{Colors.END}")
-                trim_choice = input(f"Do you want to trim silence from the front and back of each file? ({Colors.GREEN}y{Colors.END}/{Colors.RED}n{Colors.END}): ").strip().lower()
-                if trim_choice in ('y', 'yes'):
-                    trim_completed, trim_failed = run_silence_trim(folder)
-                else:
-                    print(f"\n{Colors.YELLOW}Skipping silence trim pass.{Colors.END}\n")
+                print(f"\n{Colors.YELLOW}Skipping silence trim pass.{Colors.END}\n")
     except KeyboardInterrupt:
         print(f"\n\n{Colors.RED}Process interrupted by user. Exiting.{Colors.END}")
         sys.exit(0)
 
     # ── Summary ─────────────────────────────────────────────────────────────
-    print(f"\n{Colors.CYAN}{Colors.BOLD}{'\u2550' * 50}{Colors.END}")
+    print(f"\n{Colors.CYAN}{Colors.BOLD}{'═' * 50}{Colors.END}")
     print(f"{Colors.CYAN}{Colors.BOLD}  SESSION SUMMARY{Colors.END}")
-    print(f"{Colors.CYAN}{Colors.BOLD}{'\u2550' * 50}{Colors.END}")
+    print(f"{Colors.CYAN}{Colors.BOLD}{'═' * 50}{Colors.END}")
     print(f"  {Colors.GREEN}Already formatted / skipped:{Colors.END} {already_formatted_count}")
     print(f"  {Colors.GREEN}Renamed:                    {Colors.END} {renamed_count}")
     print(f"  {Colors.GREEN}Tagged:                     {Colors.END} {tagged_count}")
@@ -1052,7 +989,7 @@ def main():
     if trim_completed or trim_failed:
         print(f"  {Colors.GREEN}Silence-trimmed:            {Colors.END} {trim_completed}  "
               f"{Colors.RED}(failed: {trim_failed}){Colors.END}")
-    print(f"{Colors.CYAN}{Colors.BOLD}{'\u2550' * 50}{Colors.END}")
+    print(f"{Colors.CYAN}{Colors.BOLD}{'═' * 50}{Colors.END}")
     print(f"\n{Colors.CYAN}{Colors.BOLD}All processes complete.{Colors.END}")
 
     try:

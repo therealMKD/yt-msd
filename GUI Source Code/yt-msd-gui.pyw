@@ -728,6 +728,19 @@ class SettingsDialog(QDialog):
         self.eq_edit.setEnabled(state)
         self.parent.save_config()
 
+    def _update_dl_threads(self, text):
+        try:
+            val = int(text)
+            if val > 0:
+                self.parent.download_threads = val
+                self.parent.save_config()
+        except ValueError:
+            pass
+
+    def _update_norm_threads(self, val):
+        self.parent.normalization_threads = val
+        self.parent.save_config()
+
     def _update_eq(self, text):
         self.parent.custom_eq_string = text
         self.parent.save_config()
@@ -1342,6 +1355,7 @@ class MainApp(QMainWindow):
         
         self.local_path_combo = QComboBox()
         self.local_path_combo.addItems(self.local_folders)
+        self.local_path_combo.currentTextChanged.connect(self.load_local_folder)
         h.addWidget(self.local_path_combo, 1)
         local_browse_btn = QPushButton("\uE8B7")
         local_browse_btn.setObjectName("topIconBtn")
@@ -1633,6 +1647,7 @@ class MainApp(QMainWindow):
         path = os.path.abspath(path)
         self.local_current_path = path
         
+        self.local_path_combo.blockSignals(True)
         if path not in self.local_folders:
             self.local_folders.insert(0, path)
             self.local_folders = self.local_folders[:5]
@@ -1640,6 +1655,7 @@ class MainApp(QMainWindow):
             self.local_path_combo.addItems(self.local_folders)
             
         self.local_path_combo.setCurrentText(path)
+        self.local_path_combo.blockSignals(False)
         self.save_config()
         self.refresh_local_list()
 
