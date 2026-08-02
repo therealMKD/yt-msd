@@ -11,18 +11,20 @@ I don't want to deal with spotify's ads (Or pay for premium), and youtube playli
 
 # GUI Version Readme
 
-The GUI version is currently "complete" at v1.0, but further feature updates are still coming, and I'm not going to complete this until they are finished.
+The GUI version is currently "complete" at v1.0, (and "improved" at v2.1) but further feature updates are still coming, and I'm not going to complete this until they are finished.
 
-**Upcoming features in GUI v2.0**
+**Upcoming features in GUI v3.0** (Features with an exclamation point (!) are currently added in beta, if you manually download "yt-msd-gui.pyw" from the files, and not releases)
 - Built-in support for renaming and metadata tagging downloaded files - and a much more improved algorithm compared to the current beta version, based on me downloading my massive playlists and using the script
-- Normalization option for files
+- Normalization option for files (!) - v2.1 has this feature, reliant on an external script
+- Parallel downloading (!)
+- Improved local file navigation (!)
 - Local file playlist logic (Saved filename lists to organize files that are in one big folder)
 - Import/Export logic for settings, music files, etc.
 - Automatic update checking
 - An icon that isn't a single-color circle
 - Music player only mode (hiding all download features)
 - Various QOL changes and bug fixes
-- MusicBee Plugin version - Tenative, this might happen later on after v2.0 releases
+- MusicBee Plugin version - Tenative, this might happen later on after v3.0 releases
 
 ### Support for other operating systems
 **MacOS**: Exe files don't run on MacOS, but you can still use the python file and install the dependencies. Unfortunately due to the migration to Pyside6, I can no longer make a pex file properly (At least in my windows development environment). You could also use WINE to emulate windows functionality with the exe. I don't plan on releasing any additional files supporting MacOS, both because I don't have a Mac to test on, and also because MacOS is not a superior operating system.
