@@ -313,6 +313,7 @@ def clean_and_tag_files(folder_path, start_auto=False):
         
         auto_mode = start_auto if not is_manual_skipped_pass else False
         skipped_files = []
+        forced_redo_indices = set()
         
         idx = 1
         while idx <= len(file_list):
@@ -326,7 +327,11 @@ def clean_and_tag_files(folder_path, start_auto=False):
             filename_is_correct = (current_suggestion == stem and " - " in stem)
             has_valid_tags = bool(existing_artist and existing_title)
             
-            if not is_manual_skipped_pass and filename_is_correct and has_valid_tags:
+            is_forced_redo = (idx in forced_redo_indices)
+            if is_forced_redo:
+                forced_redo_indices.remove(idx)
+            
+            if not is_manual_skipped_pass and not is_forced_redo and filename_is_correct and has_valid_tags:
                 print(f"{Colors.DIM}[{idx}/{len(file_list)}] {Colors.GREEN}✔ Already formatted and tagged: {Colors.END}{file.name}")
                 already_formatted_count += 1
                 idx += 1
@@ -386,6 +391,7 @@ def clean_and_tag_files(folder_path, start_auto=False):
                         elif user_input.lower() == 'prev':
                             if idx > 1:
                                 go_prev = True
+                                forced_redo_indices.add(idx - 1)
                             else:
                                 print(f"  {Colors.YELLOW}Already at the first file.{Colors.END}")
                             break
@@ -431,6 +437,7 @@ def clean_and_tag_files(folder_path, start_auto=False):
                         elif user_input.lower() == 'prev':
                             if idx > 1:
                                 go_prev = True
+                                forced_redo_indices.add(idx - 1)
                             else:
                                 print(f"  {Colors.YELLOW}Already at the first file.{Colors.END}")
                             break
@@ -490,6 +497,7 @@ def clean_and_tag_files(folder_path, start_auto=False):
                     file.rename(new_filepath)
                     print(f"  {Colors.GREEN}Renamed to:{Colors.END} {new_filename}")
                     active_filepath = new_filepath
+                    file_list[idx - 1] = new_filepath
                     renamed_count += 1
                     renamed = True
                 except Exception as e:
@@ -621,12 +629,13 @@ def normalize_file(index, total, filepath):
     except Exception as e:
         return False, filepath.name, f"Failed to create temp file: {e}"
         
-    SILENCE_THRESHOLD = "-50dB"
+    SILENCE_THRESHOLD = "-60dB"
     SILENCE_DURATION = "0.5"
+    SILENCE_KEEP = "0.5"
     af_chain = (
-        f"silenceremove=start_periods=1:start_duration={SILENCE_DURATION}:start_threshold={SILENCE_THRESHOLD},"
+        f"silenceremove=start_periods=1:start_duration={SILENCE_DURATION}:start_threshold={SILENCE_THRESHOLD}:start_silence={SILENCE_KEEP}:stop_silence={SILENCE_KEEP},"
         f"areverse,"
-        f"silenceremove=start_periods=1:start_duration={SILENCE_DURATION}:start_threshold={SILENCE_THRESHOLD},"
+        f"silenceremove=start_periods=1:start_duration={SILENCE_DURATION}:start_threshold={SILENCE_THRESHOLD}:start_silence={SILENCE_KEEP}:stop_silence={SILENCE_KEEP},"
         f"areverse,"
         f"volume={final_gain:.2f}dB"
     )
@@ -737,12 +746,13 @@ def trim_silence_file(index, total, filepath):
     except Exception as e:
         return False, filepath.name, f"Failed to create temp file: {e}"
     
-    SILENCE_THRESHOLD = "-50dB"
+    SILENCE_THRESHOLD = "-60dB"
     SILENCE_DURATION = "0.5"
+    SILENCE_KEEP = "0.5"
     af_chain = (
-        f"silenceremove=start_periods=1:start_duration={SILENCE_DURATION}:start_threshold={SILENCE_THRESHOLD},"
+        f"silenceremove=start_periods=1:start_duration={SILENCE_DURATION}:start_threshold={SILENCE_THRESHOLD}:start_silence={SILENCE_KEEP}:stop_silence={SILENCE_KEEP},"
         f"areverse,"
-        f"silenceremove=start_periods=1:start_duration={SILENCE_DURATION}:start_threshold={SILENCE_THRESHOLD},"
+        f"silenceremove=start_periods=1:start_duration={SILENCE_DURATION}:start_threshold={SILENCE_THRESHOLD}:start_silence={SILENCE_KEEP}:stop_silence={SILENCE_KEEP},"
         f"areverse"
     )
     command = ["ffmpeg", "-y", "-i", str(filepath), "-af", af_chain]
@@ -1002,15 +1012,25 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.parent = parent
         self.setWindowTitle("Settings")
-        self.setMinimumWidth(500)
+        self.setMinimumWidth(820)
         self.setWindowFlags(self.windowFlags() | Qt.Tool)
         
-        self.layout = QVBoxLayout(self)
-        self.layout.setContentsMargins(25, 25, 25, 25)
-        self.layout.setSpacing(15)
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setSpacing(15)
+        
+        # 2-Column Horizontal Container
+        columns_layout = QHBoxLayout()
+        columns_layout.setSpacing(20)
+        
+        # ── LEFT COLUMN ──
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(12)
         
         # APPEARANCE MODE
-        self.layout.addWidget(QLabel("APPEARANCE MODE", font=QFont("Segoe UI Semibold", 10)))
+        left_layout.addWidget(QLabel("APPEARANCE MODE", font=QFont("Segoe UI Semibold", 10)))
         mode_layout = QHBoxLayout()
         self.mode_btns = {}
         for mode in ["System", "Light", "Dark"]:
@@ -1020,28 +1040,28 @@ class SettingsDialog(QDialog):
             btn.clicked.connect(lambda checked=False, m=mode: self._change_mode(m))
             mode_layout.addWidget(btn)
             self.mode_btns[mode] = btn
-        self.layout.addLayout(mode_layout)
+        left_layout.addLayout(mode_layout)
         
         # ACCENT COLOR
-        self.layout.addWidget(QLabel("ACCENT COLOR", font=QFont("Segoe UI Semibold", 10)))
+        left_layout.addWidget(QLabel("ACCENT COLOR", font=QFont("Segoe UI Semibold", 10)))
         grid = QGridLayout()
-        grid.setSpacing(8)
+        grid.setSpacing(6)
         colors = ["System"] + list(THEME_COLORS.keys())
         self.accent_btns = {}
         for i, color in enumerate(colors):
             r, c = i // 5, i % 5
             btn = QPushButton()
-            btn.setFixedSize(35, 35)
+            btn.setFixedSize(32, 32)
             c_val = get_system_accent_color() if color == "System" else THEME_COLORS[color][0]
             btn.setStyleSheet(f"background-color: {c_val}; border-radius: 6px; border: {'2px solid white' if parent.accent_color_name == color else 'none'};")
             if color == "System": btn.setText("\uE771"); btn.setFont(QFont("Segoe MDL2 Assets", 12))
             btn.clicked.connect(lambda checked=False, clr=color: self._change_accent(clr))
             grid.addWidget(btn, r, c)
             self.accent_btns[color] = btn
-        self.layout.addLayout(grid)
+        left_layout.addLayout(grid)
         
-        # ADVANCED
-        self.layout.addWidget(QLabel("CUSTOM YT-DLP ARGUMENTS (ADVANCED)", font=QFont("Segoe UI Semibold", 10)))
+        # ADVANCED YT-DLP
+        left_layout.addWidget(QLabel("CUSTOM YT-DLP ARGUMENTS (ADVANCED)", font=QFont("Segoe UI Semibold", 10)))
         arg_h = QHBoxLayout()
         self.args_cb = QCheckBox()
         self.args_cb.setChecked(parent.use_custom_args)
@@ -1052,19 +1072,19 @@ class SettingsDialog(QDialog):
         self.args_edit.setEnabled(parent.use_custom_args)
         self.args_edit.textChanged.connect(self._update_args)
         arg_h.addWidget(self.args_edit, 1)
-        self.layout.addLayout(arg_h)
-        self.layout.addWidget(QLabel("Manual override ignores GUI bitrate/format settings.", font=QFont("Segoe UI", 8)))
+        left_layout.addLayout(arg_h)
+        left_layout.addWidget(QLabel("Manual override ignores GUI bitrate/format settings.", font=QFont("Segoe UI", 8)))
         
         # OPTIONS
         self.tray_cb = QCheckBox("Minimize to System Tray")
         self.tray_cb.setChecked(parent.minimize_to_tray)
         self.tray_cb.toggled.connect(self._toggle_tray)
-        self.layout.addWidget(self.tray_cb)
+        left_layout.addWidget(self.tray_cb)
         
         self.session_cb = QCheckBox("Restore Last Session on Startup")
         self.session_cb.setChecked(getattr(parent, 'save_place', False))
         self.session_cb.toggled.connect(self._toggle_session)
-        self.layout.addWidget(self.session_cb)
+        left_layout.addWidget(self.session_cb)
         
         # Parallel downloads option
         dl_threads_h = QHBoxLayout()
@@ -1075,12 +1095,24 @@ class SettingsDialog(QDialog):
         self.dl_threads_edit.textChanged.connect(self._update_dl_threads)
         dl_threads_h.addWidget(self.dl_threads_edit)
         dl_threads_h.addStretch()
-        self.layout.addLayout(dl_threads_h)
+        left_layout.addLayout(dl_threads_h)
+        left_layout.addWidget(QLabel("Disclaimer: Too many parallel downloads may cause your internet\n"
+                                     "to throttle or YouTube to rate-limit requests.", font=QFont("Segoe UI", 8)))
+        left_layout.addStretch()
         
-        self.layout.addWidget(QLabel("Disclaimer: If too many run at once, your internet might not keep up,\nand you could get flagged by YouTube and throttled.", font=QFont("Segoe UI", 8)))
+        # Vertical Divider Frame
+        divider = QFrame()
+        divider.setFrameShape(QFrame.VLine)
+        divider.setFrameShadow(QFrame.Sunken)
+        
+        # ── RIGHT COLUMN ──
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(12)
         
         # MP3 RENAMER
-        self.layout.addWidget(QLabel("MP3 RENAMER", font=QFont("Segoe UI Semibold", 10)))
+        right_layout.addWidget(QLabel("MP3 RENAMER & NORMALIZER", font=QFont("Segoe UI Semibold", 10)))
 
         # Normalization mode
         norm_h = QHBoxLayout()
@@ -1094,26 +1126,26 @@ class SettingsDialog(QDialog):
             norm_h.addWidget(btn)
             self.norm_btns[mode] = btn
         norm_h.addStretch()
-        self.layout.addLayout(norm_h)
-        self.layout.addWidget(QLabel("ON = always normalize  |  OFF = always skip  |  ASK = prompt each time",
-                                     font=QFont("Segoe UI", 8)))
+        right_layout.addLayout(norm_h)
+        right_layout.addWidget(QLabel("ON = always normalize  |  OFF = always skip  |  ASK = prompt each time",
+                                      font=QFont("Segoe UI", 8)))
 
         # Auto-rename
-        self.auto_rename_cb = QCheckBox("Auto-rename without prompts (auto-accept all predictions)")
+        self.auto_rename_cb = QCheckBox("Auto-rename without prompts (auto-accept predictions)")
         self.auto_rename_cb.setChecked(parent.auto_rename)
         self.auto_rename_cb.toggled.connect(self._toggle_auto_rename)
-        self.layout.addWidget(self.auto_rename_cb)
+        right_layout.addWidget(self.auto_rename_cb)
 
         # Silence pad duration
         pad_h = QHBoxLayout()
-        pad_h.addWidget(QLabel("Silence padded at end of each file (seconds):"))
+        pad_h.addWidget(QLabel("Silence padded at end of file (seconds):"))
         self.silence_pad_edit = QLineEdit(str(parent.silence_pad_dur))
         self.silence_pad_edit.setFixedWidth(70)
         self.silence_pad_edit.setPlaceholderText("e.g. 2.0")
         self.silence_pad_edit.textChanged.connect(self._update_silence_pad)
         pad_h.addWidget(self.silence_pad_edit)
         pad_h.addStretch()
-        self.layout.addLayout(pad_h)
+        right_layout.addLayout(pad_h)
         
         # Normalization threads
         from PySide6.QtWidgets import QSpinBox
@@ -1125,10 +1157,10 @@ class SettingsDialog(QDialog):
         self.norm_threads_spin.valueChanged.connect(self._update_norm_threads)
         norm_threads_h.addWidget(self.norm_threads_spin)
         norm_threads_h.addStretch()
-        self.layout.addLayout(norm_threads_h)
+        right_layout.addLayout(norm_threads_h)
 
-        # Custom EQ string (mirrors custom yt-dlp args section)
-        self.layout.addWidget(QLabel("CUSTOM FFMPEG EQ FILTER (ADVANCED)", font=QFont("Segoe UI Semibold", 10)))
+        # Custom EQ string
+        right_layout.addWidget(QLabel("CUSTOM FFMPEG EQ FILTER (ADVANCED)", font=QFont("Segoe UI Semibold", 10)))
         eq_h = QHBoxLayout()
         self.eq_cb = QCheckBox()
         self.eq_cb.setChecked(parent.use_custom_eq)
@@ -1139,27 +1171,31 @@ class SettingsDialog(QDialog):
         self.eq_edit.setEnabled(parent.use_custom_eq)
         self.eq_edit.textChanged.connect(self._update_eq)
         eq_h.addWidget(self.eq_edit, 1)
-        self.layout.addLayout(eq_h)
-        self.layout.addWidget(QLabel("Appended to the ffmpeg filter chain during normalization.",
-                                     font=QFont("Segoe UI", 8)))
-
-        self.layout.addStretch()
+        right_layout.addLayout(eq_h)
+        right_layout.addWidget(QLabel("Appended to the ffmpeg filter chain during normalization.",
+                                      font=QFont("Segoe UI", 8)))
+        right_layout.addStretch()
         
-        # RESET
+        columns_layout.addWidget(left_widget, 1)
+        columns_layout.addWidget(divider)
+        columns_layout.addWidget(right_widget, 1)
+        
+        main_layout.addLayout(columns_layout)
+        
+        # FOOTER / RESET
+        footer = QHBoxLayout()
         self.reset_btn = QPushButton("Reset to Default Config")
         self.reset_btn.setObjectName("topIconBtn")
         self.reset_btn.clicked.connect(self._reset_defaults)
-        self.layout.addWidget(self.reset_btn)
+        footer.addWidget(self.reset_btn)
         
-        # FOOTER
-        footer = QHBoxLayout()
         footer.addStretch()
         ok_btn = QPushButton("OK")
         ok_btn.setFixedWidth(100)
         ok_btn.clicked.connect(self.accept)
         footer.addWidget(ok_btn)
-        self.layout.addLayout(footer)
         
+        main_layout.addLayout(footer)
         self.update_styles()
 
     def update_styles(self):
@@ -2733,14 +2769,16 @@ class MainApp(QMainWindow):
         
         def bg_download():
             from concurrent.futures import ThreadPoolExecutor
+            import time
             
             with self.active_downloads_lock:
                 self.active_downloads.clear()
                 
-            pending_items = [(idx, q) for idx, q in enumerate(self.queue_items) if q['status'] == "Pending"]
+            threads_count = max(1, int(getattr(self, 'download_threads', 3)))
             
             def download_single(item):
                 idx, q = item
+                vid_id = q['video']['id']
                 if getattr(self, 'cancel_download', False):
                     q['status'] = "Pending"
                     self.queue_status_changed_signal.emit(idx)
@@ -2759,16 +2797,24 @@ class MainApp(QMainWindow):
                             'preferredquality': self.bitrate_combo.currentText(),
                         }],
                         'progress_hooks': [self._dl_progress_hook],
-                        'quiet': True
+                        'quiet': True,
+                        'retries': 10,
+                        'fragment_retries': 10,
+                        'file_access_retries': 5,
+                        'ignoreerrors': True,
                     }
                     if getattr(sys, 'frozen', False):
                         ydl_opts['ffmpeg_location'] = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
                         
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        ydl.download([f"https://www.youtube.com/watch?v={q['video']['id']}"])
+                        ydl.download([f"https://www.youtube.com/watch?v={vid_id}"])
                     success = True
                 except Exception:
                     pass
+                finally:
+                    with self.active_downloads_lock:
+                        if vid_id in self.active_downloads:
+                            del self.active_downloads[vid_id]
                 
                 if getattr(self, 'cancel_download', False):
                     q['status'] = "Pending"
@@ -2776,17 +2822,37 @@ class MainApp(QMainWindow):
                     q['status'] = "Finished" if success else "Pending"
                 self.queue_status_changed_signal.emit(idx)
                 
-            max_workers = min(getattr(self, 'download_threads', 3), len(pending_items)) if pending_items else 1
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = []
-                for item in pending_items:
-                    if getattr(self, 'cancel_download', False):
-                        break
-                    futures.append(executor.submit(download_single, item))
-                for fut in futures:
-                    fut.result()
+            max_passes = 3
+            for pass_num in range(1, max_passes + 1):
+                pending_items = [(idx, q) for idx, q in enumerate(self.queue_items) if q['status'] == "Pending"]
+                if not pending_items or getattr(self, 'cancel_download', False):
+                    break
+                
+                if pass_num > 1:
+                    self.status_signal.emit(
+                        f"Re-checking queue (Pass {pass_num}: retrying {len(pending_items)} skipped downloads)...",
+                        False, "#FF8C00"
+                    )
+                    time.sleep(1.0)
+                
+                max_workers = min(threads_count, len(pending_items))
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = []
+                    for item in pending_items:
+                        if getattr(self, 'cancel_download', False):
+                            break
+                        futures.append(executor.submit(download_single, item))
+                    for fut in futures:
+                        fut.result()
             
-            self.status_signal.emit("Batch complete!", False, "#1abd33")
+            if getattr(self, 'cancel_download', False):
+                self.status_signal.emit("Download cancelled.", False, "#E31E24")
+            else:
+                remaining = [q for q in self.queue_items if q['status'] == "Pending"]
+                if remaining:
+                    self.status_signal.emit(f"Batch completed ({len(remaining)} failed).", False, "#FF8C00")
+                else:
+                    self.status_signal.emit("Batch complete!", False, "#1abd33")
             
         threading.Thread(target=bg_download, daemon=True).start()
         
