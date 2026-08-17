@@ -30,9 +30,10 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QComboBox, QCheckBox, QSlider, QScrollArea, 
                                QSplitter, QSplitterHandle, QFileDialog, QMessageBox, QDialog,
                                QSystemTrayIcon, QMenu, QFrame, QGridLayout,
-                               QSizePolicy)
+                               QSizePolicy, QStyle, QToolTip)
 from PySide6.QtCore import Qt, Signal, QTimer, Slot, QPoint, QRect, QMargins
-from PySide6.QtGui import QIcon, QPixmap, QImage, QAction, QColor, QPalette, QPainter, QBrush, QFont
+from PySide6.QtGui import QIcon, QPixmap, QImage, QAction, QColor, QPalette, QPainter, QBrush, QFont, QDrag
+from PySide6.QtCore import QMimeData
 
 # ============================================================
 # INTEGRATED MP3 RENAMER, TAGGER & LOUDNESS NORMALIZER
@@ -210,13 +211,34 @@ def clean_youtube_title(filename):
         title = re.sub(bracket_pair_pattern, process_brackets, title)
 
     title = re.sub(r'[\(\)\{\}\[\]]', '', title)
-    title = re.sub(r'\b(hd|version|original|official|4k|uhd|upgraded|upscaled|remastered)\b', '', title, flags=re.IGNORECASE)
+    title = re.sub(r'\b(hd|version|original|official|4k|uhd|upgraded|upscaled|remastered|lyrics)\b', '', title, flags=re.IGNORECASE)
     title = re.compile(r'\b(ft|feat|featuring)\b\.?', re.IGNORECASE).split(title)[0]
     title = re.sub(r'#\S+', '', title)
 
+    # Quote handling:
+    # 1. Remove balanced double-quote pairs ("x") - outermost first
+    old = None
+    while old != title:
+        old = title
+        title = re.sub(r'"([^"]*)"', r'\1', title)
+    title = re.sub(r'(?<![a-zA-Z0-9])"(?![a-zA-Z0-9])', '', title)
     title = title.replace('"', '')
-    title = re.sub(r"'([^']+)'", r'\1', title)
-    title = re.sub(r"(?<![a-zA-Z])'(?![a-zA-Z])", "", title)
+
+    # 2. Mask interior word contractions (e.g. Don't, won't, it's, rock'n'roll)
+    MASK = "\x00APOS\x00"
+    title = re.sub(r"([a-zA-Z0-9])'([a-zA-Z0-9])", rf"\1{MASK}\2", title)
+
+    # 3. Remove balanced single-quote pairs ('x')
+    old = None
+    while old != title:
+        old = title
+        title = re.sub(r"'([^']*)'", r'\1', title)
+
+    # 4. Remove any UNATTACHED single quotes (not touching any letters/numbers on either side)
+    title = re.sub(r"(?<![a-zA-Z0-9])'(?![a-zA-Z0-9])", "", title)
+
+    # 5. Restore masked interior contractions (e.g. Don't stays as Don't)
+    title = title.replace(MASK, "'")
 
     try:
         title = re.sub(r'[\U00010000-\U0010ffff\u2600-\u27bf]', '', title, flags=re.UNICODE)
@@ -237,7 +259,7 @@ def clean_youtube_title(filename):
         title = re.sub(r'^\s*-\s*', '', title)
         title = title.strip()
 
-    invalid_chars = r'[\\/:*?"<>|]'
+    invalid_chars = r'[\\/:*?<>|]'
     title = re.sub(invalid_chars, '_', title)
     title = re.sub(r'\s+', ' ', title).strip()
 
@@ -601,9 +623,33 @@ def measure_loudness(filepath):
     except Exception as e:
         return None, None, str(e)
 
+def _get_audio_duration(filepath):
+    """Return duration in seconds via ffprobe, or None on failure."""
+    try:
+        startupinfo = None
+        if sys.platform == "win32":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(filepath)]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, encoding='utf-8', errors='ignore',
+                                startupinfo=startupinfo)
+        if result.returncode == 0 and result.stdout:
+            import json as _json
+            data = _json.loads(result.stdout)
+            dur = data.get('format', {}).get('duration')
+            if dur:
+                return float(dur)
+    except Exception:
+        pass
+    return None
+
 def normalize_file(index, total, filepath):
     suffix = filepath.suffix.lower()
     artist, title = read_metadata_tags(filepath)
+    
+    # Measure original duration before processing
+    orig_duration = _get_audio_duration(filepath)
     
     input_i, input_tp, err = measure_loudness(filepath)
     if err:
@@ -686,11 +732,25 @@ def normalize_file(index, total, filepath):
         os.replace(temp_path, str(filepath))
     except Exception as e:
         return False, filepath.name, f"Failed to replace original file with temp: {e}"
+    
+    # Report silence removal stats
+    new_duration = _get_audio_duration(filepath)
+    if orig_duration is not None and new_duration is not None:
+        total_removed = orig_duration - new_duration
+        pad_added = SILENCE_PAD_DUR if SILENCE_PAD_DUR > 0 else 0.0
+        net_removed = total_removed + pad_added  # silence removed before pad was added
+        front_est = net_removed / 2.0
+        back_est = net_removed / 2.0
+        _safe_print(
+            f"  {Colors.DIM}├─ Original duration: {orig_duration:.2f}s  →  New: {new_duration:.2f}s{Colors.END}\n"
+            f"  {Colors.DIM}└─ Silence removed: ~{front_est:.2f}s front, ~{back_est:.2f}s back (total: {net_removed:.2f}s){Colors.END}"
+        )
         
     if (artist or title) and _MUTAGEN_AVAILABLE:
         write_metadata_tags(filepath, artist, title)
         
     return True, filepath.name, None
+
 
 def run_loudness_normalization(folder_path):
     print(f"\n{Colors.CYAN}{Colors.BOLD}========================================{Colors.END}")
@@ -891,18 +951,12 @@ def run_integrated_renamer_cli():
         elif norm_mode == 'off':
             print(f"\n{Colors.YELLOW}Skipping volume adjustment (disabled in settings).{Colors.END}\n")
         else:
-            print(f"{Colors.BOLD}Volume Adjustment / Loudness Normalization{Colors.END}")
-            choice = input(f"Do you want to run the volume adjustment pass? ({Colors.GREEN}y{Colors.END}/{Colors.RED}n{Colors.END}): ").strip().lower()
+            print(f"{Colors.BOLD}Normalization and Silence Trimming{Colors.END}")
+            choice = input(f"Do you want to run normalization and silence trimming? ({Colors.GREEN}y{Colors.END}/{Colors.RED}n{Colors.END}): ").strip().lower()
             if choice in ('y', 'yes'):
                 norm_completed, norm_failed = run_loudness_normalization(folder)
             else:
-                print(f"\n{Colors.YELLOW}Skipping volume adjustment pass.{Colors.END}\n")
-                print(f"{Colors.BOLD}Silence Trimming{Colors.END}")
-                trim_choice = input(f"Do you want to trim silence from the front and back of each file? ({Colors.GREEN}y{Colors.END}/{Colors.RED}n{Colors.END}): ").strip().lower()
-                if trim_choice in ('y', 'yes'):
-                    trim_completed, trim_failed = run_silence_trim(folder)
-                else:
-                    print(f"\n{Colors.YELLOW}Skipping silence trim pass.{Colors.END}\n")
+                print(f"\n{Colors.YELLOW}Skipping normalization and silence trim pass.{Colors.END}\n")
     except KeyboardInterrupt:
         print(f"\n\n{Colors.RED}Process interrupted by user. Exiting.{Colors.END}")
         sys.exit(0)
@@ -976,7 +1030,123 @@ def pil_to_qpixmap(pil_image):
     qimg = QImage(data, img.width, img.height, QImage.Format_RGBA8888)
     return QPixmap.fromImage(qimg)
 
+
+class ClickableSlider(QSlider):
+    """A QSlider that seeks immediately on mouse press (click-to-seek), not just drag."""
+    def __init__(self, orientation, parent=None):
+        super().__init__(orientation, parent)
+        self._seeking = False
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            # Compute value from click position
+            val = QStyle.sliderValueFromPosition(
+                self.minimum(), self.maximum(),
+                event.position().toPoint().x(), self.width()
+            )
+            self._seeking = True
+            self.setValue(val)
+            self._seeking = False
+            # Emit sliderMoved so on_seek fires
+            self.sliderMoved.emit(val)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.LeftButton:
+            val = QStyle.sliderValueFromPosition(
+                self.minimum(), self.maximum(),
+                event.position().toPoint().x(), self.width()
+            )
+            self.setValue(val)
+            self.sliderMoved.emit(val)
+        super().mouseMoveEvent(event)
+
+
+class DoubleClickButton(QPushButton):
+    """QPushButton that only triggers its primary action on double-click."""
+    doubleClicked = Signal()
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.doubleClicked.emit()
+        super().mouseDoubleClickEvent(event)
+
+    def mousePressEvent(self, event):
+        # Absorb single click so it doesn't trigger clicked signal for playback
+        # (still allow default visual press styling)
+        event.accept()
+
+
+class DraggableQueueWidget(QWidget):
+    """Queue container widget that supports drag-and-drop reordering of pending items."""
+    order_changed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self._drag_start_pos = None
+        self._drag_source_widget = None
+
+    def get_item_at(self, pos):
+        for i in range(self.layout().count()):
+            w = self.layout().itemAt(i).widget()
+            if w and w.geometry().contains(pos):
+                return i, w
+        return None, None
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            idx, w = self.get_item_at(event.position().toPoint())
+            if w is not None:
+                q = w.property("queue_item")
+                if q and q.get('status') == 'Pending':
+                    self._drag_start_pos = event.position().toPoint()
+                    self._drag_source_widget = w
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (self._drag_source_widget and self._drag_start_pos and
+                event.buttons() & Qt.LeftButton):
+            dist = (event.position().toPoint() - self._drag_start_pos).manhattanLength()
+            if dist > 6:
+                drag = QDrag(self)
+                mime = QMimeData()
+                lay = self.layout()
+                src_idx = -1
+                for i in range(lay.count()):
+                    if lay.itemAt(i).widget() == self._drag_source_widget:
+                        src_idx = i
+                        break
+                mime.setText(str(src_idx))
+                drag.setMimeData(mime)
+                drag.exec(Qt.MoveAction)
+        super().mouseMoveEvent(event)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasText():
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event):
+        event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        src_idx = int(event.mimeData().text())
+        drop_pos = event.position().toPoint()
+        dst_idx, _ = self.get_item_at(drop_pos)
+        if dst_idx is None:
+            dst_idx = self.layout().count() - 1
+        if src_idx != dst_idx and dst_idx >= 0:
+            self.order_changed.emit()
+            # Emit signal with indices – parent will do the actual reorder
+            self._pending_reorder = (src_idx, dst_idx)
+            self.order_changed.emit()
+        event.acceptProposedAction()
+        self._drag_start_pos = None
+        self._drag_source_widget = None
+
+
 class ThumbnailWidget(QWidget):
+
     def __init__(self, video, parent_app, parent=None):
         super().__init__(parent)
         self.setFixedSize(90, 50)
@@ -1697,10 +1867,12 @@ class MainApp(QMainWindow):
         self.search_entry.setPlaceholderText("Search YouTube or Paste a Video Link")
         self.search_entry.returnPressed.connect(self.perform_search)
         self.search_btn = QPushButton("Search")
+        self.search_btn.setToolTip("Search YouTube for songs or playlists")
         self.search_btn.clicked.connect(self.perform_search)
         self.playlist_btn = QPushButton("\uE142")
         self.playlist_btn.setObjectName("topIconBtn")
         self.playlist_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 16px;")
+        self.playlist_btn.setToolTip("Recent Playlists")
         self.playlist_btn.clicked.connect(self.open_playlist_dialog)
         
         search_r.addWidget(self.search_entry, 1)
@@ -1709,6 +1881,7 @@ class MainApp(QMainWindow):
         settings_btn = QPushButton("\uE713")
         settings_btn.setObjectName("topIconBtn")
         settings_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 16px;")
+        settings_btn.setToolTip("Settings")
         settings_btn.clicked.connect(self.open_settings_dialog)
         search_r.addWidget(settings_btn)
         c_layout.addLayout(search_r)
@@ -1750,6 +1923,7 @@ class MainApp(QMainWindow):
         self.browse_btn.setObjectName("topIconBtn")
         self.browse_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 16px; padding: 0px;")
         self.browse_btn.setFixedSize(36, 30)
+        self.browse_btn.setToolTip("Browse destination folder")
         self.browse_btn.clicked.connect(self.browse_folder)
         set_r.addWidget(self.browse_btn)
         set_r.addSpacing(6)
@@ -1765,10 +1939,13 @@ class MainApp(QMainWindow):
         
         status_bar = QHBoxLayout()
         self.playing_label = QLabel("")
+        self.playing_label.setTextFormat(Qt.PlainText)
         self.playing_label.setStyleSheet("font-size: 11px; margin-top: -2px;")
         self.status_label = QLabel("Ready")
+        self.status_label.setTextFormat(Qt.PlainText)
         self.status_label.setStyleSheet("font-size: 11px; margin-top: -2px;")
         self.dl_progress_label = QLabel("")
+        self.dl_progress_label.setTextFormat(Qt.PlainText)
         self.dl_progress_label.setStyleSheet("font-size: 11px; margin-top: -2px; color: #888;")
         self.dl_progress_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         
@@ -1823,18 +2000,21 @@ class MainApp(QMainWindow):
         
         self.prev_btn = QPushButton("\uE892")
         self.prev_btn.setObjectName("playerBtn")
+        self.prev_btn.setToolTip("Previous track")
         self.prev_btn.clicked.connect(self.play_previous)
         self.prev_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 13px;")
         c.addWidget(self.prev_btn)
         
         self.play_btn = QPushButton("\uE768")
         self.play_btn.setObjectName("playerPlayBtn")
+        self.play_btn.setToolTip("Play / Pause")
         self.play_btn.clicked.connect(self.toggle_playback)
         self.play_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 24px;")
         c.addWidget(self.play_btn)
         
         self.next_btn = QPushButton("\uE893")
         self.next_btn.setObjectName("playerBtn")
+        self.next_btn.setToolTip("Next track")
         self.next_btn.clicked.connect(self.play_next)
         self.next_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 13px;")
         c.addWidget(self.next_btn)
@@ -1845,10 +2025,10 @@ class MainApp(QMainWindow):
         c.addWidget(self.time_label)
         p_layout.addLayout(c)
         
-        self.progress_slider = QSlider(Qt.Horizontal)
-        self.progress_slider.setFixedHeight(12)
+        self.progress_slider = ClickableSlider(Qt.Horizontal)
+        self.progress_slider.setFixedHeight(20)
         self.progress_slider.setRange(0, 10000)
-        self.progress_slider.valueChanged.connect(self.on_seek)
+        self.progress_slider.sliderMoved.connect(self.on_seek)
         p_layout.addWidget(self.progress_slider)
 
         # Restore last search
@@ -1985,27 +2165,42 @@ class MainApp(QMainWindow):
         h.addWidget(self.queue_label)
         h.addStretch()
         self.dl_btn = QPushButton("Download All")
+        self.dl_btn.setToolTip("Download all pending tracks in queue")
         self.dl_btn.clicked.connect(self.start_batch_download)
         h.addWidget(self.dl_btn)
         self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setToolTip("Cancel ongoing download")
         self.cancel_btn.clicked.connect(self.cancel_batch_download)
         self.cancel_btn.setVisible(False)
         h.addWidget(self.cancel_btn)
         self.clear_btn = QPushButton("Clear")
+        self.clear_btn.setToolTip("Clear finished items from queue")
         self.clear_btn.clicked.connect(self.clear_completed)
         h.addWidget(self.clear_btn)
         l.addLayout(h)
         
         self.queue_area = QScrollArea()
         self.queue_area.setWidgetResizable(True)
-        self.queue_content = QWidget()
+        self.queue_content = DraggableQueueWidget()
         self.queue_content.setObjectName("scrollContent")
         self.queue_vbox = QVBoxLayout(self.queue_content)
         self.queue_vbox.setAlignment(Qt.AlignTop)
         self.queue_area.setWidget(self.queue_content)
         self.queue_area.verticalScrollBar().valueChanged.connect(self.lazy_load_visible_queue)
+        self.queue_content.order_changed.connect(self._on_queue_order_changed)
         l.addWidget(self.queue_area, 1)
         self.content_splitter.addWidget(w)
+
+    def _on_queue_order_changed(self):
+        if hasattr(self.queue_content, '_pending_reorder'):
+            src_idx, dst_idx = self.queue_content._pending_reorder
+            if 0 <= src_idx < len(self.queue_items) and 0 <= dst_idx < len(self.queue_items):
+                src_item = self.queue_items[src_idx]
+                dst_item = self.queue_items[dst_idx]
+                if src_item.get('status') == 'Pending' and dst_item.get('status') == 'Pending':
+                    item = self.queue_items.pop(src_idx)
+                    self.queue_items.insert(dst_idx, item)
+                    self.queue_update_signal.emit()
 
     def apply_theme(self):
         mode = self.appearance_mode
@@ -2120,9 +2315,9 @@ class MainApp(QMainWindow):
             QScrollArea {{ border: none; background-color: {scroll_bg}; border-radius: 6px;}}
             QFrame {{ background-color: {frame_bg}; border-radius: 6px; padding: 5px;}}
             QSplitter::handle {{ background-color: {splitter_handle}; width: 6px; margin: 0px 2px; }}
-            QSlider::groove:horizontal {{ border: none; height: 3px; background: {slider_bg}; border-radius: 1px; }}
-            QSlider::sub-page:horizontal {{ background: {accent}; border-radius: 1px; }}
-            QSlider::handle:horizontal {{ background: {accent}; width: 14px; height: 14px; margin-top: -6px; margin-bottom: -5px; border-radius: 7px; }}
+            QSlider::groove:horizontal {{ border: none; height: 4px; background: {slider_bg}; border-radius: 2px; }}
+            QSlider::sub-page:horizontal {{ background: {accent}; border-radius: 2px; }}
+            QSlider::handle:horizontal {{ background: {accent}; width: 16px; height: 16px; margin-top: -6px; margin-bottom: -6px; border-radius: 8px; }}
             QSlider#volSlider[volume_state="normal"]::sub-page:horizontal {{ background: {accent}; }}
             QSlider#volSlider[volume_state="normal"]::handle:horizontal {{ background: {accent}; }}
             QSlider#volSlider[volume_state="orange"]::sub-page:horizontal {{ background: #FF8C00; }}
@@ -2186,6 +2381,15 @@ class MainApp(QMainWindow):
             QPushButton#playerPlayBtn:hover {{
                 background-color: {btn_hover};
             }}
+            QToolTip {{
+                background-color: {frame_bg};
+                color: {fg};
+                border: 1px solid {input_border};
+                padding: 4px 8px;
+                border-radius: 4px;
+                font-size: 11px;
+                show-delay: 2000ms;
+            }}
         """.format(
             bg=bg, fg=fg, frame_bg=frame_bg, input_bg=input_bg, input_border=input_border,
             scroll_bg=scroll_bg, splitter_handle=splitter_handle, slider_bg=slider_bg,
@@ -2245,24 +2449,48 @@ class MainApp(QMainWindow):
         
         self.local_btns = []
         for item in items:
-            text = f"{'📁' if item['is_dir'] else '🎵'}  {item.get('meta_name', item['name']) if getattr(self, 'show_local_metadata', False) else item['name']}"
-            btn = QPushButton(text)
-            btn.setObjectName("transparentBtn")
-            btn.clicked.connect(lambda checked=False, i=item: self._on_local_click(i))
-            self.local_vbox.addWidget(btn)
-            if not item['is_dir']:
-                self.local_btns.append((btn, item))
+            raw_title = item.get('meta_name', item['name']) if getattr(self, 'show_local_metadata', False) else item['name']
+            escaped_title = raw_title.replace('&', '&&')
+            if item['is_dir']:
+                btn = QPushButton(f"📁  {escaped_title}")
+                btn.setObjectName("transparentBtn")
+                btn.setToolTip("Open folder")
+                btn.clicked.connect(lambda checked=False, i=item: self._on_local_click(i))
+                self.local_vbox.addWidget(btn)
+            else:
+                row_w = QWidget()
+                row_l = QHBoxLayout(row_w)
+                row_l.setContentsMargins(0, 0, 0, 0)
+                row_l.setSpacing(4)
                 
-        if getattr(self, 'show_local_metadata', False) and self.local_btns:
+                btn = DoubleClickButton(f"🎵  {escaped_title}")
+                btn.setObjectName("transparentBtn")
+                btn.setToolTip("Double-click to play")
+                btn.doubleClicked.connect(lambda i=item: self._on_local_click(i))
+                row_l.addWidget(btn, 1)
+                
+                dur_lbl = QLabel(item.get('duration_str', ''))
+                dur_lbl.setStyleSheet("color: #888888; font-size: 11px; padding-right: 6px;")
+                row_l.addWidget(dur_lbl)
+                
+                self.local_vbox.addWidget(row_w)
+                self.local_btns.append((btn, dur_lbl, item))
+                
+        if self.local_btns:
             self._fetch_local_metadata_bg()
             
     def _fetch_local_metadata_bg(self):
         from PySide6.QtCore import QObject, Signal
         class MetaWorker(QObject):
-            meta_done = Signal(object, object)
+            meta_done = Signal(object, object, object)
             
         self._meta_worker = MetaWorker()
-        self._meta_worker.meta_done.connect(lambda b, i: b.setText(f"🎵  {i['meta_name']}"))
+        self._meta_worker.meta_done.connect(
+            lambda b, d_lbl, i: (
+                b.setText(f"🎵  {i.get('meta_name', i['name']).replace('&', '&&')}"),
+                d_lbl.setText(i.get('duration_str', ''))
+            )
+        )
         
         btns_to_process = list(self.local_btns)
         
@@ -2275,16 +2503,16 @@ class MainApp(QMainWindow):
                 ffprobe_path = ff_exe
                 
         def bg_task():
-            for btn, item in btns_to_process:
-                if not getattr(self, 'show_local_metadata', False): break
-                if 'meta_name' not in item:
+            for btn, d_lbl, item in btns_to_process:
+                if 'meta_name' not in item or 'duration_str' not in item:
                     try:
                         cmd = [ffprobe_path, '-v', 'quiet', '-print_format', 'json', '-show_format', item['path']]
                         # 0x08000000 is CREATE_NO_WINDOW on Windows
                         result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='ignore', creationflags=0x08000000)
                         if result.stdout:
                             data = json.loads(result.stdout)
-                            tags = data.get('format', {}).get('tags', {})
+                            fmt = data.get('format', {})
+                            tags = fmt.get('tags', {})
                             
                             title = tags.get('title') or tags.get('TITLE')
                             artist = tags.get('artist') or tags.get('ARTIST')
@@ -2293,12 +2521,24 @@ class MainApp(QMainWindow):
                                 item['meta_name'] = f"{artist} - {title}" if artist else title
                             else:
                                 item['meta_name'] = item['name']
+                                
+                            dur = fmt.get('duration')
+                            if dur:
+                                d = float(dur)
+                                if d >= 3600:
+                                    item['duration_str'] = f"{int(d//3600)}:{int((d%3600)//60):02d}:{int(d%60):02d}"
+                                else:
+                                    item['duration_str'] = f"{int(d//60)}:{int(d%60):02d}"
+                            else:
+                                item['duration_str'] = ""
                         else:
                             item['meta_name'] = item['name']
+                            item['duration_str'] = ""
                     except Exception:
                         item['meta_name'] = item['name']
+                        item['duration_str'] = ""
                 # Update UI safely
-                self._meta_worker.meta_done.emit(btn, item)
+                self._meta_worker.meta_done.emit(btn, d_lbl, item)
         threading.Thread(target=bg_task, daemon=True).start()
 
     def _on_local_click(self, item, paused_at_start=False):
@@ -2524,7 +2764,7 @@ class MainApp(QMainWindow):
             
         title = video.get('title', 'Unknown')
         if len(title) > 55: title = title[:52] + "..."
-        cb = QCheckBox(f"{title}")
+        cb = QCheckBox(f"{title.replace('&', '&&')}")
         cb.setProperty("video_id", video.get('id', ''))
         
         # Persist checked state
@@ -2532,6 +2772,22 @@ class MainApp(QMainWindow):
             
         cb.stateChanged.connect(lambda state, v=video: self.toggle_queue(v, state))
         l.addWidget(cb, 1)
+        
+        # Length indicator (to the left of Open Video button)
+        dur = video.get('duration_string')
+        if not dur and video.get('duration'):
+            try:
+                d = float(video['duration'])
+                if d >= 3600:
+                    dur = f"{int(d//3600)}:{int((d%3600)//60):02d}:{int(d%60):02d}"
+                else:
+                    dur = f"{int(d//60)}:{int(d%60):02d}"
+            except:
+                dur = ""
+        if dur:
+            dur_lbl = QLabel(dur)
+            dur_lbl.setStyleSheet("color: #888888; font-size: 11px; padding-right: 4px;")
+            l.addWidget(dur_lbl)
         
         # Open on YouTube button
         yt_btn = QPushButton("")
@@ -2607,11 +2863,15 @@ class MainApp(QMainWindow):
         st = "\uE73E " if q['status'] == "Finished" else ("\uE896 " if q['status'] == "Downloading" else "")
         t = q['video'].get('title', 'Unknown')
         if len(t) > 40: t = t[:37] + "..."
+        import html
+        t_escaped = html.escape(t)
         
-        l.addWidget(QLabel(f"<span style='font-family: \"Segoe MDL2 Assets\";'>{st}</span> {t}"), 1)
+        lbl = QLabel(f"<span style='font-family: \"Segoe MDL2 Assets\";'>{st}</span> {t_escaped}")
+        l.addWidget(lbl, 1)
         
         rm_btn = QPushButton("\uE711")
         rm_btn.setObjectName("iconBtn")
+        rm_btn.setToolTip("Remove from queue")
         rm_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 14px;")
         rm_btn.setFixedSize(26, 26)
         rm_btn.clicked.connect(lambda checked=False, i=idx: self.remove_from_queue(i))
@@ -2641,7 +2901,8 @@ class MainApp(QMainWindow):
                 st = "\uE73E " if q['status'] == "Finished" else ("\uE896 " if q['status'] == "Downloading" else "")
                 t = q['video'].get('title', 'Unknown')
                 if len(t) > 40: t = t[:37] + "..."
-                labels[0].setText(f"<span style='font-family: \"Segoe MDL2 Assets\";'>{st}</span> {t}")
+                import html
+                labels[0].setText(f"<span style='font-family: \"Segoe MDL2 Assets\";'>{st}</span> {html.escape(t)}")
             new_name = "queueItemFinished" if q['status'] == "Finished" else "queueItemPending"
             if placeholder.objectName() != new_name:
                 placeholder.setObjectName(new_name)
@@ -3084,8 +3345,6 @@ class MainApp(QMainWindow):
             self.play_result(self.search_results[self.playback_index])
 
     def on_seek(self, val):
-        # Ignore programmatic updates triggering seek
-        if not self.progress_slider.isSliderDown(): return
         if self.vlc_player:
             self.vlc_player.set_position(float(val)/10000.0)
 
