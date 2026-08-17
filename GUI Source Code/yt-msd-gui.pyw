@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QComboBox, QCheckBox, QSlider, QScrollArea, 
                                QSplitter, QSplitterHandle, QFileDialog, QMessageBox, QDialog,
                                QSystemTrayIcon, QMenu, QFrame, QGridLayout,
-                               QSizePolicy, QStyle, QToolTip)
+                               QSizePolicy, QStyle, QToolTip, QStyleOption)
 from PySide6.QtCore import Qt, Signal, QTimer, Slot, QPoint, QRect, QMargins
 from PySide6.QtGui import QIcon, QPixmap, QImage, QAction, QColor, QPalette, QPainter, QBrush, QFont, QDrag
 from PySide6.QtCore import QMimeData
@@ -314,6 +314,63 @@ def write_metadata_tags(filepath, artist, title):
     except Exception as e:
         print(f"{Colors.RED}Error writing tags to {filepath.name}: {e}{Colors.END}")
     return False
+
+def _add_placeholder_tag(filepath):
+    if not _MUTAGEN_AVAILABLE or not os.path.exists(filepath): return
+    ext = os.path.splitext(filepath)[1].lower()
+    try:
+        if ext == ".mp3":
+            try:
+                tags = EasyID3(filepath)
+            except ID3NoHeaderError:
+                tags = EasyID3()
+                tags.save(filepath)
+                tags = EasyID3(filepath)
+            except Exception:
+                return
+            tags['comment'] = ['YTMSD_PENDING_VERIFY']
+            tags.save()
+        elif ext == ".m4a":
+            try:
+                tags = EasyMP4(filepath)
+                tags['comment'] = ['YTMSD_PENDING_VERIFY']
+                tags.save()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+def _has_placeholder_tag(filepath):
+    if not _MUTAGEN_AVAILABLE or not os.path.exists(filepath): return False
+    ext = os.path.splitext(filepath)[1].lower()
+    try:
+        if ext == ".mp3":
+            tags = EasyID3(filepath)
+            return 'YTMSD_PENDING_VERIFY' in tags.get('comment', [])
+        elif ext == ".m4a":
+            tags = EasyMP4(filepath)
+            return 'YTMSD_PENDING_VERIFY' in tags.get('comment', [])
+    except Exception:
+        return False
+    return False
+
+def _remove_placeholder_tag(filepath):
+    if not _MUTAGEN_AVAILABLE or not os.path.exists(filepath): return
+    ext = os.path.splitext(filepath)[1].lower()
+    try:
+        if ext == ".mp3":
+            tags = EasyID3(filepath)
+            if 'comment' in tags:
+                tags['comment'] = [c for c in tags['comment'] if c != 'YTMSD_PENDING_VERIFY']
+                tags.save()
+        elif ext == ".m4a":
+            tags = EasyMP4(filepath)
+            if 'comment' in tags:
+                tags['comment'] = [c for c in tags['comment'] if c != 'YTMSD_PENDING_VERIFY']
+                tags.save()
+    except Exception:
+        pass
+
 
 def clean_and_tag_files(folder_path, start_auto=False):
     extensions = {".mp3", ".m4a"}
@@ -1083,9 +1140,16 @@ class DraggableQueueWidget(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setAttribute(Qt.WA_StyledBackground, True)
         self.setAcceptDrops(True)
         self._drag_start_pos = None
         self._drag_source_widget = None
+
+    def paintEvent(self, event):
+        opt = QStyleOption()
+        opt.initFrom(self)
+        p = QPainter(self)
+        self.style().drawPrimitive(QStyle.PE_Widget, opt, p, self)
 
     def get_item_at(self, pos):
         for i in range(self.layout().count()):
@@ -1858,7 +1922,7 @@ class MainApp(QMainWindow):
         search_r = QHBoxLayout()
         self.toggle_pane_btn = QPushButton("\uE8A0")
         self.toggle_pane_btn.setObjectName("topIconBtn")
-        self.toggle_pane_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 16px;")
+        self.toggle_pane_btn.setFixedSize(36, 30)
         self.toggle_pane_btn.setToolTip("Toggle File Browser")
         self.toggle_pane_btn.clicked.connect(self.toggle_local_pane)
         search_r.addWidget(self.toggle_pane_btn)
@@ -1871,7 +1935,7 @@ class MainApp(QMainWindow):
         self.search_btn.clicked.connect(self.perform_search)
         self.playlist_btn = QPushButton("\uE142")
         self.playlist_btn.setObjectName("topIconBtn")
-        self.playlist_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 16px;")
+        self.playlist_btn.setFixedSize(36, 30)
         self.playlist_btn.setToolTip("Recent Playlists")
         self.playlist_btn.clicked.connect(self.open_playlist_dialog)
         
@@ -1880,7 +1944,7 @@ class MainApp(QMainWindow):
         search_r.addWidget(self.playlist_btn)
         settings_btn = QPushButton("\uE713")
         settings_btn.setObjectName("topIconBtn")
-        settings_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 16px;")
+        settings_btn.setFixedSize(36, 30)
         settings_btn.setToolTip("Settings")
         settings_btn.clicked.connect(self.open_settings_dialog)
         search_r.addWidget(settings_btn)
@@ -2002,21 +2066,18 @@ class MainApp(QMainWindow):
         self.prev_btn.setObjectName("playerBtn")
         self.prev_btn.setToolTip("Previous track")
         self.prev_btn.clicked.connect(self.play_previous)
-        self.prev_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 13px;")
         c.addWidget(self.prev_btn)
         
         self.play_btn = QPushButton("\uE768")
         self.play_btn.setObjectName("playerPlayBtn")
         self.play_btn.setToolTip("Play / Pause")
         self.play_btn.clicked.connect(self.toggle_playback)
-        self.play_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 24px;")
         c.addWidget(self.play_btn)
         
         self.next_btn = QPushButton("\uE893")
         self.next_btn.setObjectName("playerBtn")
         self.next_btn.setToolTip("Next track")
         self.next_btn.clicked.connect(self.play_next)
-        self.next_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 13px;")
         c.addWidget(self.next_btn)
         c.addStretch(1)
         
@@ -2273,13 +2334,16 @@ class MainApp(QMainWindow):
             btn_hover = "rgba(255, 255, 255, 0.1)"
             main_btn_border = "none"
 
+        secondary_fg = "#777777" if mode == "Light" else "#999999"
+
         self.setStyleSheet("""
             QMainWindow, QDialog {{ background-color: {bg}; }}
             QWidget {{ color: {fg}; font-family: 'Segoe UI'; font-size: 13px; }}
-            QWidget#scrollContent {{ background-color: {scroll_bg}; }}
+            QWidget#scrollContent, DraggableQueueWidget#scrollContent {{ background-color: {scroll_bg}; }}
             QWidget#queueItemPending {{ background-color: {queue_item_bg}; border-radius: 4px; margin-bottom: 2px; }}
             QWidget#queueItemFinished {{ background-color: {queue_item_bg_finished}; border-radius: 4px; margin-bottom: 2px; }}
             QLabel {{ color: {fg}; }}
+            QLabel#durationLabel {{ color: {secondary_fg}; font-size: 11px; background: transparent; border: none; }}
             QPushButton {{ 
                 background-color: {accent}; 
                 color: {accent_fg}; border: {main_btn_border}; padding: 6px 12px; border-radius: 4px; font-weight: bold;
@@ -2347,16 +2411,15 @@ class MainApp(QMainWindow):
                 font-weight: normal;
                 padding: 0px;
             }}
-            QPushButton#iconBtn:hover {{
-                background-color: {btn_hover};
-            }}
             QPushButton#topIconBtn {{
                 background-color: transparent;
                 color: {fg};
+                font-family: 'Segoe MDL2 Assets';
+                font-size: 15px;
                 font-weight: normal;
                 border: 1px solid {input_border};
                 border-radius: 4px;
-                padding: 6px 12px;
+                padding: 0px;
             }}
             QPushButton#topIconBtn:hover {{
                 background-color: {btn_hover};
@@ -2364,6 +2427,8 @@ class MainApp(QMainWindow):
             QPushButton#playerBtn {{
                 background-color: transparent;
                 color: {fg};
+                font-family: 'Segoe MDL2 Assets';
+                font-size: 14px;
                 font-weight: normal;
                 border-radius: 4px;
                 padding: 0px 4px;
@@ -2374,6 +2439,8 @@ class MainApp(QMainWindow):
             QPushButton#playerPlayBtn {{
                 background-color: transparent;
                 color: {fg};
+                font-family: 'Segoe MDL2 Assets';
+                font-size: 22px;
                 font-weight: normal;
                 border-radius: 6px;
                 padding: 0px 4px;
@@ -2385,10 +2452,12 @@ class MainApp(QMainWindow):
                 background-color: {frame_bg};
                 color: {fg};
                 border: 1px solid {input_border};
-                padding: 4px 8px;
+                padding: 2px 6px;
                 border-radius: 4px;
-                font-size: 11px;
-                show-delay: 2000ms;
+                font-family: 'Segoe UI';
+                font-size: 10px;
+                font-weight: normal;
+                show-delay: 4000ms;
             }}
         """.format(
             bg=bg, fg=fg, frame_bg=frame_bg, input_bg=input_bg, input_border=input_border,
@@ -2396,7 +2465,7 @@ class MainApp(QMainWindow):
             hover_bg=hover_bg, hover_fg=hover_fg, accent=accent, accent_fg=accent_fg,
             queue_item_bg=queue_item_bg, queue_item_bg_finished=queue_item_bg_finished,
             btn_hover=btn_hover, checkmark_path=checkmark_path, downarrow_path=downarrow_path,
-            main_btn_border=main_btn_border
+            main_btn_border=main_btn_border, secondary_fg=secondary_fg
         ))
 
     # --- Local Folder Logic ---
@@ -2470,7 +2539,8 @@ class MainApp(QMainWindow):
                 row_l.addWidget(btn, 1)
                 
                 dur_lbl = QLabel(item.get('duration_str', ''))
-                dur_lbl.setStyleSheet("color: #888888; font-size: 11px; padding-right: 6px;")
+                dur_lbl.setObjectName("durationLabel")
+                dur_lbl.setStyleSheet("border: none; background: transparent; padding-right: 6px;")
                 row_l.addWidget(dur_lbl)
                 
                 self.local_vbox.addWidget(row_w)
@@ -2786,7 +2856,8 @@ class MainApp(QMainWindow):
                 dur = ""
         if dur:
             dur_lbl = QLabel(dur)
-            dur_lbl.setStyleSheet("color: #888888; font-size: 11px; padding-right: 4px;")
+            dur_lbl.setObjectName("durationLabel")
+            dur_lbl.setStyleSheet("border: none; background: transparent; padding-right: 4px;")
             l.addWidget(dur_lbl)
         
         # Open on YouTube button
@@ -3030,16 +3101,20 @@ class MainApp(QMainWindow):
         
         def bg_download():
             from concurrent.futures import ThreadPoolExecutor
-            import time
+            import time, glob
             
             with self.active_downloads_lock:
                 self.active_downloads.clear()
                 
             threads_count = max(1, int(getattr(self, 'download_threads', 3)))
+            target_format = self.format_combo.currentText().lower()
+            downloaded_filepaths = []
+            downloaded_lock = threading.Lock()
             
             def download_single(item):
                 idx, q = item
-                vid_id = q['video']['id']
+                vid_id = q['video'].get('id', '')
+                if not vid_id: return
                 if getattr(self, 'cancel_download', False):
                     q['status'] = "Pending"
                     self.queue_status_changed_signal.emit(idx)
@@ -3048,42 +3123,62 @@ class MainApp(QMainWindow):
                 self.queue_status_changed_signal.emit(idx)
                 
                 success = False
+                downloaded_file = None
                 try:
                     ydl_opts = {
                         'format': 'bestaudio/best',
                         'outtmpl': f"{folder}/%(title)s.%(ext)s",
                         'postprocessors': [{
                             'key': 'FFmpegExtractAudio',
-                            'preferredcodec': self.format_combo.currentText(),
+                            'preferredcodec': target_format,
                             'preferredquality': self.bitrate_combo.currentText(),
                         }],
                         'progress_hooks': [self._dl_progress_hook],
                         'quiet': True,
-                        'retries': 10,
-                        'fragment_retries': 10,
-                        'file_access_retries': 5,
-                        'ignoreerrors': True,
+                        'retries': 15,
+                        'fragment_retries': 15,
+                        'file_access_retries': 10,
+                        'ignoreerrors': False,
                     }
                     if getattr(sys, 'frozen', False):
                         ydl_opts['ffmpeg_location'] = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
                         
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        ydl.download([f"https://www.youtube.com/watch?v={vid_id}"])
-                    success = True
+                        info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid_id}", download=True)
+                        if info:
+                            raw_name = ydl.prepare_filename(info)
+                            base, _ = os.path.splitext(raw_name)
+                            candidate = f"{base}.{target_format}"
+                            if os.path.exists(candidate) and os.path.getsize(candidate) > 1024:
+                                downloaded_file = candidate
+                                success = True
+                            else:
+                                matching = glob.glob(f"{glob.escape(base)}.*")
+                                for m in matching:
+                                    if os.path.exists(m) and os.path.getsize(m) > 1024:
+                                        downloaded_file = m
+                                        success = True
+                                        break
                 except Exception:
-                    pass
+                    success = False
                 finally:
                     with self.active_downloads_lock:
                         if vid_id in self.active_downloads:
                             del self.active_downloads[vid_id]
                 
+                if success and downloaded_file:
+                    _add_placeholder_tag(downloaded_file)
+                    with downloaded_lock:
+                        downloaded_filepaths.append(downloaded_file)
+                    q['status'] = "Finished"
+                else:
+                    q['status'] = "Pending"
+                    
                 if getattr(self, 'cancel_download', False):
                     q['status'] = "Pending"
-                else:
-                    q['status'] = "Finished" if success else "Pending"
                 self.queue_status_changed_signal.emit(idx)
                 
-            max_passes = 3
+            max_passes = 4
             for pass_num in range(1, max_passes + 1):
                 pending_items = [(idx, q) for idx, q in enumerate(self.queue_items) if q['status'] == "Pending"]
                 if not pending_items or getattr(self, 'cancel_download', False):
@@ -3091,7 +3186,7 @@ class MainApp(QMainWindow):
                 
                 if pass_num > 1:
                     self.status_signal.emit(
-                        f"Re-checking queue (Pass {pass_num}: retrying {len(pending_items)} skipped downloads)...",
+                        f"Re-checking queue (Pass {pass_num}: retrying {len(pending_items)} pending downloads)...",
                         False, "#FF8C00"
                     )
                     time.sleep(1.0)
@@ -3105,6 +3200,37 @@ class MainApp(QMainWindow):
                         futures.append(executor.submit(download_single, item))
                     for fut in futures:
                         fut.result()
+            
+            # --- Verification Pass with Placeholder Tag & Title Matching ---
+            if not getattr(self, 'cancel_download', False):
+                valid_tagged_files = [f for f in downloaded_filepaths if os.path.exists(f) and os.path.getsize(f) > 1024]
+                queued_finished = [q for q in self.queue_items if q['status'] == "Finished"]
+                
+                if len(valid_tagged_files) < len(queued_finished):
+                    missing_items = []
+                    for idx, q in enumerate(self.queue_items):
+                        if q['status'] == "Finished":
+                            title = q['video'].get('title', '')
+                            found = any(title.lower() in os.path.basename(f).lower() for f in valid_tagged_files)
+                            if not found:
+                                q['status'] = "Pending"
+                                missing_items.append((idx, q))
+                                self.queue_status_changed_signal.emit(idx)
+                                
+                    if missing_items:
+                        self.status_signal.emit(
+                            f"Verification: {len(missing_items)} files missing on disk. Redownloading missing tracks...",
+                            False, "#FF8C00"
+                        )
+                        with ThreadPoolExecutor(max_workers=min(threads_count, len(missing_items))) as executor:
+                            futures = [executor.submit(download_single, item) for item in missing_items]
+                            for fut in futures:
+                                fut.result()
+                
+                # Strip placeholder verification tag from all confirmed files
+                for f in downloaded_filepaths:
+                    if os.path.exists(f):
+                        _remove_placeholder_tag(f)
             
             if getattr(self, 'cancel_download', False):
                 self.status_signal.emit("Download cancelled.", False, "#E31E24")
@@ -3252,17 +3378,27 @@ class MainApp(QMainWindow):
     def play_result(self, video, paused_at_start=False):
         self._on_status_update(f"Fetching stream: {video.get('title', 'Unknown')}...", False, "#3B8ED0")
         
+        # Track pending fetch ID and loading state, but DO NOT stop the current playback
+        vid_id = video.get('id', '')
+        self._pending_fetch_id = vid_id
+        self._is_loading_stream = True
+        
         # update index
         self.playback_index = -1
         for i, res in enumerate(self.search_results):
-            if res['id'] == video['id']:
+            if res.get('id') == vid_id:
                 self.playback_index = i; break
                 
         def bg_fetch():
             try:
                 with yt_dlp.YoutubeDL({'quiet': True, 'format': 'bestaudio/best'}) as ydl:
-                    info = ydl.extract_info(f"https://www.youtube.com/watch?v={video['id']}", download=False)
+                    info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid_id}", download=False)
                     url = info['url']
+                    
+                    # If another stream request started while fetching, ignore this one
+                    if getattr(self, '_pending_fetch_id', None) != vid_id:
+                        return
+                        
                     media = self.vlc_instance.media_new(url)
                     self.vlc_player.set_media(media)
                     if paused_at_start:
@@ -3275,8 +3411,12 @@ class MainApp(QMainWindow):
                         self.vlc_player.audio_set_mute(False)
                     else:
                         self.vlc_player.play()
-                    self.playback_started_signal.emit(video.get('title', 'Unknown'), video['id'], paused_at_start)
+                    self._is_loading_stream = False
+                    self._ended_trigger = False
+                    self.playback_started_signal.emit(video.get('title', 'Unknown'), vid_id, paused_at_start)
             except Exception:
+                if getattr(self, '_pending_fetch_id', None) == vid_id:
+                    self._is_loading_stream = False
                 self.search_failed_signal.emit()
         threading.Thread(target=bg_fetch, daemon=True).start()
 
@@ -3370,13 +3510,15 @@ class MainApp(QMainWindow):
 
     def update_player_ui(self):
         if not self.vlc_player or not self.current_video_id: return
+        if getattr(self, '_is_loading_stream', False): return
         
-        # Check ended
-        if self.vlc_player.get_state() == vlc.State.Ended:
-            if not getattr(self, '_ended_trigger', False):
+        # Check ended - only trigger if was actively playing
+        state = self.vlc_player.get_state()
+        if state == vlc.State.Ended:
+            if not getattr(self, '_ended_trigger', False) and getattr(self, 'is_playing', False):
                 self._ended_trigger = True
                 self.play_next()
-        else:
+        elif state == vlc.State.Playing:
             self._ended_trigger = False
             
         pos = self.vlc_player.get_position() * 10000
