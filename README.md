@@ -28,7 +28,7 @@ The GUI version is currently "complete" at v1.0, (and "improved" at v2.1) but fu
 - MusicBee Plugin version - Tenative, this might happen later on after v3.0 releases
 
 ### Support for other operating systems
-**MacOS**: Exe files don't run on MacOS, but you can still use the python file and install the dependencies. Unfortunately due to the migration to Pyside6, I can no longer make a pex file properly (At least in my windows development environment). You could also use WINE to emulate windows functionality with the exe. I don't plan on releasing any additional files supporting MacOS, both because I don't have a Mac to test on, and also because MacOS is not a superior operating system.
+**MacOS**: Exe files don't run on MacOS, but you can still use the python file and install the dependencies. Unfortunately due to the migration to Pyside6, I can no longer make a pex file properly (At least in my windows development environment). You could also use WINE to emulate windows functionality with the exe. I don't plan on releasing any additional files supporting MacOS, both because I don't have a Mac to test on, and also because MacOS sucks ass.
 
 **Linux**: Support is coming for linux, in the form of an appimage file, but that will not be created until the final feature update. For now, you can do the same things as MacOS: Either the python file, or WINE.
 
@@ -73,5 +73,5 @@ When you add the exe to PATH, it will work from anywhere AS LONG as it isn't mov
 ## Support for other operating systems:
 **MacOS**: Exe files don't run on MacOS, so you will have to use the pex version or the python version. I don't have a mac, so you'll need to figure out how to install python yourself. If you are using the python version, you will also need to install pip and the required dependencies with `pip install yt-dlp` and `pip install ffmpeg`
 
-**Linux**: Linux also doesn't support exes, so you must use the python or pex version. To install python on linux: Use `sudo apt install python3-pip` on debian-based linux, or `sudo dnf install python3-pip -y` on fedora. If you use Arch, well, figure it out.
+**Linux**: Linux also doesn't support exes, so you must use the python or pex version. To install python on linux: Use `sudo apt install python3-pip` on debian-based linux, or `sudo dnf install python3-pip -y` on fedora. If you use Arch btw, figure it out.
 If you are using the normal python version and not pex, you must also install the dependencies with `pip install yt-dlp` and `pip install ffmpeg`
