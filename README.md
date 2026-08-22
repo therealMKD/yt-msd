@@ -20,6 +20,7 @@ The GUI version is currently "complete" at v1.0, (and "improved" at v2.1) but fu
 - Improved local file navigation (!)
 - Local file playlist logic (Saved filename lists to organize files that are in one big folder)
 - Import/Export logic for settings, music files, etc.
+- Master playlist syncing for all devices on a local network
 - Automatic update checking
 - An icon that isn't a single-color circle
 - Music player only mode (hiding all download features)
