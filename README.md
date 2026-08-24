@@ -11,12 +11,10 @@ I don't want to deal with spotify's ads (Or pay for premium), and youtube playli
 
 # GUI Version Readme
 
-The GUI version is currently "complete" at v1.0, (and "improved" at v2.1) but further feature updates are still coming, and I'm not going to complete this until they are finished.
+The GUI version is currently "complete" at v1.0, (and "improved" at v2.3) but further feature updates are still coming, and I'm not going to complete this until they are finished.
 
 **Upcoming features in GUI v3.0** (Features with an exclamation point (!) are currently added in beta, if you manually download "yt-msd-gui.pyw" from the files, and not releases)
 - Built-in support for renaming and metadata tagging downloaded files - and a much more improved algorithm compared to the current beta version, based on me downloading my massive playlists and using the script
-- Normalization option for files (!) - v2.1 has this feature, reliant on an external script
-- Parallel downloading (!)
 - Improved local file navigation (!)
 - Local file playlist logic (Saved filename lists to organize files that are in one big folder)
 - Import/Export logic for settings, music files, etc.
