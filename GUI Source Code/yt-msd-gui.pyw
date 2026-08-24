@@ -69,7 +69,7 @@ CUSTOM_EQ_STRING = ""
 _MUTAGEN_AVAILABLE = False
 try:
     from mutagen.easyid3 import EasyID3
-    from mutagen.id3 import ID3NoHeaderError
+    from mutagen.id3 import ID3, COMM, ID3NoHeaderError
     from mutagen.easymp4 import EasyMP4
     _MUTAGEN_AVAILABLE = True
 except ImportError:
@@ -321,15 +321,11 @@ def _add_placeholder_tag(filepath):
     try:
         if ext == ".mp3":
             try:
-                tags = EasyID3(filepath)
+                audio = ID3(filepath)
             except ID3NoHeaderError:
-                tags = EasyID3()
-                tags.save(filepath)
-                tags = EasyID3(filepath)
-            except Exception:
-                return
-            tags['comment'] = ['YTMSD_PENDING_VERIFY']
-            tags.save()
+                audio = ID3()
+            audio.setall('COMM', [COMM(encoding=3, lang='eng', desc='ytmsd', text='YTMSD_PENDING_VERIFY')])
+            audio.save(filepath)
         elif ext == ".m4a":
             try:
                 tags = EasyMP4(filepath)
@@ -345,8 +341,8 @@ def _has_placeholder_tag(filepath):
     ext = os.path.splitext(filepath)[1].lower()
     try:
         if ext == ".mp3":
-            tags = EasyID3(filepath)
-            return 'YTMSD_PENDING_VERIFY' in tags.get('comment', [])
+            audio = ID3(filepath)
+            return any('YTMSD_PENDING_VERIFY' in str(c.text) for c in audio.getall('COMM'))
         elif ext == ".m4a":
             tags = EasyMP4(filepath)
             return 'YTMSD_PENDING_VERIFY' in tags.get('comment', [])
@@ -359,10 +355,10 @@ def _remove_placeholder_tag(filepath):
     ext = os.path.splitext(filepath)[1].lower()
     try:
         if ext == ".mp3":
-            tags = EasyID3(filepath)
-            if 'comment' in tags:
-                tags['comment'] = [c for c in tags['comment'] if c != 'YTMSD_PENDING_VERIFY']
-                tags.save()
+            audio = ID3(filepath)
+            comms = [c for c in audio.getall('COMM') if 'YTMSD_PENDING_VERIFY' not in str(c.text)]
+            audio.setall('COMM', comms)
+            audio.save(filepath)
         elif ext == ".m4a":
             tags = EasyMP4(filepath)
             if 'comment' in tags:
@@ -3159,7 +3155,8 @@ class MainApp(QMainWindow):
                                         downloaded_file = m
                                         success = True
                                         break
-                except Exception:
+                except Exception as e:
+                    print(f"Download exception for {vid_id}: {e}")
                     success = False
                 finally:
                     with self.active_downloads_lock:
@@ -3330,8 +3327,8 @@ class MainApp(QMainWindow):
         if getattr(self, 'cancel_download', False):
             raise Exception("Download cancelled by user")
             
-        info = d.get('info_dict', {})
-        vid_id = info.get('id')
+        info = d.get('info_dict') or {}
+        vid_id = info.get('id') if isinstance(info, dict) else None
         if not vid_id:
             return
             
@@ -3378,10 +3375,12 @@ class MainApp(QMainWindow):
     def play_result(self, video, paused_at_start=False):
         self._on_status_update(f"Fetching stream: {video.get('title', 'Unknown')}...", False, "#3B8ED0")
         
-        # Track pending fetch ID and loading state, but DO NOT stop the current playback
+        # Track pending fetch ID and loading state
         vid_id = video.get('id', '')
         self._pending_fetch_id = vid_id
         self._is_loading_stream = True
+        self._has_played_current = False
+        self._ended_trigger = True
         
         # update index
         self.playback_index = -1
@@ -3391,15 +3390,38 @@ class MainApp(QMainWindow):
                 
         def bg_fetch():
             try:
-                with yt_dlp.YoutubeDL({'quiet': True, 'format': 'bestaudio/best'}) as ydl:
+                ydl_opts = {
+                    'quiet': True,
+                    'format': 'bestaudio/best',
+                    'extractor_args': {'youtube': {'player_client': ['android']}},
+                    'noplaylist': True
+                }
+                if getattr(sys, 'frozen', False):
+                    ydl_opts['ffmpeg_location'] = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
+                    
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid_id}", download=False)
-                    url = info['url']
+                    url = info.get('url') if info else None
+                    if not url and info and 'formats' in info:
+                        for f in reversed(info['formats']):
+                            if f.get('url') and (f.get('acodec') != 'none' or f.get('vcodec') == 'none'):
+                                url = f['url']
+                                break
+                        if not url and info['formats']:
+                            url = info['formats'][-1].get('url')
+                            
+                    if not url:
+                        raise Exception("No playable audio stream URL found")
+                    
+                    headers = info.get('http_headers', {}) if info else {}
+                    user_agent = headers.get('User-Agent', 'com.google.android.youtube/19.29.37 (Linux; U; Android 11)')
                     
                     # If another stream request started while fetching, ignore this one
                     if getattr(self, '_pending_fetch_id', None) != vid_id:
                         return
                         
                     media = self.vlc_instance.media_new(url)
+                    media.add_option(f':http-user-agent={user_agent}')
                     self.vlc_player.set_media(media)
                     if paused_at_start:
                         self.vlc_player.audio_set_mute(True)
@@ -3412,9 +3434,9 @@ class MainApp(QMainWindow):
                     else:
                         self.vlc_player.play()
                     self._is_loading_stream = False
-                    self._ended_trigger = False
                     self.playback_started_signal.emit(video.get('title', 'Unknown'), vid_id, paused_at_start)
-            except Exception:
+            except Exception as e:
+                print(f"Stream error: {e}")
                 if getattr(self, '_pending_fetch_id', None) == vid_id:
                     self._is_loading_stream = False
                 self.search_failed_signal.emit()
@@ -3510,16 +3532,17 @@ class MainApp(QMainWindow):
 
     def update_player_ui(self):
         if not self.vlc_player or not self.current_video_id: return
-        if getattr(self, '_is_loading_stream', False): return
         
-        # Check ended - only trigger if was actively playing
         state = self.vlc_player.get_state()
-        if state == vlc.State.Ended:
-            if not getattr(self, '_ended_trigger', False) and getattr(self, 'is_playing', False):
-                self._ended_trigger = True
-                self.play_next()
-        elif state == vlc.State.Playing:
+        if state == vlc.State.Playing:
+            self._has_played_current = True
             self._ended_trigger = False
+        elif state == vlc.State.Ended:
+            # ONLY trigger auto-advance if this track actually played and hasn't triggered ended yet
+            if getattr(self, '_has_played_current', False) and not getattr(self, '_ended_trigger', False) and getattr(self, 'is_playing', False):
+                self._ended_trigger = True
+                self._has_played_current = False
+                self.play_next()
             
         pos = self.vlc_player.get_position() * 10000
         ms = self.vlc_player.get_time()
@@ -3567,6 +3590,7 @@ if __name__ == "__main__":
     else:
         QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
         app = QApplication(sys.argv)
+        QToolTip.setFont(QFont("Segoe UI", 9))
         window = MainApp()
         window.show()
         sys.exit(app.exec())
