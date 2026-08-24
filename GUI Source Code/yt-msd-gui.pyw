@@ -65,6 +65,7 @@ BITRATE = "320k"
 MAX_WORKERS = max(1, _available_threads // 2)
 SILENCE_PAD_DUR = 2.0
 CUSTOM_EQ_STRING = ""
+CUSTOM_NORM_CMD = ""  # Optional full ffmpeg -af override for normalization/trim
 
 _MUTAGEN_AVAILABLE = False
 try:
@@ -406,8 +407,9 @@ def clean_and_tag_files(folder_path, start_auto=False):
             if is_forced_redo:
                 forced_redo_indices.remove(idx)
             
-            if not is_manual_skipped_pass and not is_forced_redo and filename_is_correct and has_valid_tags:
-                print(f"{Colors.DIM}[{idx}/{len(file_list)}] {Colors.GREEN}✔ Already formatted and tagged: {Colors.END}{file.name}")
+            # Skip renaming AND normalization if file already has both artist and title tags
+            if not is_manual_skipped_pass and not is_forced_redo and has_valid_tags:
+                print(f"{Colors.DIM}[{idx}/{len(file_list)}] {Colors.GREEN}✔ Already tagged (artist+title present), skipping: {Colors.END}{file.name}")
                 already_formatted_count += 1
                 idx += 1
                 continue
@@ -697,9 +699,14 @@ def _get_audio_duration(filepath):
         pass
     return None
 
-def normalize_file(index, total, filepath):
+def normalize_file(index, total, filepath, custom_norm_cmd=None):
     suffix = filepath.suffix.lower()
     artist, title = read_metadata_tags(filepath)
+    
+    # If file already has both tags, skip normalization
+    if artist and title:
+        _safe_print(f"[{index}/{total}] {Colors.DIM}Skipping (already tagged): {filepath.name}{Colors.END}")
+        return True, filepath.name, None
     
     # Measure original duration before processing
     orig_duration = _get_audio_duration(filepath)
@@ -742,6 +749,11 @@ def normalize_file(index, total, filepath):
         af_chain += f",apad=pad_dur={SILENCE_PAD_DUR}"
     if CUSTOM_EQ_STRING:
         af_chain += f",{CUSTOM_EQ_STRING}"
+
+    # Allow full af_chain override from custom norm command
+    _effective_norm_cmd = custom_norm_cmd or CUSTOM_NORM_CMD
+    if _effective_norm_cmd:
+        af_chain = _effective_norm_cmd
 
     command = ["ffmpeg", "-y", "-i", str(filepath), "-af", af_chain]
     
@@ -848,10 +860,15 @@ def run_loudness_normalization(folder_path):
     print(f"  {Colors.GREEN}Success: {completed}{Colors.END} | {Colors.RED}Failed: {failed}{Colors.END}\n")
     return completed, failed
 
-def trim_silence_file(index, total, filepath):
+def trim_silence_file(index, total, filepath, custom_norm_cmd=None):
+    # If file already has both tags, skip trimming
+    artist, title = read_metadata_tags(filepath)
+    if artist and title:
+        _safe_print(f"[{index}/{total}] {Colors.DIM}Skipping trim (already tagged): {filepath.name}{Colors.END}")
+        return True, filepath.name, None
+
     _safe_print(f"[{index}/{total}] {Colors.CYAN}Trimming silence:{Colors.END} {filepath.name}...")
     suffix = filepath.suffix.lower()
-    artist, title = read_metadata_tags(filepath)
     
     try:
         temp_fd, temp_path = tempfile.mkstemp(suffix=suffix)
@@ -868,6 +885,9 @@ def trim_silence_file(index, total, filepath):
         f"silenceremove=start_periods=1:start_duration={SILENCE_DURATION}:start_threshold={SILENCE_THRESHOLD}:start_silence={SILENCE_KEEP}:stop_silence={SILENCE_KEEP},"
         f"areverse"
     )
+    _effective_norm_cmd = custom_norm_cmd or CUSTOM_NORM_CMD
+    if _effective_norm_cmd:
+        af_chain = _effective_norm_cmd
     command = ["ffmpeg", "-y", "-i", str(filepath), "-af", af_chain]
     
     if suffix == ".mp3":
@@ -910,7 +930,7 @@ def trim_silence_file(index, total, filepath):
         return False, filepath.name, f"Failed to replace original file with temp: {e}"
     
     if (artist or title) and _MUTAGEN_AVAILABLE:
-        write_metadata_tags(filepath, artist, title)
+        write_metadata_tags(filepath, artist or "", title or "")
     
     return True, filepath.name, None
 
@@ -1404,6 +1424,22 @@ class SettingsDialog(QDialog):
         right_layout.addLayout(eq_h)
         right_layout.addWidget(QLabel("Appended to the ffmpeg filter chain during normalization.",
                                       font=QFont("Segoe UI", 8)))
+
+        # Custom normalization command override (replaces built-in filter chain)
+        right_layout.addWidget(QLabel("CUSTOM NORM/TRIM COMMAND OVERRIDE (ADVANCED)", font=QFont("Segoe UI Semibold", 10)))
+        norm_cmd_h = QHBoxLayout()
+        self.norm_cmd_cb = QCheckBox()
+        self.norm_cmd_cb.setChecked(parent.use_custom_norm_cmd)
+        self.norm_cmd_cb.toggled.connect(self._toggle_norm_cmd)
+        norm_cmd_h.addWidget(self.norm_cmd_cb)
+        self.norm_cmd_edit = QLineEdit(parent.custom_norm_cmd)
+        self.norm_cmd_edit.setPlaceholderText("e.g. loudnorm=I=-16:TP=-1.5:LRA=11")
+        self.norm_cmd_edit.setEnabled(parent.use_custom_norm_cmd)
+        self.norm_cmd_edit.textChanged.connect(self._update_norm_cmd)
+        norm_cmd_h.addWidget(self.norm_cmd_edit, 1)
+        right_layout.addLayout(norm_cmd_h)
+        right_layout.addWidget(QLabel("Replaces the entire -af filter chain for normalization AND silence trim.",
+                                      font=QFont("Segoe UI", 8)))
         right_layout.addStretch()
         
         columns_layout.addWidget(left_widget, 1)
@@ -1528,7 +1564,21 @@ class SettingsDialog(QDialog):
     def _update_eq(self, text):
         self.parent.custom_eq_string = text
         self.parent.save_config()
-        
+
+    def _toggle_norm_cmd(self, state):
+        self.parent.use_custom_norm_cmd = state
+        self.norm_cmd_edit.setEnabled(state)
+        global CUSTOM_NORM_CMD
+        CUSTOM_NORM_CMD = self.parent.custom_norm_cmd if state else ""
+        self.parent.save_config()
+
+    def _update_norm_cmd(self, text):
+        self.parent.custom_norm_cmd = text
+        global CUSTOM_NORM_CMD
+        if self.parent.use_custom_norm_cmd:
+            CUSTOM_NORM_CMD = text
+        self.parent.save_config()
+
     def _reset_defaults(self):
         if QMessageBox.question(self, "Confirm Reset", "This will wipe your config and recent data. Continue?") == QMessageBox.Yes:
             self.parent.reset_to_defaults()
@@ -1617,6 +1667,8 @@ class MainApp(QMainWindow):
         self.silence_pad_dur = 2.0
         self.use_custom_eq = False
         self.custom_eq_string = ""
+        self.use_custom_norm_cmd = False
+        self.custom_norm_cmd = ""
         self.download_threads = 3
         self.normalization_threads = max(1, os.cpu_count() // 2)
         
@@ -1710,6 +1762,8 @@ class MainApp(QMainWindow):
                     self.silence_pad_dur = c.get('silence_pad_dur', 2.0)
                     self.use_custom_eq = c.get('use_custom_eq', False)
                     self.custom_eq_string = c.get('custom_eq_string', '')
+                    self.use_custom_norm_cmd = c.get('use_custom_norm_cmd', False)
+                    self.custom_norm_cmd = c.get('custom_norm_cmd', '')
                     self.download_threads = c.get('download_threads', 3)
                     self.normalization_threads = c.get('normalization_threads', max(1, os.cpu_count() // 2))
                     if self.save_place:
@@ -1744,6 +1798,8 @@ class MainApp(QMainWindow):
             'silence_pad_dur': self.silence_pad_dur,
             'use_custom_eq': self.use_custom_eq,
             'custom_eq_string': self.custom_eq_string,
+            'use_custom_norm_cmd': self.use_custom_norm_cmd,
+            'custom_norm_cmd': self.custom_norm_cmd,
             'download_threads': self.download_threads,
             'normalization_threads': self.normalization_threads,
             'session_data': {
@@ -1818,6 +1874,8 @@ class MainApp(QMainWindow):
         self.silence_pad_dur = 2.0
         self.use_custom_eq = False
         self.custom_eq_string = ""
+        self.use_custom_norm_cmd = False
+        self.custom_norm_cmd = ""
         self.download_threads = 3
         self.normalization_threads = max(1, os.cpu_count() // 2)
         if hasattr(self, 'run_renamer_cb'):
@@ -3290,6 +3348,8 @@ class MainApp(QMainWindow):
         args.append(f'--norm-threads={self.normalization_threads}')
         if self.use_custom_eq and self.custom_eq_string.strip():
             args.append(f'--eq={self.custom_eq_string.strip()}')
+        if self.use_custom_norm_cmd and self.custom_norm_cmd.strip():
+            args.append(f'--custom-norm-cmd={self.custom_norm_cmd.strip()}')
 
         try:
             creationflags = 0x00000010 if sys.platform == "win32" else 0
