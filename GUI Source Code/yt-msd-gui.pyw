@@ -23,15 +23,26 @@ import vlc
 import shlex
 import time
 import random
+import socket
+import struct
+import hashlib
+from typing import Dict, List, Optional, Tuple, Callable
 from PIL import Image
+
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler
+    _WATCHDOG_AVAILABLE = True
+except ImportError:
+    _WATCHDOG_AVAILABLE = False
 
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QHBoxLayout, QLabel, QPushButton, QLineEdit, 
                                QComboBox, QCheckBox, QSlider, QScrollArea, 
                                QSplitter, QSplitterHandle, QFileDialog, QMessageBox, QDialog,
                                QSystemTrayIcon, QMenu, QFrame, QGridLayout,
-                               QSizePolicy, QStyle, QToolTip, QStyleOption)
-from PySide6.QtCore import Qt, Signal, QTimer, Slot, QPoint, QRect, QMargins
+                               QSizePolicy, QStyle, QToolTip, QStyleOption, QSpinBox, QProgressBar)
+from PySide6.QtCore import Qt, Signal, QTimer, Slot, QPoint, QRect, QMargins, QThread
 from PySide6.QtGui import QIcon, QPixmap, QImage, QAction, QColor, QPalette, QPainter, QBrush, QFont, QDrag
 from PySide6.QtCore import QMimeData
 
@@ -1260,6 +1271,1284 @@ class ThumbnailWidget(QWidget):
         self.play_btn.hide()
         super().leaveEvent(event)
 
+# ============================================================
+# LOCAL NETWORK PLAYLIST & AUDIO FILE SYNC ("SYNC CHAINS")
+# ============================================================
+
+SYNC_PORT_START = 63350
+SYNC_PORT_END = 63370
+UDP_BEACON_PORT = 63350
+SYNC_SOCKET_TIMEOUT = 12.0
+SYNC_CHUNK_SIZE = 64 * 1024
+
+
+def get_local_ip() -> str:
+    """Returns the primary local IPv4 address on the LAN interface."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(('8.8.8.8', 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = '127.0.0.1'
+    finally:
+        s.close()
+    return ip
+
+
+def compute_file_sha256(filepath: Path) -> str:
+    """Computes SHA-256 hash of a file in streaming chunks."""
+    h = hashlib.sha256()
+    with open(filepath, 'rb') as f:
+        while True:
+            chunk = f.read(SYNC_CHUNK_SIZE)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def filter_audio_files(folder_path: Path) -> List[Path]:
+    """Scans folder non-recursively, filtering ONLY audio files (ignoring dirs, zips, etc.)."""
+    if not folder_path.is_dir():
+        return []
+    files = []
+    try:
+        for entry in folder_path.iterdir():
+            if entry.is_file() and entry.suffix.lower() in AUDIO_EXTENSIONS:
+                files.append(entry)
+    except Exception:
+        pass
+    return sorted(files, key=lambda p: p.name.lower())
+
+
+def send_json_msg(sock: socket.socket, data: dict) -> None:
+    raw = json.dumps(data).encode('utf-8')
+    header = struct.pack('!I', len(raw))
+    sock.sendall(header + raw)
+
+
+def recv_json_msg(sock: socket.socket, timeout: float = SYNC_SOCKET_TIMEOUT) -> Optional[dict]:
+    sock.settimeout(timeout)
+    header = _recv_all(sock, 4)
+    if not header:
+        return None
+    length = struct.unpack('!I', header)[0]
+    payload = _recv_all(sock, length)
+    if not payload:
+        return None
+    return json.loads(payload.decode('utf-8'))
+
+
+def _recv_all(sock: socket.socket, n: int) -> Optional[bytes]:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def stream_file_to_socket(sock: socket.socket, filepath: Path, progress_cb: Optional[Callable[[int, int], None]] = None) -> str:
+    total_size = filepath.stat().st_size
+    h = hashlib.sha256()
+    sent_bytes = 0
+    with open(filepath, 'rb') as f:
+        while True:
+            chunk = f.read(SYNC_CHUNK_SIZE)
+            if not chunk:
+                break
+            sock.sendall(chunk)
+            h.update(chunk)
+            sent_bytes += len(chunk)
+            if progress_cb:
+                progress_cb(sent_bytes, total_size)
+    return h.hexdigest()
+
+
+def recv_file_from_socket(sock: socket.socket, target_path: Path, expected_size: int, expected_sha256: str,
+                          progress_cb: Optional[Callable[[int, int], None]] = None) -> bool:
+    tmp_path = target_path.with_suffix(target_path.suffix + '.tmp_sync')
+    h = hashlib.sha256()
+    received_bytes = 0
+    try:
+        with open(tmp_path, 'wb') as f:
+            while received_bytes < expected_size:
+                to_read = min(SYNC_CHUNK_SIZE, expected_size - received_bytes)
+                chunk = sock.recv(to_read)
+                if not chunk:
+                    raise ConnectionError("Socket closed prematurely while receiving file")
+                f.write(chunk)
+                h.update(chunk)
+                received_bytes += len(chunk)
+                if progress_cb:
+                    progress_cb(received_bytes, expected_size)
+
+        actual_sha256 = h.hexdigest()
+        if actual_sha256.lower() != expected_sha256.lower():
+            if tmp_path.exists():
+                tmp_path.unlink()
+            return False
+
+        if target_path.exists():
+            target_path.unlink()
+        tmp_path.replace(target_path)
+        return True
+    except Exception:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+        return False
+
+
+class UDPBeaconBroadcaster:
+    """Broadcaster & Listener for LAN host discovery and dynamic IP updates."""
+    def __init__(self, get_hosted_chains_cb: Callable[[], List[dict]], get_tcp_port_cb: Callable[[], int]):
+        self.get_hosted_chains_cb = get_hosted_chains_cb
+        self.get_tcp_port_cb = get_tcp_port_cb
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+
+    def _run_loop(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        try:
+            sock.bind(('', UDP_BEACON_PORT))
+        except Exception:
+            pass
+        sock.settimeout(2.0)
+
+        last_beacon_time = 0
+        while self._running:
+            now = time.time()
+            if now - last_beacon_time >= 4.0:
+                last_beacon_time = now
+                chains = self.get_hosted_chains_cb()
+                tcp_port = self.get_tcp_port_cb()
+                if chains and tcp_port > 0:
+                    codes = [c.get('sync_code') for c in chains if c.get('sync_code')]
+                    beacon_data = {
+                        'type': 'BEACON',
+                        'sync_codes': codes,
+                        'tcp_port': tcp_port,
+                        'host_ip': get_local_ip()
+                    }
+                    try:
+                        raw = json.dumps(beacon_data).encode('utf-8')
+                        sock.sendto(raw, ('<broadcast>', UDP_BEACON_PORT))
+                    except Exception:
+                        pass
+
+            try:
+                msg, addr = sock.recvfrom(2048)
+                data = json.loads(msg.decode('utf-8'))
+                if data.get('type') == 'PROBE':
+                    target_code = str(data.get('sync_code', ''))
+                    chains = self.get_hosted_chains_cb()
+                    tcp_port = self.get_tcp_port_cb()
+                    for c in chains:
+                        if str(c.get('sync_code')) == target_code and tcp_port > 0:
+                            reply = {
+                                'type': 'PROBE_REPLY',
+                                'sync_code': target_code,
+                                'chain_name': c.get('name', 'Audio Playlist'),
+                                'tcp_port': tcp_port,
+                                'host_ip': get_local_ip()
+                            }
+                            sock.sendto(json.dumps(reply).encode('utf-8'), addr)
+                            break
+            except (socket.timeout, json.JSONDecodeError, OSError):
+                pass
+        sock.close()
+
+
+def discover_host_on_lan(sync_code: str, timeout: float = 2.5) -> Optional[Tuple[str, int, str]]:
+    """Broadcasts a UDP discovery probe for a 4-digit sync code; returns (host_ip, tcp_port, chain_name) or None."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    sock.settimeout(0.5)
+
+    probe = json.dumps({'type': 'PROBE', 'sync_code': str(sync_code)}).encode('utf-8')
+    start_time = time.time()
+    result = None
+
+    try:
+        sock.sendto(probe, ('<broadcast>', UDP_BEACON_PORT))
+        while time.time() - start_time < timeout:
+            try:
+                msg, (sender_ip, _) = sock.recvfrom(2048)
+                data = json.loads(msg.decode('utf-8'))
+                if data.get('type') == 'PROBE_REPLY' and str(data.get('sync_code')) == str(sync_code):
+                    port = int(data.get('tcp_port', 63350))
+                    name = data.get('chain_name', 'Audio Playlist')
+                    ip = data.get('host_ip') or sender_ip
+                    result = (ip, port, name)
+                    break
+            except socket.timeout:
+                try:
+                    sock.sendto(probe, ('<broadcast>', UDP_BEACON_PORT))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+    finally:
+        sock.close()
+    return result
+
+
+def send_lan_update_notification(sync_code: str, host_port: int):
+    """Sends a UDP broadcast notification to LAN that a hosted chain's files have been modified."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    try:
+        payload = json.dumps({
+            'type': 'CHAIN_UPDATED',
+            'sync_code': str(sync_code),
+            'host_ip': get_local_ip(),
+            'tcp_port': host_port
+        }).encode('utf-8')
+        sock.sendto(payload, ('<broadcast>', UDP_BEACON_PORT))
+    except Exception:
+        pass
+    finally:
+        sock.close()
+
+
+class HostFolderWatcher:
+    """Monitors hosted sync chain folders and debounces notifications to avoid spamming."""
+    def __init__(self, on_change_callback: Callable[[str], None]):
+        self.on_change_callback = on_change_callback
+        self.watched_chains: Dict[str, dict] = {}
+        self.lock = threading.Lock()
+
+    def add_or_update_chain(self, chain_id: str, folder_path: str, sync_code: str, delay_mins: int = 5):
+        with self.lock:
+            self.remove_chain(chain_id)
+            if not _WATCHDOG_AVAILABLE:
+                return
+            p = Path(folder_path)
+            if not p.is_dir():
+                return
+
+            delay_sec = max(5, delay_mins * 60)
+
+            class Handler(FileSystemEventHandler):
+                def __init__(self, watcher_ref, cid):
+                    self.watcher_ref = watcher_ref
+                    self.cid = cid
+                def on_any_event(self, event):
+                    src = getattr(event, 'src_path', '')
+                    dest = getattr(event, 'dest_path', '')
+                    ext1 = os.path.splitext(src)[1].lower() if src else ''
+                    ext2 = os.path.splitext(dest)[1].lower() if dest else ''
+                    if ext1 in AUDIO_EXTENSIONS or ext2 in AUDIO_EXTENSIONS:
+                        self.watcher_ref._trigger_debounce(self.cid)
+
+            observer = Observer()
+            handler = Handler(self, chain_id)
+            observer.schedule(handler, str(p), recursive=False)
+            observer.start()
+
+            self.watched_chains[chain_id] = {
+                'folder_path': folder_path,
+                'sync_code': sync_code,
+                'delay_sec': delay_sec,
+                'timer': None,
+                'observer': observer
+            }
+
+    def remove_chain(self, chain_id: str):
+        with self.lock:
+            info = self.watched_chains.pop(chain_id, None)
+            if info:
+                timer = info.get('timer')
+                if timer and timer.is_alive():
+                    timer.cancel()
+                obs = info.get('observer')
+                if obs:
+                    try:
+                        obs.stop()
+                        obs.join(timeout=1.0)
+                    except Exception:
+                        pass
+
+    def stop_all(self):
+        with self.lock:
+            for cid in list(self.watched_chains.keys()):
+                self.remove_chain(cid)
+
+    def _trigger_debounce(self, chain_id: str):
+        with self.lock:
+            info = self.watched_chains.get(chain_id)
+            if not info:
+                return
+            timer = info.get('timer')
+            if timer and timer.is_alive():
+                timer.cancel()
+
+            sync_code = info['sync_code']
+            delay_sec = info['delay_sec']
+
+            def _fire():
+                self.on_change_callback(sync_code)
+
+            new_timer = threading.Timer(delay_sec, _fire)
+            new_timer.daemon = True
+            info['timer'] = new_timer
+            new_timer.start()
+
+
+class SyncHostServer:
+    """TCP Server serving hosted sync chains to connected clients."""
+    def __init__(self, get_hosted_chains_cb: Callable[[], List[dict]],
+                 on_client_activity_cb: Optional[Callable[[str, str, str], None]] = None):
+        self.get_hosted_chains_cb = get_hosted_chains_cb
+        self.on_client_activity_cb = on_client_activity_cb
+        self.server_sock: Optional[socket.socket] = None
+        self.active_port: int = 0
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> int:
+        if self._running:
+            return self.active_port
+
+        for port in range(SYNC_PORT_START, SYNC_PORT_END + 1):
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(('', port))
+                s.listen(10)
+                self.server_sock = s
+                self.active_port = port
+                self._running = True
+                self._thread = threading.Thread(target=self._accept_loop, daemon=True)
+                self._thread.start()
+                return port
+            except OSError:
+                continue
+        return 0
+
+    def stop(self):
+        self._running = False
+        if self.server_sock:
+            try:
+                self.server_sock.close()
+            except Exception:
+                pass
+            self.server_sock = None
+        self.active_port = 0
+
+    def _accept_loop(self):
+        while self._running and self.server_sock:
+            try:
+                client_sock, (client_ip, client_port) = self.server_sock.accept()
+                threading.Thread(target=self._handle_client, args=(client_sock, client_ip), daemon=True).start()
+            except OSError:
+                break
+
+    def _handle_client(self, sock: socket.socket, client_ip: str):
+        try:
+            sock.settimeout(SYNC_SOCKET_TIMEOUT)
+            auth_msg = recv_json_msg(sock)
+            if not auth_msg or auth_msg.get('cmd') != 'AUTH':
+                send_json_msg(sock, {'status': 'ERROR', 'reason': 'Expected AUTH command'})
+                return
+
+            sync_code = str(auth_msg.get('sync_code', ''))
+            chains = self.get_hosted_chains_cb()
+            matching_chain = None
+            for c in chains:
+                if str(c.get('sync_code')) == sync_code:
+                    matching_chain = c
+                    break
+
+            if not matching_chain:
+                send_json_msg(sock, {'status': 'ERROR', 'reason': f'Sync code {sync_code} not found on host'})
+                return
+
+            folder_path = Path(matching_chain.get('folder_path', ''))
+            if not folder_path.is_dir():
+                send_json_msg(sock, {'status': 'ERROR', 'reason': 'Hosted folder path does not exist on disk'})
+                return
+
+            audio_files = filter_audio_files(folder_path)
+            send_json_msg(sock, {
+                'status': 'OK',
+                'chain_name': matching_chain.get('name', 'Audio Playlist'),
+                'files_count': len(audio_files)
+            })
+
+            if self.on_client_activity_cb:
+                self.on_client_activity_cb(sync_code, client_ip, 'Connected')
+
+            while self._running:
+                req = recv_json_msg(sock, timeout=30.0)
+                if not req:
+                    break
+                cmd = req.get('cmd')
+                if cmd == 'GET_INDEX':
+                    index = []
+                    for f in filter_audio_files(folder_path):
+                        try:
+                            stat = f.stat()
+                            art, tit = read_metadata_tags(f)
+                            sha = compute_file_sha256(f)
+                            index.append({
+                                'name': f.name,
+                                'size': stat.st_size,
+                                'mtime': stat.st_mtime,
+                                'sha256': sha,
+                                'artist': art,
+                                'title': tit
+                            })
+                        except Exception:
+                            pass
+                    send_json_msg(sock, {'status': 'OK', 'files': index})
+
+                elif cmd == 'PULL_FILE':
+                    filename = req.get('filename', '')
+                    target_file = folder_path / filename
+                    if not target_file.is_file() or target_file.suffix.lower() not in AUDIO_EXTENSIONS:
+                        send_json_msg(sock, {'status': 'ERROR', 'reason': 'File not found or not an audio file'})
+                    else:
+                        size = target_file.stat().st_size
+                        sha = compute_file_sha256(target_file)
+                        send_json_msg(sock, {
+                            'status': 'SENDING',
+                            'filename': filename,
+                            'filesize': size,
+                            'sha256': sha
+                        })
+                        if self.on_client_activity_cb:
+                            self.on_client_activity_cb(sync_code, client_ip, f'Sending {filename}')
+                        stream_file_to_socket(sock, target_file)
+
+                elif cmd == 'PING':
+                    send_json_msg(sock, {'status': 'PONG'})
+                else:
+                    send_json_msg(sock, {'status': 'ERROR', 'reason': f'Unknown command: {cmd}'})
+        except Exception:
+            pass
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+
+class SyncClientWorker:
+    """Executes client synchronization against a remote host."""
+    @staticmethod
+    def sync_chain(chain_config: dict,
+                   status_cb: Optional[Callable[[str], None]] = None,
+                   progress_cb: Optional[Callable[[int, int, str], None]] = None) -> Tuple[bool, str, int, int]:
+        sync_code = str(chain_config.get('sync_code', ''))
+        folder_str = chain_config.get('folder_path', '')
+        dest_folder = Path(folder_str)
+        dest_folder.mkdir(parents=True, exist_ok=True)
+
+        host_ip = chain_config.get('last_known_host_ip', '')
+        host_port = int(chain_config.get('host_port', 63350))
+        deletion_mode = chain_config.get('deletion_mode', 'mirror')
+
+        if status_cb:
+            status_cb(f"Connecting to host for Sync Code {sync_code}...")
+
+        sock = None
+        if host_ip and host_port > 0:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(3.0)
+                sock.connect((host_ip, host_port))
+            except Exception:
+                sock = None
+
+        if not sock:
+            if status_cb:
+                status_cb(f"Host unreachable at {host_ip}. Broadcasting LAN discovery...")
+            found = discover_host_on_lan(sync_code, timeout=3.0)
+            if not found:
+                return False, f"Could not find active host for Sync Code {sync_code} on local network.", 0, 0
+            host_ip, host_port, _ = found
+            chain_config['last_known_host_ip'] = host_ip
+            chain_config['host_port'] = host_port
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(SYNC_SOCKET_TIMEOUT)
+                sock.connect((host_ip, host_port))
+            except Exception as e:
+                return False, f"Failed to connect to host at {host_ip}:{host_port}: {e}", 0, 0
+
+        transferred = 0
+        deleted = 0
+        try:
+            sock.settimeout(SYNC_SOCKET_TIMEOUT)
+            send_json_msg(sock, {'cmd': 'AUTH', 'sync_code': sync_code, 'client_ip': get_local_ip()})
+            auth_resp = recv_json_msg(sock)
+            if not auth_resp or auth_resp.get('status') != 'OK':
+                err = auth_resp.get('reason', 'Authentication rejected by host') if auth_resp else 'No auth response'
+                return False, err, 0, 0
+
+            if status_cb:
+                status_cb("Fetching file index from host...")
+            send_json_msg(sock, {'cmd': 'GET_INDEX'})
+            index_resp = recv_json_msg(sock, timeout=25.0)
+            if not index_resp or index_resp.get('status') != 'OK':
+                return False, "Failed to retrieve file index from host.", 0, 0
+
+            host_files: List[dict] = index_resp.get('files', [])
+            host_files_map = {f['name']: f for f in host_files}
+
+            local_files = filter_audio_files(dest_folder)
+            local_files_map = {f.name: f for f in local_files}
+
+            if deletion_mode == 'mirror':
+                for local_name, local_path in list(local_files_map.items()):
+                    if local_name not in host_files_map:
+                        try:
+                            local_path.unlink()
+                            deleted += 1
+                            if status_cb:
+                                status_cb(f"Removed deleted track: {local_name}")
+                        except Exception:
+                            pass
+
+            total_items = len(host_files)
+            for idx, hf in enumerate(host_files, 1):
+                name = hf['name']
+                h_size = hf['size']
+                h_sha256 = hf['sha256']
+                h_mtime = hf.get('mtime', 0)
+                h_artist = hf.get('artist')
+                h_title = hf.get('title')
+
+                target_path = dest_folder / name
+                needs_download = False
+                needs_tag_update = False
+
+                if not target_path.exists():
+                    needs_download = True
+                else:
+                    l_size = target_path.stat().st_size
+                    l_mtime = target_path.stat().st_mtime
+                    if l_size != h_size or h_mtime > l_mtime + 1.0:
+                        l_sha256 = compute_file_sha256(target_path)
+                        if l_sha256.lower() != h_sha256.lower():
+                            l_art, l_tit = read_metadata_tags(target_path)
+                            if (l_art != h_artist or l_tit != h_title) and abs(l_size - h_size) < 4096:
+                                write_metadata_tags(target_path, h_artist or "", h_title or "")
+                                if compute_file_sha256(target_path).lower() == h_sha256.lower():
+                                    needs_tag_update = True
+                                else:
+                                    needs_download = True
+                            else:
+                                needs_download = True
+
+                if needs_download:
+                    if status_cb:
+                        status_cb(f"Downloading [{idx}/{total_items}]: {name}")
+                    send_json_msg(sock, {'cmd': 'PULL_FILE', 'filename': name})
+                    pull_resp = recv_json_msg(sock)
+                    if not pull_resp or pull_resp.get('status') != 'SENDING':
+                        continue
+
+                    def _progress(bytes_done, bytes_total):
+                        if progress_cb:
+                            progress_cb(bytes_done, bytes_total, name)
+
+                    ok = recv_file_from_socket(sock, target_path, h_size, h_sha256, _progress)
+                    if ok:
+                        transferred += 1
+                        try:
+                            os.utime(target_path, (time.time(), h_mtime))
+                        except Exception:
+                            pass
+                elif needs_tag_update:
+                    transferred += 1
+
+            return True, f"Synced successfully ({transferred} updated, {deleted} removed).", transferred, deleted
+        except Exception as e:
+            return False, f"Sync error: {e}", transferred, deleted
+        finally:
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+
+class SyncConfigManager:
+    """Manages persistence of sync_config.json for hosted and client chains."""
+    def __init__(self, config_dir: str):
+        self.config_file = os.path.join(config_dir, "sync_config.json")
+        self.settings: dict = {"auto_sync_interval_mins": 30, "firewall_prompted": False}
+        self.hosted_chains: List[dict] = []
+        self.client_chains: List[dict] = []
+        self.load()
+
+    def load(self):
+        if not os.path.exists(self.config_file):
+            return
+        try:
+            with open(self.config_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                self.settings = data.get('settings', self.settings)
+                self.hosted_chains = data.get('hosted_chains', [])
+                self.client_chains = data.get('client_chains', [])
+        except Exception:
+            pass
+
+    def save(self):
+        data = {
+            'settings': self.settings,
+            'hosted_chains': self.hosted_chains,
+            'client_chains': self.client_chains
+        }
+        try:
+            with open(self.config_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4)
+        except Exception:
+            pass
+
+    def generate_unique_sync_code(self) -> str:
+        import random
+        used = {str(c.get('sync_code')) for c in self.hosted_chains}
+        for _ in range(1000):
+            code = str(random.randint(1000, 9999))
+            if code not in used:
+                return code
+        return "1000"
+
+    def add_hosted_chain(self, name: str, folder_path: str, sync_code: Optional[str] = None, notify_delay_mins: int = 5) -> dict:
+        code = sync_code or self.generate_unique_sync_code()
+        chain = {
+            'id': f'hc_{code}',
+            'sync_code': code,
+            'name': name,
+            'folder_path': folder_path,
+            'notify_delay_mins': notify_delay_mins,
+            'created_at': time.time(),
+            'last_synced': 0,
+            'status': 'Active'
+        }
+        self.hosted_chains.append(chain)
+        self.save()
+        return chain
+
+    def add_client_chain(self, name: str, folder_path: str, sync_code: str, host_ip: str,
+                         host_port: int = 63350, deletion_mode: str = 'mirror') -> dict:
+        chain = {
+            'id': f'cc_{sync_code}',
+            'sync_code': sync_code,
+            'name': name,
+            'folder_path': folder_path,
+            'last_known_host_ip': host_ip,
+            'host_port': host_port,
+            'deletion_mode': deletion_mode,
+            'created_at': time.time(),
+            'last_synced': 0,
+            'status': 'Pending Sync'
+        }
+        self.client_chains.append(chain)
+        self.save()
+        return chain
+
+    def remove_chain(self, chain_id: str):
+        self.hosted_chains = [c for c in self.hosted_chains if c.get('id') != chain_id]
+        self.client_chains = [c for c in self.client_chains if c.get('id') != chain_id]
+        self.save()
+
+
+class ClientSyncThread(QThread):
+    status_signal = Signal(str)
+    progress_signal = Signal(int, int, str)
+    finished_signal = Signal(bool, str, int, int)
+
+    def __init__(self, chain_config: dict):
+        super().__init__()
+        self.chain_config = chain_config
+
+    def run(self):
+        def _status(txt):
+            self.status_signal.emit(txt)
+
+        def _progress(done, total, filename):
+            self.progress_signal.emit(done, total, filename)
+
+        ok, msg, transferred, deleted = SyncClientWorker.sync_chain(
+            self.chain_config,
+            status_cb=_status,
+            progress_cb=_progress
+        )
+        self.finished_signal.emit(ok, msg, transferred, deleted)
+
+
+class CreateHostChainDialog(QDialog):
+    """Dialog to create a new hosted Sync Chain."""
+    def __init__(self, parent_window, config_manager: SyncConfigManager):
+        super().__init__(parent_window)
+        self.parent_window = parent_window
+        self.config_manager = config_manager
+        self.setWindowTitle("Create Sync Chain (Host)")
+        self.setFixedSize(520, 360)
+        self.setWindowFlags(self.windowFlags() | Qt.Tool)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+
+        title_lbl = QLabel("CREATE A NEW SYNC CHAIN (HOST)")
+        title_lbl.setFont(QFont("Segoe UI Semibold", 11))
+        layout.addWidget(title_lbl)
+
+        desc = QLabel("You will host this folder on your local network. Other yt-msd clients with your sync code can connect and sync audio files.")
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color: #888; font-size: 11px;")
+        layout.addWidget(desc)
+
+        layout.addWidget(QLabel("Playlist / Sync Chain Name:"))
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("e.g. Rock Classics")
+        layout.addWidget(self.name_edit)
+
+        layout.addWidget(QLabel("Master Audio Folder to Sync:"))
+        folder_h = QHBoxLayout()
+        self.folder_edit = QLineEdit()
+        self.folder_edit.setPlaceholderText("Select folder...")
+        self.folder_edit.textChanged.connect(self._update_file_count)
+        folder_h.addWidget(self.folder_edit, 1)
+
+        browse_btn = QPushButton("Browse...")
+        browse_btn.clicked.connect(self._browse_folder)
+        folder_h.addWidget(browse_btn)
+        layout.addLayout(folder_h)
+
+        self.count_lbl = QLabel("0 audio files detected (subfolders/zips ignored)")
+        self.count_lbl.setStyleSheet("color: #3B8ED0; font-size: 11px;")
+        layout.addWidget(self.count_lbl)
+
+        options_h = QHBoxLayout()
+        options_h.addWidget(QLabel("Sync Code (4-digit):"))
+        self.code_edit = QLineEdit(self.config_manager.generate_unique_sync_code())
+        self.code_edit.setFixedWidth(70)
+        options_h.addWidget(self.code_edit)
+
+        options_h.addSpacing(20)
+        options_h.addWidget(QLabel("Change Notify Delay:"))
+        self.delay_spin = QSpinBox()
+        self.delay_spin.setRange(1, 60)
+        self.delay_spin.setValue(5)
+        self.delay_spin.setSuffix(" min")
+        options_h.addWidget(self.delay_spin)
+        options_h.addStretch()
+        layout.addLayout(options_h)
+
+        layout.addStretch()
+
+        btn_h = QHBoxLayout()
+        btn_h.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_h.addWidget(cancel_btn)
+
+        create_btn = QPushButton("Create Chain")
+        create_btn.clicked.connect(self._create_chain)
+        btn_h.addWidget(create_btn)
+        layout.addLayout(btn_h)
+
+    def _browse_folder(self):
+        f = QFileDialog.getExistingDirectory(self, "Select Master Audio Folder", self.folder_edit.text() or "")
+        if f:
+            self.folder_edit.setText(f)
+            if not self.name_edit.text().strip():
+                self.name_edit.setText(Path(f).name)
+
+    def _update_file_count(self, path_str: str):
+        p = Path(path_str)
+        if p.is_dir():
+            files = filter_audio_files(p)
+            self.count_lbl.setText(f"✔ {len(files)} audio files detected (non-audio & subfolders ignored)")
+            self.count_lbl.setStyleSheet("color: #1abd33; font-size: 11px;")
+        else:
+            self.count_lbl.setText("Folder does not exist or is invalid")
+            self.count_lbl.setStyleSheet("color: #E31E24; font-size: 11px;")
+
+    def _create_chain(self):
+        name = self.name_edit.text().strip()
+        folder = self.folder_edit.text().strip()
+        code = self.code_edit.text().strip()
+        delay = self.delay_spin.value()
+
+        if not name:
+            QMessageBox.warning(self, "Missing Name", "Please enter a name for this sync chain.")
+            return
+        if not folder or not Path(folder).is_dir():
+            QMessageBox.warning(self, "Invalid Folder", "Please select a valid folder containing your audio files.")
+            return
+        if not code.isdigit() or len(code) != 4:
+            QMessageBox.warning(self, "Invalid Code", "Sync code must be a 4-digit number (e.g. 1002).")
+            return
+
+        self.config_manager.add_hosted_chain(name, folder, code, notify_delay_mins=delay)
+        self.accept()
+
+
+class ConnectClientChainDialog(QDialog):
+    """Dialog to connect to a remote Host's Sync Chain."""
+    def __init__(self, parent_window, config_manager: SyncConfigManager):
+        super().__init__(parent_window)
+        self.parent_window = parent_window
+        self.config_manager = config_manager
+        self.setWindowTitle("Connect to Sync Chain (Client)")
+        self.setFixedSize(540, 420)
+        self.setWindowFlags(self.windowFlags() | Qt.Tool)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+
+        title_lbl = QLabel("CONNECT TO A REMOTE SYNC CHAIN")
+        title_lbl.setFont(QFont("Segoe UI Semibold", 11))
+        layout.addWidget(title_lbl)
+
+        desc = QLabel("Enter the Host PC's IP and 4-digit Sync Code, or use auto-discovery on your local network.")
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color: #888; font-size: 11px;")
+        layout.addWidget(desc)
+
+        layout.addWidget(QLabel("Host Computer IP Address:"))
+        ip_h = QHBoxLayout()
+        self.ip_edit = QLineEdit()
+        self.ip_edit.setPlaceholderText("e.g. 192.168.1.50")
+        ip_h.addWidget(self.ip_edit, 1)
+
+        self.discover_btn = QPushButton("🔍 Discover on LAN")
+        self.discover_btn.clicked.connect(self._discover_on_lan)
+        ip_h.addWidget(self.discover_btn)
+        layout.addLayout(ip_h)
+
+        layout.addWidget(QLabel("4-Digit Sync Code:"))
+        self.code_edit = QLineEdit()
+        self.code_edit.setPlaceholderText("e.g. 1002")
+        self.code_edit.setFixedWidth(100)
+        layout.addWidget(self.code_edit)
+
+        layout.addWidget(QLabel("Local Folder where files should be synced:"))
+        folder_h = QHBoxLayout()
+        self.folder_edit = QLineEdit()
+        self.folder_edit.setPlaceholderText("Base folder (e.g. C:\\Music)...")
+        folder_h.addWidget(self.folder_edit, 1)
+
+        browse_btn = QPushButton("Browse...")
+        browse_btn.clicked.connect(self._browse_base_folder)
+        folder_h.addWidget(browse_btn)
+        layout.addLayout(folder_h)
+
+        layout.addWidget(QLabel("Playlist / Subfolder Name:"))
+        self.playlist_name_edit = QLineEdit()
+        self.playlist_name_edit.setPlaceholderText("e.g. Rock Classics")
+        layout.addWidget(self.playlist_name_edit)
+
+        layout.addWidget(QLabel("Sync / Deletion Mode:"))
+        self.del_mode_combo = QComboBox()
+        self.del_mode_combo.addItem("Mirror Mode (Default: Sync all files, update edits & delete removed files)", "mirror")
+        self.del_mode_combo.addItem("Additive Mode (Only download new/updated files, keep local files)", "additive")
+        layout.addWidget(self.del_mode_combo)
+
+        layout.addStretch()
+
+        btn_h = QHBoxLayout()
+        self.status_lbl = QLabel("")
+        self.status_lbl.setStyleSheet("color: #3B8ED0; font-size: 11px;")
+        btn_h.addWidget(self.status_lbl, 1)
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_h.addWidget(cancel_btn)
+
+        connect_btn = QPushButton("Connect & Join")
+        connect_btn.clicked.connect(self._connect_chain)
+        btn_h.addWidget(connect_btn)
+        layout.addLayout(btn_h)
+
+    def _browse_base_folder(self):
+        f = QFileDialog.getExistingDirectory(self, "Select Base Music Directory", self.folder_edit.text() or "")
+        if f:
+            self.folder_edit.setText(f)
+
+    def _discover_on_lan(self):
+        code = self.code_edit.text().strip()
+        if not code:
+            QMessageBox.information(self, "Sync Code Needed", "Please enter the 4-digit Sync Code first to search for its host on LAN.")
+            return
+
+        self.status_lbl.setText("Searching local network for host...")
+        self.discover_btn.setEnabled(False)
+
+        def _bg():
+            found = discover_host_on_lan(code, timeout=3.0)
+            def _ui():
+                self.discover_btn.setEnabled(True)
+                if found:
+                    host_ip, host_port, chain_name = found
+                    self.ip_edit.setText(host_ip)
+                    if not self.playlist_name_edit.text().strip():
+                        self.playlist_name_edit.setText(chain_name)
+                    self.status_lbl.setText(f"✔ Found Host '{chain_name}' at {host_ip}")
+                    self.status_lbl.setStyleSheet("color: #1abd33; font-size: 11px;")
+                else:
+                    self.status_lbl.setText("✘ No host found on LAN for this code.")
+                    self.status_lbl.setStyleSheet("color: #E31E24; font-size: 11px;")
+            QTimer.singleShot(0, _ui)
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _connect_chain(self):
+        ip = self.ip_edit.text().strip()
+        code = self.code_edit.text().strip()
+        base_folder = self.folder_edit.text().strip()
+        subfolder = self.playlist_name_edit.text().strip()
+        del_mode = self.del_mode_combo.currentData()
+
+        if not ip:
+            QMessageBox.warning(self, "Missing IP", "Please enter the Host computer IP address.")
+            return
+        if not code.isdigit() or len(code) != 4:
+            QMessageBox.warning(self, "Invalid Code", "Sync code must be a 4-digit number (e.g. 1002).")
+            return
+        if not base_folder or not Path(base_folder).exists():
+            QMessageBox.warning(self, "Invalid Folder", "Please select a valid base folder on your computer.")
+            return
+        if not subfolder:
+            QMessageBox.warning(self, "Missing Name", "Please enter a name for the playlist folder.")
+            return
+
+        full_dest_path = str(Path(base_folder) / subfolder)
+        self.config_manager.add_client_chain(
+            name=subfolder,
+            folder_path=full_dest_path,
+            sync_code=code,
+            host_ip=ip,
+            deletion_mode=del_mode
+        )
+        self.accept()
+
+
+class SyncManagerDialog(QDialog):
+    """Main Sync Chains Management Dialog with Host & Client chain cards and live transfer tracking."""
+    def __init__(self, parent_app):
+        super().__init__(parent_app)
+        self.parent_app = parent_app
+        self.config_manager: SyncConfigManager = parent_app.sync_config_manager
+        self.setWindowTitle("Sync Chains Manager - Local Network Playlist Sync")
+        self.resize(880, 600)
+
+        # Trigger firewall socket binding if opening for the first time
+        if not self.config_manager.settings.get('firewall_prompted', False):
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(('', SYNC_PORT_START))
+                s.listen(1)
+                s.close()
+                self.config_manager.settings['firewall_prompted'] = True
+                self.config_manager.save()
+            except Exception:
+                pass
+
+        self.sync_threads = {}
+
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(18, 18, 18, 18)
+        main_layout.setSpacing(12)
+
+        top_bar = QHBoxLayout()
+        local_ip = get_local_ip()
+        self.ip_badge = QLabel(f"🖥️  Your Local IP: <b>{local_ip}</b>")
+        self.ip_badge.setStyleSheet("background: rgba(59, 142, 208, 0.15); border: 1px solid #3B8ED0; padding: 6px 12px; border-radius: 4px; font-size: 12px;")
+        top_bar.addWidget(self.ip_badge)
+
+        copy_ip_btn = QPushButton("Copy IP")
+        copy_ip_btn.setFixedWidth(75)
+        copy_ip_btn.clicked.connect(lambda: QApplication.clipboard().setText(local_ip))
+        top_bar.addWidget(copy_ip_btn)
+
+        top_bar.addStretch()
+
+        create_btn = QPushButton("➕ Create Chain (Host)")
+        create_btn.clicked.connect(self._open_create_dialog)
+        top_bar.addWidget(create_btn)
+
+        connect_btn = QPushButton("🔗 Connect Chain (Client)")
+        connect_btn.clicked.connect(self._open_connect_dialog)
+        top_bar.addWidget(connect_btn)
+
+        sync_all_btn = QPushButton("🔄 Force Sync All")
+        sync_all_btn.clicked.connect(self._force_sync_all)
+        top_bar.addWidget(sync_all_btn)
+
+        main_layout.addLayout(top_bar)
+
+        settings_bar = QHBoxLayout()
+        settings_bar.addWidget(QLabel("Client Auto-Sync Frequency (minutes):"))
+        self.interval_spin = QSpinBox()
+        self.interval_spin.setRange(1, 1440)
+        self.interval_spin.setValue(self.config_manager.settings.get('auto_sync_interval_mins', 30))
+        self.interval_spin.setSuffix(" min")
+        self.interval_spin.valueChanged.connect(self._update_interval)
+        settings_bar.addWidget(self.interval_spin)
+
+        settings_bar.addSpacing(20)
+        self.host_port_lbl = QLabel(f"Host Server: Port {getattr(parent_app.sync_host_server, 'active_port', 'Offline')}")
+        self.host_port_lbl.setStyleSheet("color: #888; font-size: 11px;")
+        settings_bar.addWidget(self.host_port_lbl)
+
+        settings_bar.addStretch()
+        main_layout.addLayout(settings_bar)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setObjectName("scrollContent")
+
+        self.cards_container = QWidget()
+        self.cards_container.setObjectName("scrollContent")
+        self.cards_layout = QVBoxLayout(self.cards_container)
+        self.cards_layout.setContentsMargins(4, 4, 4, 4)
+        self.cards_layout.setSpacing(10)
+        scroll.setWidget(self.cards_container)
+        main_layout.addWidget(scroll, 1)
+
+        footer = QHBoxLayout()
+        footer.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.setFixedWidth(100)
+        close_btn.clicked.connect(self.accept)
+        footer.addWidget(close_btn)
+        main_layout.addLayout(footer)
+
+        self.refresh_cards()
+
+    def _update_interval(self, val: int):
+        self.config_manager.settings['auto_sync_interval_mins'] = val
+        self.config_manager.save()
+        if hasattr(self.parent_app, '_update_sync_timer'):
+            self.parent_app._update_sync_timer()
+
+    def _open_create_dialog(self):
+        dlg = CreateHostChainDialog(self, self.config_manager)
+        if dlg.exec():
+            self.config_manager.save()
+            self.parent_app.refresh_sync_watchers()
+            self.refresh_cards()
+
+    def _open_connect_dialog(self):
+        dlg = ConnectClientChainDialog(self, self.config_manager)
+        if dlg.exec():
+            self.config_manager.save()
+            self.refresh_cards()
+            if self.config_manager.client_chains:
+                self._sync_single_client_chain(self.config_manager.client_chains[-1])
+
+    def refresh_cards(self):
+        while self.cards_layout.count():
+            item = self.cards_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        hosted = self.config_manager.hosted_chains
+        clients = self.config_manager.client_chains
+
+        if not hosted and not clients:
+            empty_lbl = QLabel("No active Sync Chains. Click 'Create Chain' to host a folder or 'Connect Chain' to join an existing one.")
+            empty_lbl.setAlignment(Qt.AlignCenter)
+            empty_lbl.setStyleSheet("color: #888; padding: 40px; font-size: 13px;")
+            self.cards_layout.addWidget(empty_lbl)
+            self.cards_layout.addStretch()
+            return
+
+        if hosted:
+            sec_lbl = QLabel("HOSTED SYNC CHAINS (This computer is sharing)")
+            sec_lbl.setFont(QFont("Segoe UI Semibold", 10))
+            sec_lbl.setStyleSheet("color: #3B8ED0; margin-top: 6px;")
+            self.cards_layout.addWidget(sec_lbl)
+
+            for hc in hosted:
+                card = self._build_host_card(hc)
+                self.cards_layout.addWidget(card)
+
+        if clients:
+            sec_lbl2 = QLabel("CLIENT SYNC CHAINS (Subscribed to remote hosts)")
+            sec_lbl2.setFont(QFont("Segoe UI Semibold", 10))
+            sec_lbl2.setStyleSheet("color: #1abd33; margin-top: 14px;")
+            self.cards_layout.addWidget(sec_lbl2)
+
+            for cc in clients:
+                card = self._build_client_card(cc)
+                self.cards_layout.addWidget(card)
+
+        self.cards_layout.addStretch()
+
+    def _build_host_card(self, hc: dict) -> QWidget:
+        card = QFrame()
+        card.setStyleSheet("background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 6px; padding: 8px;")
+        l = QVBoxLayout(card)
+        l.setContentsMargins(10, 8, 10, 8)
+        l.setSpacing(6)
+
+        header = QHBoxLayout()
+        badge = QLabel("HOST")
+        badge.setStyleSheet("background: #3B8ED0; color: white; padding: 2px 6px; border-radius: 3px; font-weight: bold; font-size: 10px;")
+        header.addWidget(badge)
+
+        name_lbl = QLabel(f"<b>{hc.get('name', 'Audio Playlist')}</b>")
+        name_lbl.setFont(QFont("Segoe UI", 12))
+        header.addWidget(name_lbl)
+
+        header.addSpacing(10)
+        code_lbl = QLabel(f"Sync Code: <b style='color: #FF8C00;'>{hc.get('sync_code')}</b>")
+        header.addWidget(code_lbl)
+
+        header.addStretch()
+
+        copy_code_btn = QPushButton("Copy Code")
+        copy_code_btn.setFixedWidth(80)
+        copy_code_btn.clicked.connect(lambda: QApplication.clipboard().setText(str(hc.get('sync_code'))))
+        header.addWidget(copy_code_btn)
+
+        del_btn = QPushButton("✕")
+        del_btn.setFixedSize(26, 26)
+        del_btn.setToolTip("Delete this hosted sync chain")
+        del_btn.setStyleSheet("background: #E31E24; color: white; border: none; border-radius: 3px; font-weight: bold;")
+        del_btn.clicked.connect(lambda: self._delete_chain(hc.get('id')))
+        header.addWidget(del_btn)
+
+        l.addLayout(header)
+
+        folder_str = hc.get('folder_path', '')
+        folder_path = Path(folder_str)
+        audio_cnt = len(filter_audio_files(folder_path)) if folder_path.is_dir() else 0
+
+        info_h = QHBoxLayout()
+        path_lbl = QLabel(f"📁 {folder_str} ({audio_cnt} tracks)")
+        path_lbl.setStyleSheet("color: #888; font-size: 11px;")
+        info_h.addWidget(path_lbl, 1)
+
+        open_btn = QPushButton("Open Folder")
+        open_btn.setFixedWidth(90)
+        open_btn.clicked.connect(lambda: os.startfile(folder_str) if Path(folder_str).exists() else None)
+        info_h.addWidget(open_btn)
+
+        l.addLayout(info_h)
+        return card
+
+    def _build_client_card(self, cc: dict) -> QWidget:
+        card = QFrame()
+        card.setStyleSheet("background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 6px; padding: 8px;")
+        l = QVBoxLayout(card)
+        l.setContentsMargins(10, 8, 10, 8)
+        l.setSpacing(6)
+
+        header = QHBoxLayout()
+        badge = QLabel("CLIENT")
+        badge.setStyleSheet("background: #1abd33; color: white; padding: 2px 6px; border-radius: 3px; font-weight: bold; font-size: 10px;")
+        header.addWidget(badge)
+
+        name_lbl = QLabel(f"<b>{cc.get('name', 'Audio Playlist')}</b>")
+        name_lbl.setFont(QFont("Segoe UI", 12))
+        header.addWidget(name_lbl)
+
+        header.addSpacing(10)
+        code_lbl = QLabel(f"Code: <b style='color: #FF8C00;'>{cc.get('sync_code')}</b> | Host: {cc.get('last_known_host_ip', 'Unknown')}")
+        code_lbl.setStyleSheet("color: #aaa; font-size: 11px;")
+        header.addWidget(code_lbl)
+
+        header.addStretch()
+
+        sync_btn = QPushButton("🔄 Sync Now")
+        sync_btn.clicked.connect(lambda: self._sync_single_client_chain(cc))
+        header.addWidget(sync_btn)
+
+        del_btn = QPushButton("✕")
+        del_btn.setFixedSize(26, 26)
+        del_btn.setToolTip("Remove this client sync chain")
+        del_btn.setStyleSheet("background: #E31E24; color: white; border: none; border-radius: 3px; font-weight: bold;")
+        del_btn.clicked.connect(lambda: self._delete_chain(cc.get('id')))
+        header.addWidget(del_btn)
+
+        l.addLayout(header)
+
+        folder_str = cc.get('folder_path', '')
+        last_sync = cc.get('last_synced', 0)
+        last_sync_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_sync)) if last_sync > 0 else "Never"
+        del_mode = cc.get('deletion_mode', 'mirror').capitalize()
+
+        status_lbl = QLabel(f"Status: {cc.get('status', 'Idle')}  |  Last Synced: {last_sync_str}  |  Mode: {del_mode}")
+        status_lbl.setStyleSheet("color: #888; font-size: 11px;")
+        card.setProperty("status_lbl", status_lbl)
+        l.addWidget(status_lbl)
+
+        info_h = QHBoxLayout()
+        path_lbl = QLabel(f"📁 {folder_str}")
+        path_lbl.setStyleSheet("color: #888; font-size: 11px;")
+        info_h.addWidget(path_lbl, 1)
+
+        open_btn = QPushButton("Open Folder")
+        open_btn.setFixedWidth(90)
+        open_btn.clicked.connect(lambda: os.startfile(folder_str) if Path(folder_str).exists() else None)
+        info_h.addWidget(open_btn)
+
+        l.addLayout(info_h)
+        return card
+
+    def _delete_chain(self, chain_id: str):
+        if QMessageBox.question(self, "Confirm Removal", "Are you sure you want to remove this sync chain? (Audio files on disk will remain untouched)") == QMessageBox.Yes:
+            self.config_manager.remove_chain(chain_id)
+            self.parent_app.refresh_sync_watchers()
+            self.refresh_cards()
+
+    def _sync_single_client_chain(self, cc: dict):
+        cid = cc.get('id')
+        if cid in self.sync_threads and self.sync_threads[cid].isRunning():
+            return
+
+        cc['status'] = "Syncing..."
+        self.refresh_cards()
+
+        thread = ClientSyncThread(cc)
+        self.sync_threads[cid] = thread
+
+        def _on_finish(ok, msg, transferred, deleted):
+            cc['status'] = "Up to date" if ok else f"Failed: {msg}"
+            if ok:
+                cc['last_synced'] = time.time()
+            self.config_manager.save()
+            self.refresh_cards()
+            if self.parent_app.local_current_path == cc.get('folder_path'):
+                self.parent_app.refresh_local_list()
+
+        thread.finished_signal.connect(_on_finish)
+        thread.start()
+
+    def _force_sync_all(self):
+        for cc in self.config_manager.client_chains:
+            self._sync_single_client_chain(cc)
+
+
 class SettingsDialog(QDialog):
     def __init__(self, parent):
         super().__init__(parent)
@@ -1480,13 +2769,17 @@ class SettingsDialog(QDialog):
         
         main_layout.addLayout(columns_layout)
         
-        # FOOTER / RESET
+        # FOOTER / RESET & SYNC
         footer = QHBoxLayout()
         self.reset_btn = QPushButton("Reset to Default Config")
         self.reset_btn.setObjectName("topIconBtn")
         self.reset_btn.clicked.connect(self._reset_defaults)
         footer.addWidget(self.reset_btn)
-        
+
+        self.sync_btn = QPushButton("🔗 Sync Chains Manager")
+        self.sync_btn.clicked.connect(self._open_sync_manager)
+        footer.addWidget(self.sync_btn)
+
         footer.addStretch()
         ok_btn = QPushButton("OK")
         ok_btn.setFixedWidth(100)
@@ -1617,6 +2910,10 @@ class SettingsDialog(QDialog):
         if self.parent.use_custom_norm_cmd:
             CUSTOM_NORM_CMD = text
         self.parent.save_config()
+
+    def _open_sync_manager(self):
+        dlg = sync_gui.SyncManagerDialog(self.parent)
+        dlg.exec()
 
     def _reset_defaults(self):
         if QMessageBox.question(self, "Confirm Reset", "This will wipe your config and recent data. Continue?") == QMessageBox.Yes:
@@ -1783,6 +3080,28 @@ class MainApp(QMainWindow):
                 if 0 <= idx < len(audio_files):
                     QTimer.singleShot(100, lambda: self._on_local_click(audio_files[idx], paused_at_start=True))
 
+        # --- Local Network Sync Chains Subsystem ---
+        self.sync_config_manager = sync_engine.SyncConfigManager(self.config_dir)
+        self.sync_host_server = sync_engine.SyncHostServer(lambda: self.sync_config_manager.hosted_chains)
+        self.udp_beacon = sync_engine.UDPBeaconBroadcaster(
+            lambda: self.sync_config_manager.hosted_chains,
+            lambda: self.sync_host_server.active_port
+        )
+        self.host_watcher = sync_engine.HostFolderWatcher(self._on_hosted_folder_changed)
+
+        # Start host server, UDP beacon, and folder watchers
+        self.sync_host_server.start()
+        self.udp_beacon.start()
+        self.refresh_sync_watchers()
+
+        # Client Auto-Sync Periodic Timer
+        self.sync_timer = QTimer(self)
+        self.sync_timer.timeout.connect(self._auto_sync_client_chains)
+        self._update_sync_timer()
+
+        # Initial client chain sync check shortly after startup
+        QTimer.singleShot(2500, self._auto_sync_client_chains)
+
         QApplication.instance().installEventFilter(self)
 
     def _on_renamer_finished(self):
@@ -1799,6 +3118,53 @@ class MainApp(QMainWindow):
     def _auto_rescan_local_folder(self):
         if self.local_current_path and os.path.exists(self.local_current_path):
             self.refresh_local_list()
+
+    def refresh_sync_watchers(self):
+        """Registers all hosted sync chains with the watchdog monitor."""
+        if hasattr(self, 'host_watcher'):
+            self.host_watcher.stop_all()
+            for hc in self.sync_config_manager.hosted_chains:
+                cid = hc.get('id')
+                folder = hc.get('folder_path')
+                code = hc.get('sync_code')
+                delay = hc.get('notify_delay_mins', 5)
+                if cid and folder and code:
+                    self.host_watcher.add_or_update_chain(cid, folder, code, delay)
+
+    def _on_hosted_folder_changed(self, sync_code: str):
+        """Called when a hosted folder has changed after the debounce timer elapses."""
+        port = self.sync_host_server.active_port if hasattr(self, 'sync_host_server') else 63350
+        sync_engine.send_lan_update_notification(sync_code, port)
+        self._on_status_update(f"Sync Chain (Code {sync_code}) updated. Notified clients on LAN.", False, "#1abd33")
+
+    def _update_sync_timer(self):
+        if hasattr(self, 'sync_config_manager') and hasattr(self, 'sync_timer'):
+            mins = self.sync_config_manager.settings.get('auto_sync_interval_mins', 30)
+            if mins > 0:
+                self.sync_timer.start(mins * 60 * 1000)
+            else:
+                self.sync_timer.stop()
+
+    def _auto_sync_client_chains(self):
+        """Background routine that runs sync checks for all client sync chains."""
+        if not hasattr(self, 'sync_config_manager') or not self.sync_config_manager.client_chains:
+            return
+
+        def _bg():
+            for cc in list(self.sync_config_manager.client_chains):
+                ok, msg, transferred, deleted = sync_engine.SyncClientWorker.sync_chain(cc)
+                if ok:
+                    cc['last_synced'] = time.time()
+                    cc['status'] = "Up to date"
+                    if transferred > 0 or deleted > 0:
+                        self.status_signal.emit(f"Sync Chain '{cc.get('name')}': {transferred} updated, {deleted} removed.", False, "#1abd33")
+                        if self.local_current_path == cc.get('folder_path'):
+                            QTimer.singleShot(0, self.refresh_local_list)
+                else:
+                    cc['status'] = f"Host Offline"
+            self.sync_config_manager.save()
+
+        threading.Thread(target=_bg, daemon=True).start()
 
     def _init_vlc_background(self):
         """Initialize libVLC in a background thread to avoid blocking the UI during plugin scanning."""
@@ -1941,6 +3307,9 @@ class MainApp(QMainWindow):
     def closeEvent(self, event):
         self.save_config()
         if self.vlc_player: self.vlc_player.stop()
+        if hasattr(self, 'sync_host_server'): self.sync_host_server.stop()
+        if hasattr(self, 'udp_beacon'): self.udp_beacon.stop()
+        if hasattr(self, 'host_watcher'): self.host_watcher.stop_all()
         super().closeEvent(event)
 
     def reset_to_defaults(self):
