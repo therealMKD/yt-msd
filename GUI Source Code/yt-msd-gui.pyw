@@ -2443,6 +2443,7 @@ class MainApp(QMainWindow):
             QWidget#queueItemFinished {{ background-color: {queue_item_bg_finished}; border-radius: 4px; margin-bottom: 2px; }}
             QLabel {{ color: {fg}; }}
             QLabel#durationLabel {{ color: {secondary_fg}; font-size: 11px; background: transparent; border: none; }}
+            QLabel#channelLabel {{ color: {secondary_fg}; font-size: 11px; background: transparent; border: none; }}
             QPushButton {{ 
                 background-color: {accent}; 
                 color: {accent_fg}; border: {main_btn_border}; padding: 6px 12px; border-radius: 4px; font-weight: bold;
@@ -2947,7 +2948,17 @@ class MainApp(QMainWindow):
         cb.stateChanged.connect(lambda state, v=video: self.toggle_queue(v, state))
         l.addWidget(cb, 1)
         
-        # Length indicator (to the left of Open Video button)
+        # Channel name (to the left of duration/timestamp)
+        channel = video.get('channel') or video.get('uploader') or ''
+        if channel:
+            if len(channel) > 25:
+                channel = channel[:23] + '…'
+            ch_lbl = QLabel(channel)
+            ch_lbl.setObjectName("channelLabel")
+            ch_lbl.setStyleSheet("border: none; background: transparent; padding-right: 6px;")
+            l.addWidget(ch_lbl)
+
+        # Duration/timestamp
         dur = video.get('duration_string')
         if not dur and video.get('duration'):
             try:
