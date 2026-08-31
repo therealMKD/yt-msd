@@ -67,14 +67,9 @@ SILENCE_PAD_DUR = 2.0
 CUSTOM_EQ_STRING = ""
 CUSTOM_NORM_CMD = ""  # Optional full ffmpeg -af override for normalization/trim
 
-_MUTAGEN_AVAILABLE = False
-try:
-    from mutagen.easyid3 import EasyID3
-    from mutagen.id3 import ID3, COMM, ID3NoHeaderError
-    from mutagen.easymp4 import EasyMP4
-    _MUTAGEN_AVAILABLE = True
-except ImportError:
-    pass
+from mutagen.easyid3 import EasyID3
+from mutagen.id3 import ID3, COMM, ID3NoHeaderError
+from mutagen.easymp4 import EasyMP4
 
 def _print_renamer_banner():
     banner = rf"""{Colors.CYAN}{Colors.BOLD}                                                  
@@ -87,13 +82,7 @@ def _print_renamer_banner():
     print(f"{Colors.BOLD}Interactive MP3/M4A Renamer, Tagger & Loudness Normalizer{Colors.END}")
     print(f"{Colors.BOLD}Available CPU Threads: {_available_threads}{Colors.END}\n")
     print(f"{Colors.BOLD}Using {MAX_WORKERS} CPU Threads for Processing{Colors.END}\n")
-
-    if _MUTAGEN_AVAILABLE:
-        print(f"{Colors.GREEN}[✓] Mutagen library active. Automatic metadata tagging is enabled.{Colors.END}\n")
-    else:
-        print(f"{Colors.YELLOW}[!] Mutagen library not found. Metadata tagging will be disabled.{Colors.END}")
-        print(f"{Colors.DIM}    Run 'pip install mutagen' in your terminal to enable tagging.{Colors.END}")
-        print(f"{Colors.DIM}    Continuing in Rename-Only mode.{Colors.END}\n")
+    print(f"{Colors.GREEN}[✓] Mutagen library active. Automatic metadata tagging is enabled.{Colors.END}\n")
 
 def _select_renamer_folder():
     print(f"{Colors.BLUE}Please select the folder containing your audio files...{Colors.END}")
@@ -267,20 +256,22 @@ def clean_youtube_title(filename):
     return title
 
 def read_metadata_tags(filepath):
-    if not _MUTAGEN_AVAILABLE:
-        return None, None
     suffix = filepath.suffix.lower()
     try:
         if suffix == ".mp3":
             try:
                 tags = EasyID3(filepath)
-                return tags.get("artist", [None])[0], tags.get("title", [None])[0]
+                artist = tags.get("artist", [None])[0] or tags.get("albumartist", [None])[0] or tags.get("performer", [None])[0]
+                title = tags.get("title", [None])[0]
+                return (str(artist).strip() if artist else None), (str(title).strip() if title else None)
             except ID3NoHeaderError:
                 return None, None
         elif suffix == ".m4a":
             try:
                 tags = EasyMP4(filepath)
-                return tags.get("artist", [None])[0], tags.get("title", [None])[0]
+                artist = tags.get("artist", [None])[0] or tags.get("albumartist", [None])[0]
+                title = tags.get("title", [None])[0]
+                return (str(artist).strip() if artist else None), (str(title).strip() if title else None)
             except Exception:
                 return None, None
     except Exception:
@@ -288,8 +279,6 @@ def read_metadata_tags(filepath):
     return None, None
 
 def write_metadata_tags(filepath, artist, title):
-    if not _MUTAGEN_AVAILABLE:
-        return False
     suffix = filepath.suffix.lower()
     try:
         if suffix == ".mp3":
@@ -317,7 +306,7 @@ def write_metadata_tags(filepath, artist, title):
     return False
 
 def _add_placeholder_tag(filepath):
-    if not _MUTAGEN_AVAILABLE or not os.path.exists(filepath): return
+    if not os.path.exists(filepath): return
     ext = os.path.splitext(filepath)[1].lower()
     try:
         if ext == ".mp3":
@@ -338,7 +327,7 @@ def _add_placeholder_tag(filepath):
         pass
 
 def _has_placeholder_tag(filepath):
-    if not _MUTAGEN_AVAILABLE or not os.path.exists(filepath): return False
+    if not os.path.exists(filepath): return False
     ext = os.path.splitext(filepath)[1].lower()
     try:
         if ext == ".mp3":
@@ -352,7 +341,7 @@ def _has_placeholder_tag(filepath):
     return False
 
 def _remove_placeholder_tag(filepath):
-    if not _MUTAGEN_AVAILABLE or not os.path.exists(filepath): return
+    if not os.path.exists(filepath): return
     ext = os.path.splitext(filepath)[1].lower()
     try:
         if ext == ".mp3":
@@ -591,17 +580,13 @@ def clean_and_tag_files(folder_path, start_auto=False):
                 title = parts[1].strip()
                 
             if artist and title:
-                if _MUTAGEN_AVAILABLE:
-                    success = write_metadata_tags(active_filepath, artist, title)
-                    if success:
-                        tagged_count += 1
-                        tag_status = "Renamed & Tagged" if renamed else "Tagged"
-                        print(f"  {Colors.GREEN}✔ {tag_status} successfully:{Colors.END} Artist='{artist}', Title='{title}'")
-                    else:
-                        print(f"  {Colors.YELLOW}Renamed, but failed to write metadata tags.{Colors.END}")
+                success = write_metadata_tags(active_filepath, artist, title)
+                if success:
+                    tagged_count += 1
+                    tag_status = "Renamed & Tagged" if renamed else "Tagged"
+                    print(f"  {Colors.GREEN}✔ {tag_status} successfully:{Colors.END} Artist='{artist}', Title='{title}'")
                 else:
-                    if renamed:
-                        print(f"  {Colors.YELLOW}Renamed, but skipped tagging (Mutagen not available).{Colors.END}")
+                    print(f"  {Colors.YELLOW}Renamed, but failed to write metadata tags.{Colors.END}")
             else:
                 print(f"  {Colors.YELLOW}Could not parse 'Artist - Title' format. Skipping metadata tagging.{Colors.END}")
                 
@@ -806,7 +791,7 @@ def normalize_file(index, total, filepath, custom_norm_cmd=None):
             f"  {Colors.DIM}└─ Silence removed: ~{front_est:.2f}s front, ~{back_est:.2f}s back (total: {net_removed:.2f}s){Colors.END}"
         )
         
-    if (artist or title) and _MUTAGEN_AVAILABLE:
+    if (artist or title):
         write_metadata_tags(filepath, artist, title)
         
     return True, filepath.name, None
@@ -926,7 +911,7 @@ def trim_silence_file(index, total, filepath, custom_norm_cmd=None):
     except Exception as e:
         return False, filepath.name, f"Failed to replace original file with temp: {e}"
     
-    if (artist or title) and _MUTAGEN_AVAILABLE:
+    if (artist or title):
         write_metadata_tags(filepath, artist or "", title or "")
     
     return True, filepath.name, None
@@ -1366,6 +1351,35 @@ class SettingsDialog(QDialog):
         left_layout.addLayout(dl_threads_h)
         left_layout.addWidget(QLabel("Disclaimer: Too many parallel downloads may cause your internet\n"
                                      "to throttle or YouTube to rate-limit requests.", font=QFont("Segoe UI", 8)))
+        
+        # Local folder auto-rescan interval
+        rescan_h = QHBoxLayout()
+        rescan_h.addWidget(QLabel("Local folder auto-rescan:"))
+        self.rescan_combo = QComboBox()
+        self.rescan_options = [
+            ("Disabled", 0),
+            ("15 minutes", 15),
+            ("30 minutes", 30),
+            ("1 hour (Default)", 60),
+            ("2 hours", 120),
+            ("4 hours", 240),
+            ("12 hours", 720),
+            ("24 hours", 1440)
+        ]
+        for label, mins in self.rescan_options:
+            self.rescan_combo.addItem(label, mins)
+
+        current_mins = getattr(parent, 'local_rescan_interval', 60)
+        idx = self.rescan_combo.findData(current_mins)
+        if idx >= 0:
+            self.rescan_combo.setCurrentIndex(idx)
+        else:
+            self.rescan_combo.setCurrentIndex(3)  # 1 hour default
+
+        self.rescan_combo.currentIndexChanged.connect(self._update_rescan_interval)
+        rescan_h.addWidget(self.rescan_combo)
+        rescan_h.addStretch()
+        left_layout.addLayout(rescan_h)
         left_layout.addStretch()
         
         # Vertical Divider Frame
@@ -1575,6 +1589,13 @@ class SettingsDialog(QDialog):
         except ValueError:
             pass
 
+    def _update_rescan_interval(self, index):
+        mins = self.rescan_combo.itemData(index)
+        if mins is not None:
+            self.parent.local_rescan_interval = mins
+            self.parent._update_local_rescan_timer()
+            self.parent.save_config()
+
     def _update_norm_threads(self, val):
         self.parent.normalization_threads = val
         self.parent.save_config()
@@ -1647,6 +1668,7 @@ class MainApp(QMainWindow):
     queue_update_signal = Signal()
     queue_status_changed_signal = Signal(int)
     dl_progress_signal = Signal(str)
+    renamer_finished_signal = Signal()
 
     def __init__(self):
         super().__init__()
@@ -1689,6 +1711,9 @@ class MainApp(QMainWindow):
         self.custom_norm_cmd = ""
         self.download_threads = 3
         self.normalization_threads = max(1, os.cpu_count() // 2)
+        self.local_rescan_interval = 60  # minutes (default 1 hour)
+        self.local_rescan_timer = QTimer(self)
+        self.local_rescan_timer.timeout.connect(self._auto_rescan_local_folder)
         
         # Player Flags
         self.is_playing = False
@@ -1732,12 +1757,14 @@ class MainApp(QMainWindow):
         self.queue_status_changed_signal.connect(self._on_queue_status_changed)
         self.thumbnails_loaded_signal.connect(self._on_thumbnail_loaded)
         self.dl_progress_signal.connect(lambda txt: self.dl_progress_label.setText(txt))
+        self.renamer_finished_signal.connect(self._on_renamer_finished)
 
         self.player_timer = QTimer(self)
         self.player_timer.timeout.connect(self.update_player_ui)
         self.player_timer.start(16)
 
         self.setup_tray()
+        self._update_local_rescan_timer()
 
         # Initialize VLC in a background thread (plugin scanning can take seconds)
         _startup_pool = ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 4))
@@ -1757,6 +1784,21 @@ class MainApp(QMainWindow):
                     QTimer.singleShot(100, lambda: self._on_local_click(audio_files[idx], paused_at_start=True))
 
         QApplication.instance().installEventFilter(self)
+
+    def _on_renamer_finished(self):
+        self._on_status_update("MP3 Renamer finished execution.", False, "#1abd33")
+        self.refresh_local_list()
+
+    def _update_local_rescan_timer(self):
+        mins = getattr(self, 'local_rescan_interval', 60)
+        if mins > 0:
+            self.local_rescan_timer.start(mins * 60 * 1000)
+        else:
+            self.local_rescan_timer.stop()
+
+    def _auto_rescan_local_folder(self):
+        if self.local_current_path and os.path.exists(self.local_current_path):
+            self.refresh_local_list()
 
     def _init_vlc_background(self):
         """Initialize libVLC in a background thread to avoid blocking the UI during plugin scanning."""
@@ -1811,6 +1853,9 @@ class MainApp(QMainWindow):
                     self.custom_norm_cmd = c.get('custom_norm_cmd', '')
                     self.download_threads = c.get('download_threads', 3)
                     self.normalization_threads = c.get('normalization_threads', max(1, os.cpu_count() // 2))
+                    self.local_rescan_interval = c.get('local_rescan_interval', 60)
+                    if hasattr(self, 'local_rescan_timer'):
+                        self._update_local_rescan_timer()
                     if self.save_place:
                         self.session_data = c.get('session_data', {})
         except Exception: pass
@@ -1847,6 +1892,7 @@ class MainApp(QMainWindow):
             'custom_norm_cmd': self.custom_norm_cmd,
             'download_threads': self.download_threads,
             'normalization_threads': self.normalization_threads,
+            'local_rescan_interval': getattr(self, 'local_rescan_interval', 60),
             'session_data': {
                 'search_results': self.search_results,
                 'playback_index': self.playback_index,
@@ -1923,6 +1969,9 @@ class MainApp(QMainWindow):
         self.custom_norm_cmd = ""
         self.download_threads = 3
         self.normalization_threads = max(1, os.cpu_count() // 2)
+        self.local_rescan_interval = 60
+        if hasattr(self, 'local_rescan_timer'):
+            self._update_local_rescan_timer()
         if hasattr(self, 'run_renamer_cb'):
             self.run_renamer_cb.blockSignals(True)
             self.run_renamer_cb.setChecked(False)
@@ -2657,7 +2706,7 @@ class MainApp(QMainWindow):
         self._meta_worker = MetaWorker()
         self._meta_worker.meta_done.connect(
             lambda b, d_lbl, i: (
-                b.setText(f"🎵  {i.get('meta_name', i['name']).replace('&', '&&')}"),
+                b.setText(f"🎵  {(i.get('meta_name', i['name']) if getattr(self, 'show_local_metadata', False) else i['name']).replace('&', '&&')}"),
                 d_lbl.setText(i.get('duration_str', ''))
             )
         )
@@ -3206,6 +3255,7 @@ class MainApp(QMainWindow):
         
         self.is_downloading = True
         self.cancel_download = False
+        self._batch_total_count = len(pending)
         self.dl_btn.setEnabled(False)
         self.dl_btn.setText("Downloading...")
         self.cancel_btn.setText("Cancel")
@@ -3293,6 +3343,19 @@ class MainApp(QMainWindow):
                 if getattr(self, 'cancel_download', False):
                     q['status'] = "Pending"
                 self.queue_status_changed_signal.emit(idx)
+
+                finished_cnt = len([item_q for item_q in getattr(self, 'queue_items', []) if item_q.get('status') == "Finished"])
+                total_cnt = getattr(self, '_batch_total_count', len(getattr(self, 'queue_items', [])))
+                prog_prefix = f"({finished_cnt}/{total_cnt}) " if total_cnt > 0 else ""
+                with self.active_downloads_lock:
+                    if self.active_downloads:
+                        vals = list(self.active_downloads.values())
+                        if len(vals) > 5:
+                            self.dl_progress_signal.emit(f"{prog_prefix}Downloading: {', '.join(vals[:5])} (+{len(vals)-5} more)")
+                        else:
+                            self.dl_progress_signal.emit(f"{prog_prefix}Downloading: {', '.join(vals)}")
+                    else:
+                        self.dl_progress_signal.emit(f"{prog_prefix}Processing...")
                 
             max_passes = 4
             for pass_num in range(1, max_passes + 1):
@@ -3414,8 +3477,14 @@ class MainApp(QMainWindow):
 
         try:
             creationflags = 0x00000010 if sys.platform == "win32" else 0
-            subprocess.Popen(args, creationflags=creationflags)
+            proc = subprocess.Popen(args, creationflags=creationflags)
             self._on_status_update("Launched MP3 Renamer in a new console window.", False, "#1abd33")
+
+            def _wait_renamer():
+                proc.wait()
+                self.renamer_finished_signal.emit()
+
+            threading.Thread(target=_wait_renamer, daemon=True).start()
         except Exception as e:
             self._on_status_update(f"Failed to launch MP3 Renamer: {str(e)}", False, "red")
 
@@ -3452,6 +3521,10 @@ class MainApp(QMainWindow):
         vid_id = info.get('id') if isinstance(info, dict) else None
         if not vid_id:
             return
+
+        finished_cnt = len([q for q in getattr(self, 'queue_items', []) if q.get('status') == "Finished"])
+        total_cnt = getattr(self, '_batch_total_count', len(getattr(self, 'queue_items', [])))
+        prog_prefix = f"({finished_cnt}/{total_cnt}) " if total_cnt > 0 else ""
             
         if d['status'] == 'downloading':
             p = d.get('_percent_str', '').strip()
@@ -3462,9 +3535,9 @@ class MainApp(QMainWindow):
                     vals = list(self.active_downloads.values())
                     if len(vals) > 5:
                         self.dl_progress_signal.emit(
-                            f"Downloading: {', '.join(vals[:5])} (+{len(vals)-5} more)")
+                            f"{prog_prefix}Downloading: {', '.join(vals[:5])} (+{len(vals)-5} more)")
                     else:
-                        self.dl_progress_signal.emit(f"Downloading: {', '.join(vals)}")
+                        self.dl_progress_signal.emit(f"{prog_prefix}Downloading: {', '.join(vals)}")
         elif d['status'] == 'finished':
             with self.active_downloads_lock:
                 if vid_id in self.active_downloads:
@@ -3473,11 +3546,11 @@ class MainApp(QMainWindow):
                     vals = list(self.active_downloads.values())
                     if len(vals) > 5:
                         self.dl_progress_signal.emit(
-                            f"Downloading: {', '.join(vals[:5])} (+{len(vals)-5} more)")
+                            f"{prog_prefix}Downloading: {', '.join(vals[:5])} (+{len(vals)-5} more)")
                     else:
-                        self.dl_progress_signal.emit(f"Downloading: {', '.join(vals)}")
+                        self.dl_progress_signal.emit(f"{prog_prefix}Downloading: {', '.join(vals)}")
                 else:
-                    self.dl_progress_signal.emit("Processing...")
+                    self.dl_progress_signal.emit(f"{prog_prefix}Processing...")
 
     # --- Player Logic ---
     def _on_status_update(self, text, is_playing, color):
