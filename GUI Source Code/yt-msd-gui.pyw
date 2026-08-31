@@ -702,12 +702,7 @@ def _get_audio_duration(filepath):
 def normalize_file(index, total, filepath, custom_norm_cmd=None):
     suffix = filepath.suffix.lower()
     artist, title = read_metadata_tags(filepath)
-    
-    # If file already has both tags, skip normalization
-    if artist and title:
-        _safe_print(f"[{index}/{total}] {Colors.DIM}Skipping (already tagged): {filepath.name}{Colors.END}")
-        return True, filepath.name, None
-    
+
     # Measure original duration before processing
     orig_duration = _get_audio_duration(filepath)
     
@@ -817,7 +812,7 @@ def normalize_file(index, total, filepath, custom_norm_cmd=None):
     return True, filepath.name, None
 
 
-def run_loudness_normalization(folder_path):
+def run_loudness_normalization(folder_path, skip_files=None):
     print(f"\n{Colors.CYAN}{Colors.BOLD}========================================{Colors.END}")
     print(f"{Colors.CYAN}{Colors.BOLD}=== TWO-PASS VOLUME ADJUSTMENT PASS ===={Colors.END}")
     print(f"{Colors.CYAN}{Colors.BOLD}========================================{Colors.END}\n")
@@ -830,7 +825,14 @@ def run_loudness_normalization(folder_path):
         
     extensions = {".mp3", ".m4a"}
     files = sorted([f for f in folder_path.iterdir() if f.is_file() and f.suffix.lower() in extensions])
-    
+
+    # Filter out files that were already tagged before the renaming pass started
+    if skip_files:
+        pre_skip_count = len([f for f in files if f in skip_files])
+        files = [f for f in files if f not in skip_files]
+        if pre_skip_count:
+            print(f"{Colors.DIM}Skipping {pre_skip_count} already-tagged file(s) from normalization.{Colors.END}")
+
     if not files:
         print(f"{Colors.YELLOW}No MP3 or M4A files found to adjust.{Colors.END}\n")
         return 0, 0
@@ -861,15 +863,10 @@ def run_loudness_normalization(folder_path):
     return completed, failed
 
 def trim_silence_file(index, total, filepath, custom_norm_cmd=None):
-    # If file already has both tags, skip trimming
-    artist, title = read_metadata_tags(filepath)
-    if artist and title:
-        _safe_print(f"[{index}/{total}] {Colors.DIM}Skipping trim (already tagged): {filepath.name}{Colors.END}")
-        return True, filepath.name, None
-
     _safe_print(f"[{index}/{total}] {Colors.CYAN}Trimming silence:{Colors.END} {filepath.name}...")
     suffix = filepath.suffix.lower()
-    
+    artist, title = read_metadata_tags(filepath)
+
     try:
         temp_fd, temp_path = tempfile.mkstemp(suffix=suffix)
         os.close(temp_fd)
@@ -934,7 +931,7 @@ def trim_silence_file(index, total, filepath, custom_norm_cmd=None):
     
     return True, filepath.name, None
 
-def run_silence_trim(folder_path):
+def run_silence_trim(folder_path, skip_files=None):
     print(f"\n{Colors.CYAN}{Colors.BOLD}====================================={Colors.END}")
     print(f"{Colors.CYAN}{Colors.BOLD}=== SILENCE TRIM PASS ==============={Colors.END}")
     print(f"{Colors.CYAN}{Colors.BOLD}====================================={Colors.END}\n")
@@ -946,11 +943,18 @@ def run_silence_trim(folder_path):
     
     extensions = {".mp3", ".m4a"}
     files = sorted([f for f in folder_path.iterdir() if f.is_file() and f.suffix.lower() in extensions])
-    
+
+    # Filter out files that were already tagged before the renaming pass started
+    if skip_files:
+        pre_skip_count = len([f for f in files if f in skip_files])
+        files = [f for f in files if f not in skip_files]
+        if pre_skip_count:
+            print(f"{Colors.DIM}Skipping {pre_skip_count} already-tagged file(s) from silence trim.{Colors.END}")
+
     if not files:
         print(f"{Colors.YELLOW}No MP3 or M4A files found to trim.{Colors.END}\n")
         return 0, 0
-    
+
     print(f"{Colors.GREEN}Trimming silence on {len(files)} files with {MAX_WORKERS} worker threads...{Colors.END}")
     print(f"{Colors.DIM}Threshold: -50 dB | Min silence duration: 0.5s{Colors.END}\n")
     
@@ -992,13 +996,17 @@ def run_integrated_renamer_cli():
                         help="Worker threads for normalization pass")
     parser.add_argument('--eq', default=None,
                         help="Extra ffmpeg -af filter string appended after the main chain")
+    parser.add_argument('--custom-norm-cmd', default=None,
+                        help="Replace the entire ffmpeg -af filter chain for normalization and silence trim")
     args, _ = parser.parse_known_args()
 
-    global SILENCE_PAD_DUR, CUSTOM_EQ_STRING, MAX_WORKERS
+    global SILENCE_PAD_DUR, CUSTOM_EQ_STRING, MAX_WORKERS, CUSTOM_NORM_CMD
     if args.silence_pad is not None:
         SILENCE_PAD_DUR = args.silence_pad
     if args.eq:
         CUSTOM_EQ_STRING = args.eq
+    if args.custom_norm_cmd:
+        CUSTOM_NORM_CMD = args.custom_norm_cmd
     if args.norm_threads is not None and args.norm_threads > 0:
         MAX_WORKERS = args.norm_threads
 
@@ -1013,6 +1021,16 @@ def run_integrated_renamer_cli():
     else:
         folder = _select_renamer_folder()
 
+    # Snapshot which files already have both artist+title tags BEFORE renaming writes new tags
+    _ext = {".mp3", ".m4a"}
+    _pre_tagged = frozenset(
+        f for f in folder.iterdir()
+        if f.is_file() and f.suffix.lower() in _ext
+        and all(read_metadata_tags(f))
+    )
+    if _pre_tagged:
+        print(f"{Colors.DIM}Found {len(_pre_tagged)} already-tagged file(s) — will skip them in normalization/trim.{Colors.END}\n")
+
     renamed_count, tagged_count, skipped_count, already_formatted_count = clean_and_tag_files(folder, start_auto=start_auto)
 
     norm_completed, norm_failed = 0, 0
@@ -1020,14 +1038,14 @@ def run_integrated_renamer_cli():
 
     try:
         if norm_mode == 'on':
-            norm_completed, norm_failed = run_loudness_normalization(folder)
+            norm_completed, norm_failed = run_loudness_normalization(folder, skip_files=_pre_tagged)
         elif norm_mode == 'off':
             print(f"\n{Colors.YELLOW}Skipping volume adjustment (disabled in settings).{Colors.END}\n")
         else:
             print(f"{Colors.BOLD}Normalization and Silence Trimming{Colors.END}")
             choice = input(f"Do you want to run normalization and silence trimming? ({Colors.GREEN}y{Colors.END}/{Colors.RED}n{Colors.END}): ").strip().lower()
             if choice in ('y', 'yes'):
-                norm_completed, norm_failed = run_loudness_normalization(folder)
+                norm_completed, norm_failed = run_loudness_normalization(folder, skip_files=_pre_tagged)
             else:
                 print(f"\n{Colors.YELLOW}Skipping normalization and silence trim pass.{Colors.END}\n")
     except KeyboardInterrupt:
@@ -1692,17 +1710,20 @@ class MainApp(QMainWindow):
             
         self.config_path = os.path.join(self.config_dir, "gui_config.json")
         self.load_config()
-        
-        try:
-            self.vlc_instance = vlc.Instance('--quiet', '--no-video')
-            self.vlc_player = self.vlc_instance.media_player_new()
-            if self.vlc_player: self.vlc_player.audio_set_volume(self.volume_val)
-        except:
-            self.vlc_instance = None; self.vlc_player = None
+
+        # Apply CUSTOM_NORM_CMD global from loaded config immediately
+        global CUSTOM_NORM_CMD
+        if self.use_custom_norm_cmd and self.custom_norm_cmd.strip():
+            CUSTOM_NORM_CMD = self.custom_norm_cmd.strip()
+
+        # Placeholder so UI code can check readiness before VLC is initialized
+        self.vlc_instance = None
+        self.vlc_player = None
+        self._vlc_ready = False
 
         self.setup_ui()
         self.apply_theme()
-        
+
         self.status_signal.connect(self._on_status_update)
         self.search_results_signal.connect(self._on_search_results)
         self.search_failed_signal.connect(self._on_search_failed)
@@ -1711,24 +1732,48 @@ class MainApp(QMainWindow):
         self.queue_status_changed_signal.connect(self._on_queue_status_changed)
         self.thumbnails_loaded_signal.connect(self._on_thumbnail_loaded)
         self.dl_progress_signal.connect(lambda txt: self.dl_progress_label.setText(txt))
-        
+
         self.player_timer = QTimer(self)
         self.player_timer.timeout.connect(self.update_player_ui)
         self.player_timer.start(16)
-        
+
         self.setup_tray()
+
+        # Initialize VLC in a background thread (plugin scanning can take seconds)
+        _startup_pool = ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 4))
+        _startup_pool.submit(self._init_vlc_background)
+        _startup_pool.shutdown(wait=False)
+
+        # Defer local folder load until after the window is shown
         if self.local_current_path:
-            self.load_local_folder(self.local_current_path)
-            
+            QTimer.singleShot(0, lambda: self.load_local_folder(self.local_current_path))
+
         if getattr(self, 'save_place', False) and hasattr(self, 'session_data'):
             sd = self.session_data
             if sd.get('current_video_id') == "local" and sd.get('local_current_path'):
                 idx = sd.get('local_playback_index', -1)
                 audio_files = [x for x in getattr(self, 'current_local_items', []) if x.get('is_dir') is False]
                 if 0 <= idx < len(audio_files):
-                    self._on_local_click(audio_files[idx], paused_at_start=True)
+                    QTimer.singleShot(100, lambda: self._on_local_click(audio_files[idx], paused_at_start=True))
 
         QApplication.instance().installEventFilter(self)
+
+    def _init_vlc_background(self):
+        """Initialize libVLC in a background thread to avoid blocking the UI during plugin scanning."""
+        try:
+            instance = vlc.Instance('--quiet', '--no-video')
+            player = instance.media_player_new()
+            # Switch to main-thread ownership safely
+            self.vlc_instance = instance
+            self.vlc_player = player
+            if self.vlc_player:
+                self.vlc_player.audio_set_volume(self.volume_val)
+            self._vlc_ready = True
+        except Exception:
+            self.vlc_instance = None
+            self.vlc_player = None
+            self._vlc_ready = True  # Still mark ready so playback attempts don't hang
+
 
     def load_config(self):
         default_dl = os.path.join(os.path.expanduser("~"), "Downloads")
@@ -2669,6 +2714,11 @@ class MainApp(QMainWindow):
         if item['is_dir']: 
             self.load_local_folder(item['path'])
         else:
+            # If VLC is still initializing in background, retry after a short delay
+            if self.vlc_instance is None or self.vlc_player is None:
+                QTimer.singleShot(200, lambda: self._on_local_click(item, paused_at_start))
+                return
+
             display_name = item.get('meta_name', item['name']) if getattr(self, 'show_local_metadata', False) else item['name']
             self._on_status_update(f"Playing Local: {display_name}", False, "#3B8ED0")
             url = item['path'].replace("\\", "/")
@@ -3433,6 +3483,11 @@ class MainApp(QMainWindow):
             self._on_batch_complete()
 
     def play_result(self, video, paused_at_start=False):
+        # If VLC is still initializing in background, defer and retry
+        if self.vlc_instance is None or self.vlc_player is None:
+            QTimer.singleShot(200, lambda: self.play_result(video, paused_at_start))
+            return
+
         self._on_status_update(f"Fetching stream: {video.get('title', 'Unknown')}...", False, "#3B8ED0")
         
         # Track pending fetch ID and loading state
