@@ -629,7 +629,7 @@ def check_ffmpeg_available():
         if sys.platform == "win32":
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, startupinfo=startupinfo)
+        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, check=True, startupinfo=startupinfo)
         return True
     except Exception:
         return False
@@ -637,6 +637,7 @@ def check_ffmpeg_available():
 def measure_loudness(filepath):
     command = [
         "ffmpeg",
+        "-nostdin",
         "-y",
         "-i", str(filepath),
         "-af", f"loudnorm=I={TARGET_LUFS}:TP={TRUE_PEAK}:print_format=json",
@@ -651,6 +652,7 @@ def measure_loudness(filepath):
             
         result = subprocess.run(
             command,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -681,8 +683,8 @@ def _get_audio_duration(filepath):
         if sys.platform == "win32":
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(filepath)]
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        cmd = ["ffprobe", "-nostdin", "-v", "quiet", "-print_format", "json", "-show_format", str(filepath)]
+        result = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, encoding='utf-8', errors='ignore',
                                 startupinfo=startupinfo)
         if result.returncode == 0 and result.stdout:
@@ -746,7 +748,7 @@ def normalize_file(index, total, filepath, custom_norm_cmd=None):
     if _effective_norm_cmd:
         af_chain = _effective_norm_cmd
 
-    command = ["ffmpeg", "-y", "-i", str(filepath), "-af", af_chain]
+    command = ["ffmpeg", "-nostdin", "-y", "-i", str(filepath), "-af", af_chain]
     
     if suffix == ".mp3":
         command += ["-codec:a", "libmp3lame", "-b:a", BITRATE]
@@ -769,6 +771,7 @@ def normalize_file(index, total, filepath, custom_norm_cmd=None):
             
         result = subprocess.run(
             command,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -881,7 +884,7 @@ def trim_silence_file(index, total, filepath, custom_norm_cmd=None):
     _effective_norm_cmd = custom_norm_cmd or CUSTOM_NORM_CMD
     if _effective_norm_cmd:
         af_chain = _effective_norm_cmd
-    command = ["ffmpeg", "-y", "-i", str(filepath), "-af", af_chain]
+    command = ["ffmpeg", "-nostdin", "-y", "-i", str(filepath), "-af", af_chain]
     
     if suffix == ".mp3":
         command += ["-codec:a", "libmp3lame", "-b:a", BITRATE]
@@ -902,6 +905,7 @@ def trim_silence_file(index, total, filepath, custom_norm_cmd=None):
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         result = subprocess.run(
             command,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
