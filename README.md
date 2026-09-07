@@ -3,11 +3,19 @@
 
 **DISCLAIMER:** This program is for educational purposes ONLY, and is not intended to be used for any form of piracy. This is intended to be a tool to allow you to have your music in an OFFLINE playlist, NOT as a way to distribute or sell music. I am NOT liable in any way for any illegal use of this program, and I DO NOT condone it. This program is for PERSONAL use ONLY. Don't do stupid stuff with it.
 
-***Another disclaimer:** This program was created with the help of AI, specifically Google Antigravity. If you have a problem with this, then don't use the program. I understand the general bias against "vibe coded" programs, but I would argue that this program doesn't fit under those categories because I don't just blindly make additions without checking anything. However, it is up to you to decide what you think it is. I have done extensive bug testing on all release versions (beta versions are buggy) to ensure that the program doesn't break or act wierdly, and works as it should. The reason I am using AI for this project is that my programming skills in Python are basic, but not advanced enough to build a program like this. This program is firstly intended to be a personal tool, the github release is simply because others might find it useful. Remember that.*
+***Another disclaimer:** This program was created with the help of AI, specifically Google Antigravity. If you have a problem with this, then don't use the program. I have done extensive bug testing on all release versions (beta versions are buggy) to ensure that the program doesn't break or act wierdly, and works as it should. The reason I am using AI for this project is that my programming skills in Python are basic, but not advanced enough to build a program like this. This program is firstly intended to be a personal tool, the github release is simply because others might find it useful. Remember that.*
 
 ## Why did I make this program?
 
-I don't want to deal with spotify's ads (Or pay for premium), and youtube playlists don't have working shuffle features, so I started downloading the mp3s of my playlist with yt-dlp, but it is still annoying to do, so I created this tool to make it faster. This program WILL function as a bare bones music player, but I would highly recommend using a dedicated program (I use MusicBee) that has more options. However, if you just want to have your music in a folder and listen to it, this will do it for you.
+I don't want to deal with spotify's ads (Or pay for premium), and youtube playlists don't have working shuffle features, so I started downloading the mp3s of my playlist with yt-dlp, but it is still annoying to do, so I created this tool to make it faster. This program WILL function as a bare bones music player, but I would highly recommend using a dedicated program (I use MusicBee) that has more options. However, if you just want to have your music in a folder and listen to it, this will do it for you. 
+
+As development has continued, this program has shifted from just a downloader to a full music library manager, with eventual local network syncing. My end goal is to integrate this program with Musicbee, as a plugin, which will allow updating your library and playing your library with one program. (Yes, you can play your library with yt-msd standalone, but you can't do all the fancy stuff musicbee lets you do.) If your preferred method of music is to add songs to a youtube playlist, and then download them, this is the exact program you are looking for. Not only will future releases have support for automatic, local network syncing between devices, there will also eventually be automatic library updating, by scanning the master youtube playlist, and automatically applying changes (New songs, removed songs, etc.) without any user intervention.
+
+### Table of Contents:
+
+[GUI Version Readme](#gui-version-readme)
+
+[CLI Version Readme](#cli-version-readme)
 
 # GUI Version Readme
 
@@ -23,7 +31,8 @@ The GUI version is currently "complete" at v1.0, (and "improved" at v2.3) but fu
 - An icon that isn't a single-color circle
 - Music player only mode (hiding all download features)
 - Various QOL changes and bug fixes
-- MusicBee Plugin version - Tenative, this might happen later on after v3.0 releases
+- MusicBee Plugin version - Will be released once the program has completely matured. This will be when all features have been added, and will probably just be the entire yt-msd program wrapped in C++. (Yeah, very optimized, I know)
+- Automatic master playlist scanning and updating. Will work with the local syncing feature, if enabled. The master program controlling the sync chain will periodically refresh the youtube playlist it pulls songs from, and apply changes to it's masterlist, and clients on the sync chain.
 
 ### Support for other operating systems
 **MacOS**: Exe files don't run on MacOS, but you can still use the python file and install the dependencies. Unfortunately due to the migration to Pyside6, I can no longer make a pex file properly (At least in my windows development environment). You could also use WINE to emulate windows functionality with the exe. I don't plan on releasing any additional files supporting MacOS, both because I don't have a Mac to test on, and also because MacOS sucks ass.
@@ -69,7 +78,7 @@ There are 3 versions of the CLI: The python version, which requires python to be
 When you add the exe to PATH, it will work from anywhere AS LONG as it isn't moved. If you move the exe's location, you will have to run it manually by finding it and doubleclicking on it, and accepting the add to path prompt again. You can also just manually edit the PATH in windows settings. Note that running it and adding it to path twice will leave the old PATH variable there, so if you move it a bunch and re-add it, you will have a bunch of garbage PATH entries. If you don't want to add it to PATH, and you also don't want to tell it no every time you launch it, use the pex version instead.
 
 ## Support for other operating systems:
-**MacOS**: Exe files don't run on MacOS, so you will have to use the pex version or the python version. I don't have a mac, so you'll need to figure out how to install python yourself. If you are using the python version, you will also need to install pip and the required dependencies with `pip install yt-dlp` and `pip install ffmpeg`
+**MacOS**: Exe files don't run on MacOS, so you will have to use the pex version or the python version. I don't have a mac, so you'll need to figure out how to [install python yourself](https://letmegooglethat.com/?q=How+to+install+python+on+mac+os). If you are using the python version, you will also need to install pip and the required dependencies with `pip install yt-dlp` and `pip install ffmpeg`
 
-**Linux**: Linux also doesn't support exes, so you must use the python or pex version. To install python on linux: Use `sudo apt install python3-pip` on debian-based linux, or `sudo dnf install python3-pip -y` on fedora. If you use Arch btw, figure it out.
+**Linux**: Linux also doesn't support exe files, so you must use the python or pex version. To install python on linux: Use `sudo apt install python3-pip` on debian-based linux, or `sudo dnf install python3-pip -y` on fedora. If you use Arch btw, figure it out.
 If you are using the normal python version and not pex, you must also install the dependencies with `pip install yt-dlp` and `pip install ffmpeg`
