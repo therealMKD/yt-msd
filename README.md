@@ -7,7 +7,9 @@
 
 ## Why did I make this program?
 
-I don't want to deal with spotify's ads (Or pay for premium), and youtube playlists don't have working shuffle features, so I started downloading the mp3s of my playlist with yt-dlp, but it is still annoying to do, so I created this tool to make it faster. This program WILL function as a bare bones music player, but I would highly recommend using a dedicated program (I use MusicBee) that has more options. However, if you just want to have your music in a folder and listen to it, this will do it for you.
+I don't want to deal with spotify's ads (Or pay for premium), and youtube playlists don't have working shuffle features, so I started downloading the mp3s of my playlist with yt-dlp, but it is still annoying to do, so I created this tool to make it faster. This program WILL function as a bare bones music player, but I would highly recommend using a dedicated program (I use MusicBee) that has more options. However, if you just want to have your music in a folder and listen to it, this will do it for you. 
+
+As development has continued, this program has shifted from just a downloader to a full music library manager, with eventual local network syncing. My end goal is to integrate this program with Musicbee, as a plugin, which will allow updating your library and playing your library with one program. (Yes, you can play your library with yt-msd standalone, but you can't do all the fancy stuff musicbee lets you do.) If your preferred method of music is to add songs to a youtube playlist, and then download them, this is the exact program you are looking for. Not only will future releases have support for automatic, local network syncing between devices, there will also eventually be automatic library updating, by scanning the master youtube playlist, and automatically applying changes (New songs, removed songs, etc.) without any user intervention.
 
 # GUI Version Readme
 
@@ -23,7 +25,8 @@ The GUI version is currently "complete" at v1.0, (and "improved" at v2.3) but fu
 - An icon that isn't a single-color circle
 - Music player only mode (hiding all download features)
 - Various QOL changes and bug fixes
-- MusicBee Plugin version - Tenative, this might happen later on after v3.0 releases
+- MusicBee Plugin version - Will be released once the program has completely matured. This will be when all features have been added, and will probably just be the entire yt-msd program wrapped in C++. (Yeah, very optimized, I know)
+- Automatic master playlist scanning and updating. Will work with the local syncing feature, if enabled. The master program controlling the sync chain will periodically refresh the youtube playlist it pulls songs from, and apply changes to it's masterlist, and clients on the sync chain.
 
 ### Support for other operating systems
 **MacOS**: Exe files don't run on MacOS, but you can still use the python file and install the dependencies. Unfortunately due to the migration to Pyside6, I can no longer make a pex file properly (At least in my windows development environment). You could also use WINE to emulate windows functionality with the exe. I don't plan on releasing any additional files supporting MacOS, both because I don't have a Mac to test on, and also because MacOS sucks ass.
