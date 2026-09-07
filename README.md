@@ -11,6 +11,12 @@ I don't want to deal with spotify's ads (Or pay for premium), and youtube playli
 
 As development has continued, this program has shifted from just a downloader to a full music library manager, with eventual local network syncing. My end goal is to integrate this program with Musicbee, as a plugin, which will allow updating your library and playing your library with one program. (Yes, you can play your library with yt-msd standalone, but you can't do all the fancy stuff musicbee lets you do.) If your preferred method of music is to add songs to a youtube playlist, and then download them, this is the exact program you are looking for. Not only will future releases have support for automatic, local network syncing between devices, there will also eventually be automatic library updating, by scanning the master youtube playlist, and automatically applying changes (New songs, removed songs, etc.) without any user intervention.
 
+### Table of Contents:
+
+[GUI Version Readme](#gui-version-readme)
+
+[CLI Version Readme](#cli-version-readme)
+
 # GUI Version Readme
 
 The GUI version is currently "complete" at v1.0, (and "improved" at v2.3) but further feature updates are still coming, and I'm not going to complete this until they are finished.
