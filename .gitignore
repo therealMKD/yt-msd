@@ -37,3 +37,4 @@ ffmpeg.zip
 mp3renamer5000legacy.py
 GUI Source Code/mp3renamer5000.py
 GUI Source Code/mp3renamer5000_restored.py
+*.json

@@ -1,16 +1,16 @@
 {
     "settings": {
         "auto_sync_interval_mins": 30,
-        "firewall_prompted": false
+        "firewall_prompted": true
     },
     "hosted_chains": [
         {
             "id": "hc_6767",
             "sync_code": "6767",
-            "name": "Other",
+            "name": "Other Playlist",
             "folder_path": "C:/Users/mason/Music",
             "notify_delay_mins": 5,
-            "created_at": 1788201581.8352203,
+            "created_at": 1788799427.9853418,
             "last_synced": 0,
             "status": "Active"
         }

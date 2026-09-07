@@ -1282,16 +1282,56 @@ SYNC_SOCKET_TIMEOUT = 12.0
 SYNC_CHUNK_SIZE = 64 * 1024
 
 
+_CACHED_LOCAL_IP = None
+_CACHED_LOCAL_IP_TIME = 0
+
+
 def get_local_ip() -> str:
-    """Returns the primary local IPv4 address on the LAN interface."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    """Returns the primary local IPv4 address on the LAN interface with fast memory caching."""
+    global _CACHED_LOCAL_IP, _CACHED_LOCAL_IP_TIME
+    now = time.time()
+    if _CACHED_LOCAL_IP and (now - _CACHED_LOCAL_IP_TIME < 60.0):
+        return _CACHED_LOCAL_IP
+
+    # 1. First attempt: UDP routing table query (instant 0ms kernel lookup, no packets sent)
+    ip = None
     try:
-        s.connect(('8.8.8.8', 80))
-        ip = s.getsockname()[0]
-    except Exception:
-        ip = '127.0.0.1'
-    finally:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('10.255.255.255', 1))
+        cand = s.getsockname()[0]
         s.close()
+        if cand and not cand.startswith('127.'):
+            ip = cand
+    except Exception:
+        pass
+
+    # 2. Fallback: Hostname adapter resolution with LAN subnet priority (prefer 192.168.x.x / 10.x.x.x)
+    if not ip or ip.startswith('127.'):
+        try:
+            hostname = socket.gethostname()
+            candidates = socket.gethostbyname_ex(hostname)[2]
+            for c in candidates:
+                if c.startswith('192.168.'):
+                    ip = c
+                    break
+            if not ip:
+                for c in candidates:
+                    if c.startswith('10.'):
+                        ip = c
+                        break
+            if not ip:
+                for c in candidates:
+                    if not c.startswith('127.') and not c.startswith('172.17.') and not c.startswith('172.18.') and not c.startswith('172.21.'):
+                        ip = c
+                        break
+        except Exception:
+            pass
+
+    if not ip:
+        ip = '127.0.0.1'
+
+    _CACHED_LOCAL_IP = ip
+    _CACHED_LOCAL_IP_TIME = now
     return ip
 
 
@@ -1404,7 +1444,7 @@ def recv_file_from_socket(sock: socket.socket, target_path: Path, expected_size:
 
 
 class UDPBeaconBroadcaster:
-    """Broadcaster & Listener for LAN host discovery and dynamic IP updates."""
+    """Broadcaster & Listener for LAN host discovery and dynamic IP updates (runs in dedicated daemon thread)."""
     def __init__(self, get_hosted_chains_cb: Callable[[], List[dict]], get_tcp_port_cb: Callable[[], int]):
         self.get_hosted_chains_cb = get_hosted_chains_cb
         self.get_tcp_port_cb = get_tcp_port_cb
@@ -1425,54 +1465,71 @@ class UDPBeaconBroadcaster:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        if sys.platform == 'win32':
+            try:
+                sock.ioctl(0x9800000C, False)
+            except Exception:
+                pass
+
+        is_bound = False
         try:
             sock.bind(('', UDP_BEACON_PORT))
+            is_bound = True
         except Exception:
-            pass
-        sock.settimeout(2.0)
+            is_bound = False
+        sock.settimeout(1.0)
 
         last_beacon_time = 0
         while self._running:
             now = time.time()
             if now - last_beacon_time >= 4.0:
                 last_beacon_time = now
-                chains = self.get_hosted_chains_cb()
-                tcp_port = self.get_tcp_port_cb()
-                if chains and tcp_port > 0:
-                    codes = [c.get('sync_code') for c in chains if c.get('sync_code')]
-                    beacon_data = {
-                        'type': 'BEACON',
-                        'sync_codes': codes,
-                        'tcp_port': tcp_port,
-                        'host_ip': get_local_ip()
-                    }
-                    try:
-                        raw = json.dumps(beacon_data).encode('utf-8')
-                        sock.sendto(raw, ('<broadcast>', UDP_BEACON_PORT))
-                    except Exception:
-                        pass
-
-            try:
-                msg, addr = sock.recvfrom(2048)
-                data = json.loads(msg.decode('utf-8'))
-                if data.get('type') == 'PROBE':
-                    target_code = str(data.get('sync_code', ''))
+                try:
                     chains = self.get_hosted_chains_cb()
                     tcp_port = self.get_tcp_port_cb()
-                    for c in chains:
-                        if str(c.get('sync_code')) == target_code and tcp_port > 0:
-                            reply = {
-                                'type': 'PROBE_REPLY',
-                                'sync_code': target_code,
-                                'chain_name': c.get('name', 'Audio Playlist'),
-                                'tcp_port': tcp_port,
-                                'host_ip': get_local_ip()
-                            }
-                            sock.sendto(json.dumps(reply).encode('utf-8'), addr)
-                            break
-            except (socket.timeout, json.JSONDecodeError, OSError):
-                pass
-        sock.close()
+                    if chains and tcp_port > 0:
+                        codes = [c.get('sync_code') for c in chains if c.get('sync_code')]
+                        beacon_data = {
+                            'type': 'BEACON',
+                            'sync_codes': codes,
+                            'tcp_port': tcp_port,
+                            'host_ip': get_local_ip()
+                        }
+                        raw = json.dumps(beacon_data).encode('utf-8')
+                        sock.sendto(raw, ('<broadcast>', UDP_BEACON_PORT))
+                except Exception:
+                    pass
+
+            if is_bound:
+                try:
+                    msg, addr = sock.recvfrom(2048)
+                    data = json.loads(msg.decode('utf-8'))
+                    if data.get('type') == 'PROBE':
+                        target_code = str(data.get('sync_code', ''))
+                        chains = self.get_hosted_chains_cb()
+                        tcp_port = self.get_tcp_port_cb()
+                        for c in chains:
+                            if str(c.get('sync_code')) == target_code and tcp_port > 0:
+                                reply = {
+                                    'type': 'PROBE_REPLY',
+                                    'sync_code': target_code,
+                                    'chain_name': c.get('name', 'Audio Playlist'),
+                                    'tcp_port': tcp_port,
+                                    'host_ip': get_local_ip()
+                                }
+                                sock.sendto(json.dumps(reply).encode('utf-8'), addr)
+                                break
+                except socket.timeout:
+                    pass
+                except Exception:
+                    time.sleep(0.5)
+            else:
+                time.sleep(1.0)
+
+        try:
+            sock.close()
+        except Exception:
+            pass
 
 
 def discover_host_on_lan(sync_code: str, timeout: float = 2.5) -> Optional[Tuple[str, int, str]]:
@@ -1480,7 +1537,12 @@ def discover_host_on_lan(sync_code: str, timeout: float = 2.5) -> Optional[Tuple
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    sock.settimeout(0.5)
+    if sys.platform == 'win32':
+        try:
+            sock.ioctl(0x9800000C, False)
+        except Exception:
+            pass
+    sock.settimeout(0.4)
 
     probe = json.dumps({'type': 'PROBE', 'sync_code': str(sync_code)}).encode('utf-8')
     start_time = time.time()
@@ -1506,7 +1568,10 @@ def discover_host_on_lan(sync_code: str, timeout: float = 2.5) -> Optional[Tuple
             except Exception:
                 pass
     finally:
-        sock.close()
+        try:
+            sock.close()
+        except Exception:
+            pass
     return result
 
 
@@ -1514,6 +1579,11 @@ def send_lan_update_notification(sync_code: str, host_port: int):
     """Sends a UDP broadcast notification to LAN that a hosted chain's files have been modified."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    if sys.platform == 'win32':
+        try:
+            sock.ioctl(0x9800000C, False)
+        except Exception:
+            pass
     try:
         payload = json.dumps({
             'type': 'CHAIN_UPDATED',
@@ -1525,7 +1595,10 @@ def send_lan_update_notification(sync_code: str, host_port: int):
     except Exception:
         pass
     finally:
-        sock.close()
+        try:
+            sock.close()
+        except Exception:
+            pass
 
 
 class HostFolderWatcher:
@@ -1572,24 +1645,26 @@ class HostFolderWatcher:
             }
 
     def remove_chain(self, chain_id: str):
+        obs = None
+        timer = None
         with self.lock:
             info = self.watched_chains.pop(chain_id, None)
             if info:
                 timer = info.get('timer')
-                if timer and timer.is_alive():
-                    timer.cancel()
                 obs = info.get('observer')
-                if obs:
-                    try:
-                        obs.stop()
-                        obs.join(timeout=1.0)
-                    except Exception:
-                        pass
+        if timer and timer.is_alive():
+            timer.cancel()
+        if obs:
+            try:
+                obs.stop()
+            except Exception:
+                pass
 
     def stop_all(self):
         with self.lock:
-            for cid in list(self.watched_chains.keys()):
-                self.remove_chain(cid)
+            chain_ids = list(self.watched_chains.keys())
+        for cid in chain_ids:
+            self.remove_chain(cid)
 
     def _trigger_debounce(self, chain_id: str):
         with self.lock:
@@ -2427,14 +2502,16 @@ class SyncManagerDialog(QDialog):
 
         copy_code_btn = QPushButton("Copy Code")
         copy_code_btn.setFixedWidth(80)
-        copy_code_btn.clicked.connect(lambda: QApplication.clipboard().setText(str(hc.get('sync_code'))))
+        code_val = str(hc.get('sync_code', ''))
+        copy_code_btn.clicked.connect(lambda chk=False, c=code_val: QApplication.clipboard().setText(c))
         header.addWidget(copy_code_btn)
 
         del_btn = QPushButton("✕")
         del_btn.setFixedSize(26, 26)
         del_btn.setToolTip("Delete this hosted sync chain")
         del_btn.setStyleSheet("background: #E31E24; color: white; border: none; border-radius: 3px; font-weight: bold;")
-        del_btn.clicked.connect(lambda: self._delete_chain(hc.get('id')))
+        cid_val = hc.get('id')
+        del_btn.clicked.connect(lambda chk=False, cid=cid_val: self._delete_chain(cid))
         header.addWidget(del_btn)
 
         l.addLayout(header)
@@ -2450,7 +2527,7 @@ class SyncManagerDialog(QDialog):
 
         open_btn = QPushButton("Open Folder")
         open_btn.setFixedWidth(90)
-        open_btn.clicked.connect(lambda: os.startfile(folder_str) if Path(folder_str).exists() else None)
+        open_btn.clicked.connect(lambda chk=False, f=folder_str: os.startfile(f) if Path(f).exists() else None)
         info_h.addWidget(open_btn)
 
         l.addLayout(info_h)
@@ -2480,14 +2557,15 @@ class SyncManagerDialog(QDialog):
         header.addStretch()
 
         sync_btn = QPushButton("🔄 Sync Now")
-        sync_btn.clicked.connect(lambda: self._sync_single_client_chain(cc))
+        sync_btn.clicked.connect(lambda chk=False, c=cc: self._sync_single_client_chain(c))
         header.addWidget(sync_btn)
 
         del_btn = QPushButton("✕")
         del_btn.setFixedSize(26, 26)
         del_btn.setToolTip("Remove this client sync chain")
         del_btn.setStyleSheet("background: #E31E24; color: white; border: none; border-radius: 3px; font-weight: bold;")
-        del_btn.clicked.connect(lambda: self._delete_chain(cc.get('id')))
+        cid_val = cc.get('id')
+        del_btn.clicked.connect(lambda chk=False, cid=cid_val: self._delete_chain(cid))
         header.addWidget(del_btn)
 
         l.addLayout(header)
@@ -2509,7 +2587,7 @@ class SyncManagerDialog(QDialog):
 
         open_btn = QPushButton("Open Folder")
         open_btn.setFixedWidth(90)
-        open_btn.clicked.connect(lambda: os.startfile(folder_str) if Path(folder_str).exists() else None)
+        open_btn.clicked.connect(lambda chk=False, f=folder_str: os.startfile(f) if Path(f).exists() else None)
         info_h.addWidget(open_btn)
 
         l.addLayout(info_h)
@@ -2518,7 +2596,8 @@ class SyncManagerDialog(QDialog):
     def _delete_chain(self, chain_id: str):
         if QMessageBox.question(self, "Confirm Removal", "Are you sure you want to remove this sync chain? (Audio files on disk will remain untouched)") == QMessageBox.Yes:
             self.config_manager.remove_chain(chain_id)
-            self.parent_app.refresh_sync_watchers()
+            if hasattr(self.parent_app, 'refresh_sync_watchers'):
+                self.parent_app.refresh_sync_watchers()
             self.refresh_cards()
 
     def _sync_single_client_chain(self, cc: dict):
@@ -2912,7 +2991,7 @@ class SettingsDialog(QDialog):
         self.parent.save_config()
 
     def _open_sync_manager(self):
-        dlg = sync_gui.SyncManagerDialog(self.parent)
+        dlg = SyncManagerDialog(self.parent)
         dlg.exec()
 
     def _reset_defaults(self):
@@ -3081,26 +3160,32 @@ class MainApp(QMainWindow):
                     QTimer.singleShot(100, lambda: self._on_local_click(audio_files[idx], paused_at_start=True))
 
         # --- Local Network Sync Chains Subsystem ---
-        self.sync_config_manager = sync_engine.SyncConfigManager(self.config_dir)
-        self.sync_host_server = sync_engine.SyncHostServer(lambda: self.sync_config_manager.hosted_chains)
-        self.udp_beacon = sync_engine.UDPBeaconBroadcaster(
+        self.sync_config_manager = SyncConfigManager(self.config_dir)
+        self.sync_host_server = SyncHostServer(lambda: self.sync_config_manager.hosted_chains)
+        self.udp_beacon = UDPBeaconBroadcaster(
             lambda: self.sync_config_manager.hosted_chains,
             lambda: self.sync_host_server.active_port
         )
-        self.host_watcher = sync_engine.HostFolderWatcher(self._on_hosted_folder_changed)
-
-        # Start host server, UDP beacon, and folder watchers
-        self.sync_host_server.start()
-        self.udp_beacon.start()
-        self.refresh_sync_watchers()
+        self.host_watcher = HostFolderWatcher(self._on_hosted_folder_changed)
 
         # Client Auto-Sync Periodic Timer
         self.sync_timer = QTimer(self)
         self.sync_timer.timeout.connect(self._auto_sync_client_chains)
-        self._update_sync_timer()
 
-        # Initial client chain sync check shortly after startup
-        QTimer.singleShot(2500, self._auto_sync_client_chains)
+        # Start host server, UDP beacon, folder watchers, and client check on a background thread
+        def _deferred_sync_startup():
+            def _bg_init():
+                try:
+                    self.sync_host_server.start()
+                    self.udp_beacon.start()
+                    self.refresh_sync_watchers()
+                except Exception:
+                    pass
+            threading.Thread(target=_bg_init, daemon=True).start()
+            self._update_sync_timer()
+            QTimer.singleShot(2500, self._auto_sync_client_chains)
+
+        QTimer.singleShot(150, _deferred_sync_startup)
 
         QApplication.instance().installEventFilter(self)
 
@@ -3120,21 +3205,26 @@ class MainApp(QMainWindow):
             self.refresh_local_list()
 
     def refresh_sync_watchers(self):
-        """Registers all hosted sync chains with the watchdog monitor."""
-        if hasattr(self, 'host_watcher'):
-            self.host_watcher.stop_all()
-            for hc in self.sync_config_manager.hosted_chains:
-                cid = hc.get('id')
-                folder = hc.get('folder_path')
-                code = hc.get('sync_code')
-                delay = hc.get('notify_delay_mins', 5)
-                if cid and folder and code:
-                    self.host_watcher.add_or_update_chain(cid, folder, code, delay)
+        """Registers all hosted sync chains with the watchdog monitor in a background thread."""
+        if hasattr(self, 'host_watcher') and hasattr(self, 'sync_config_manager'):
+            def _bg():
+                try:
+                    self.host_watcher.stop_all()
+                    for hc in list(self.sync_config_manager.hosted_chains):
+                        cid = hc.get('id')
+                        folder = hc.get('folder_path')
+                        code = hc.get('sync_code')
+                        delay = hc.get('notify_delay_mins', 5)
+                        if cid and folder and code:
+                            self.host_watcher.add_or_update_chain(cid, folder, code, delay)
+                except Exception:
+                    pass
+            threading.Thread(target=_bg, daemon=True).start()
 
     def _on_hosted_folder_changed(self, sync_code: str):
         """Called when a hosted folder has changed after the debounce timer elapses."""
         port = self.sync_host_server.active_port if hasattr(self, 'sync_host_server') else 63350
-        sync_engine.send_lan_update_notification(sync_code, port)
+        send_lan_update_notification(sync_code, port)
         self._on_status_update(f"Sync Chain (Code {sync_code}) updated. Notified clients on LAN.", False, "#1abd33")
 
     def _update_sync_timer(self):
@@ -3152,7 +3242,7 @@ class MainApp(QMainWindow):
 
         def _bg():
             for cc in list(self.sync_config_manager.client_chains):
-                ok, msg, transferred, deleted = sync_engine.SyncClientWorker.sync_chain(cc)
+                ok, msg, transferred, deleted = SyncClientWorker.sync_chain(cc)
                 if ok:
                     cc['last_synced'] = time.time()
                     cc['status'] = "Up to date"
