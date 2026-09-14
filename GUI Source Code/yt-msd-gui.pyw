@@ -41,7 +41,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QComboBox, QCheckBox, QSlider, QScrollArea, 
                                QSplitter, QSplitterHandle, QFileDialog, QMessageBox, QDialog,
                                QSystemTrayIcon, QMenu, QFrame, QGridLayout,
-                               QSizePolicy, QStyle, QToolTip, QStyleOption, QSpinBox, QProgressBar)
+                               QSizePolicy, QStyle, QToolTip, QStyleOption, QSpinBox, QProgressBar, QInputDialog)
 from PySide6.QtCore import Qt, Signal, QTimer, Slot, QPoint, QRect, QMargins, QThread
 from PySide6.QtGui import QIcon, QPixmap, QImage, QAction, QColor, QPalette, QPainter, QBrush, QFont, QDrag
 from PySide6.QtCore import QMimeData
@@ -1296,6 +1296,97 @@ SYNC_SOCKET_TIMEOUT = 12.0
 SYNC_CHUNK_SIZE = 64 * 1024
 
 
+def get_current_wifi_ssid() -> Optional[str]:
+    """Returns the current connected Wi-Fi SSID on Windows, or None if not connected to Wi-Fi."""
+    if sys.platform != 'win32':
+        return None
+    try:
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        res = subprocess.run(
+            ["netsh", "wlan", "show", "interfaces"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding='utf-8',
+            errors='ignore',
+            startupinfo=startupinfo
+        )
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                line = line.strip()
+                if line.startswith("SSID") and not line.startswith("SSID name") and not line.startswith("BSSID"):
+                    parts = line.split(":", 1)
+                    if len(parts) == 2:
+                        ssid = parts[1].strip()
+                        if ssid:
+                            return ssid
+    except Exception:
+        pass
+    return None
+
+
+def is_run_on_startup_enabled() -> bool:
+    """Checks whether yt-msd is configured in the Windows HKCU Run startup registry key."""
+    if sys.platform != 'win32':
+        return False
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
+        try:
+            val, _ = winreg.QueryValueEx(key, "yt-msd")
+            winreg.CloseKey(key)
+            return bool(val)
+        except FileNotFoundError:
+            winreg.CloseKey(key)
+            return False
+    except Exception:
+        return False
+
+
+def set_run_on_startup(enable: bool) -> bool:
+    """Enables or disables running yt-msd on Windows startup via HKCU Run registry key."""
+    if sys.platform != 'win32':
+        return False
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_ALL_ACCESS)
+        app_name = "yt-msd"
+        if enable:
+            if getattr(sys, 'frozen', False):
+                cmd = f'"{sys.executable}"'
+            else:
+                script_path = os.path.abspath(__file__)
+                pythonw = sys.executable
+                idx = pythonw.lower().rfind("python.exe")
+                if idx != -1:
+                    pythonw = pythonw[:idx] + "pythonw.exe"
+                cmd = f'"{pythonw}" "{script_path}"'
+            winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, cmd)
+        else:
+            try:
+                winreg.DeleteValue(key, app_name)
+            except FileNotFoundError:
+                pass
+        winreg.CloseKey(key)
+        return True
+    except Exception:
+        return False
+
+
+def is_client_chain_paused(cc: dict) -> bool:
+    """Returns True if the client sync chain is currently paused."""
+    paused_until = cc.get('paused_until', 0)
+    if paused_until == -1:
+        return True
+    if paused_until > 0:
+        if paused_until > time.time():
+            return True
+        else:
+            cc['paused_until'] = 0
+    return False
+
+
 _CACHED_LOCAL_IP = None
 _CACHED_LOCAL_IP_TIME = 0
 
@@ -1480,9 +1571,11 @@ def recv_file_from_socket(sock: socket.socket, target_path: Path, expected_size:
 
 class UDPBeaconBroadcaster:
     """Broadcaster & Listener for LAN host discovery and dynamic IP updates (runs in dedicated daemon thread)."""
-    def __init__(self, get_hosted_chains_cb: Callable[[], List[dict]], get_tcp_port_cb: Callable[[], int]):
+    def __init__(self, get_hosted_chains_cb: Callable[[], List[dict]], get_tcp_port_cb: Callable[[], int],
+                 on_chain_updated_cb: Optional[Callable[[str], None]] = None):
         self.get_hosted_chains_cb = get_hosted_chains_cb
         self.get_tcp_port_cb = get_tcp_port_cb
+        self.on_chain_updated_cb = on_chain_updated_cb
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
@@ -1563,6 +1656,10 @@ class UDPBeaconBroadcaster:
                                         sock.sendto(json.dumps(reply).encode('utf-8'), addr)
                                     except Exception:
                                         pass
+                    elif msg_type == 'CHAIN_UPDATED':
+                        target_code = str(data.get('sync_code', '')).strip()
+                        if target_code and self.on_chain_updated_cb:
+                            self.on_chain_updated_cb(target_code)
                 except socket.timeout:
                     pass
                 except Exception:
@@ -2105,7 +2202,7 @@ class SyncConfigManager:
         return chain
 
     def add_client_chain(self, name: str, folder_path: str, sync_code: str, host_ip: str,
-                         host_port: int = 63350, deletion_mode: str = 'mirror') -> dict:
+                         host_port: int = 63350, deletion_mode: str = 'mirror', bound_wifi_ssid: str = '') -> dict:
         chain = {
             'id': f'cc_{sync_code}',
             'sync_code': sync_code,
@@ -2114,6 +2211,8 @@ class SyncConfigManager:
             'last_known_host_ip': host_ip,
             'host_port': host_port,
             'deletion_mode': deletion_mode,
+            'paused_until': 0,
+            'bound_wifi_ssid': bound_wifi_ssid,
             'created_at': time.time(),
             'last_synced': 0,
             'status': 'Pending Sync'
@@ -2121,6 +2220,31 @@ class SyncConfigManager:
         self.client_chains.append(chain)
         self.save()
         return chain
+
+    def pause_client_chain(self, chain_id: str, duration_sec: int):
+        """Pauses a client chain for duration_sec seconds (-1 for forever)."""
+        paused_until = -1 if duration_sec == -1 else int(time.time() + duration_sec)
+        for c in self.client_chains:
+            if c.get('id') == chain_id:
+                c['paused_until'] = paused_until
+                break
+        self.save()
+
+    def resume_client_chain(self, chain_id: str):
+        """Resumes a paused client chain."""
+        for c in self.client_chains:
+            if c.get('id') == chain_id:
+                c['paused_until'] = 0
+                break
+        self.save()
+
+    def bind_client_wifi(self, chain_id: str, ssid: str):
+        """Sets or clears the bound Wi-Fi network SSID for auto-sync."""
+        for c in self.client_chains:
+            if c.get('id') == chain_id:
+                c['bound_wifi_ssid'] = ssid.strip()
+                break
+        self.save()
 
     def remove_chain(self, chain_id: str):
         self.hosted_chains = [c for c in self.hosted_chains if c.get('id') != chain_id]
@@ -2269,7 +2393,7 @@ class ConnectClientChainDialog(QDialog):
         self.parent_window = parent_window
         self.config_manager = config_manager
         self.setWindowTitle("Connect to Sync Chain (Client)")
-        self.setFixedSize(540, 420)
+        self.setFixedSize(520, 390)
         self.setWindowFlags(self.windowFlags() | Qt.Tool)
 
         layout = QVBoxLayout(self)
@@ -2280,21 +2404,15 @@ class ConnectClientChainDialog(QDialog):
         title_lbl.setFont(QFont("Segoe UI Semibold", 11))
         layout.addWidget(title_lbl)
 
-        desc = QLabel("Enter the Host PC's IP and 4-digit Sync Code, or use auto-discovery on your local network.")
+        desc = QLabel("Enter the Host PC's IP address and 4-digit Sync Code to subscribe to their sync chain.")
         desc.setWordWrap(True)
         desc.setStyleSheet("color: #888; font-size: 11px;")
         layout.addWidget(desc)
 
         layout.addWidget(QLabel("Host Computer IP Address:"))
-        ip_h = QHBoxLayout()
         self.ip_edit = QLineEdit()
         self.ip_edit.setPlaceholderText("e.g. 192.168.1.50")
-        ip_h.addWidget(self.ip_edit, 1)
-
-        self.discover_btn = QPushButton("🔍 Discover on LAN")
-        self.discover_btn.clicked.connect(self._discover_on_lan)
-        ip_h.addWidget(self.discover_btn)
-        layout.addLayout(ip_h)
+        layout.addWidget(self.ip_edit)
 
         layout.addWidget(QLabel("4-Digit Sync Code:"))
         self.code_edit = QLineEdit()
@@ -2302,7 +2420,7 @@ class ConnectClientChainDialog(QDialog):
         self.code_edit.setFixedWidth(100)
         layout.addWidget(self.code_edit)
 
-        layout.addWidget(QLabel("Local Folder where files should be synced:"))
+        layout.addWidget(QLabel("Local Base Folder where files should be synced:"))
         folder_h = QHBoxLayout()
         self.folder_edit = QLineEdit()
         self.folder_edit.setPlaceholderText("Base folder (e.g. C:\\Music)...")
@@ -2327,9 +2445,7 @@ class ConnectClientChainDialog(QDialog):
         layout.addStretch()
 
         btn_h = QHBoxLayout()
-        self.status_lbl = QLabel("")
-        self.status_lbl.setStyleSheet("color: #3B8ED0; font-size: 11px;")
-        btn_h.addWidget(self.status_lbl, 1)
+        btn_h.addStretch()
 
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
@@ -2344,34 +2460,6 @@ class ConnectClientChainDialog(QDialog):
         f = QFileDialog.getExistingDirectory(self, "Select Base Music Directory", self.folder_edit.text() or "")
         if f:
             self.folder_edit.setText(f)
-
-    def _discover_on_lan(self):
-        code = self.code_edit.text().strip()
-        self.status_lbl.setText("Searching local network for host(s)...")
-        self.status_lbl.setStyleSheet("color: #3B8ED0; font-size: 11px;")
-        self.discover_btn.setEnabled(False)
-
-        def _bg():
-            found_list = discover_hosts_on_lan(sync_code=code if code else None, timeout=3.0)
-            def _ui():
-                self.discover_btn.setEnabled(True)
-                if found_list:
-                    host_ip, host_port, sync_code, chain_name = found_list[0]
-                    self.ip_edit.setText(host_ip)
-                    self.code_edit.setText(sync_code)
-                    if not self.playlist_name_edit.text().strip():
-                        self.playlist_name_edit.setText(chain_name)
-                    if len(found_list) == 1:
-                        self.status_lbl.setText(f"✔ Found Host '{chain_name}' ({host_ip} - Code: {sync_code})")
-                    else:
-                        self.status_lbl.setText(f"✔ Found {len(found_list)} host(s) on LAN. Loaded '{chain_name}'")
-                    self.status_lbl.setStyleSheet("color: #1abd33; font-size: 11px;")
-                else:
-                    self.status_lbl.setText("✘ No host found on LAN.")
-                    self.status_lbl.setStyleSheet("color: #E31E24; font-size: 11px;")
-            QTimer.singleShot(0, _ui)
-
-        threading.Thread(target=_bg, daemon=True).start()
 
     def _connect_chain(self):
         ip = self.ip_edit.text().strip()
@@ -2683,7 +2771,8 @@ class SyncManagerDialog(QDialog):
 
     def _build_client_card(self, cc: dict) -> QWidget:
         card = QFrame()
-        card.setProperty("chain_id", cc.get('id'))
+        cid_val = cc.get('id')
+        card.setProperty("chain_id", cid_val)
         card.setStyleSheet("background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 6px; padding: 8px;")
         l = QVBoxLayout(card)
         l.setContentsMargins(10, 8, 10, 8)
@@ -2705,6 +2794,51 @@ class SyncManagerDialog(QDialog):
 
         header.addStretch()
 
+        # Pause / Resume Sync Controls
+        is_paused, pause_until = is_client_chain_paused(cc)
+        if is_paused:
+            resume_btn = QPushButton("▶️ Resume Sync")
+            resume_btn.setStyleSheet("background: #3B8ED0; color: white; font-size: 11px; padding: 3px 8px; border-radius: 4px;")
+            resume_btn.clicked.connect(lambda chk=False, cid=cid_val: self._resume_chain_sync(cid))
+            header.addWidget(resume_btn)
+        else:
+            pause_btn = QPushButton("⏸️ Pause Sync ▾")
+            pause_btn.setStyleSheet("font-size: 11px; padding: 3px 8px;")
+            pause_menu = QMenu(self)
+            durations = [
+                ("30 Minutes", 30 * 60),
+                ("1 Hour", 1 * 3600),
+                ("2 Hours", 2 * 3600),
+                ("5 Hours", 5 * 3600),
+                ("12 Hours", 12 * 3600),
+                ("24 Hours", 24 * 3600),
+                ("1 Week", 7 * 86400),
+                ("Forever (Until Re-enabled)", 0)
+            ]
+            for label, secs in durations:
+                act = pause_menu.addAction(label)
+                act.triggered.connect(lambda chk=False, cid=cid_val, s=secs: self._pause_chain_sync(cid, s))
+            pause_btn.setMenu(pause_menu)
+            header.addWidget(pause_btn)
+
+        # Wi-Fi SSID Auto-Sync Binding Control
+        wifi_ssid = cc.get('wifi_ssid', '')
+        wifi_btn = QPushButton(f"📶 Wi-Fi: {wifi_ssid}" if wifi_ssid else "📶 Bind Wi-Fi ▾")
+        wifi_btn.setStyleSheet("font-size: 11px; padding: 3px 8px;" + (" background: rgba(59, 142, 208, 0.25);" if wifi_ssid else ""))
+        wifi_menu = QMenu(self)
+        curr_ssid = get_current_wifi_ssid()
+        if curr_ssid:
+            act_cur = wifi_menu.addAction(f"Bind to current network: '{curr_ssid}'")
+            act_cur.triggered.connect(lambda chk=False, cid=cid_val, s=curr_ssid: self._bind_chain_wifi(cid, s))
+        act_custom = wifi_menu.addAction("Enter Wi-Fi SSID manually...")
+        act_custom.triggered.connect(lambda chk=False, cid=cid_val: self._prompt_custom_wifi(cid))
+        if wifi_ssid:
+            wifi_menu.addSeparator()
+            act_clear = wifi_menu.addAction("Unbind Wi-Fi (Sync on any network)")
+            act_clear.triggered.connect(lambda chk=False, cid=cid_val: self._bind_chain_wifi(cid, ""))
+        wifi_btn.setMenu(wifi_menu)
+        header.addWidget(wifi_btn)
+
         sync_btn = QPushButton("🔄 Sync Now")
         sync_btn.clicked.connect(lambda chk=False, c=cc: self._sync_single_client_chain(c))
         header.addWidget(sync_btn)
@@ -2713,7 +2847,6 @@ class SyncManagerDialog(QDialog):
         del_btn.setFixedSize(26, 26)
         del_btn.setToolTip("Remove this client sync chain")
         del_btn.setStyleSheet("background: #E31E24; color: white; border: none; border-radius: 3px; font-weight: bold;")
-        cid_val = cc.get('id')
         del_btn.clicked.connect(lambda chk=False, cid=cid_val: self._delete_chain(cid))
         header.addWidget(del_btn)
 
@@ -2724,7 +2857,17 @@ class SyncManagerDialog(QDialog):
         last_sync_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_sync)) if last_sync > 0 else "Never"
         del_mode = cc.get('deletion_mode', 'mirror').capitalize()
 
-        status_lbl = QLabel(f"Status: {cc.get('status', 'Idle')}  |  Last Synced: {last_sync_str}  |  Mode: {del_mode}")
+        pause_info = ""
+        if is_paused:
+            if pause_until > 0:
+                p_time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(pause_until))
+                pause_info = f"  |  <span style='color: #FF8C00; font-weight: bold;'>⏸️ Paused until {p_time_str}</span>"
+            else:
+                pause_info = "  |  <span style='color: #FF8C00; font-weight: bold;'>⏸️ Paused Forever</span>"
+
+        wifi_info = f"  |  <span style='color: #3B8ED0;'>📶 Wi-Fi: {wifi_ssid}</span>" if wifi_ssid else ""
+
+        status_lbl = QLabel(f"Status: {cc.get('status', 'Idle')}  |  Last Synced: {last_sync_str}  |  Mode: {del_mode}{pause_info}{wifi_info}")
         status_lbl.setStyleSheet("color: #888; font-size: 11px;")
         card.setProperty("status_lbl", status_lbl)
         l.addWidget(status_lbl)
@@ -2746,6 +2889,23 @@ class SyncManagerDialog(QDialog):
 
         l.addLayout(info_h)
         return card
+
+    def _pause_chain_sync(self, chain_id: str, duration_seconds: int):
+        self.config_manager.pause_client_chain(chain_id, duration_seconds)
+        self.refresh_cards()
+
+    def _resume_chain_sync(self, chain_id: str):
+        self.config_manager.resume_client_chain(chain_id)
+        self.refresh_cards()
+
+    def _bind_chain_wifi(self, chain_id: str, ssid: str):
+        self.config_manager.bind_client_wifi(chain_id, ssid)
+        self.refresh_cards()
+
+    def _prompt_custom_wifi(self, chain_id: str):
+        ssid, ok = QInputDialog.getText(self, "Wi-Fi SSID Binding", "Enter Wi-Fi Network SSID:")
+        if ok and ssid.strip():
+            self._bind_chain_wifi(chain_id, ssid.strip())
 
     def _delete_chain(self, chain_id: str):
         if QMessageBox.question(self, "Confirm Removal", "Are you sure you want to remove this sync chain? (Audio files on disk will remain untouched)") == QMessageBox.Yes:
@@ -2892,6 +3052,11 @@ class SettingsDialog(QDialog):
         left_layout.addWidget(QLabel("Manual override ignores GUI bitrate/format settings.", font=QFont("Segoe UI", 8)))
         
         # OPTIONS
+        self.startup_cb = QCheckBox("Run yt-msd on Windows Startup")
+        self.startup_cb.setChecked(is_run_on_startup_enabled())
+        self.startup_cb.toggled.connect(self._toggle_startup)
+        left_layout.addWidget(self.startup_cb)
+
         self.tray_cb = QCheckBox("Minimize to System Tray")
         self.tray_cb.setChecked(parent.minimize_to_tray)
         self.tray_cb.toggled.connect(self._toggle_tray)
@@ -3113,6 +3278,9 @@ class SettingsDialog(QDialog):
         self.parent.custom_args = text
         self.parent.save_config()
         
+    def _toggle_startup(self, state):
+        set_run_on_startup(bool(state))
+
     def _toggle_tray(self, state):
         self.parent.minimize_to_tray = state
         self.parent.save_config()
@@ -3297,11 +3465,13 @@ class MainApp(QMainWindow):
         self.current_playing_title = ""
         self.playback_index = -1
         self.is_shuffled = False
+        self.shuffle_history = []
         self.shuffle_order = []
         self.is_muted = False
         self.active_downloads = {}
         self.active_downloads_lock = threading.Lock()
         self.sync_manager_dialog = None
+        self.last_wifi_ssid = get_current_wifi_ssid()
         
         if getattr(sys, 'frozen', False):
             self.config_dir = os.path.dirname(os.path.abspath(sys.executable))
@@ -3342,6 +3512,11 @@ class MainApp(QMainWindow):
         self.setup_tray()
         self._update_local_rescan_timer()
 
+        # Wi-Fi network change monitor timer (checks every 15s)
+        self.wifi_monitor_timer = QTimer(self)
+        self.wifi_monitor_timer.timeout.connect(self._check_wifi_network_change)
+        self.wifi_monitor_timer.start(15000)
+
         # Initialize VLC in a background thread (plugin scanning can take seconds)
         _startup_pool = ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 4))
         _startup_pool.submit(self._init_vlc_background)
@@ -3367,7 +3542,8 @@ class MainApp(QMainWindow):
         )
         self.udp_beacon = UDPBeaconBroadcaster(
             lambda: self.sync_config_manager.hosted_chains,
-            lambda: self.sync_host_server.active_port
+            lambda: self.sync_host_server.active_port,
+            on_chain_updated_cb=self._on_lan_chain_updated
         )
         self.host_watcher = HostFolderWatcher(self._on_hosted_folder_changed)
 
@@ -3464,8 +3640,20 @@ class MainApp(QMainWindow):
         if not hasattr(self, 'sync_config_manager') or not self.sync_config_manager.client_chains:
             return
 
+        curr_wifi = get_current_wifi_ssid()
+
         def _bg():
             for cc in list(self.sync_config_manager.client_chains):
+                # Respect pause duration
+                paused, _ = is_client_chain_paused(cc)
+                if paused:
+                    continue
+
+                # Respect Wi-Fi binding if set
+                req_wifi = cc.get('wifi_ssid', '').strip()
+                if req_wifi and curr_wifi and req_wifi.lower() != curr_wifi.lower():
+                    continue
+
                 chain_name = cc.get('name', 'Sync')
                 def _status(t):
                     if hasattr(self, 'dl_progress_signal'):
@@ -3495,6 +3683,63 @@ class MainApp(QMainWindow):
             self.sync_config_manager.save()
 
         threading.Thread(target=_bg, daemon=True).start()
+
+    def _on_lan_chain_updated(self, sync_code: str):
+        """Called when a UDP broadcast notifies of a host update on the LAN (pushes clients to sync)."""
+        if not hasattr(self, 'sync_config_manager') or not self.sync_config_manager.client_chains:
+            return
+        matching = [cc for cc in self.sync_config_manager.client_chains if str(cc.get('sync_code')) == str(sync_code)]
+        if not matching:
+            return
+
+        curr_wifi = get_current_wifi_ssid()
+        for cc in matching:
+            paused, _ = is_client_chain_paused(cc)
+            if paused:
+                continue
+            req_wifi = cc.get('wifi_ssid', '').strip()
+            if req_wifi and curr_wifi and req_wifi.lower() != curr_wifi.lower():
+                continue
+
+            chain_name = cc.get('name', 'Sync')
+            self._on_status_update(f"Sync Chain '{chain_name}': Push notification received from host. Syncing...", False, "#3B8ED0")
+
+            def _bg(c=cc):
+                ok, msg, transferred, deleted = SyncClientWorker.sync_chain(
+                    c,
+                    status_cb=lambda t: self.dl_progress_signal.emit(f"[Sync: {c.get('name', 'Sync')}] {t}") if hasattr(self, 'dl_progress_signal') else None,
+                    progress_cb=lambda done, total, fname, idx, total_items: self.dl_progress_signal.emit(
+                        f"[Sync: {c.get('name', 'Sync')}] [{idx}/{total_items}] ({int(done/total*100) if total > 0 else 0}%) {fname}"
+                    ) if hasattr(self, 'dl_progress_signal') else None
+                )
+                if hasattr(self, 'dl_progress_signal'):
+                    self.dl_progress_signal.emit("")
+                if ok:
+                    c['last_synced'] = time.time()
+                    c['status'] = "Up to date"
+                    if transferred > 0 or deleted > 0:
+                        self.status_signal.emit(f"Sync Chain '{c.get('name')}': {transferred} updated, {deleted} removed.", False, "#1abd33")
+                        if self.local_current_path == c.get('folder_path'):
+                            QTimer.singleShot(0, self.refresh_local_list)
+                self.sync_config_manager.save()
+            threading.Thread(target=_bg, daemon=True).start()
+
+    def _check_wifi_network_change(self):
+        """Monitors for Wi-Fi SSID changes and triggers auto-sync for bound sync chains."""
+        curr = get_current_wifi_ssid()
+        if not curr:
+            return
+        last = getattr(self, 'last_wifi_ssid', None)
+        if curr != last:
+            self.last_wifi_ssid = curr
+            if hasattr(self, 'sync_config_manager') and self.sync_config_manager.client_chains:
+                bound = [
+                    cc for cc in self.sync_config_manager.client_chains
+                    if cc.get('wifi_ssid', '').strip().lower() == curr.lower() and not is_client_chain_paused(cc)[0]
+                ]
+                if bound:
+                    self._on_status_update(f"Connected to Wi-Fi '{curr}': Auto-syncing bound sync chain(s)...", False, "#1abd33")
+                    self._auto_sync_client_chains()
 
     def _init_vlc_background(self):
         """Initialize libVLC in a background thread to avoid blocking the UI during plugin scanning."""
@@ -3926,6 +4171,12 @@ class MainApp(QMainWindow):
         self.next_btn.setToolTip("Next track")
         self.next_btn.clicked.connect(self.play_next)
         c.addWidget(self.next_btn)
+
+        self.shuffle_btn = QPushButton("\uE8B1")
+        self.shuffle_btn.setObjectName("playerBtn")
+        self.shuffle_btn.setToolTip("Shuffle Playback (Toggle)")
+        self.shuffle_btn.clicked.connect(self.toggle_shuffle)
+        c.addWidget(self.shuffle_btn)
         c.addStretch(1)
         
         self.time_label = QLabel("0:00 / 0:00")
@@ -4284,6 +4535,15 @@ class MainApp(QMainWindow):
             QPushButton#playerBtn:hover {{
                 background-color: {btn_hover};
             }}
+            QPushButton#playerBtn[active="true"] {{
+                background-color: {accent};
+                color: {accent_fg};
+                font-weight: bold;
+            }}
+            QPushButton#playerBtn[active="true"]:hover {{
+                background-color: {hover_bg};
+                color: {hover_fg};
+            }}
             QPushButton#playerPlayBtn {{
                 background-color: transparent;
                 color: {fg};
@@ -4315,6 +4575,7 @@ class MainApp(QMainWindow):
             btn_hover=btn_hover, checkmark_path=checkmark_path, downarrow_path=downarrow_path,
             main_btn_border=main_btn_border, secondary_fg=secondary_fg
         ))
+        self.update_shuffle_btn_style()
 
     # --- Local Folder Logic ---
     def load_local_folder(self, path):
@@ -4459,13 +4720,13 @@ class MainApp(QMainWindow):
                 self._meta_worker.meta_done.emit(btn, d_lbl, item)
         threading.Thread(target=bg_task, daemon=True).start()
 
-    def _on_local_click(self, item, paused_at_start=False):
+    def _on_local_click(self, item, paused_at_start=False, from_nav=False):
         if item['is_dir']: 
             self.load_local_folder(item['path'])
         else:
             # If VLC is still initializing in background, retry after a short delay
             if self.vlc_instance is None or self.vlc_player is None:
-                QTimer.singleShot(200, lambda: self._on_local_click(item, paused_at_start))
+                QTimer.singleShot(200, lambda: self._on_local_click(item, paused_at_start, from_nav))
                 return
 
             display_name = item.get('meta_name', item['name']) if getattr(self, 'show_local_metadata', False) else item['name']
@@ -4479,6 +4740,10 @@ class MainApp(QMainWindow):
                 if af.get('path') == item.get('path'):
                     self.local_playback_index = i
                     break
+
+            if not from_nav:
+                # User manually selected a track: reset shuffle history with this track
+                self.shuffle_history = [getattr(self, 'local_playback_index', 0)]
                     
             media = self.vlc_instance.media_new(url)
             self.vlc_player.set_media(media)
@@ -5265,10 +5530,10 @@ class MainApp(QMainWindow):
             self.dl_progress_signal.emit("")
             self._on_batch_complete()
 
-    def play_result(self, video, paused_at_start=False):
+    def play_result(self, video, paused_at_start=False, from_nav=False):
         # If VLC is still initializing in background, defer and retry
         if self.vlc_instance is None or self.vlc_player is None:
-            QTimer.singleShot(200, lambda: self.play_result(video, paused_at_start))
+            QTimer.singleShot(200, lambda: self.play_result(video, paused_at_start, from_nav))
             return
 
         self._on_status_update(f"Fetching stream: {video.get('title', 'Unknown')}...", False, "#3B8ED0")
@@ -5285,6 +5550,10 @@ class MainApp(QMainWindow):
         for i, res in enumerate(self.search_results):
             if res.get('id') == vid_id:
                 self.playback_index = i; break
+
+        if not from_nav:
+            # User manually clicked a track: reset shuffle history with this track
+            self.shuffle_history = [self.playback_index] if self.playback_index >= 0 else []
                 
         def bg_fetch():
             try:
@@ -5379,30 +5648,103 @@ class MainApp(QMainWindow):
             self.vlc_player.play()
             self.play_btn.setText("\uE769")
             self.is_playing = True
-            
+
+    def toggle_shuffle(self):
+        self.is_shuffled = not self.is_shuffled
+        self.update_shuffle_btn_style()
+        if self.is_shuffled:
+            if self.current_video_id == "local" and hasattr(self, 'local_playback_index') and self.local_playback_index >= 0:
+                self.shuffle_history = [self.local_playback_index]
+            elif self.playback_index >= 0:
+                self.shuffle_history = [self.playback_index]
+            else:
+                self.shuffle_history = []
+        else:
+            self.shuffle_history = []
+
+    def update_shuffle_btn_style(self):
+        if hasattr(self, 'shuffle_btn'):
+            self.shuffle_btn.setProperty("active", "true" if getattr(self, 'is_shuffled', False) else "false")
+            self.shuffle_btn.style().unpolish(self.shuffle_btn)
+            self.shuffle_btn.style().polish(self.shuffle_btn)
+
     def play_previous(self):
         if self.current_video_id == "local" and hasattr(self, 'local_playback_index'):
             audio_files = [x for x in getattr(self, 'current_local_items', []) if x.get('is_dir') is False]
+            if not audio_files: return
+            if getattr(self, 'is_shuffled', False):
+                hist = getattr(self, 'shuffle_history', [])
+                if len(hist) > 1:
+                    hist.pop()  # remove current
+                    prev_idx = hist[-1]
+                    if 0 <= prev_idx < len(audio_files):
+                        self.local_playback_index = prev_idx
+                        self._on_local_click(audio_files[prev_idx], from_nav=True)
+                        return
             if self.local_playback_index > 0:
                 self.local_playback_index -= 1
-                self._on_local_click(audio_files[self.local_playback_index])
+                self._on_local_click(audio_files[self.local_playback_index], from_nav=True)
             return
             
+        if not self.search_results: return
+        if getattr(self, 'is_shuffled', False):
+            hist = getattr(self, 'shuffle_history', [])
+            if len(hist) > 1:
+                hist.pop()  # remove current
+                prev_idx = hist[-1]
+                if 0 <= prev_idx < len(self.search_results):
+                    self.playback_index = prev_idx
+                    self.play_result(self.search_results[prev_idx], from_nav=True)
+                    return
         if self.playback_index > 0:
             self.playback_index -= 1
-            self.play_result(self.search_results[self.playback_index])
+            self.play_result(self.search_results[self.playback_index], from_nav=True)
             
     def play_next(self):
         if self.current_video_id == "local" and hasattr(self, 'local_playback_index'):
             audio_files = [x for x in getattr(self, 'current_local_items', []) if x.get('is_dir') is False]
+            if not audio_files: return
+            if getattr(self, 'is_shuffled', False):
+                if not hasattr(self, 'shuffle_history'):
+                    self.shuffle_history = []
+                unplayed = [i for i in range(len(audio_files)) if i not in self.shuffle_history]
+                if not unplayed:
+                    self.shuffle_history = [self.local_playback_index] if hasattr(self, 'local_playback_index') else []
+                    unplayed = [i for i in range(len(audio_files)) if i != getattr(self, 'local_playback_index', -1)]
+                if unplayed:
+                    next_idx = random.choice(unplayed)
+                    self.shuffle_history.append(next_idx)
+                    self.local_playback_index = next_idx
+                    self._on_local_click(audio_files[next_idx], from_nav=True)
+                    return
+                elif len(audio_files) == 1:
+                    self._on_local_click(audio_files[0], from_nav=True)
+                    return
             if self.local_playback_index + 1 < len(audio_files):
                 self.local_playback_index += 1
-                self._on_local_click(audio_files[self.local_playback_index])
+                self._on_local_click(audio_files[self.local_playback_index], from_nav=True)
             return
             
+        if not self.search_results: return
+        if getattr(self, 'is_shuffled', False):
+            if not hasattr(self, 'shuffle_history'):
+                self.shuffle_history = []
+            unplayed = [i for i in range(len(self.search_results)) if i not in self.shuffle_history]
+            if not unplayed:
+                self.shuffle_history = [self.playback_index] if self.playback_index >= 0 else []
+                unplayed = [i for i in range(len(self.search_results)) if i != self.playback_index]
+            if unplayed:
+                next_idx = random.choice(unplayed)
+                self.shuffle_history.append(next_idx)
+                self.playback_index = next_idx
+                self.play_result(self.search_results[next_idx], from_nav=True)
+                return
+            elif len(self.search_results) == 1:
+                self.play_result(self.search_results[0], from_nav=True)
+                return
         if self.playback_index + 1 < len(self.search_results):
             self.playback_index += 1
-            self.play_result(self.search_results[self.playback_index])
+            self.play_result(self.search_results[self.playback_index], from_nav=True)
 
     def on_seek(self, val):
         if self.vlc_player:
