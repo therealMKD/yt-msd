@@ -11,7 +11,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Enable ANSI escape sequences on Windows for beautiful terminal output
 if sys.platform == "win32":
     os.system("")
-
 class Colors:
     HEADER = '\033[95m'
     BLUE = '\033[94m'

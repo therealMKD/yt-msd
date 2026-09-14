@@ -981,6 +981,16 @@ def run_silence_trim(folder_path, skip_files=None):
 def run_integrated_renamer_cli():
     if sys.platform == "win32":
         os.system("")
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            hStdin = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+            mode = ctypes.c_uint32()
+            if kernel32.GetConsoleMode(hStdin, ctypes.byref(mode)):
+                new_mode = (mode.value & ~0x0040) | 0x0080  # Disable ENABLE_QUICK_EDIT_MODE, set ENABLE_EXTENDED_FLAGS
+                kernel32.SetConsoleMode(hStdin, new_mode)
+        except Exception:
+            pass
         
     import argparse
     parser = argparse.ArgumentParser(description="Integrated MP3 Renamer 5000", add_help=False)
@@ -1339,6 +1349,27 @@ def get_local_ip() -> str:
     return ip
 
 
+def get_broadcast_addresses() -> list:
+    """Returns a list of broadcast addresses: subnet-directed (e.g. 192.168.1.255) across all network adapters and global."""
+    addrs = set()
+    addrs.add('255.255.255.255')
+    try:
+        local_ip = get_local_ip()
+        if local_ip and not local_ip.startswith('127.'):
+            parts = local_ip.split('.')
+            if len(parts) == 4:
+                addrs.add(f"{parts[0]}.{parts[1]}.{parts[2]}.255")
+        hostname = socket.gethostname()
+        for cand in socket.gethostbyname_ex(hostname)[2]:
+            if cand and not cand.startswith('127.'):
+                parts = cand.split('.')
+                if len(parts) == 4:
+                    addrs.add(f"{parts[0]}.{parts[1]}.{parts[2]}.255")
+    except Exception:
+        pass
+    return list(addrs)
+
+
 def compute_file_sha256(filepath: Path) -> str:
     """Computes SHA-256 hash of a file in streaming chunks."""
     h = hashlib.sha256()
@@ -1500,7 +1531,11 @@ class UDPBeaconBroadcaster:
                             'host_ip': get_local_ip()
                         }
                         raw = json.dumps(beacon_data).encode('utf-8')
-                        sock.sendto(raw, ('<broadcast>', UDP_BEACON_PORT))
+                        for _bcast_addr in get_broadcast_addresses():
+                            try:
+                                sock.sendto(raw, (_bcast_addr, UDP_BEACON_PORT))
+                            except Exception:
+                                pass
                 except Exception:
                     pass
 
@@ -1508,21 +1543,26 @@ class UDPBeaconBroadcaster:
                 try:
                     msg, addr = sock.recvfrom(2048)
                     data = json.loads(msg.decode('utf-8'))
-                    if data.get('type') == 'PROBE':
-                        target_code = str(data.get('sync_code', ''))
+                    msg_type = data.get('type')
+                    if msg_type in ('PROBE', 'PROBE_ALL'):
+                        target_code = str(data.get('sync_code', '')).strip()
                         chains = self.get_hosted_chains_cb()
                         tcp_port = self.get_tcp_port_cb()
-                        for c in chains:
-                            if str(c.get('sync_code')) == target_code and tcp_port > 0:
-                                reply = {
-                                    'type': 'PROBE_REPLY',
-                                    'sync_code': target_code,
-                                    'chain_name': c.get('name', 'Audio Playlist'),
-                                    'tcp_port': tcp_port,
-                                    'host_ip': get_local_ip()
-                                }
-                                sock.sendto(json.dumps(reply).encode('utf-8'), addr)
-                                break
+                        if chains and tcp_port > 0:
+                            for c in chains:
+                                c_code = str(c.get('sync_code', ''))
+                                if not target_code or target_code == c_code or msg_type == 'PROBE_ALL':
+                                    reply = {
+                                        'type': 'PROBE_REPLY',
+                                        'sync_code': c_code,
+                                        'chain_name': c.get('name', 'Audio Playlist'),
+                                        'tcp_port': tcp_port,
+                                        'host_ip': get_local_ip()
+                                    }
+                                    try:
+                                        sock.sendto(json.dumps(reply).encode('utf-8'), addr)
+                                    except Exception:
+                                        pass
                 except socket.timeout:
                     pass
                 except Exception:
@@ -1536,8 +1576,8 @@ class UDPBeaconBroadcaster:
             pass
 
 
-def discover_host_on_lan(sync_code: str, timeout: float = 2.5) -> Optional[Tuple[str, int, str]]:
-    """Broadcasts a UDP discovery probe for a 4-digit sync code; returns (host_ip, tcp_port, chain_name) or None."""
+def discover_hosts_on_lan(sync_code: Optional[str] = None, timeout: float = 2.5) -> List[Tuple[str, int, str, str]]:
+    """Broadcasts a UDP discovery probe; returns list of (host_ip, tcp_port, sync_code, chain_name)."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -1546,27 +1586,47 @@ def discover_host_on_lan(sync_code: str, timeout: float = 2.5) -> Optional[Tuple
             sock.ioctl(0x9800000C, False)
         except Exception:
             pass
-    sock.settimeout(0.4)
+    sock.settimeout(0.3)
 
-    probe = json.dumps({'type': 'PROBE', 'sync_code': str(sync_code)}).encode('utf-8')
+    probe_type = 'PROBE' if sync_code else 'PROBE_ALL'
+    probe = json.dumps({'type': probe_type, 'sync_code': str(sync_code or '')}).encode('utf-8')
     start_time = time.time()
-    result = None
+    results = []
+    seen = set()
 
     try:
-        sock.sendto(probe, ('<broadcast>', UDP_BEACON_PORT))
+        for _bcast_addr in get_broadcast_addresses():
+            try:
+                sock.sendto(probe, (_bcast_addr, UDP_BEACON_PORT))
+            except Exception:
+                pass
         while time.time() - start_time < timeout:
             try:
                 msg, (sender_ip, _) = sock.recvfrom(2048)
                 data = json.loads(msg.decode('utf-8'))
-                if data.get('type') == 'PROBE_REPLY' and str(data.get('sync_code')) == str(sync_code):
+                if data.get('type') in ('PROBE_REPLY', 'BEACON'):
+                    rep_code = str(data.get('sync_code') or '')
+                    codes = data.get('sync_codes', [rep_code] if rep_code else [])
                     port = int(data.get('tcp_port', 63350))
                     name = data.get('chain_name', 'Audio Playlist')
                     ip = data.get('host_ip') or sender_ip
-                    result = (ip, port, name)
-                    break
+                    for c in codes:
+                        c_str = str(c)
+                        if sync_code and c_str != str(sync_code):
+                            continue
+                        key = (ip, port, c_str)
+                        if key not in seen:
+                            seen.add(key)
+                            results.append((ip, port, c_str, name))
+                            if sync_code and c_str == str(sync_code):
+                                return results
             except socket.timeout:
                 try:
-                    sock.sendto(probe, ('<broadcast>', UDP_BEACON_PORT))
+                    for _bcast_addr in get_broadcast_addresses():
+                        try:
+                            sock.sendto(probe, (_bcast_addr, UDP_BEACON_PORT))
+                        except Exception:
+                            pass
                 except Exception:
                     pass
             except Exception:
@@ -1576,7 +1636,16 @@ def discover_host_on_lan(sync_code: str, timeout: float = 2.5) -> Optional[Tuple
             sock.close()
         except Exception:
             pass
-    return result
+    return results
+
+
+def discover_host_on_lan(sync_code: str, timeout: float = 2.5) -> Optional[Tuple[str, int, str]]:
+    """Broadcasts a UDP discovery probe for a 4-digit sync code; returns (host_ip, tcp_port, chain_name) or None."""
+    res = discover_hosts_on_lan(sync_code=str(sync_code), timeout=timeout)
+    if res:
+        ip, port, _, name = res[0]
+        return (ip, port, name)
+    return None
 
 
 def send_lan_update_notification(sync_code: str, host_port: int):
@@ -1595,7 +1664,11 @@ def send_lan_update_notification(sync_code: str, host_port: int):
             'host_ip': get_local_ip(),
             'tcp_port': host_port
         }).encode('utf-8')
-        sock.sendto(payload, ('<broadcast>', UDP_BEACON_PORT))
+        for _bcast_addr in get_broadcast_addresses():
+            try:
+                sock.sendto(payload, (_bcast_addr, UDP_BEACON_PORT))
+            except Exception:
+                pass
     except Exception:
         pass
     finally:
@@ -1835,7 +1908,7 @@ class SyncClientWorker:
     @staticmethod
     def sync_chain(chain_config: dict,
                    status_cb: Optional[Callable[[str], None]] = None,
-                   progress_cb: Optional[Callable[[int, int, str], None]] = None) -> Tuple[bool, str, int, int]:
+                   progress_cb: Optional[Callable[[int, int, str, int, int], None]] = None) -> Tuple[bool, str, int, int]:
         sync_code = str(chain_config.get('sync_code', ''))
         folder_str = chain_config.get('folder_path', '')
         dest_folder = Path(folder_str)
@@ -1946,9 +2019,9 @@ class SyncClientWorker:
                     if not pull_resp or pull_resp.get('status') != 'SENDING':
                         continue
 
-                    def _progress(bytes_done, bytes_total):
+                    def _progress(bytes_done, bytes_total, _name=name, _idx=idx, _tot=total_items):
                         if progress_cb:
-                            progress_cb(bytes_done, bytes_total, name)
+                            progress_cb(bytes_done, bytes_total, _name, _idx, _tot)
 
                     ok = recv_file_from_socket(sock, target_path, h_size, h_sha256, _progress)
                     if ok:
@@ -1958,6 +2031,8 @@ class SyncClientWorker:
                         except Exception:
                             pass
                 elif needs_tag_update:
+                    if status_cb:
+                        status_cb(f"Updated metadata [{idx}/{total_items}]: {name}")
                     transferred += 1
 
             return True, f"Synced successfully ({transferred} updated, {deleted} removed).", transferred, deleted
@@ -2055,7 +2130,7 @@ class SyncConfigManager:
 
 class ClientSyncThread(QThread):
     status_signal = Signal(str)
-    progress_signal = Signal(int, int, str)
+    progress_signal = Signal(int, int, str, int, int)
     finished_signal = Signal(bool, str, int, int)
 
     def __init__(self, chain_config: dict):
@@ -2066,8 +2141,8 @@ class ClientSyncThread(QThread):
         def _status(txt):
             self.status_signal.emit(txt)
 
-        def _progress(done, total, filename):
-            self.progress_signal.emit(done, total, filename)
+        def _progress(done, total, filename, idx, total_items):
+            self.progress_signal.emit(done, total, filename, idx, total_items)
 
         ok, msg, transferred, deleted = SyncClientWorker.sync_chain(
             self.chain_config,
@@ -2272,26 +2347,27 @@ class ConnectClientChainDialog(QDialog):
 
     def _discover_on_lan(self):
         code = self.code_edit.text().strip()
-        if not code:
-            QMessageBox.information(self, "Sync Code Needed", "Please enter the 4-digit Sync Code first to search for its host on LAN.")
-            return
-
-        self.status_lbl.setText("Searching local network for host...")
+        self.status_lbl.setText("Searching local network for host(s)...")
+        self.status_lbl.setStyleSheet("color: #3B8ED0; font-size: 11px;")
         self.discover_btn.setEnabled(False)
 
         def _bg():
-            found = discover_host_on_lan(code, timeout=3.0)
+            found_list = discover_hosts_on_lan(sync_code=code if code else None, timeout=3.0)
             def _ui():
                 self.discover_btn.setEnabled(True)
-                if found:
-                    host_ip, host_port, chain_name = found
+                if found_list:
+                    host_ip, host_port, sync_code, chain_name = found_list[0]
                     self.ip_edit.setText(host_ip)
+                    self.code_edit.setText(sync_code)
                     if not self.playlist_name_edit.text().strip():
                         self.playlist_name_edit.setText(chain_name)
-                    self.status_lbl.setText(f"✔ Found Host '{chain_name}' at {host_ip}")
+                    if len(found_list) == 1:
+                        self.status_lbl.setText(f"✔ Found Host '{chain_name}' ({host_ip} - Code: {sync_code})")
+                    else:
+                        self.status_lbl.setText(f"✔ Found {len(found_list)} host(s) on LAN. Loaded '{chain_name}'")
                     self.status_lbl.setStyleSheet("color: #1abd33; font-size: 11px;")
                 else:
-                    self.status_lbl.setText("✘ No host found on LAN for this code.")
+                    self.status_lbl.setText("✘ No host found on LAN.")
                     self.status_lbl.setStyleSheet("color: #E31E24; font-size: 11px;")
             QTimer.singleShot(0, _ui)
 
@@ -2337,18 +2413,8 @@ class SyncManagerDialog(QDialog):
         self.setWindowTitle("Sync Chains Manager - Local Network Playlist Sync")
         self.resize(880, 600)
 
-        # Trigger firewall socket binding if opening for the first time
-        if not self.config_manager.settings.get('firewall_prompted', False):
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                s.bind(('', SYNC_PORT_START))
-                s.listen(1)
-                s.close()
-                self.config_manager.settings['firewall_prompted'] = True
-                self.config_manager.save()
-            except Exception:
-                pass
+        # Check Windows Firewall rule every time the sync window opens
+        self._check_firewall_rule()
 
         self.sync_threads = {}
 
@@ -2422,6 +2488,58 @@ class SyncManagerDialog(QDialog):
 
         self.refresh_cards()
 
+    def _check_firewall_rule(self):
+        """Binds to sync ports and triggers the Windows Firewall permission alert if no rule exists yet."""
+        if sys.platform != 'win32':
+            return
+        def _bg_firewall():
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(('0.0.0.0', 0))
+                s.listen(1)
+                port = s.getsockname()[1]
+                try:
+                    c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    c.settimeout(0.2)
+                    c.connect(('127.0.0.1', port))
+                    c.close()
+                except Exception:
+                    pass
+                s.close()
+
+                s2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s2.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s2.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                s2.bind(('0.0.0.0', 0))
+                port2 = s2.getsockname()[1]
+                try:
+                    s2.sendto(b'probe', ('127.0.0.1', port2))
+                except Exception:
+                    pass
+                s2.close()
+            except Exception:
+                pass
+        threading.Thread(target=_bg_firewall, daemon=True).start()
+
+    def closeEvent(self, event):
+        super().closeEvent(event)
+        if self.parent_app:
+            self.parent_app.raise_()
+            self.parent_app.activateWindow()
+
+    def accept(self):
+        super().accept()
+        if self.parent_app:
+            self.parent_app.raise_()
+            self.parent_app.activateWindow()
+
+    def reject(self):
+        super().reject()
+        if self.parent_app:
+            self.parent_app.raise_()
+            self.parent_app.activateWindow()
+
     def _update_interval(self, val: int):
         self.config_manager.settings['auto_sync_interval_mins'] = val
         self.config_manager.save()
@@ -2484,6 +2602,8 @@ class SyncManagerDialog(QDialog):
 
     def _build_host_card(self, hc: dict) -> QWidget:
         card = QFrame()
+        card.setProperty("chain_id", hc.get('id'))
+        card.setProperty("sync_code", str(hc.get('sync_code', '')))
         card.setStyleSheet("background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 6px; padding: 8px;")
         l = QVBoxLayout(card)
         l.setContentsMargins(10, 8, 10, 8)
@@ -2524,6 +2644,11 @@ class SyncManagerDialog(QDialog):
         folder_path = Path(folder_str)
         audio_cnt = len(filter_audio_files(folder_path)) if folder_path.is_dir() else 0
 
+        host_activity_lbl = QLabel("Status: Ready (Serving clients)")
+        host_activity_lbl.setStyleSheet("color: #888; font-size: 11px;")
+        card.setProperty("host_activity_lbl", host_activity_lbl)
+        l.addWidget(host_activity_lbl)
+
         info_h = QHBoxLayout()
         path_lbl = QLabel(f"📁 {folder_str} ({audio_cnt} tracks)")
         path_lbl.setStyleSheet("color: #888; font-size: 11px;")
@@ -2537,8 +2662,28 @@ class SyncManagerDialog(QDialog):
         l.addLayout(info_h)
         return card
 
+    def _on_host_activity_received(self, sync_code: str, client_ip: str, activity: str):
+        """Updates host card in UI when a client connects or downloads files."""
+        for i in range(self.cards_layout.count()):
+            item = self.cards_layout.itemAt(i)
+            if item and item.widget():
+                w = item.widget()
+                if w.property("sync_code") == str(sync_code):
+                    lbl = w.property("host_activity_lbl")
+                    if lbl:
+                        lbl.setText(f"🟢 Active Sync Event: {activity} ({client_ip})")
+                        lbl.setStyleSheet("color: #1abd33; font-size: 11px; font-weight: bold;")
+                        def _reset(_l=lbl):
+                            try:
+                                _l.setText("Status: Ready (Serving clients)")
+                                _l.setStyleSheet("color: #888; font-size: 11px;")
+                            except Exception:
+                                pass
+                        QTimer.singleShot(4000, _reset)
+
     def _build_client_card(self, cc: dict) -> QWidget:
         card = QFrame()
+        card.setProperty("chain_id", cc.get('id'))
         card.setStyleSheet("background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 6px; padding: 8px;")
         l = QVBoxLayout(card)
         l.setContentsMargins(10, 8, 10, 8)
@@ -2584,6 +2729,11 @@ class SyncManagerDialog(QDialog):
         card.setProperty("status_lbl", status_lbl)
         l.addWidget(status_lbl)
 
+        progress_lbl = QLabel("")
+        progress_lbl.setStyleSheet("color: #3B8ED0; font-size: 11px;")
+        card.setProperty("progress_lbl", progress_lbl)
+        l.addWidget(progress_lbl)
+
         info_h = QHBoxLayout()
         path_lbl = QLabel(f"📁 {folder_str}")
         path_lbl.setStyleSheet("color: #888; font-size: 11px;")
@@ -2615,21 +2765,62 @@ class SyncManagerDialog(QDialog):
         thread = ClientSyncThread(cc)
         self.sync_threads[cid] = thread
 
+        chain_name = cc.get('name', 'Sync')
+
+        def _on_status(txt):
+            self._update_client_card_label(cid, "status_lbl", txt)
+            if hasattr(self.parent_app, 'dl_progress_signal'):
+                self.parent_app.dl_progress_signal.emit(f"[Sync: {chain_name}] {txt}")
+
+        def _on_progress(done, total, filename, idx, total_items):
+            pct = int(done / total * 100) if total > 0 else 0
+            prog_txt = f"[{idx}/{total_items}] ({pct}%) {filename}"
+            self._update_client_card_label(cid, "progress_lbl", prog_txt)
+            if hasattr(self.parent_app, 'dl_progress_signal'):
+                self.parent_app.dl_progress_signal.emit(f"[Sync: {chain_name}] {prog_txt}")
+
         def _on_finish(ok, msg, transferred, deleted):
             cc['status'] = "Up to date" if ok else f"Failed: {msg}"
             if ok:
                 cc['last_synced'] = time.time()
             self.config_manager.save()
+            self._update_client_card_label(cid, "progress_lbl", "")
             self.refresh_cards()
             if self.parent_app.local_current_path == cc.get('folder_path'):
                 self.parent_app.refresh_local_list()
+            if hasattr(self.parent_app, 'dl_progress_signal'):
+                self.parent_app.dl_progress_signal.emit("")
 
+        thread.status_signal.connect(_on_status)
+        thread.progress_signal.connect(_on_progress)
         thread.finished_signal.connect(_on_finish)
         thread.start()
 
+    def _update_client_card_label(self, chain_id: str, prop_name: str, text: str):
+        """Update a visible card's label (status_lbl or progress_lbl) by chain_id."""
+        for i in range(self.cards_layout.count()):
+            item = self.cards_layout.itemAt(i)
+            if item and item.widget():
+                w = item.widget()
+                if w.property("chain_id") == chain_id:
+                    lbl = w.property(prop_name)
+                    if lbl:
+                        lbl.setText(text)
+                    break
+
     def _force_sync_all(self):
+        # 1. Sync all subscribed client chains
         for cc in self.config_manager.client_chains:
             self._sync_single_client_chain(cc)
+        # 2. Push update notification to clients of our hosted chains (force clients to sync)
+        port = getattr(self.parent_app.sync_host_server, 'active_port', 0)
+        if port > 0:
+            for hc in self.config_manager.hosted_chains:
+                code = hc.get('sync_code')
+                if code:
+                    send_lan_update_notification(str(code), port)
+        if hasattr(self.parent_app, 'status_signal'):
+            self.parent_app.status_signal.emit("Force Sync initiated: syncing client chains & notified LAN peers.", False, "#1abd33")
 
 
 class SettingsDialog(QDialog):
@@ -2996,7 +3187,9 @@ class SettingsDialog(QDialog):
 
     def _open_sync_manager(self):
         dlg = SyncManagerDialog(self.parent)
+        self.parent.sync_manager_dialog = dlg
         dlg.exec()
+        self.parent.sync_manager_dialog = None
 
     def _reset_defaults(self):
         if QMessageBox.question(self, "Confirm Reset", "This will wipe your config and recent data. Continue?") == QMessageBox.Yes:
@@ -3049,6 +3242,7 @@ class MainApp(QMainWindow):
     queue_status_changed_signal = Signal(int)
     dl_progress_signal = Signal(str)
     renamer_finished_signal = Signal()
+    host_activity_signal = Signal(str, str, str)
 
     def __init__(self):
         super().__init__()
@@ -3107,6 +3301,7 @@ class MainApp(QMainWindow):
         self.is_muted = False
         self.active_downloads = {}
         self.active_downloads_lock = threading.Lock()
+        self.sync_manager_dialog = None
         
         if getattr(sys, 'frozen', False):
             self.config_dir = os.path.dirname(os.path.abspath(sys.executable))
@@ -3138,6 +3333,7 @@ class MainApp(QMainWindow):
         self.thumbnails_loaded_signal.connect(self._on_thumbnail_loaded)
         self.dl_progress_signal.connect(lambda txt: self.dl_progress_label.setText(txt))
         self.renamer_finished_signal.connect(self._on_renamer_finished)
+        self.host_activity_signal.connect(self._on_host_activity)
 
         self.player_timer = QTimer(self)
         self.player_timer.timeout.connect(self.update_player_ui)
@@ -3165,7 +3361,10 @@ class MainApp(QMainWindow):
 
         # --- Local Network Sync Chains Subsystem ---
         self.sync_config_manager = SyncConfigManager(self.config_dir)
-        self.sync_host_server = SyncHostServer(lambda: self.sync_config_manager.hosted_chains)
+        self.sync_host_server = SyncHostServer(
+            lambda: self.sync_config_manager.hosted_chains,
+            on_client_activity_cb=self.host_activity_signal.emit
+        )
         self.udp_beacon = UDPBeaconBroadcaster(
             lambda: self.sync_config_manager.hosted_chains,
             lambda: self.sync_host_server.active_port
@@ -3192,6 +3391,27 @@ class MainApp(QMainWindow):
         QTimer.singleShot(150, _deferred_sync_startup)
 
         QApplication.instance().installEventFilter(self)
+
+    def _on_host_activity(self, sync_code: str, client_ip: str, activity: str):
+        """Called when a client connects or pulls files from our hosted sync chain."""
+        chain_name = "Playlist"
+        if hasattr(self, 'sync_config_manager'):
+            for c in self.sync_config_manager.hosted_chains:
+                if str(c.get('sync_code')) == str(sync_code):
+                    chain_name = c.get('name', 'Playlist')
+                    break
+        msg = f"[Sync Host: {chain_name}] {activity} ({client_ip})"
+        if hasattr(self, 'dl_progress_signal'):
+            self.dl_progress_signal.emit(msg)
+            def _clear_prog():
+                try:
+                    if self.dl_progress_label.text() == msg:
+                        self.dl_progress_signal.emit("")
+                except Exception:
+                    pass
+            QTimer.singleShot(4000, _clear_prog)
+        if hasattr(self, 'sync_manager_dialog') and self.sync_manager_dialog and self.sync_manager_dialog.isVisible():
+            self.sync_manager_dialog._on_host_activity_received(sync_code, client_ip, activity)
 
     def _on_renamer_finished(self):
         self._on_status_update("MP3 Renamer finished execution.", False, "#1abd33")
@@ -3240,13 +3460,29 @@ class MainApp(QMainWindow):
                 self.sync_timer.stop()
 
     def _auto_sync_client_chains(self):
-        """Background routine that runs sync checks for all client sync chains."""
+        """Background routine that runs sync checks for all client sync chains with live progress reporting."""
         if not hasattr(self, 'sync_config_manager') or not self.sync_config_manager.client_chains:
             return
 
         def _bg():
             for cc in list(self.sync_config_manager.client_chains):
-                ok, msg, transferred, deleted = SyncClientWorker.sync_chain(cc)
+                chain_name = cc.get('name', 'Sync')
+                def _status(t):
+                    if hasattr(self, 'dl_progress_signal'):
+                        self.dl_progress_signal.emit(f"[Sync: {chain_name}] {t}")
+
+                def _prog(done, total, fname, idx, total_items):
+                    pct = int(done / total * 100) if total > 0 else 0
+                    if hasattr(self, 'dl_progress_signal'):
+                        self.dl_progress_signal.emit(f"[Sync: {chain_name}] [{idx}/{total_items}] ({pct}%) {fname}")
+
+                ok, msg, transferred, deleted = SyncClientWorker.sync_chain(
+                    cc,
+                    status_cb=_status,
+                    progress_cb=_prog
+                )
+                if hasattr(self, 'dl_progress_signal'):
+                    self.dl_progress_signal.emit("")
                 if ok:
                     cc['last_synced'] = time.time()
                     cc['status'] = "Up to date"
