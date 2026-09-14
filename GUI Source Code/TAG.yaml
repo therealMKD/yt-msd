@@ -1,0 +1,16 @@
+# This is a marker file for yt-msd syncing. DO NOT DELETE!
+# This file is automatically created by yt-msd, when syncing a playlist onto removable media (Like an SD card)
+# Modifiying or deleting this file will break the sync process. If you no longer want to sync, delete the sync chain inside of yt-msd.
+
+sync_code: XXXX
+
+# Either Mirror, or Additive
+sync_style:
+
+last_synced: MM-DD-YYYY HH:MM:SS
+
+# Either host of the chain, or client in the same chain.
+last_synced_by:
+
+# Filepath of master folder on host
+parent_sync_folder: 
