@@ -24,7 +24,6 @@ The GUI version is currently "complete" at v1.0, (and "improved" at v2.3) but fu
 **Upcoming features in GUI v3.0** (Features with an exclamation point (!) are currently added in beta, if you manually download "yt-msd-gui.pyw" from the files, and not releases)
 - Built-in support for renaming and metadata tagging downloaded files - and a much more improved algorithm compared to the current beta version, based on me downloading my massive playlists and using the script
 - Improved local file navigation (!)
-- Local file playlist logic (Saved filename lists to organize files that are in one big folder)
 - Import/Export logic for settings, music files, etc.
 - Master playlist syncing for all devices on a local network (!)
 - Automatic update checking
