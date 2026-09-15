@@ -7,7 +7,7 @@
 
 ## Why did I make this program?
 
-I don't want to deal with spotify's ads (Or pay for premium), and youtube playlists don't have working shuffle features, so I started downloading the mp3s of my playlist with yt-dlp, but it is still annoying to do, so I created this tool to make it faster. This program WILL function as a bare bones music player, but I would highly recommend using a dedicated program (I use MusicBee) that has more options. However, if you just want to have your music in a folder and listen to it, this will do it for you. 
+I don't want to deal with spotify's ads (Or pay for premium), and youtube playlists don't have working shuffle features, so I started downloading the mp3s of my playlist with yt-dlp. That was still annoying to do from the command line, so I created this. This program WILL function as a bare bones music player, but I would highly recommend using a dedicated program (I use MusicBee) that has more options. However, if you just want to have your music in a folder and listen to it, this will do it for you. 
 
 As development has continued, this program has shifted from just a downloader to a full music library manager, with eventual local network syncing. My end goal is to integrate this program with Musicbee, as a plugin, which will allow updating your library and playing your library with one program. (Yes, you can play your library with yt-msd standalone, but you can't do all the fancy stuff musicbee lets you do.) If your preferred method of music is to add songs to a youtube playlist, and then download them, this is the exact program you are looking for.
 
