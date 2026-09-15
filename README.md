@@ -79,4 +79,4 @@ When you add the exe to PATH, it will work from anywhere AS LONG as it isn't mov
 **MacOS**: Exe files don't run on MacOS, so you will have to use the pex version or the python version. I don't have a mac, so you'll need to figure out how to [install python yourself](https://letmegooglethat.com/?q=How+to+install+python+on+mac+os). If you are using the python version, you will also need to install pip and the required dependencies with `pip install yt-dlp` and `pip install ffmpeg`
 
 **Linux**: Linux also doesn't support exe files, so you must use the python or pex version. To install python on linux: Use `sudo apt install python3-pip` on debian-based linux, or `sudo dnf install python3-pip -y` on fedora. If you use Arch btw, figure it out.
-If you are using the normal python version and not pex, you must also install the dependencies with `pip install yt-dlp` and `pip install ffmpeg`
+If you are using the normal python version and not pex, you must also install the dependencies with `pip install yt-dlp` and `pip install ffmpeg`.
