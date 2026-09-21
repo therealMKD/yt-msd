@@ -26,7 +26,7 @@ import random
 import socket
 import struct
 import hashlib
-from typing import Dict, List, Optional, Tuple, Callable
+from typing import Dict, List, Optional, Tuple, Callable, Union
 from PIL import Image
 
 try:
@@ -2152,33 +2152,155 @@ class SyncClientWorker:
                     pass
 
 
+# Placeholder tag file placed in removable media / USB drive folders
+SYNC_TAG_FILENAME = "TAG.yaml"
+
+def write_sync_tag_file(folder_path: Union[str, Path], sync_code: str, sync_style: str = 'Mirror',
+                        last_synced_by: str = 'Host', parent_sync_folder: str = '') -> bool:
+    try:
+        p = Path(folder_path)
+        p.mkdir(parents=True, exist_ok=True)
+        tag_file = p / SYNC_TAG_FILENAME
+        now_str = time.strftime("%m-%d-%Y %H:%M:%S")
+        content = (
+            "# This is a marker file for yt-msd syncing. DO NOT DELETE!\n"
+            "# This file is automatically created by yt-msd, when syncing a playlist onto removable media (Like an SD card)\n"
+            "# Modifiying or deleting this file will break the sync process. If you no longer want to sync, delete the sync chain inside of yt-msd.\n\n"
+            f"sync_code: {sync_code}\n\n"
+            "# Either Mirror, or Additive\n"
+            f"sync_style: {sync_style}\n\n"
+            f"last_synced: {now_str}\n\n"
+            "# Either host of the chain, or client in the same chain.\n"
+            f"last_synced_by: {last_synced_by}\n\n"
+            "# Filepath of master folder on host\n"
+            f"parent_sync_folder: {parent_sync_folder}\n"
+        )
+        with open(tag_file, 'w', encoding='utf-8') as f:
+            f.write(content)
+        return True
+    except Exception as e:
+        print(f"Error writing sync tag file to {folder_path}: {e}")
+        return False
+
+def read_sync_tag_file(folder_path: Union[str, Path]) -> Optional[dict]:
+    p = Path(folder_path)
+    for fname in (SYNC_TAG_FILENAME, "TAG.yaml", "tag.yaml", "TAG.yml", ".ytmsd_sync_tag"):
+        tag_file = p / fname
+        if tag_file.is_file():
+            try:
+                res = {}
+                with open(tag_file, 'r', encoding='utf-8', errors='ignore') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith('#'):
+                            continue
+                        if ':' in line:
+                            parts = line.split(':', 1)
+                            k = parts[0].strip()
+                            v = parts[1].strip()
+                            res[k] = v
+                if res.get('sync_code'):
+                    style = res.get('sync_style', 'Mirror').strip()
+                    res['deletion_mode'] = 'mirror' if style.lower() == 'mirror' else 'additive'
+                    return res
+            except Exception:
+                pass
+    return None
+
+def find_tagged_sync_folders_on_drive(drive_root: str) -> List[Tuple[Path, dict]]:
+    """Scans drive root and top-level subdirectories (up to depth 2) for yt-msd TAG.yaml files."""
+    results = []
+    root = Path(drive_root)
+    if not root.is_dir():
+        return results
+
+    # 1. Check drive root
+    tag = read_sync_tag_file(root)
+    if tag and tag.get('sync_code'):
+        results.append((root, tag))
+
+    # 2. Check subdirectories
+    try:
+        for entry1 in root.iterdir():
+            if entry1.is_dir() and not entry1.name.startswith('$') and entry1.name != 'System Volume Information':
+                tag1 = read_sync_tag_file(entry1)
+                if tag1 and tag1.get('sync_code'):
+                    results.append((entry1, tag1))
+                else:
+                    try:
+                        for entry2 in entry1.iterdir():
+                            if entry2.is_dir() and not entry2.name.startswith('.'):
+                                tag2 = read_sync_tag_file(entry2)
+                                if tag2 and tag2.get('sync_code'):
+                                    results.append((entry2, tag2))
+                    except (PermissionError, OSError):
+                        pass
+    except (PermissionError, OSError):
+        pass
+
+    return results
+
+
 class SyncConfigManager:
-    """Manages persistence of sync_config.json for hosted and client chains."""
+    """Manages persistence of sync configuration within the unified gui_config.json."""
     def __init__(self, config_dir: str):
-        self.config_file = os.path.join(config_dir, "sync_config.json")
+        self.config_dir = config_dir
+        self.config_file = os.path.join(config_dir, "gui_config.json")
+        self.legacy_file = os.path.join(config_dir, "sync_config.json")
         self.settings: dict = {"auto_sync_interval_mins": 30, "firewall_prompted": False}
         self.hosted_chains: List[dict] = []
         self.client_chains: List[dict] = []
+        self.removable_chains: List[dict] = []
         self.load()
 
     def load(self):
-        if not os.path.exists(self.config_file):
-            return
-        try:
-            with open(self.config_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                self.settings = data.get('settings', self.settings)
-                self.hosted_chains = data.get('hosted_chains', [])
-                self.client_chains = data.get('client_chains', [])
-        except Exception:
-            pass
+        migrated = False
+        # Migrate legacy sync_config.json if present
+        if os.path.exists(self.legacy_file):
+            try:
+                with open(self.legacy_file, 'r', encoding='utf-8') as f:
+                    legacy_data = json.load(f)
+                    self.settings = legacy_data.get('settings', self.settings)
+                    self.hosted_chains = legacy_data.get('hosted_chains', [])
+                    self.client_chains = legacy_data.get('client_chains', [])
+                    self.removable_chains = legacy_data.get('removable_chains', [])
+                migrated = True
+            except Exception:
+                pass
+            try:
+                os.remove(self.legacy_file)
+            except Exception:
+                pass
+
+        if os.path.exists(self.config_file):
+            try:
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if not migrated or 'hosted_chains' in data:
+                        self.settings = data.get('sync_settings', self.settings)
+                        self.hosted_chains = data.get('hosted_chains', self.hosted_chains)
+                        self.client_chains = data.get('client_chains', self.client_chains)
+                        self.removable_chains = data.get('removable_chains', self.removable_chains)
+            except Exception:
+                pass
+
+        if migrated:
+            self.save()
 
     def save(self):
-        data = {
-            'settings': self.settings,
-            'hosted_chains': self.hosted_chains,
-            'client_chains': self.client_chains
-        }
+        data = {}
+        if os.path.exists(self.config_file):
+            try:
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+
+        data['sync_settings'] = self.settings
+        data['hosted_chains'] = self.hosted_chains
+        data['client_chains'] = self.client_chains
+        data['removable_chains'] = self.removable_chains
+
         try:
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=4)
@@ -2186,7 +2308,6 @@ class SyncConfigManager:
             pass
 
     def generate_unique_sync_code(self) -> str:
-        import random
         used = {str(c.get('sync_code')) for c in self.hosted_chains}
         for _ in range(1000):
             code = str(random.randint(1000, 9999))
@@ -2230,8 +2351,24 @@ class SyncConfigManager:
         self.save()
         return chain
 
+    def add_removable_chain(self, name: str, folder_path: str, sync_code: str, deletion_mode: str = 'mirror') -> dict:
+        cid = f'rc_{sync_code}_{hashlib.md5(folder_path.encode()).hexdigest()[:6]}'
+        chain = {
+            'id': cid,
+            'sync_code': sync_code,
+            'name': name,
+            'folder_path': folder_path,
+            'deletion_mode': deletion_mode,
+            'created_at': time.time(),
+            'last_synced': 0,
+            'status': 'Ready'
+        }
+        self.removable_chains = [c for c in self.removable_chains if c.get('folder_path') != folder_path]
+        self.removable_chains.append(chain)
+        self.save()
+        return chain
+
     def pause_client_chain(self, chain_id: str, duration_sec: int):
-        """Pauses a client chain for duration_sec seconds (-1 for forever)."""
         paused_until = -1 if duration_sec == -1 else int(time.time() + duration_sec)
         for c in self.client_chains:
             if c.get('id') == chain_id:
@@ -2240,7 +2377,6 @@ class SyncConfigManager:
         self.save()
 
     def resume_client_chain(self, chain_id: str):
-        """Resumes a paused client chain."""
         for c in self.client_chains:
             if c.get('id') == chain_id:
                 c['paused_until'] = 0
@@ -2248,7 +2384,6 @@ class SyncConfigManager:
         self.save()
 
     def bind_client_wifi(self, chain_id: str, ssid: str):
-        """Sets or clears the bound Wi-Fi network SSID for auto-sync."""
         for c in self.client_chains:
             if c.get('id') == chain_id:
                 c['bound_wifi_ssid'] = ssid.strip()
@@ -2258,6 +2393,7 @@ class SyncConfigManager:
     def remove_chain(self, chain_id: str):
         self.hosted_chains = [c for c in self.hosted_chains if c.get('id') != chain_id]
         self.client_chains = [c for c in self.client_chains if c.get('id') != chain_id]
+        self.removable_chains = [c for c in self.removable_chains if c.get('id') != chain_id]
         self.save()
 
 
@@ -2279,6 +2415,147 @@ class ClientSyncThread(QThread):
 
         ok, msg, transferred, deleted = SyncClientWorker.sync_chain(
             self.chain_config,
+            status_cb=_status,
+            progress_cb=_progress
+        )
+        self.finished_signal.emit(ok, msg, transferred, deleted)
+
+
+class SyncRemovableWorker:
+    """Synchronizes audio files between local master folders and removable storage devices."""
+    @staticmethod
+    def sync_local_folders(src_dir: Path, dest_dir: Path, deletion_mode: str = 'mirror',
+                           status_cb: Optional[Callable[[str], None]] = None,
+                           progress_cb: Optional[Callable[[int, int, str, int, int], None]] = None) -> Tuple[bool, str, int, int]:
+        import shutil
+        if not src_dir.is_dir():
+            return False, f"Source directory '{src_dir}' does not exist.", 0, 0
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        src_files = filter_audio_files(src_dir)
+        src_map = {f.name: f for f in src_files}
+        dest_files = filter_audio_files(dest_dir)
+        dest_map = {f.name: f for f in dest_files}
+
+        transferred = 0
+        deleted = 0
+
+        # Mirror deletion
+        if deletion_mode == 'mirror':
+            for local_name, local_path in list(dest_map.items()):
+                if local_name not in src_map:
+                    try:
+                        local_path.unlink()
+                        deleted += 1
+                        if status_cb:
+                            status_cb(f"Removed deleted track: {local_name}")
+                    except Exception:
+                        pass
+
+        total_items = len(src_files)
+        for idx, (name, src_file) in enumerate(src_map.items(), 1):
+            dest_file = dest_dir / name
+            needs_copy = False
+
+            if not dest_file.exists():
+                needs_copy = True
+            else:
+                try:
+                    s_stat = src_file.stat()
+                    d_stat = dest_file.stat()
+                    if s_stat.st_size != d_stat.st_size or s_stat.st_mtime > d_stat.st_mtime + 1.0:
+                        if compute_file_sha256(src_file).lower() != compute_file_sha256(dest_file).lower():
+                            needs_copy = True
+                except Exception:
+                    needs_copy = True
+
+            if needs_copy:
+                if status_cb:
+                    status_cb(f"Copying [{idx}/{total_items}]: {name}")
+                try:
+                    shutil.copy2(src_file, dest_file)
+                    transferred += 1
+                    if progress_cb:
+                        progress_cb(idx, total_items, name, idx, total_items)
+                except Exception as e:
+                    print(f"Error copying {name} to {dest_file}: {e}")
+
+        return True, f"Synced {transferred} files ({deleted} removed).", transferred, deleted
+
+    @staticmethod
+    def sync_removable_chain(removable_chain: dict, config_manager: SyncConfigManager,
+                             status_cb: Optional[Callable[[str], None]] = None,
+                             progress_cb: Optional[Callable[[int, int, str, int, int], None]] = None) -> Tuple[bool, str, int, int]:
+        sync_code = str(removable_chain.get('sync_code', ''))
+        dest_path = Path(removable_chain.get('folder_path', ''))
+        del_mode = removable_chain.get('deletion_mode', 'mirror')
+        chain_name = removable_chain.get('name', 'Removable Media')
+
+        # Find matching hosted chain or client chain
+        matching_hc = next((hc for hc in config_manager.hosted_chains if str(hc.get('sync_code')) == sync_code), None)
+        matching_cc = next((cc for cc in config_manager.client_chains if str(cc.get('sync_code')) == sync_code), None)
+
+        if matching_hc:
+            src_dir = Path(matching_hc.get('folder_path', ''))
+            if status_cb:
+                status_cb(f"[USB Sync: {chain_name}] Syncing from hosted master folder '{src_dir.name}'...")
+            ok, msg, transferred, deleted = SyncRemovableWorker.sync_local_folders(src_dir, dest_path, del_mode, status_cb, progress_cb)
+            if ok:
+                write_sync_tag_file(
+                    dest_path,
+                    sync_code=sync_code,
+                    sync_style='Mirror' if del_mode == 'mirror' else 'Additive',
+                    last_synced_by='Host',
+                    parent_sync_folder=str(src_dir)
+                )
+            return ok, msg, transferred, deleted
+
+        elif matching_cc:
+            # 1. Sync client from host first over network
+            if status_cb:
+                status_cb(f"[USB Sync: {chain_name}] Step 1/2: Updating client chain from host...")
+            ok, msg, t, d = SyncClientWorker.sync_chain(matching_cc, status_cb=status_cb, progress_cb=progress_cb)
+            if not ok and status_cb:
+                status_cb(f"[USB Sync: {chain_name}] Host offline, syncing with local client cache...")
+
+            src_dir = Path(matching_cc.get('folder_path', ''))
+            if status_cb:
+                status_cb(f"[USB Sync: {chain_name}] Step 2/2: Syncing local files to removable device...")
+            ok2, msg2, transferred, deleted = SyncRemovableWorker.sync_local_folders(src_dir, dest_path, del_mode, status_cb, progress_cb)
+            if ok2:
+                write_sync_tag_file(
+                    dest_path,
+                    sync_code=sync_code,
+                    sync_style='Mirror' if del_mode == 'mirror' else 'Additive',
+                    last_synced_by='Client',
+                    parent_sync_folder=str(matching_cc.get('folder_path', ''))
+                )
+            return ok2, msg2, transferred, deleted
+
+        else:
+            return False, f"No hosted or client sync chain with Sync Code {sync_code} found on this PC.", 0, 0
+
+
+class RemovableSyncThread(QThread):
+    status_signal = Signal(str)
+    progress_signal = Signal(int, int, str, int, int)
+    finished_signal = Signal(bool, str, int, int)
+
+    def __init__(self, removable_config: dict, config_manager: SyncConfigManager):
+        super().__init__()
+        self.removable_config = removable_config
+        self.config_manager = config_manager
+
+    def run(self):
+        def _status(txt):
+            self.status_signal.emit(txt)
+
+        def _progress(done, total, filename, idx, total_items):
+            self.progress_signal.emit(done, total, filename, idx, total_items)
+
+        ok, msg, transferred, deleted = SyncRemovableWorker.sync_removable_chain(
+            self.removable_config,
+            self.config_manager,
             status_cb=_status,
             progress_cb=_progress
         )
@@ -2501,14 +2778,183 @@ class ConnectClientChainDialog(QDialog):
         self.accept()
 
 
+class ConnectRemovableMediaDialog(QDialog):
+    """Dialog to configure and sync a chain onto a Removable Storage Drive (USB/SD Card/MP3 Player)."""
+    def __init__(self, parent_window, config_manager: SyncConfigManager):
+        super().__init__(parent_window)
+        self.parent_window = parent_window
+        self.config_manager = config_manager
+        self.setWindowTitle("Connect Removable Media (USB / SD Card / MP3 Player)")
+        self.setFixedSize(540, 440)
+        self.setWindowFlags(self.windowFlags() | Qt.Tool)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+
+        title_lbl = QLabel("CONNECT REMOVABLE MEDIA SYNC")
+        title_lbl.setFont(QFont("Segoe UI Semibold", 11))
+        layout.addWidget(title_lbl)
+
+        desc = QLabel("Tag and synchronize a playlist to a removable USB flash drive, SD card, or portable MP3 player. A TAG.yaml file will be placed in the folder to identify it.")
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color: #888; font-size: 11px;")
+        layout.addWidget(desc)
+
+        # 1. Select Sync Chain
+        layout.addWidget(QLabel("Select Sync Chain to Mirror:"))
+        self.chain_combo = QComboBox()
+        
+        all_chains = []
+        for hc in self.config_manager.hosted_chains:
+            all_chains.append(("Host", hc))
+        for cc in self.config_manager.client_chains:
+            all_chains.append(("Client", cc))
+
+        if not all_chains:
+            self.chain_combo.addItem("No active chains (Create or join a chain first)", None)
+            self.chain_combo.setEnabled(False)
+        else:
+            for c_type, c in all_chains:
+                label = f"[{c_type}] {c.get('name', 'Chain')} (Sync Code: {c.get('sync_code')})"
+                self.chain_combo.addItem(label, (c_type, c))
+
+        layout.addWidget(self.chain_combo)
+
+        # 2. Target Removable Drive / Folder
+        layout.addWidget(QLabel("Target Removable Drive or Folder:"))
+        folder_h = QHBoxLayout()
+        self.folder_edit = QLineEdit()
+        self.folder_edit.setPlaceholderText("Select drive or folder on USB/SD card (e.g. E:\\Music)...")
+        folder_h.addWidget(self.folder_edit, 1)
+
+        browse_btn = QPushButton("Browse...")
+        browse_btn.clicked.connect(self._browse_folder)
+        folder_h.addWidget(browse_btn)
+        layout.addLayout(folder_h)
+
+        # Detected removable drives quick buttons
+        detected_drives = []
+        if sys.platform == 'win32':
+            import string
+            for letter in string.ascii_uppercase:
+                d = f"{letter}:\\"
+                if d.upper() != "C:\\" and os.path.exists(d):
+                    detected_drives.append(d)
+
+        if detected_drives:
+            quick_h = QHBoxLayout()
+            quick_lbl = QLabel("Detected Drives:")
+            quick_lbl.setStyleSheet("color: #888; font-size: 11px;")
+            quick_h.addWidget(quick_lbl)
+            for d in detected_drives:
+                d_btn = QPushButton(d)
+                d_btn.setFixedHeight(22)
+                d_btn.setStyleSheet("font-size: 11px; padding: 2px 6px;")
+                d_btn.clicked.connect(lambda chk=False, drv=d: self._set_drive(drv))
+                quick_h.addWidget(d_btn)
+            quick_h.addStretch()
+            layout.addLayout(quick_h)
+
+        # Subfolder name
+        layout.addWidget(QLabel("Playlist / Subfolder Name on Drive:"))
+        self.subfolder_edit = QLineEdit()
+        self._update_subfolder_placeholder()
+        self.chain_combo.currentIndexChanged.connect(self._update_subfolder_placeholder)
+        layout.addWidget(self.subfolder_edit)
+
+        # Deletion mode
+        layout.addWidget(QLabel("Sync Style:"))
+        self.del_mode_combo = QComboBox()
+        self.del_mode_combo.addItem("Mirror (Sync all files, delete removed files)", "mirror")
+        self.del_mode_combo.addItem("Additive (Only download new/updated, keep existing files)", "additive")
+        layout.addWidget(self.del_mode_combo)
+
+        layout.addStretch()
+
+        btn_h = QHBoxLayout()
+        btn_h.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_h.addWidget(cancel_btn)
+
+        self.connect_btn = QPushButton("Connect & Initialize Drive")
+        self.connect_btn.clicked.connect(self._connect_removable)
+        btn_h.addWidget(self.connect_btn)
+        layout.addLayout(btn_h)
+
+    def _set_drive(self, drive_str: str):
+        self.folder_edit.setText(drive_str)
+
+    def _update_subfolder_placeholder(self):
+        data = self.chain_combo.currentData()
+        if data:
+            _, chain = data
+            self.subfolder_edit.setText(chain.get('name', ''))
+
+    def _browse_folder(self):
+        f = QFileDialog.getExistingDirectory(self, "Select Removable Folder / Drive", self.folder_edit.text() or "")
+        if f:
+            self.folder_edit.setText(f)
+
+    def _connect_removable(self):
+        data = self.chain_combo.currentData()
+        if not data:
+            QMessageBox.warning(self, "No Chain Selected", "Please create or connect to a sync chain before adding removable media.")
+            return
+
+        c_type, chain = data
+        base_dir = self.folder_edit.text().strip()
+        subfolder = self.subfolder_edit.text().strip()
+        del_mode = self.del_mode_combo.currentData()
+        sync_code = str(chain.get('sync_code', ''))
+
+        if not base_dir:
+            QMessageBox.warning(self, "Missing Folder", "Please select a target folder or drive on the removable device.")
+            return
+
+        dest_path = Path(base_dir)
+        if subfolder:
+            dest_path = dest_path / subfolder
+
+        try:
+            dest_path.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            QMessageBox.warning(self, "Invalid Path", f"Could not create folder on drive:\n{e}")
+            return
+
+        name = subfolder or chain.get('name', 'Removable Drive')
+        parent_folder = chain.get('folder_path', '')
+
+        # Write the initial TAG.yaml
+        ok = write_sync_tag_file(
+            dest_path,
+            sync_code=sync_code,
+            sync_style='Mirror' if del_mode == 'mirror' else 'Additive',
+            last_synced_by=c_type,
+            parent_sync_folder=parent_folder
+        )
+        if not ok:
+            QMessageBox.warning(self, "Error", f"Failed to write TAG.yaml file to {dest_path}.")
+            return
+
+        self.config_manager.add_removable_chain(
+            name=name,
+            folder_path=str(dest_path),
+            sync_code=sync_code,
+            deletion_mode=del_mode
+        )
+        self.accept()
+
+
 class SyncManagerDialog(QDialog):
-    """Main Sync Chains Management Dialog with Host & Client chain cards and live transfer tracking."""
+    """Main Sync Chains Management Dialog with Host, Client, and Removable Drive cards and live transfer tracking."""
     def __init__(self, parent_app):
         super().__init__(parent_app)
         self.parent_app = parent_app
         self.config_manager: SyncConfigManager = parent_app.sync_config_manager
         self.setWindowTitle("Sync Chains Manager - Local Network Playlist Sync")
-        self.resize(880, 600)
+        self.resize(920, 620)
 
         # Check Windows Firewall rule every time the sync window opens
         self._check_firewall_rule()
@@ -2539,6 +2985,10 @@ class SyncManagerDialog(QDialog):
         connect_btn = QPushButton("🔗 Connect Chain (Client)")
         connect_btn.clicked.connect(self._open_connect_dialog)
         top_bar.addWidget(connect_btn)
+
+        removable_btn = QPushButton("💾 Connect Removable Drive (USB)")
+        removable_btn.clicked.connect(self._open_removable_dialog)
+        top_bar.addWidget(removable_btn)
 
         sync_all_btn = QPushButton("🔄 Force Sync All")
         sync_all_btn.clicked.connect(self._force_sync_all)
@@ -2658,6 +3108,14 @@ class SyncManagerDialog(QDialog):
             if self.config_manager.client_chains:
                 self._sync_single_client_chain(self.config_manager.client_chains[-1])
 
+    def _open_removable_dialog(self):
+        dlg = ConnectRemovableMediaDialog(self, self.config_manager)
+        if dlg.exec():
+            self.config_manager.save()
+            self.refresh_cards()
+            if self.config_manager.removable_chains:
+                self._sync_single_removable_chain(self.config_manager.removable_chains[-1])
+
     def refresh_cards(self):
         while self.cards_layout.count():
             item = self.cards_layout.takeAt(0)
@@ -2666,9 +3124,10 @@ class SyncManagerDialog(QDialog):
 
         hosted = self.config_manager.hosted_chains
         clients = self.config_manager.client_chains
+        removables = self.config_manager.removable_chains
 
-        if not hosted and not clients:
-            empty_lbl = QLabel("No active Sync Chains. Click 'Create Chain' to host a folder or 'Connect Chain' to join an existing one.")
+        if not hosted and not clients and not removables:
+            empty_lbl = QLabel("No active Sync Chains. Click 'Create Chain' to host a folder, 'Connect Chain' to join an existing one, or 'Connect Removable Drive' for USB syncing.")
             empty_lbl.setAlignment(Qt.AlignCenter)
             empty_lbl.setStyleSheet("color: #888; padding: 40px; font-size: 13px;")
             self.cards_layout.addWidget(empty_lbl)
@@ -2693,6 +3152,16 @@ class SyncManagerDialog(QDialog):
 
             for cc in clients:
                 card = self._build_client_card(cc)
+                self.cards_layout.addWidget(card)
+
+        if removables:
+            sec_lbl3 = QLabel("REMOVABLE MEDIA SYNC (USB Flash Drives / SD Cards / MP3 Players)")
+            sec_lbl3.setFont(QFont("Segoe UI Semibold", 10))
+            sec_lbl3.setStyleSheet("color: #9B59B6; margin-top: 14px;")
+            self.cards_layout.addWidget(sec_lbl3)
+
+            for rc in removables:
+                card = self._build_removable_card(rc)
                 self.cards_layout.addWidget(card)
 
         self.cards_layout.addStretch()
@@ -2722,7 +3191,7 @@ class SyncManagerDialog(QDialog):
         header.addStretch()
 
         copy_code_btn = QPushButton("Copy Code")
-        copy_code_btn.setFixedWidth(80)
+        copy_code_btn.setFixedWidth(105)
         code_val = str(hc.get('sync_code', ''))
         copy_code_btn.clicked.connect(lambda chk=False, c=code_val: QApplication.clipboard().setText(c))
         header.addWidget(copy_code_btn)
@@ -2752,7 +3221,7 @@ class SyncManagerDialog(QDialog):
         info_h.addWidget(path_lbl, 1)
 
         open_btn = QPushButton("Open Folder")
-        open_btn.setFixedWidth(90)
+        open_btn.setFixedWidth(115)
         open_btn.clicked.connect(lambda chk=False, f=folder_str: os.startfile(f) if Path(f).exists() else None)
         info_h.addWidget(open_btn)
 
@@ -2892,7 +3361,74 @@ class SyncManagerDialog(QDialog):
         info_h.addWidget(path_lbl, 1)
 
         open_btn = QPushButton("Open Folder")
-        open_btn.setFixedWidth(90)
+        open_btn.setFixedWidth(115)
+        open_btn.clicked.connect(lambda chk=False, f=folder_str: os.startfile(f) if Path(f).exists() else None)
+        info_h.addWidget(open_btn)
+
+        l.addLayout(info_h)
+        return card
+
+    def _build_removable_card(self, rc: dict) -> QWidget:
+        card = QFrame()
+        cid_val = rc.get('id')
+        card.setProperty("chain_id", cid_val)
+        card.setStyleSheet("background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 6px; padding: 8px;")
+        l = QVBoxLayout(card)
+        l.setContentsMargins(10, 8, 10, 8)
+        l.setSpacing(6)
+
+        header = QHBoxLayout()
+        badge = QLabel("REMOVABLE")
+        badge.setStyleSheet("background: #9B59B6; color: white; padding: 2px 6px; border-radius: 3px; font-weight: bold; font-size: 10px;")
+        header.addWidget(badge)
+
+        name_lbl = QLabel(f"<b>{rc.get('name', 'Removable Drive')}</b>")
+        name_lbl.setFont(QFont("Segoe UI", 12))
+        header.addWidget(name_lbl)
+
+        header.addSpacing(10)
+        code_lbl = QLabel(f"Code: <b style='color: #FF8C00;'>{rc.get('sync_code')}</b> | Style: {rc.get('deletion_mode', 'mirror').capitalize()}")
+        code_lbl.setStyleSheet("color: #aaa; font-size: 11px;")
+        header.addWidget(code_lbl)
+
+        header.addStretch()
+
+        sync_btn = QPushButton("🔄 Sync Now")
+        sync_btn.clicked.connect(lambda chk=False, r=rc: self._sync_single_removable_chain(r))
+        header.addWidget(sync_btn)
+
+        del_btn = QPushButton("✕")
+        del_btn.setFixedSize(26, 26)
+        del_btn.setToolTip("Remove this removable sync chain")
+        del_btn.setStyleSheet("background: #E31E24; color: white; border: none; border-radius: 3px; font-weight: bold;")
+        del_btn.clicked.connect(lambda chk=False, cid=cid_val: self._delete_chain(cid))
+        header.addWidget(del_btn)
+
+        l.addLayout(header)
+
+        folder_str = rc.get('folder_path', '')
+        last_sync = rc.get('last_synced', 0)
+        last_sync_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_sync)) if last_sync > 0 else "Never"
+        is_mounted = Path(folder_str).exists()
+        mount_str = "Mounted" if is_mounted else "Drive Not Connected"
+
+        status_lbl = QLabel(f"Status: {rc.get('status', 'Ready')} ({mount_str})  |  Last Synced: {last_sync_str}")
+        status_lbl.setStyleSheet("color: #888; font-size: 11px;")
+        card.setProperty("status_lbl", status_lbl)
+        l.addWidget(status_lbl)
+
+        progress_lbl = QLabel("")
+        progress_lbl.setStyleSheet("color: #9B59B6; font-size: 11px;")
+        card.setProperty("progress_lbl", progress_lbl)
+        l.addWidget(progress_lbl)
+
+        info_h = QHBoxLayout()
+        path_lbl = QLabel(f"💾 {folder_str}")
+        path_lbl.setStyleSheet("color: #888; font-size: 11px;")
+        info_h.addWidget(path_lbl, 1)
+
+        open_btn = QPushButton("Open Folder")
+        open_btn.setFixedWidth(115)
         open_btn.clicked.connect(lambda chk=False, f=folder_str: os.startfile(f) if Path(f).exists() else None)
         info_h.addWidget(open_btn)
 
@@ -2965,6 +3501,46 @@ class SyncManagerDialog(QDialog):
         thread.finished_signal.connect(_on_finish)
         thread.start()
 
+    def _sync_single_removable_chain(self, rc: dict):
+        cid = rc.get('id')
+        if cid in self.sync_threads and self.sync_threads[cid].isRunning():
+            return
+
+        rc['status'] = "Syncing..."
+        self.refresh_cards()
+
+        thread = RemovableSyncThread(rc, self.config_manager)
+        self.sync_threads[cid] = thread
+
+        chain_name = rc.get('name', 'Removable Drive')
+
+        def _on_status(txt):
+            self._update_client_card_label(cid, "status_lbl", txt)
+            if hasattr(self.parent_app, 'dl_progress_signal'):
+                self.parent_app.dl_progress_signal.emit(f"[USB Sync: {chain_name}] {txt}")
+
+        def _on_progress(done, total, filename, idx, total_items):
+            pct = int(done / total * 100) if total > 0 else 0
+            prog_txt = f"[{idx}/{total_items}] ({pct}%) {filename}"
+            self._update_client_card_label(cid, "progress_lbl", prog_txt)
+            if hasattr(self.parent_app, 'dl_progress_signal'):
+                self.parent_app.dl_progress_signal.emit(f"[USB Sync: {chain_name}] {prog_txt}")
+
+        def _on_finish(ok, msg, transferred, deleted):
+            rc['status'] = "Up to date" if ok else f"Failed: {msg}"
+            if ok:
+                rc['last_synced'] = time.time()
+            self.config_manager.save()
+            self._update_client_card_label(cid, "progress_lbl", "")
+            self.refresh_cards()
+            if hasattr(self.parent_app, 'dl_progress_signal'):
+                self.parent_app.dl_progress_signal.emit("")
+
+        thread.status_signal.connect(_on_status)
+        thread.progress_signal.connect(_on_progress)
+        thread.finished_signal.connect(_on_finish)
+        thread.start()
+
     def _update_client_card_label(self, chain_id: str, prop_name: str, text: str):
         """Update a visible card's label (status_lbl or progress_lbl) by chain_id."""
         for i in range(self.cards_layout.count()):
@@ -2981,7 +3557,11 @@ class SyncManagerDialog(QDialog):
         # 1. Sync all subscribed client chains
         for cc in self.config_manager.client_chains:
             self._sync_single_client_chain(cc)
-        # 2. Push update notification to clients of our hosted chains (force clients to sync)
+        # 2. Sync all removable media chains whose drives are currently connected
+        for rc in self.config_manager.removable_chains:
+            if Path(rc.get('folder_path', '')).exists():
+                self._sync_single_removable_chain(rc)
+        # 3. Push update notification to clients of our hosted chains (force clients to sync)
         port = getattr(self.parent_app.sync_host_server, 'active_port', 0)
         if port > 0:
             for hc in self.config_manager.hosted_chains:
@@ -2989,7 +3569,7 @@ class SyncManagerDialog(QDialog):
                 if code:
                     send_lan_update_notification(str(code), port)
         if hasattr(self.parent_app, 'status_signal'):
-            self.parent_app.status_signal.emit("Force Sync initiated: syncing client chains & notified LAN peers.", False, "#1abd33")
+            self.parent_app.status_signal.emit("Force Sync initiated: syncing clients & removable drives, notified LAN peers.", False, "#1abd33")
 
 
 class SettingsDialog(QDialog):
@@ -3526,6 +4106,12 @@ class MainApp(QMainWindow):
         self.wifi_monitor_timer.timeout.connect(self._check_wifi_network_change)
         self.wifi_monitor_timer.start(15000)
 
+        # Removable drive auto-detect timer (checks every 3s for newly plugged drives with TAG.yaml)
+        self.known_connected_drives = self._get_current_system_drives()
+        self.drive_monitor_timer = QTimer(self)
+        self.drive_monitor_timer.timeout.connect(self._check_removable_drives_change)
+        self.drive_monitor_timer.start(3000)
+
         # Initialize VLC in a background thread (plugin scanning can take seconds)
         threading.Thread(target=self._init_vlc_background, daemon=True).start()
 
@@ -3747,6 +4333,89 @@ class MainApp(QMainWindow):
                 if bound:
                     self._on_status_update(f"Connected to Wi-Fi '{curr}': Auto-syncing bound sync chain(s)...", False, "#1abd33")
                     self._auto_sync_client_chains()
+
+    def _get_current_system_drives(self) -> set[str]:
+        drives = set()
+        if sys.platform == 'win32':
+            import string
+            for letter in string.ascii_uppercase:
+                drive = f"{letter}:\\"
+                if drive.upper() != "C:\\" and os.path.exists(drive):
+                    drives.add(drive)
+        return drives
+
+    def _check_removable_drives_change(self):
+        """Detects newly connected removable storage drives and auto-syncs any folder tagged with TAG.yaml."""
+        if not hasattr(self, 'sync_config_manager'):
+            return
+        try:
+            current_drives = self._get_current_system_drives()
+            known = getattr(self, 'known_connected_drives', set())
+            newly_connected = current_drives - known
+            self.known_connected_drives = current_drives
+
+            if not newly_connected:
+                return
+
+            def _scan_and_sync():
+                for drive in newly_connected:
+                    tagged_folders = find_tagged_sync_folders_on_drive(drive)
+                    for folder_path, tag_data in tagged_folders:
+                        sync_code = str(tag_data.get('sync_code', ''))
+                        if not sync_code:
+                            continue
+                        is_hosted = any(str(hc.get('sync_code')) == sync_code for hc in self.sync_config_manager.hosted_chains)
+                        is_client = any(str(cc.get('sync_code')) == sync_code for cc in self.sync_config_manager.client_chains)
+                        if is_hosted or is_client:
+                            f_str = str(folder_path)
+                            existing_rc = next((rc for rc in self.sync_config_manager.removable_chains if rc.get('folder_path') == f_str), None)
+                            del_mode = tag_data.get('deletion_mode', 'mirror')
+                            chain_name = folder_path.name or f"Drive ({drive[0]}:)"
+                            if not existing_rc:
+                                existing_rc = self.sync_config_manager.add_removable_chain(
+                                    name=chain_name,
+                                    folder_path=f_str,
+                                    sync_code=sync_code,
+                                    deletion_mode=del_mode
+                                )
+                            self._auto_sync_removable_chain(existing_rc)
+
+            threading.Thread(target=_scan_and_sync, daemon=True).start()
+        except Exception:
+            pass
+
+    def _auto_sync_removable_chain(self, rc: dict):
+        chain_name = rc.get('name', 'Removable Media')
+        self.status_signal.emit(f"Removable media detected for '{chain_name}'. Starting auto-sync...", False, "#3B8ED0")
+
+        def _status(t):
+            if hasattr(self, 'dl_progress_signal'):
+                self.dl_progress_signal.emit(f"[USB Sync: {chain_name}] {t}")
+
+        def _prog(done, total, fname, idx, total_items):
+            pct = int(done / total * 100) if total > 0 else 0
+            if hasattr(self, 'dl_progress_signal'):
+                self.dl_progress_signal.emit(f"[USB Sync: {chain_name}] [{idx}/{total_items}] ({pct}%) {fname}")
+
+        ok, msg, transferred, deleted = SyncRemovableWorker.sync_removable_chain(
+            rc,
+            self.sync_config_manager,
+            status_cb=_status,
+            progress_cb=_prog
+        )
+        if hasattr(self, 'dl_progress_signal'):
+            self.dl_progress_signal.emit("")
+        if ok:
+            rc['last_synced'] = time.time()
+            rc['status'] = "Up to date"
+            self.sync_config_manager.save()
+            self.status_signal.emit(f"Removable media '{chain_name}' sync complete: {transferred} updated, {deleted} removed.", False, "#1abd33")
+            if hasattr(self, 'sync_manager_dialog') and self.sync_manager_dialog and self.sync_manager_dialog.isVisible():
+                QTimer.singleShot(0, self.sync_manager_dialog.refresh_cards)
+        else:
+            rc['status'] = f"Sync Failed: {msg}"
+            self.sync_config_manager.save()
+            self.status_signal.emit(f"Removable media '{chain_name}' sync failed: {msg}", False, "#E31E24")
 
     def _init_vlc_background(self):
         """Initialize libVLC in a background thread to avoid blocking the UI during plugin scanning."""
