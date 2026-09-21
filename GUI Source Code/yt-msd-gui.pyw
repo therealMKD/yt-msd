@@ -1588,9 +1588,16 @@ class UDPBeaconBroadcaster:
 
     def stop(self):
         self._running = False
+        if hasattr(self, '_sock') and self._sock:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
 
     def _run_loop(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock = sock
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         if sys.platform == 'win32':
@@ -1806,6 +1813,7 @@ class HostFolderWatcher:
                         self.watcher_ref._trigger_debounce(self.cid)
 
             observer = Observer()
+            observer.daemon = True
             handler = Handler(self, chain_id)
             observer.schedule(handler, str(p), recursive=False)
             observer.start()
@@ -1831,6 +1839,7 @@ class HostFolderWatcher:
         if obs:
             try:
                 obs.stop()
+                obs.join(timeout=0.3)
             except Exception:
                 pass
 
@@ -3518,9 +3527,7 @@ class MainApp(QMainWindow):
         self.wifi_monitor_timer.start(15000)
 
         # Initialize VLC in a background thread (plugin scanning can take seconds)
-        _startup_pool = ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 4))
-        _startup_pool.submit(self._init_vlc_background)
-        _startup_pool.shutdown(wait=False)
+        threading.Thread(target=self._init_vlc_background, daemon=True).start()
 
         # Defer local folder load until after the window is shown
         if self.local_current_path:
@@ -3863,7 +3870,7 @@ class MainApp(QMainWindow):
         restore_action = menu.addAction("Restore")
         restore_action.triggered.connect(self.showNormal)
         exit_action = menu.addAction("Exit")
-        exit_action.triggered.connect(QApplication.quit)
+        exit_action.triggered.connect(self.close)
         self.tray_icon.setContextMenu(menu)
         self.tray_icon.activated.connect(self._tray_activated)
         self.tray_icon.show()
@@ -3880,12 +3887,25 @@ class MainApp(QMainWindow):
         super().changeEvent(event)
 
     def closeEvent(self, event):
-        self.save_config()
-        if self.vlc_player: self.vlc_player.stop()
-        if hasattr(self, 'sync_host_server'): self.sync_host_server.stop()
-        if hasattr(self, 'udp_beacon'): self.udp_beacon.stop()
-        if hasattr(self, 'host_watcher'): self.host_watcher.stop_all()
-        super().closeEvent(event)
+        try:
+            self.save_config()
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, 'sync_config_manager') and self.sync_config_manager:
+                self.sync_config_manager.save()
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, 'tray_icon') and self.tray_icon:
+                self.tray_icon.hide()
+        except Exception:
+            pass
+
+        event.accept()
+        os._exit(0)
 
     def reset_to_defaults(self):
         if os.path.exists(self.config_path):
@@ -5833,4 +5853,9 @@ if __name__ == "__main__":
         QToolTip.setFont(QFont("Segoe UI", 9))
         window = MainApp()
         window.show()
-        sys.exit(app.exec())
+        ret = app.exec()
+        try:
+            window.close()
+        except Exception:
+            pass
+        os._exit(ret)
