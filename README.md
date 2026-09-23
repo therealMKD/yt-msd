@@ -31,6 +31,7 @@ The GUI version is currently "complete" at v1.0, (and "improved" at v2.3) but fu
 - Music player only mode (hiding all download features)
 - Various QOL changes and bug fixes
 - MusicBee Plugin version - Will be released once the program has completely matured. This will be when all features have been added, and will probably just be the entire yt-msd program wrapped in C++. (Yeah, very optimized, I know)
+- Migration from python-vlc to python-mkv so that you don't have to have VLC player installed. The new dependency will also be more lightweight, since I'm only using it for audio.
 
 ### Support for other operating systems
 **MacOS**: Exe files don't run on MacOS, but you can still use the python file and install the dependencies. Unfortunately due to the migration to Pyside6, I can no longer make a pex file properly (At least in my windows development environment). You could also use WINE to emulate windows functionality with the exe. I don't plan on releasing any additional files supporting MacOS, both because I don't have a Mac to test on, and also because MacOS sucks ass.
