@@ -2155,8 +2155,9 @@ class SyncClientWorker:
 # Placeholder tag file placed in removable media / USB drive folders
 SYNC_TAG_FILENAME = "TAG.yaml"
 
-def write_sync_tag_file(folder_path: Union[str, Path], sync_code: str, sync_style: str = 'Mirror',
-                        last_synced_by: str = 'Host', parent_sync_folder: str = '') -> bool:
+def write_sync_tag_file(folder_path: Union[str, Path], sync_code: str, chain_name: str = '',
+                        sync_style: str = 'Mirror', last_synced_by: str = 'Host',
+                        parent_sync_folder: str = '') -> bool:
     try:
         p = Path(folder_path)
         p.mkdir(parents=True, exist_ok=True)
@@ -2165,12 +2166,14 @@ def write_sync_tag_file(folder_path: Union[str, Path], sync_code: str, sync_styl
         content = (
             "# This is a marker file for yt-msd syncing. DO NOT DELETE!\n"
             "# This file is automatically created by yt-msd, when syncing a playlist onto removable media (Like an SD card)\n"
-            "# Modifiying or deleting this file will break the sync process. If you no longer want to sync, delete the sync chain inside of yt-msd.\n\n"
+            "# Modifying or deleting this file will break the sync process. If you no longer want to sync, delete the sync chain inside of yt-msd.\n\n"
             f"sync_code: {sync_code}\n\n"
+            "# Human-readable name for this sync chain\n"
+            f"chain_name: {chain_name}\n\n"
             "# Either Mirror, or Additive\n"
             f"sync_style: {sync_style}\n\n"
             f"last_synced: {now_str}\n\n"
-            "# Either host of the chain, or client in the same chain.\n"
+            "# Either Host (this machine hosts the chain) or Client (subscribed to a remote host).\n"
             f"last_synced_by: {last_synced_by}\n\n"
             "# Filepath of master folder on host\n"
             f"parent_sync_folder: {parent_sync_folder}\n"
@@ -2250,7 +2253,6 @@ class SyncConfigManager:
         self.settings: dict = {"auto_sync_interval_mins": 30, "firewall_prompted": False}
         self.hosted_chains: List[dict] = []
         self.client_chains: List[dict] = []
-        self.removable_chains: List[dict] = []
         self.load()
 
     def load(self):
@@ -2263,7 +2265,6 @@ class SyncConfigManager:
                     self.settings = legacy_data.get('settings', self.settings)
                     self.hosted_chains = legacy_data.get('hosted_chains', [])
                     self.client_chains = legacy_data.get('client_chains', [])
-                    self.removable_chains = legacy_data.get('removable_chains', [])
                 migrated = True
             except Exception:
                 pass
@@ -2280,7 +2281,6 @@ class SyncConfigManager:
                         self.settings = data.get('sync_settings', self.settings)
                         self.hosted_chains = data.get('hosted_chains', self.hosted_chains)
                         self.client_chains = data.get('client_chains', self.client_chains)
-                        self.removable_chains = data.get('removable_chains', self.removable_chains)
             except Exception:
                 pass
 
@@ -2299,7 +2299,6 @@ class SyncConfigManager:
         data['sync_settings'] = self.settings
         data['hosted_chains'] = self.hosted_chains
         data['client_chains'] = self.client_chains
-        data['removable_chains'] = self.removable_chains
 
         try:
             with open(self.config_file, 'w', encoding='utf-8') as f:
@@ -2393,7 +2392,6 @@ class SyncConfigManager:
     def remove_chain(self, chain_id: str):
         self.hosted_chains = [c for c in self.hosted_chains if c.get('id') != chain_id]
         self.client_chains = [c for c in self.client_chains if c.get('id') != chain_id]
-        self.removable_chains = [c for c in self.removable_chains if c.get('id') != chain_id]
         self.save()
 
 
@@ -2925,11 +2923,14 @@ class ConnectRemovableMediaDialog(QDialog):
 
         name = subfolder or chain.get('name', 'Removable Drive')
         parent_folder = chain.get('folder_path', '')
+        sync_code = str(chain.get('sync_code', ''))
+        chain_name = chain.get('name', name)
 
-        # Write the initial TAG.yaml
+        # Write the initial TAG.yaml (all config lives here, not in local config)
         ok = write_sync_tag_file(
             dest_path,
             sync_code=sync_code,
+            chain_name=chain_name,
             sync_style='Mirror' if del_mode == 'mirror' else 'Additive',
             last_synced_by=c_type,
             parent_sync_folder=parent_folder
@@ -2938,12 +2939,22 @@ class ConnectRemovableMediaDialog(QDialog):
             QMessageBox.warning(self, "Error", f"Failed to write TAG.yaml file to {dest_path}.")
             return
 
-        self.config_manager.add_removable_chain(
-            name=name,
-            folder_path=str(dest_path),
-            sync_code=sync_code,
-            deletion_mode=del_mode
-        )
+        # Register in the runtime active drives dict and immediately sync
+        cid = f"rc_{sync_code}_{abs(hash(str(dest_path))) % 100000}"
+        rc = {
+            'id': cid,
+            'sync_code': sync_code,
+            'name': chain_name,
+            'folder_path': str(dest_path),
+            'deletion_mode': del_mode,
+            'last_synced': '',
+            'status': 'Ready',
+            'drive_root': str(Path(base_dir).anchor),
+        }
+        app = getattr(self.parent_window, 'parent_app', None)
+        if app is None:
+            app = self.parent_window  # SyncManagerDialog -> parent_app
+        app.active_removable_drives[str(dest_path)] = rc
         self.accept()
 
 
@@ -2959,7 +2970,8 @@ class SyncManagerDialog(QDialog):
         # Check Windows Firewall rule every time the sync window opens
         self._check_firewall_rule()
 
-        self.sync_threads = {}
+        # Reference the app-level sync_threads dict (persists across dialog open/close)
+        self.sync_threads = parent_app.sync_threads
 
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(18, 18, 18, 18)
@@ -3070,19 +3082,23 @@ class SyncManagerDialog(QDialog):
         threading.Thread(target=_bg_firewall, daemon=True).start()
 
     def closeEvent(self, event):
-        super().closeEvent(event)
+        # Hide instead of closing so thread references and state survive across open/close cycles
+        event.ignore()
+        self.hide()
         if self.parent_app:
             self.parent_app.raise_()
             self.parent_app.activateWindow()
 
     def accept(self):
-        super().accept()
+        # Hide instead of accepting (would destroy the dialog with exec())
+        self.hide()
         if self.parent_app:
             self.parent_app.raise_()
             self.parent_app.activateWindow()
 
     def reject(self):
-        super().reject()
+        # Hide instead of rejecting
+        self.hide()
         if self.parent_app:
             self.parent_app.raise_()
             self.parent_app.activateWindow()
@@ -3111,10 +3127,8 @@ class SyncManagerDialog(QDialog):
     def _open_removable_dialog(self):
         dlg = ConnectRemovableMediaDialog(self, self.config_manager)
         if dlg.exec():
-            self.config_manager.save()
+            # Dialog wrote TAG.yaml; refresh to pick up any newly-tagged connected drive
             self.refresh_cards()
-            if self.config_manager.removable_chains:
-                self._sync_single_removable_chain(self.config_manager.removable_chains[-1])
 
     def refresh_cards(self):
         while self.cards_layout.count():
@@ -3124,10 +3138,10 @@ class SyncManagerDialog(QDialog):
 
         hosted = self.config_manager.hosted_chains
         clients = self.config_manager.client_chains
-        removables = self.config_manager.removable_chains
+        removables = list(getattr(self.parent_app, 'active_removable_drives', {}).values())
 
         if not hosted and not clients and not removables:
-            empty_lbl = QLabel("No active Sync Chains. Click 'Create Chain' to host a folder, 'Connect Chain' to join an existing one, or 'Connect Removable Drive' for USB syncing.")
+            empty_lbl = QLabel("No active Sync Chains. Click 'Create Chain' to host a folder, 'Connect Chain' to join an existing one, or plug in a USB drive tagged with TAG.yaml.")
             empty_lbl.setAlignment(Qt.AlignCenter)
             empty_lbl.setStyleSheet("color: #888; padding: 40px; font-size: 13px;")
             self.cards_layout.addWidget(empty_lbl)
@@ -3165,6 +3179,8 @@ class SyncManagerDialog(QDialog):
                 self.cards_layout.addWidget(card)
 
         self.cards_layout.addStretch()
+        # Immediately restore live status/progress for any in-progress syncs
+        self._restore_in_progress_labels()
 
     def _build_host_card(self, hc: dict) -> QWidget:
         card = QFrame()
@@ -3465,6 +3481,7 @@ class SyncManagerDialog(QDialog):
             return
 
         cc['status'] = "Syncing..."
+        self.parent_app.sync_progress_state[cid] = {'status': 'Syncing...', 'progress': ''}
         self.refresh_cards()
 
         thread = ClientSyncThread(cc)
@@ -3473,6 +3490,7 @@ class SyncManagerDialog(QDialog):
         chain_name = cc.get('name', 'Sync')
 
         def _on_status(txt):
+            self.parent_app.sync_progress_state.setdefault(cid, {})['status'] = txt
             self._update_client_card_label(cid, "status_lbl", txt)
             if hasattr(self.parent_app, 'dl_progress_signal'):
                 self.parent_app.dl_progress_signal.emit(f"[Sync: {chain_name}] {txt}")
@@ -3480,6 +3498,7 @@ class SyncManagerDialog(QDialog):
         def _on_progress(done, total, filename, idx, total_items):
             pct = int(done / total * 100) if total > 0 else 0
             prog_txt = f"[{idx}/{total_items}] ({pct}%) {filename}"
+            self.parent_app.sync_progress_state.setdefault(cid, {})['progress'] = prog_txt
             self._update_client_card_label(cid, "progress_lbl", prog_txt)
             if hasattr(self.parent_app, 'dl_progress_signal'):
                 self.parent_app.dl_progress_signal.emit(f"[Sync: {chain_name}] {prog_txt}")
@@ -3489,6 +3508,7 @@ class SyncManagerDialog(QDialog):
             if ok:
                 cc['last_synced'] = time.time()
             self.config_manager.save()
+            self.parent_app.sync_progress_state.pop(cid, None)
             self._update_client_card_label(cid, "progress_lbl", "")
             self.refresh_cards()
             if self.parent_app.local_current_path == cc.get('folder_path'):
@@ -3507,6 +3527,7 @@ class SyncManagerDialog(QDialog):
             return
 
         rc['status'] = "Syncing..."
+        self.parent_app.sync_progress_state[cid] = {'status': 'Syncing...', 'progress': ''}
         self.refresh_cards()
 
         thread = RemovableSyncThread(rc, self.config_manager)
@@ -3515,6 +3536,7 @@ class SyncManagerDialog(QDialog):
         chain_name = rc.get('name', 'Removable Drive')
 
         def _on_status(txt):
+            self.parent_app.sync_progress_state.setdefault(cid, {})['status'] = txt
             self._update_client_card_label(cid, "status_lbl", txt)
             if hasattr(self.parent_app, 'dl_progress_signal'):
                 self.parent_app.dl_progress_signal.emit(f"[USB Sync: {chain_name}] {txt}")
@@ -3522,6 +3544,7 @@ class SyncManagerDialog(QDialog):
         def _on_progress(done, total, filename, idx, total_items):
             pct = int(done / total * 100) if total > 0 else 0
             prog_txt = f"[{idx}/{total_items}] ({pct}%) {filename}"
+            self.parent_app.sync_progress_state.setdefault(cid, {})['progress'] = prog_txt
             self._update_client_card_label(cid, "progress_lbl", prog_txt)
             if hasattr(self.parent_app, 'dl_progress_signal'):
                 self.parent_app.dl_progress_signal.emit(f"[USB Sync: {chain_name}] {prog_txt}")
@@ -3531,6 +3554,7 @@ class SyncManagerDialog(QDialog):
             if ok:
                 rc['last_synced'] = time.time()
             self.config_manager.save()
+            self.parent_app.sync_progress_state.pop(cid, None)
             self._update_client_card_label(cid, "progress_lbl", "")
             self.refresh_cards()
             if hasattr(self.parent_app, 'dl_progress_signal'):
@@ -3550,15 +3574,30 @@ class SyncManagerDialog(QDialog):
                 if w.property("chain_id") == chain_id:
                     lbl = w.property(prop_name)
                     if lbl:
-                        lbl.setText(text)
+                        try:
+                            lbl.setText(text)
+                        except RuntimeError:
+                            pass  # widget deleted (dialog closed mid-sync)
                     break
+
+    def _restore_in_progress_labels(self):
+        """After refresh_cards(), re-populate status/progress labels for any currently running syncs."""
+        state = getattr(self.parent_app, 'sync_progress_state', {})
+        threads = getattr(self.parent_app, 'sync_threads', {})
+        for cid, ps in state.items():
+            thread = threads.get(cid)
+            if thread and thread.isRunning():
+                if ps.get('status'):
+                    self._update_client_card_label(cid, "status_lbl", ps['status'])
+                if ps.get('progress'):
+                    self._update_client_card_label(cid, "progress_lbl", ps['progress'])
 
     def _force_sync_all(self):
         # 1. Sync all subscribed client chains
         for cc in self.config_manager.client_chains:
             self._sync_single_client_chain(cc)
         # 2. Sync all removable media chains whose drives are currently connected
-        for rc in self.config_manager.removable_chains:
+        for rc in getattr(self.parent_app, 'active_removable_drives', {}).values():
             if Path(rc.get('folder_path', '')).exists():
                 self._sync_single_removable_chain(rc)
         # 3. Push update notification to clients of our hosted chains (force clients to sync)
@@ -3943,10 +3982,47 @@ class SettingsDialog(QDialog):
         self.parent.save_config()
 
     def _open_sync_manager(self):
-        dlg = SyncManagerDialog(self.parent)
-        self.parent.sync_manager_dialog = dlg
-        dlg.exec()
-        self.parent.sync_manager_dialog = None
+        app = self.parent
+
+        def _bring_to_front(dlg):
+            """Reliably bring dialog to front on Windows using a brief WindowStaysOnTopHint."""
+            try:
+                flags = dlg.windowFlags()
+                dlg.setWindowFlags(flags | Qt.WindowStaysOnTopHint)
+                dlg.show()
+                dlg.raise_()
+                dlg.activateWindow()
+                # Remove the hint after a tick so it doesn't permanently stay on top
+                def _remove_hint():
+                    try:
+                        dlg.setWindowFlags(flags)
+                        dlg.show()  # Must re-show after setWindowFlags changes
+                    except RuntimeError:
+                        pass
+                QTimer.singleShot(150, _remove_hint)
+            except RuntimeError:
+                pass
+
+        # Reuse the existing dialog if it's alive, just show and raise it
+        if app.sync_manager_dialog is not None:
+            try:
+                if app.sync_manager_dialog.isVisible():
+                    _bring_to_front(app.sync_manager_dialog)
+                    return
+                else:
+                    # Dialog exists but was hidden - refresh and re-show
+                    app.sync_manager_dialog.refresh_cards()
+                    _bring_to_front(app.sync_manager_dialog)
+                    return
+            except RuntimeError:
+                # Underlying C++ object was deleted - fall through to create a new one
+                app.sync_manager_dialog = None
+
+        dlg = SyncManagerDialog(app)
+        app.sync_manager_dialog = dlg
+        dlg.setWindowModality(Qt.NonModal)
+        dlg.setAttribute(Qt.WA_DeleteOnClose, False)  # Keep alive so we can reuse it
+        _bring_to_front(dlg)
 
     def _reset_defaults(self):
         if QMessageBox.question(self, "Confirm Reset", "This will wipe your config and recent data. Continue?") == QMessageBox.Yes:
@@ -4061,6 +4137,11 @@ class MainApp(QMainWindow):
         self.active_downloads_lock = threading.Lock()
         self.sync_manager_dialog = None
         self.last_wifi_ssid = get_current_wifi_ssid()
+        # Persistent sync thread registry - lives at MainApp level so it survives dialog close/reopen
+        self.sync_threads = {}  # chain_id -> QThread
+        self.sync_progress_state = {}  # chain_id -> {'status': str, 'progress': str}
+        # Runtime-only registry of currently connected removable drives (not persisted)
+        self.active_removable_drives: dict = {}  # folder_path_str -> rc dict
         
         if getattr(sys, 'frozen', False):
             self.config_dir = os.path.dirname(os.path.abspath(sys.executable))
@@ -4108,6 +4189,7 @@ class MainApp(QMainWindow):
 
         # Removable drive auto-detect timer (checks every 3s for newly plugged drives with TAG.yaml)
         self.known_connected_drives = self._get_current_system_drives()
+        self.active_removable_drives = {}  # folder_path_str -> rc dict (runtime only)
         self.drive_monitor_timer = QTimer(self)
         self.drive_monitor_timer.timeout.connect(self._check_removable_drives_change)
         self.drive_monitor_timer.start(3000)
@@ -4345,19 +4427,33 @@ class MainApp(QMainWindow):
         return drives
 
     def _check_removable_drives_change(self):
-        """Detects newly connected removable storage drives and auto-syncs any folder tagged with TAG.yaml."""
+        """Detects drive connect/disconnect events and auto-syncs any folder tagged with TAG.yaml."""
         if not hasattr(self, 'sync_config_manager'):
             return
         try:
             current_drives = self._get_current_system_drives()
             known = getattr(self, 'known_connected_drives', set())
             newly_connected = current_drives - known
+            newly_disconnected = known - current_drives
             self.known_connected_drives = current_drives
+
+            # Handle disconnections — remove entries whose drive root is gone
+            if newly_disconnected:
+                removed_keys = [fp for fp in list(self.active_removable_drives.keys())
+                                if any(fp.upper().startswith(d.upper()) for d in newly_disconnected)]
+                for key in removed_keys:
+                    self.active_removable_drives.pop(key, None)
+                if removed_keys and self.sync_manager_dialog:
+                    try:
+                        QTimer.singleShot(0, self.sync_manager_dialog.refresh_cards)
+                    except RuntimeError:
+                        pass
 
             if not newly_connected:
                 return
 
             def _scan_and_sync():
+                changed = False
                 for drive in newly_connected:
                     tagged_folders = find_tagged_sync_folders_on_drive(drive)
                     for folder_path, tag_data in tagged_folders:
@@ -4368,54 +4464,89 @@ class MainApp(QMainWindow):
                         is_client = any(str(cc.get('sync_code')) == sync_code for cc in self.sync_config_manager.client_chains)
                         if is_hosted or is_client:
                             f_str = str(folder_path)
-                            existing_rc = next((rc for rc in self.sync_config_manager.removable_chains if rc.get('folder_path') == f_str), None)
                             del_mode = tag_data.get('deletion_mode', 'mirror')
-                            chain_name = folder_path.name or f"Drive ({drive[0]}:)"
-                            if not existing_rc:
-                                existing_rc = self.sync_config_manager.add_removable_chain(
-                                    name=chain_name,
-                                    folder_path=f_str,
-                                    sync_code=sync_code,
-                                    deletion_mode=del_mode
-                                )
-                            self._auto_sync_removable_chain(existing_rc)
+                            # Prefer chain_name from TAG.yaml; fall back to folder name
+                            chain_name = (tag_data.get('chain_name', '') or
+                                          folder_path.name or
+                                          f"Drive ({drive[0]}:)")
+                            cid = f"rc_{sync_code}_{abs(hash(f_str)) % 100000}"
+                            rc = {
+                                'id': cid,
+                                'sync_code': sync_code,
+                                'name': chain_name,
+                                'folder_path': f_str,
+                                'deletion_mode': del_mode,
+                                'last_synced': tag_data.get('last_synced', ''),
+                                'status': 'Ready',
+                                'drive_root': drive,
+                            }
+                            self.active_removable_drives[f_str] = rc
+                            changed = True
+                            self._auto_sync_removable_chain(rc)
+                if changed and self.sync_manager_dialog:
+                    try:
+                        QTimer.singleShot(0, self.sync_manager_dialog.refresh_cards)
+                    except RuntimeError:
+                        pass
 
             threading.Thread(target=_scan_and_sync, daemon=True).start()
         except Exception:
             pass
 
     def _auto_sync_removable_chain(self, rc: dict):
+        """Launch a background removable chain sync via RemovableSyncThread so it shows in the sync manager."""
+        cid = rc.get('id', '')
+        # Don't start if already in progress
+        existing = self.sync_threads.get(cid)
+        if existing and existing.isRunning():
+            return
+
         chain_name = rc.get('name', 'Removable Media')
+        rc['status'] = 'Syncing...'
+        self.sync_progress_state[cid] = {'status': 'Syncing...', 'progress': ''}
         self.status_signal.emit(f"Removable media detected for '{chain_name}'. Starting auto-sync...", False, "#3B8ED0")
 
-        def _status(t):
-            if hasattr(self, 'dl_progress_signal'):
-                self.dl_progress_signal.emit(f"[USB Sync: {chain_name}] {t}")
+        thread = RemovableSyncThread(rc, self.sync_config_manager)
+        self.sync_threads[cid] = thread
 
-        def _prog(done, total, fname, idx, total_items):
+        def _on_status(txt):
+            self.sync_progress_state.setdefault(cid, {})['status'] = txt
+            if hasattr(self, 'dl_progress_signal'):
+                self.dl_progress_signal.emit(f"[USB Sync: {chain_name}] {txt}")
+            if self.sync_manager_dialog and self.sync_manager_dialog.isVisible():
+                self.sync_manager_dialog._update_client_card_label(cid, "status_lbl", txt)
+
+        def _on_progress(done, total, fname, idx, total_items):
             pct = int(done / total * 100) if total > 0 else 0
+            prog_txt = f"[{idx}/{total_items}] ({pct}%) {fname}"
+            self.sync_progress_state.setdefault(cid, {})['progress'] = prog_txt
             if hasattr(self, 'dl_progress_signal'):
-                self.dl_progress_signal.emit(f"[USB Sync: {chain_name}] [{idx}/{total_items}] ({pct}%) {fname}")
+                self.dl_progress_signal.emit(f"[USB Sync: {chain_name}] {prog_txt}")
+            if self.sync_manager_dialog and self.sync_manager_dialog.isVisible():
+                self.sync_manager_dialog._update_client_card_label(cid, "progress_lbl", prog_txt)
 
-        ok, msg, transferred, deleted = SyncRemovableWorker.sync_removable_chain(
-            rc,
-            self.sync_config_manager,
-            status_cb=_status,
-            progress_cb=_prog
-        )
-        if hasattr(self, 'dl_progress_signal'):
-            self.dl_progress_signal.emit("")
-        if ok:
-            rc['last_synced'] = time.time()
-            rc['status'] = "Up to date"
+        def _on_finish(ok, msg, transferred, deleted):
+            rc['status'] = "Up to date" if ok else f"Sync Failed: {msg}"
+            if ok:
+                rc['last_synced'] = time.time()
             self.sync_config_manager.save()
-            self.status_signal.emit(f"Removable media '{chain_name}' sync complete: {transferred} updated, {deleted} removed.", False, "#1abd33")
-            if hasattr(self, 'sync_manager_dialog') and self.sync_manager_dialog and self.sync_manager_dialog.isVisible():
-                QTimer.singleShot(0, self.sync_manager_dialog.refresh_cards)
-        else:
-            rc['status'] = f"Sync Failed: {msg}"
-            self.sync_config_manager.save()
-            self.status_signal.emit(f"Removable media '{chain_name}' sync failed: {msg}", False, "#E31E24")
+            self.sync_progress_state.pop(cid, None)
+            if hasattr(self, 'dl_progress_signal'):
+                self.dl_progress_signal.emit("")
+            if ok:
+                self.status_signal.emit(f"Removable media '{chain_name}' sync complete: {transferred} updated, {deleted} removed.", False, "#1abd33")
+            else:
+                self.status_signal.emit(f"Removable media '{chain_name}' sync failed: {msg}", False, "#E31E24")
+            if self.sync_manager_dialog:
+                try:
+                    QTimer.singleShot(0, self.sync_manager_dialog.refresh_cards)
+                except RuntimeError:
+                    pass
+
+        thread.status_signal.connect(_on_status)
+        thread.progress_signal.connect(_on_progress)
+        thread.finished_signal.connect(_on_finish)
+        thread.start()
 
     def _init_vlc_background(self):
         """Initialize libVLC in a background thread to avoid blocking the UI during plugin scanning."""
