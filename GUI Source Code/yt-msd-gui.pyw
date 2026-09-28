@@ -19,7 +19,13 @@ import yt_dlp
 import webbrowser
 import urllib.request
 import io
-import vlc
+try:
+    import vlc
+    _VLC_MODULE_AVAILABLE = True
+except Exception as e:
+    vlc = None
+    _VLC_MODULE_AVAILABLE = False
+    _VLC_IMPORT_ERROR = str(e)
 import shlex
 import time
 import random
@@ -633,6 +639,21 @@ def check_ffmpeg_available():
         return True
     except Exception:
         return False
+
+def check_vlc_available():
+    if not _VLC_MODULE_AVAILABLE or vlc is None:
+        return False, getattr(sys.modules[__name__], '_VLC_IMPORT_ERROR', 'python-vlc not available')
+    try:
+        instance = vlc.Instance('--quiet', '--no-video')
+        if instance is None:
+            return False, "libvlc.dll not found. Please install VLC Media Player."
+        player = instance.media_player_new()
+        if player is None:
+            return False, "Failed to create VLC media player instance."
+        return True, "OK"
+    except Exception as e:
+        return False, str(e)
+
 
 def measure_loudness(filepath):
     command = [
@@ -1293,7 +1314,7 @@ SYNC_PORT_START = 63350
 SYNC_PORT_END = 63370
 UDP_BEACON_PORT = 63350
 SYNC_SOCKET_TIMEOUT = 12.0
-SYNC_CHUNK_SIZE = 64 * 1024
+SYNC_CHUNK_SIZE = 1024 * 1024
 
 
 def get_current_wifi_ssid() -> Optional[str]:
@@ -2461,9 +2482,9 @@ class SyncRemovableWorker:
                 try:
                     s_stat = src_file.stat()
                     d_stat = dest_file.stat()
-                    if s_stat.st_size != d_stat.st_size or s_stat.st_mtime > d_stat.st_mtime + 1.0:
-                        if compute_file_sha256(src_file).lower() != compute_file_sha256(dest_file).lower():
-                            needs_copy = True
+                    # If size differs or source is newer by > 2s, copy
+                    if s_stat.st_size != d_stat.st_size or s_stat.st_mtime > d_stat.st_mtime + 2.0:
+                        needs_copy = True
                 except Exception:
                     needs_copy = True
 
@@ -2471,7 +2492,15 @@ class SyncRemovableWorker:
                 if status_cb:
                     status_cb(f"Copying [{idx}/{total_items}]: {name}")
                 try:
-                    shutil.copy2(src_file, dest_file)
+                    # High-speed unthrottled copy using 4MB streaming buffer
+                    BUF_SIZE = 4 * 1024 * 1024
+                    with open(src_file, 'rb') as sf, open(dest_file, 'wb') as df:
+                        while True:
+                            buf = sf.read(BUF_SIZE)
+                            if not buf:
+                                break
+                            df.write(buf)
+                    shutil.copystat(src_file, dest_file)
                     transferred += 1
                     if progress_cb:
                         progress_cb(idx, total_items, name, idx, total_items)
@@ -2502,6 +2531,7 @@ class SyncRemovableWorker:
                 write_sync_tag_file(
                     dest_path,
                     sync_code=sync_code,
+                    chain_name=chain_name,
                     sync_style='Mirror' if del_mode == 'mirror' else 'Additive',
                     last_synced_by='Host',
                     parent_sync_folder=str(src_dir)
@@ -2524,6 +2554,7 @@ class SyncRemovableWorker:
                 write_sync_tag_file(
                     dest_path,
                     sync_code=sync_code,
+                    chain_name=chain_name,
                     sync_style='Mirror' if del_mode == 'mirror' else 'Additive',
                     last_synced_by='Client',
                     parent_sync_folder=str(matching_cc.get('folder_path', ''))
@@ -2955,6 +2986,8 @@ class ConnectRemovableMediaDialog(QDialog):
         if app is None:
             app = self.parent_window  # SyncManagerDialog -> parent_app
         app.active_removable_drives[str(dest_path)] = rc
+        if hasattr(app, '_auto_sync_removable_chain'):
+            app._auto_sync_removable_chain(rc)
         self.accept()
 
 
@@ -3080,6 +3113,11 @@ class SyncManagerDialog(QDialog):
             except Exception:
                 pass
         threading.Thread(target=_bg_firewall, daemon=True).start()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.raise_()
+        self.activateWindow()
 
     def closeEvent(self, event):
         # Hide instead of closing so thread references and state survive across open/close cycles
@@ -3348,7 +3386,12 @@ class SyncManagerDialog(QDialog):
 
         folder_str = cc.get('folder_path', '')
         last_sync = cc.get('last_synced', 0)
-        last_sync_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_sync)) if last_sync > 0 else "Never"
+        if isinstance(last_sync, (int, float)) and last_sync > 0:
+            last_sync_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_sync))
+        elif isinstance(last_sync, str) and last_sync.strip():
+            last_sync_str = last_sync.strip()
+        else:
+            last_sync_str = "Never"
         del_mode = cc.get('deletion_mode', 'mirror').capitalize()
 
         pause_info = ""
@@ -3424,7 +3467,12 @@ class SyncManagerDialog(QDialog):
 
         folder_str = rc.get('folder_path', '')
         last_sync = rc.get('last_synced', 0)
-        last_sync_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_sync)) if last_sync > 0 else "Never"
+        if isinstance(last_sync, (int, float)) and last_sync > 0:
+            last_sync_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_sync))
+        elif isinstance(last_sync, str) and last_sync.strip():
+            last_sync_str = last_sync.strip()
+        else:
+            last_sync_str = "Never"
         is_mounted = Path(folder_str).exists()
         mount_str = "Mounted" if is_mounted else "Drive Not Connected"
 
@@ -3470,6 +3518,17 @@ class SyncManagerDialog(QDialog):
 
     def _delete_chain(self, chain_id: str):
         if QMessageBox.question(self, "Confirm Removal", "Are you sure you want to remove this sync chain? (Audio files on disk will remain untouched)") == QMessageBox.Yes:
+            # Check if removable chain
+            removables_dict = getattr(self.parent_app, 'active_removable_drives', {})
+            for f_str, rc in list(removables_dict.items()):
+                if rc.get('id') == chain_id:
+                    removables_dict.pop(f_str, None)
+                    tag_file = Path(rc.get('folder_path', '')) / SYNC_TAG_FILENAME
+                    try:
+                        if tag_file.exists():
+                            tag_file.unlink()
+                    except Exception:
+                        pass
             self.config_manager.remove_chain(chain_id)
             if hasattr(self.parent_app, 'refresh_sync_watchers'):
                 self.parent_app.refresh_sync_watchers()
@@ -3522,44 +3581,12 @@ class SyncManagerDialog(QDialog):
         thread.start()
 
     def _sync_single_removable_chain(self, rc: dict):
-        cid = rc.get('id')
-        if cid in self.sync_threads and self.sync_threads[cid].isRunning():
-            return
-
-        rc['status'] = "Syncing..."
-        self.parent_app.sync_progress_state[cid] = {'status': 'Syncing...', 'progress': ''}
-        self.refresh_cards()
-
-        thread = RemovableSyncThread(rc, self.config_manager)
-        self.sync_threads[cid] = thread
-
-        chain_name = rc.get('name', 'Removable Drive')
-
-        def _on_status(txt):
-            self.parent_app.sync_progress_state.setdefault(cid, {})['status'] = txt
-            self._update_client_card_label(cid, "status_lbl", txt)
-            if hasattr(self.parent_app, 'dl_progress_signal'):
-                self.parent_app.dl_progress_signal.emit(f"[USB Sync: {chain_name}] {txt}")
-
-        def _on_progress(done, total, filename, idx, total_items):
-            pct = int(done / total * 100) if total > 0 else 0
-            prog_txt = f"[{idx}/{total_items}] ({pct}%) {filename}"
-            self.parent_app.sync_progress_state.setdefault(cid, {})['progress'] = prog_txt
-            self._update_client_card_label(cid, "progress_lbl", prog_txt)
-            if hasattr(self.parent_app, 'dl_progress_signal'):
-                self.parent_app.dl_progress_signal.emit(f"[USB Sync: {chain_name}] {prog_txt}")
-
-        def _on_finish(ok, msg, transferred, deleted):
-            rc['status'] = "Up to date" if ok else f"Failed: {msg}"
-            if ok:
-                rc['last_synced'] = time.time()
-            self.config_manager.save()
-            self.parent_app.sync_progress_state.pop(cid, None)
-            self._update_client_card_label(cid, "progress_lbl", "")
+        if hasattr(self.parent_app, '_auto_sync_removable_chain'):
+            self.parent_app._auto_sync_removable_chain(rc)
             self.refresh_cards()
-            if hasattr(self.parent_app, 'dl_progress_signal'):
-                self.parent_app.dl_progress_signal.emit("")
 
+        thread=ClientSyncThread(rc)
+        
         thread.status_signal.connect(_on_status)
         thread.progress_signal.connect(_on_progress)
         thread.finished_signal.connect(_on_finish)
@@ -3617,7 +3644,6 @@ class SettingsDialog(QDialog):
         self.parent = parent
         self.setWindowTitle("Settings")
         self.setMinimumWidth(820)
-        self.setWindowFlags(self.windowFlags() | Qt.Tool)
         
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(20, 20, 20, 20)
@@ -3804,7 +3830,8 @@ class SettingsDialog(QDialog):
         self.eq_cb.setChecked(parent.use_custom_eq)
         self.eq_cb.toggled.connect(self._toggle_eq)
         eq_h.addWidget(self.eq_cb)
-        self.eq_edit = QLineEdit(parent.custom_eq_string)
+        initial_eq = parent.custom_eq_string if parent.custom_eq_string else "equalizer=f=100:width_type=o:width=2:g=0"
+        self.eq_edit = QLineEdit(initial_eq)
         self.eq_edit.setPlaceholderText("e.g. equalizer=f=100:width_type=o:width=2:g=-10")
         self.eq_edit.setEnabled(parent.use_custom_eq)
         self.eq_edit.textChanged.connect(self._update_eq)
@@ -3820,7 +3847,8 @@ class SettingsDialog(QDialog):
         self.norm_cmd_cb.setChecked(parent.use_custom_norm_cmd)
         self.norm_cmd_cb.toggled.connect(self._toggle_norm_cmd)
         norm_cmd_h.addWidget(self.norm_cmd_cb)
-        self.norm_cmd_edit = QLineEdit(parent.custom_norm_cmd)
+        initial_norm = parent.custom_norm_cmd if parent.custom_norm_cmd else f"loudnorm=I={TARGET_LUFS}:TP={TRUE_PEAK}:LRA=11"
+        self.norm_cmd_edit = QLineEdit(initial_norm)
         self.norm_cmd_edit.setPlaceholderText("e.g. loudnorm=I=-16:TP=-1.5:LRA=11")
         self.norm_cmd_edit.setEnabled(parent.use_custom_norm_cmd)
         self.norm_cmd_edit.textChanged.connect(self._update_norm_cmd)
@@ -3941,6 +3969,8 @@ class SettingsDialog(QDialog):
     def _toggle_eq(self, state):
         self.parent.use_custom_eq = state
         self.eq_edit.setEnabled(state)
+        if state and not self.eq_edit.text().strip():
+            self.eq_edit.setText("equalizer=f=100:width_type=o:width=2:g=0")
         self.parent.save_config()
 
     def _update_dl_threads(self, text):
@@ -3970,6 +4000,8 @@ class SettingsDialog(QDialog):
     def _toggle_norm_cmd(self, state):
         self.parent.use_custom_norm_cmd = state
         self.norm_cmd_edit.setEnabled(state)
+        if state and not self.norm_cmd_edit.text().strip():
+            self.norm_cmd_edit.setText(f"loudnorm=I={TARGET_LUFS}:TP={TRUE_PEAK}:LRA=11")
         global CUSTOM_NORM_CMD
         CUSTOM_NORM_CMD = self.parent.custom_norm_cmd if state else ""
         self.parent.save_config()
@@ -3982,47 +4014,8 @@ class SettingsDialog(QDialog):
         self.parent.save_config()
 
     def _open_sync_manager(self):
-        app = self.parent
-
-        def _bring_to_front(dlg):
-            """Reliably bring dialog to front on Windows using a brief WindowStaysOnTopHint."""
-            try:
-                flags = dlg.windowFlags()
-                dlg.setWindowFlags(flags | Qt.WindowStaysOnTopHint)
-                dlg.show()
-                dlg.raise_()
-                dlg.activateWindow()
-                # Remove the hint after a tick so it doesn't permanently stay on top
-                def _remove_hint():
-                    try:
-                        dlg.setWindowFlags(flags)
-                        dlg.show()  # Must re-show after setWindowFlags changes
-                    except RuntimeError:
-                        pass
-                QTimer.singleShot(150, _remove_hint)
-            except RuntimeError:
-                pass
-
-        # Reuse the existing dialog if it's alive, just show and raise it
-        if app.sync_manager_dialog is not None:
-            try:
-                if app.sync_manager_dialog.isVisible():
-                    _bring_to_front(app.sync_manager_dialog)
-                    return
-                else:
-                    # Dialog exists but was hidden - refresh and re-show
-                    app.sync_manager_dialog.refresh_cards()
-                    _bring_to_front(app.sync_manager_dialog)
-                    return
-            except RuntimeError:
-                # Underlying C++ object was deleted - fall through to create a new one
-                app.sync_manager_dialog = None
-
-        dlg = SyncManagerDialog(app)
-        app.sync_manager_dialog = dlg
-        dlg.setWindowModality(Qt.NonModal)
-        dlg.setAttribute(Qt.WA_DeleteOnClose, False)  # Keep alive so we can reuse it
-        _bring_to_front(dlg)
+        # Leave the settings dialog open in the background, open sync manager in foreground
+        self.parent.open_sync_manager(parent_dialog=self)
 
     def _reset_defaults(self):
         if QMessageBox.question(self, "Confirm Reset", "This will wipe your config and recent data. Continue?") == QMessageBox.Yes:
@@ -4187,12 +4180,16 @@ class MainApp(QMainWindow):
         self.wifi_monitor_timer.timeout.connect(self._check_wifi_network_change)
         self.wifi_monitor_timer.start(15000)
 
-        # Removable drive auto-detect timer (checks every 3s for newly plugged drives with TAG.yaml)
+        # Removable drive auto-detect timer (checks every 3s for plugged drives with TAG.yaml)
         self.known_connected_drives = self._get_current_system_drives()
         self.active_removable_drives = {}  # folder_path_str -> rc dict (runtime only)
         self.drive_monitor_timer = QTimer(self)
         self.drive_monitor_timer.timeout.connect(self._check_removable_drives_change)
         self.drive_monitor_timer.start(3000)
+        QTimer.singleShot(600, self._check_removable_drives_change)
+
+        # Startup dependency validation check
+        QTimer.singleShot(400, self._check_dependencies_on_startup)
 
         # Initialize VLC in a background thread (plugin scanning can take seconds)
         threading.Thread(target=self._init_vlc_background, daemon=True).start()
@@ -4432,29 +4429,22 @@ class MainApp(QMainWindow):
             return
         try:
             current_drives = self._get_current_system_drives()
-            known = getattr(self, 'known_connected_drives', set())
-            newly_connected = current_drives - known
-            newly_disconnected = known - current_drives
             self.known_connected_drives = current_drives
 
-            # Handle disconnections — remove entries whose drive root is gone
-            if newly_disconnected:
-                removed_keys = [fp for fp in list(self.active_removable_drives.keys())
-                                if any(fp.upper().startswith(d.upper()) for d in newly_disconnected)]
-                for key in removed_keys:
-                    self.active_removable_drives.pop(key, None)
-                if removed_keys and self.sync_manager_dialog:
-                    try:
-                        QTimer.singleShot(0, self.sync_manager_dialog.refresh_cards)
-                    except RuntimeError:
-                        pass
-
-            if not newly_connected:
-                return
+            # Handle disconnections — remove entries whose folder path is gone
+            removed_keys = [fp for fp in list(self.active_removable_drives.keys())
+                            if not os.path.exists(fp)]
+            for key in removed_keys:
+                self.active_removable_drives.pop(key, None)
+            if removed_keys and self.sync_manager_dialog:
+                try:
+                    QTimer.singleShot(0, self.sync_manager_dialog.refresh_cards)
+                except RuntimeError:
+                    pass
 
             def _scan_and_sync():
                 changed = False
-                for drive in newly_connected:
+                for drive in current_drives:
                     tagged_folders = find_tagged_sync_folders_on_drive(drive)
                     for folder_path, tag_data in tagged_folders:
                         sync_code = str(tag_data.get('sync_code', ''))
@@ -4464,25 +4454,25 @@ class MainApp(QMainWindow):
                         is_client = any(str(cc.get('sync_code')) == sync_code for cc in self.sync_config_manager.client_chains)
                         if is_hosted or is_client:
                             f_str = str(folder_path)
-                            del_mode = tag_data.get('deletion_mode', 'mirror')
-                            # Prefer chain_name from TAG.yaml; fall back to folder name
-                            chain_name = (tag_data.get('chain_name', '') or
-                                          folder_path.name or
-                                          f"Drive ({drive[0]}:)")
-                            cid = f"rc_{sync_code}_{abs(hash(f_str)) % 100000}"
-                            rc = {
-                                'id': cid,
-                                'sync_code': sync_code,
-                                'name': chain_name,
-                                'folder_path': f_str,
-                                'deletion_mode': del_mode,
-                                'last_synced': tag_data.get('last_synced', ''),
-                                'status': 'Ready',
-                                'drive_root': drive,
-                            }
-                            self.active_removable_drives[f_str] = rc
-                            changed = True
-                            self._auto_sync_removable_chain(rc)
+                            if f_str not in self.active_removable_drives:
+                                del_mode = tag_data.get('deletion_mode', 'mirror')
+                                chain_name = (tag_data.get('chain_name', '') or
+                                              folder_path.name or
+                                              f"Drive ({drive[0]}:)")
+                                cid = f"rc_{sync_code}_{abs(hash(f_str)) % 100000}"
+                                rc = {
+                                    'id': cid,
+                                    'sync_code': sync_code,
+                                    'name': chain_name,
+                                    'folder_path': f_str,
+                                    'deletion_mode': del_mode,
+                                    'last_synced': tag_data.get('last_synced', ''),
+                                    'status': 'Ready',
+                                    'drive_root': drive,
+                                }
+                                self.active_removable_drives[f_str] = rc
+                                changed = True
+                                self._auto_sync_removable_chain(rc)
                 if changed and self.sync_manager_dialog:
                     try:
                         QTimer.singleShot(0, self.sync_manager_dialog.refresh_cards)
@@ -4505,6 +4495,11 @@ class MainApp(QMainWindow):
         rc['status'] = 'Syncing...'
         self.sync_progress_state[cid] = {'status': 'Syncing...', 'progress': ''}
         self.status_signal.emit(f"Removable media detected for '{chain_name}'. Starting auto-sync...", False, "#3B8ED0")
+        if self.sync_manager_dialog and self.sync_manager_dialog.isVisible():
+            try:
+                self.sync_manager_dialog.refresh_cards()
+            except RuntimeError:
+                pass
 
         thread = RemovableSyncThread(rc, self.sync_config_manager)
         self.sync_threads[cid] = thread
@@ -4529,7 +4524,6 @@ class MainApp(QMainWindow):
             rc['status'] = "Up to date" if ok else f"Sync Failed: {msg}"
             if ok:
                 rc['last_synced'] = time.time()
-            self.sync_config_manager.save()
             self.sync_progress_state.pop(cid, None)
             if hasattr(self, 'dl_progress_signal'):
                 self.dl_progress_signal.emit("")
@@ -4548,11 +4542,74 @@ class MainApp(QMainWindow):
         thread.finished_signal.connect(_on_finish)
         thread.start()
 
+    def open_sync_manager(self, parent_dialog=None):
+        """Opens or brings the Sync Chains Manager to the foreground directly with Main < Settings < Sync stacking."""
+        if self.sync_manager_dialog is not None:
+            try:
+                self.sync_manager_dialog.refresh_cards()
+            except RuntimeError:
+                self.sync_manager_dialog = None
+
+        if self.sync_manager_dialog is None:
+            dlg = SyncManagerDialog(self)
+            self.sync_manager_dialog = dlg
+            dlg.setWindowModality(Qt.NonModal)
+            dlg.setAttribute(Qt.WA_DeleteOnClose, False)
+
+        # Enforce stacking: Main window < Settings window < Sync window
+        self.raise_()
+        if parent_dialog and parent_dialog.isVisible():
+            parent_dialog.raise_()
+        elif hasattr(self, 'settings_dialog') and self.settings_dialog and self.settings_dialog.isVisible():
+            self.settings_dialog.raise_()
+
+        self.sync_manager_dialog.show()
+        self.sync_manager_dialog.raise_()
+        self.sync_manager_dialog.activateWindow()
+
+    def _check_dependencies_on_startup(self):
+        """Checks for VLC and FFmpeg availability on startup and notifies the user with instructions if missing."""
+        missing = []
+
+        vlc_ok, vlc_err = check_vlc_available()
+        if not vlc_ok:
+            missing.append(
+                "• <b>VLC Media Player (libvlc.dll)</b><br>"
+                "Audio playback requires VLC Media Player (64-bit).<br>"
+                "Please download and install 64-bit VLC from: <a href='https://www.videolan.org/vlc/'>https://www.videolan.org/vlc/</a>"
+            )
+
+        if not check_ffmpeg_available():
+            missing.append(
+                "• <b>FFmpeg (ffmpeg.exe)</b><br>"
+                "Audio extraction, conversion, and loudness normalization require FFmpeg.<br>"
+                "Please install FFmpeg and make sure <code>ffmpeg.exe</code> is in your system PATH or placed in the application folder."
+            )
+
+        if missing:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Missing Required Dependencies - yt-msd")
+            msg.setIcon(QMessageBox.Warning)
+            msg.setTextFormat(Qt.RichText)
+            msg.setText(
+                "<h3>Required Dependencies Missing</h3>"
+                "yt-msd detected that the following components are not installed or could not be found:<br><br>"
+                + "<br><br>".join(missing)
+                + "<br><br>Some features (music playback, audio conversion, normalization) will not function until installed."
+            )
+            msg.setStandardButtons(QMessageBox.Ok)
+            msg.exec()
+
     def _init_vlc_background(self):
         """Initialize libVLC in a background thread to avoid blocking the UI during plugin scanning."""
+        if not _VLC_MODULE_AVAILABLE or vlc is None:
+            self.vlc_instance = None
+            self.vlc_player = None
+            self._vlc_ready = True
+            return
         try:
             instance = vlc.Instance('--quiet', '--no-video')
-            player = instance.media_player_new()
+            player = instance.media_player_new() if instance else None
             # Switch to main-thread ownership safely
             self.vlc_instance = instance
             self.vlc_player = player
@@ -4665,20 +4722,99 @@ class MainApp(QMainWindow):
         painter.drawEllipse(8, 8, 48, 48)
         painter.end()
         self.tray_icon.setIcon(QIcon(pixmap))
+        self.tray_icon.setToolTip("yt-msd")
         
-        menu = QMenu(self)
-        restore_action = menu.addAction("Restore")
-        restore_action.triggered.connect(self.showNormal)
-        exit_action = menu.addAction("Exit")
-        exit_action.triggered.connect(self.close)
-        self.tray_icon.setContextMenu(menu)
+        self.tray_menu = QMenu(self)
+        self.tray_menu.aboutToShow.connect(self._build_tray_menu)
+        self._build_tray_menu()
+        self.tray_icon.setContextMenu(self.tray_menu)
         self.tray_icon.activated.connect(self._tray_activated)
         self.tray_icon.show()
 
+    def _build_tray_menu(self):
+        self.tray_menu.clear()
+        
+        # Current song header
+        title = getattr(self, 'current_playing_title', '').strip()
+        time_txt = self.time_label.text().strip() if hasattr(self, 'time_label') else ""
+        if title:
+            header_text = f"🎵 {title}"
+            if time_txt and time_txt != "0:00 / 0:00":
+                header_text += f" | {time_txt}"
+            header_action = self.tray_menu.addAction(header_text)
+            header_action.setEnabled(False)
+            self.tray_menu.addSeparator()
+
+        # Play / Pause Action
+        is_playing = getattr(self, 'is_playing', False)
+        play_label = "⏸️ Pause" if is_playing else "▶️ Play"
+        play_action = self.tray_menu.addAction(play_label)
+        play_action.triggered.connect(self.toggle_playback)
+
+        # Prev / Next Track Actions
+        prev_action = self.tray_menu.addAction("⏮️ Previous Track")
+        prev_action.triggered.connect(self.play_previous)
+        next_action = self.tray_menu.addAction("⏭️ Next Track")
+        next_action.triggered.connect(self.play_next)
+
+        self.tray_menu.addSeparator()
+
+        # Volume Controls Submenu
+        vol_menu = self.tray_menu.addMenu(f"🔊 Volume ({self.volume_val}%)")
+        
+        vol_up = vol_menu.addAction("🔊 Volume Up (+10%)")
+        vol_up.triggered.connect(lambda: self._set_tray_volume(self.volume_val + 10))
+        
+        vol_down = vol_menu.addAction("🔉 Volume Down (-10%)")
+        vol_down.triggered.connect(lambda: self._set_tray_volume(self.volume_val - 10))
+        
+        mute_act = vol_menu.addAction("🔇 Mute (0%)")
+        mute_act.triggered.connect(lambda: self._set_tray_volume(0))
+        
+        vol_menu.addSeparator()
+        for p in [25, 50, 75, 100, 125, 150]:
+            p_act = vol_menu.addAction(f"{p}%")
+            if self.volume_val == p:
+                p_act.setIcon(self.style().standardIcon(QStyle.SP_DialogApplyButton))
+            p_act.triggered.connect(lambda checked=False, val=p: self._set_tray_volume(val))
+
+        self.tray_menu.addSeparator()
+        
+        restore_action = self.tray_menu.addAction("🖥️ Restore Window")
+        restore_action.triggered.connect(self._restore_from_tray)
+        
+        exit_action = self.tray_menu.addAction("❌ Exit")
+        exit_action.triggered.connect(self.close)
+
+    def _set_tray_volume(self, val: int):
+        clamped = max(0, min(150, val))
+        if hasattr(self, 'vol_slider'):
+            self.vol_slider.setValue(clamped)
+        else:
+            self.on_volume_changed(clamped)
+
+    def _restore_from_tray(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
     def _tray_activated(self, reason):
         if reason == QSystemTrayIcon.DoubleClick:
-            self.showNormal()
-            self.activateWindow()
+            self._restore_from_tray()
+        elif reason == QSystemTrayIcon.Trigger:
+            # Single click: show track title and current progress
+            title = getattr(self, 'current_playing_title', '').strip()
+            time_txt = self.time_label.text().strip() if hasattr(self, 'time_label') else ""
+            if title:
+                if time_txt and time_txt != "0:00 / 0:00":
+                    msg = f"{title} | {time_txt}"
+                else:
+                    msg = title
+            else:
+                msg = "No track currently playing"
+            
+            self.tray_icon.setToolTip(f"yt-msd - {msg}")
+            self.tray_icon.showMessage("yt-msd Playback", msg, QSystemTrayIcon.Information, 3000)
 
     def changeEvent(self, event):
         if event.type() == event.Type.WindowStateChange:
@@ -4976,24 +5112,28 @@ class MainApp(QMainWindow):
         
         self.prev_btn = QPushButton("\uE892")
         self.prev_btn.setObjectName("playerBtn")
+        self.prev_btn.setFixedSize(36, 36)
         self.prev_btn.setToolTip("Previous track")
         self.prev_btn.clicked.connect(self.play_previous)
         c.addWidget(self.prev_btn)
         
         self.play_btn = QPushButton("\uE768")
         self.play_btn.setObjectName("playerPlayBtn")
+        self.play_btn.setFixedSize(44, 44)
         self.play_btn.setToolTip("Play / Pause")
         self.play_btn.clicked.connect(self.toggle_playback)
         c.addWidget(self.play_btn)
         
         self.next_btn = QPushButton("\uE893")
         self.next_btn.setObjectName("playerBtn")
+        self.next_btn.setFixedSize(36, 36)
         self.next_btn.setToolTip("Next track")
         self.next_btn.clicked.connect(self.play_next)
         c.addWidget(self.next_btn)
 
         self.shuffle_btn = QPushButton("\uE8B1")
         self.shuffle_btn.setObjectName("playerBtn")
+        self.shuffle_btn.setFixedSize(36, 36)
         self.shuffle_btn.setToolTip("Shuffle Playback (Toggle)")
         self.shuffle_btn.clicked.connect(self.toggle_shuffle)
         c.addWidget(self.shuffle_btn)
@@ -5347,10 +5487,10 @@ class MainApp(QMainWindow):
                 background-color: transparent;
                 color: {fg};
                 font-family: 'Segoe MDL2 Assets';
-                font-size: 14px;
+                font-size: 20px;
                 font-weight: normal;
-                border-radius: 4px;
-                padding: 0px 4px;
+                border-radius: 6px;
+                padding: 0px;
             }}
             QPushButton#playerBtn:hover {{
                 background-color: {btn_hover};
@@ -5368,10 +5508,10 @@ class MainApp(QMainWindow):
                 background-color: transparent;
                 color: {fg};
                 font-family: 'Segoe MDL2 Assets';
-                font-size: 22px;
+                font-size: 30px;
                 font-weight: normal;
-                border-radius: 6px;
-                padding: 0px 4px;
+                border-radius: 8px;
+                padding: 0px;
             }}
             QPushButton#playerPlayBtn:hover {{
                 background-color: {btn_hover};
@@ -5545,8 +5685,11 @@ class MainApp(QMainWindow):
             self.load_local_folder(item['path'])
         else:
             # If VLC is still initializing in background, retry after a short delay
-            if self.vlc_instance is None or self.vlc_player is None:
+            if not getattr(self, '_vlc_ready', False):
                 QTimer.singleShot(200, lambda: self._on_local_click(item, paused_at_start, from_nav))
+                return
+            if self.vlc_instance is None or self.vlc_player is None:
+                self._on_status_update("Playback unavailable: VLC Media Player is not installed.", False, "#E31E24")
                 return
 
             display_name = item.get('meta_name', item['name']) if getattr(self, 'show_local_metadata', False) else item['name']
@@ -5586,8 +5729,13 @@ class MainApp(QMainWindow):
             self._on_search_results(self.search_results, False)
 
     def open_settings_dialog(self):
-        d = SettingsDialog(self)
-        d.exec()
+        if not hasattr(self, 'settings_dialog') or self.settings_dialog is None:
+            self.settings_dialog = SettingsDialog(self)
+            self.settings_dialog.setWindowModality(Qt.NonModal)
+            self.settings_dialog.setAttribute(Qt.WA_DeleteOnClose, False)
+        self.settings_dialog.show()
+        self.settings_dialog.raise_()
+        self.settings_dialog.activateWindow()
 
     def open_playlist_dialog(self):
         d = PlaylistDialog(self)
@@ -6143,7 +6291,11 @@ class MainApp(QMainWindow):
                 
             max_passes = 4
             for pass_num in range(1, max_passes + 1):
-                pending_items = [(idx, q) for idx, q in enumerate(self.queue_items) if q['status'] == "Pending"]
+                # Always check UP (from top / index 0) for undownloaded tracks before checking down
+                pending_items = sorted(
+                    [(idx, q) for idx, q in enumerate(self.queue_items) if q['status'] == "Pending"],
+                    key=lambda x: x[0]
+                )
                 if not pending_items or getattr(self, 'cancel_download', False):
                     break
                 
@@ -6181,6 +6333,7 @@ class MainApp(QMainWindow):
                                 self.queue_status_changed_signal.emit(idx)
                                 
                     if missing_items:
+                        missing_items.sort(key=lambda x: x[0])
                         self.status_signal.emit(
                             f"Verification: {len(missing_items)} files missing on disk. Redownloading missing tracks...",
                             False, "#FF8C00"
@@ -6352,8 +6505,11 @@ class MainApp(QMainWindow):
 
     def play_result(self, video, paused_at_start=False, from_nav=False):
         # If VLC is still initializing in background, defer and retry
-        if self.vlc_instance is None or self.vlc_player is None:
+        if not getattr(self, '_vlc_ready', False):
             QTimer.singleShot(200, lambda: self.play_result(video, paused_at_start, from_nav))
+            return
+        if self.vlc_instance is None or self.vlc_player is None:
+            self._on_status_update("Playback unavailable: VLC Media Player is not installed.", False, "#E31E24")
             return
 
         self._on_status_update(f"Fetching stream: {video.get('title', 'Unknown')}...", False, "#3B8ED0")
