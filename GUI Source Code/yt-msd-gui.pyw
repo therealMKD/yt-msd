@@ -2208,7 +2208,7 @@ def write_sync_tag_file(folder_path: Union[str, Path], sync_code: str, chain_nam
 
 def read_sync_tag_file(folder_path: Union[str, Path]) -> Optional[dict]:
     p = Path(folder_path)
-    for fname in (SYNC_TAG_FILENAME, "TAG.yaml", "tag.yaml", "TAG.yml", ".ytmsd_sync_tag"):
+    for fname in (SYNC_TAG_FILENAME, "TAG.yaml", "tag.yaml", "TAG.yml", "tag.yml", ".ytmsd_sync_tag"):
         tag_file = p / fname
         if tag_file.is_file():
             try:
@@ -2220,45 +2220,44 @@ def read_sync_tag_file(folder_path: Union[str, Path]) -> Optional[dict]:
                             continue
                         if ':' in line:
                             parts = line.split(':', 1)
-                            k = parts[0].strip()
-                            v = parts[1].strip()
+                            k = parts[0].strip().lower()
+                            v = parts[1].strip().strip("'\"")
                             res[k] = v
-                if res.get('sync_code'):
-                    style = res.get('sync_style', 'Mirror').strip()
+                sync_code = (res.get('sync_code') or res.get('sync code') or res.get('code') or '').strip()
+                if sync_code and sync_code.upper() != 'XXXX':
+                    res['sync_code'] = sync_code
+                    style = (res.get('sync_style') or res.get('sync style') or res.get('style') or 'Mirror').strip()
+                    res['sync_style'] = style
                     res['deletion_mode'] = 'mirror' if style.lower() == 'mirror' else 'additive'
+                    res['chain_name'] = res.get('chain_name') or res.get('chain name') or res.get('name') or p.name
+                    res['last_synced'] = res.get('last_synced') or res.get('last synced') or ''
                     return res
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"Error reading sync tag from {tag_file}: {e}")
     return None
 
 def find_tagged_sync_folders_on_drive(drive_root: str) -> List[Tuple[Path, dict]]:
-    """Scans drive root and top-level subdirectories (up to depth 2) for yt-msd TAG.yaml files."""
+    """Scans drive root and one level of subdirectories for yt-msd TAG.yaml files.
+    Playlists are always placed as a direct subfolder on the drive root."""
     results = []
     root = Path(drive_root)
-    if not root.is_dir():
+    if not root.exists():
         return results
 
-    # 1. Check drive root
+    # 1. Check drive root itself
     tag = read_sync_tag_file(root)
     if tag and tag.get('sync_code'):
         results.append((root, tag))
 
-    # 2. Check subdirectories
+    # 2. Check direct subdirectories only (depth 1)
+    skip_names = {'$recycle.bin', 'system volume information', 'windows',
+                  'program files', 'program files (x86)', 'appdata', '.git', '.gemini'}
     try:
-        for entry1 in root.iterdir():
-            if entry1.is_dir() and not entry1.name.startswith('$') and entry1.name != 'System Volume Information':
-                tag1 = read_sync_tag_file(entry1)
-                if tag1 and tag1.get('sync_code'):
-                    results.append((entry1, tag1))
-                else:
-                    try:
-                        for entry2 in entry1.iterdir():
-                            if entry2.is_dir() and not entry2.name.startswith('.'):
-                                tag2 = read_sync_tag_file(entry2)
-                                if tag2 and tag2.get('sync_code'):
-                                    results.append((entry2, tag2))
-                    except (PermissionError, OSError):
-                        pass
+        for entry in root.iterdir():
+            if entry.is_dir() and entry.name.lower() not in skip_names and not entry.name.startswith('.'):
+                tag_data = read_sync_tag_file(entry)
+                if tag_data and tag_data.get('sync_code'):
+                    results.append((entry, tag_data))
     except (PermissionError, OSError):
         pass
 
@@ -2494,16 +2493,23 @@ class SyncRemovableWorker:
                 try:
                     # High-speed unthrottled copy using 4MB streaming buffer
                     BUF_SIZE = 4 * 1024 * 1024
+                    file_size = max(1, src_file.stat().st_size)
+                    copied_bytes = 0
+                    if progress_cb:
+                        progress_cb(0, file_size, name, idx, total_items)
                     with open(src_file, 'rb') as sf, open(dest_file, 'wb') as df:
                         while True:
                             buf = sf.read(BUF_SIZE)
                             if not buf:
                                 break
                             df.write(buf)
+                            copied_bytes += len(buf)
+                            if progress_cb:
+                                progress_cb(copied_bytes, file_size, name, idx, total_items)
                     shutil.copystat(src_file, dest_file)
                     transferred += 1
                     if progress_cb:
-                        progress_cb(idx, total_items, name, idx, total_items)
+                        progress_cb(file_size, file_size, name, idx, total_items)
                 except Exception as e:
                     print(f"Error copying {name} to {dest_file}: {e}")
 
@@ -2986,9 +2992,9 @@ class ConnectRemovableMediaDialog(QDialog):
         if app is None:
             app = self.parent_window  # SyncManagerDialog -> parent_app
         app.active_removable_drives[str(dest_path)] = rc
-        if hasattr(app, '_auto_sync_removable_chain'):
-            app._auto_sync_removable_chain(rc)
         self.accept()
+        if hasattr(app, '_auto_sync_removable_chain'):
+            QTimer.singleShot(50, lambda r=rc: app._auto_sync_removable_chain(r))
 
 
 class SyncManagerDialog(QDialog):
@@ -3012,7 +3018,7 @@ class SyncManagerDialog(QDialog):
 
         top_bar = QHBoxLayout()
         local_ip = get_local_ip()
-        self.ip_badge = QLabel(f"🖥️  Your Local IP: <b>{local_ip}</b>")
+        self.ip_badge = QLabel(f"Your Local IP: <b>{local_ip}</b>")
         self.ip_badge.setStyleSheet("background: rgba(59, 142, 208, 0.15); border: 1px solid #3B8ED0; padding: 6px 12px; border-radius: 4px; font-size: 12px;")
         top_bar.addWidget(self.ip_badge)
 
@@ -3023,19 +3029,19 @@ class SyncManagerDialog(QDialog):
 
         top_bar.addStretch()
 
-        create_btn = QPushButton("➕ Create Chain (Host)")
+        create_btn = QPushButton("Create Chain (Host)")
         create_btn.clicked.connect(self._open_create_dialog)
         top_bar.addWidget(create_btn)
 
-        connect_btn = QPushButton("🔗 Connect Chain (Client)")
+        connect_btn = QPushButton("Connect Chain (Client)")
         connect_btn.clicked.connect(self._open_connect_dialog)
         top_bar.addWidget(connect_btn)
 
-        removable_btn = QPushButton("💾 Connect Removable Drive (USB)")
+        removable_btn = QPushButton("Connect Removable Drive (USB)")
         removable_btn.clicked.connect(self._open_removable_dialog)
         top_bar.addWidget(removable_btn)
 
-        sync_all_btn = QPushButton("🔄 Force Sync All")
+        sync_all_btn = QPushButton("Force Sync All")
         sync_all_btn.clicked.connect(self._force_sync_all)
         top_bar.addWidget(sync_all_btn)
 
@@ -3058,17 +3064,19 @@ class SyncManagerDialog(QDialog):
         settings_bar.addStretch()
         main_layout.addLayout(settings_bar)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setObjectName("scrollContent")
+        self.cards_scroll = QScrollArea()
+        self.cards_scroll.setWidgetResizable(True)
+        self.cards_scroll.setObjectName("scrollContent")
+        self.cards_scroll.setAttribute(Qt.WA_StyledBackground, True)
 
         self.cards_container = QWidget()
         self.cards_container.setObjectName("scrollContent")
+        self.cards_container.setAttribute(Qt.WA_StyledBackground, True)
         self.cards_layout = QVBoxLayout(self.cards_container)
-        self.cards_layout.setContentsMargins(4, 4, 4, 4)
+        self.cards_layout.setContentsMargins(6, 6, 6, 6)
         self.cards_layout.setSpacing(10)
-        scroll.setWidget(self.cards_container)
-        main_layout.addWidget(scroll, 1)
+        self.cards_scroll.setWidget(self.cards_container)
+        main_layout.addWidget(self.cards_scroll, 1)
 
         footer = QHBoxLayout()
         footer.addStretch()
@@ -3162,17 +3170,30 @@ class SyncManagerDialog(QDialog):
             if self.config_manager.client_chains:
                 self._sync_single_client_chain(self.config_manager.client_chains[-1])
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Immediately scan drives so cards appear as soon as the dialog opens
+        if hasattr(self.parent_app, '_check_removable_drives_change'):
+            self.parent_app._check_removable_drives_change()
+        QTimer.singleShot(300, self.refresh_cards)
+
     def _open_removable_dialog(self):
         dlg = ConnectRemovableMediaDialog(self, self.config_manager)
         if dlg.exec():
-            # Dialog wrote TAG.yaml; refresh to pick up any newly-tagged connected drive
-            self.refresh_cards()
+            # Defer refresh to ensure dialog destruction is completed
+            QTimer.singleShot(50, self.refresh_cards)
 
     def refresh_cards(self):
+        # Preserve scroll position so rescans don't jump back to the top
+        scroll_bar = self.cards_scroll.verticalScrollBar()
+        saved_scroll = scroll_bar.value() if scroll_bar else 0
+
         while self.cards_layout.count():
             item = self.cards_layout.takeAt(0)
             if item.widget():
-                item.widget().deleteLater()
+                w = item.widget()
+                w.setParent(None)
+                w.deleteLater()
 
         hosted = self.config_manager.hosted_chains
         clients = self.config_manager.client_chains
@@ -3184,6 +3205,8 @@ class SyncManagerDialog(QDialog):
             empty_lbl.setStyleSheet("color: #888; padding: 40px; font-size: 13px;")
             self.cards_layout.addWidget(empty_lbl)
             self.cards_layout.addStretch()
+            self.cards_container.adjustSize()
+            self.cards_container.update()
             return
 
         if hosted:
@@ -3219,6 +3242,10 @@ class SyncManagerDialog(QDialog):
         self.cards_layout.addStretch()
         # Immediately restore live status/progress for any in-progress syncs
         self._restore_in_progress_labels()
+        self.cards_container.adjustSize()
+        self.cards_container.update()
+        # Restore scroll position after layout rebuild
+        QTimer.singleShot(0, lambda: self.cards_scroll.verticalScrollBar().setValue(saved_scroll))
 
     def _build_host_card(self, hc: dict) -> QWidget:
         card = QFrame()
@@ -3270,7 +3297,7 @@ class SyncManagerDialog(QDialog):
         l.addWidget(host_activity_lbl)
 
         info_h = QHBoxLayout()
-        path_lbl = QLabel(f"📁 {folder_str} ({audio_cnt} tracks)")
+        path_lbl = QLabel(f"Path: {folder_str} ({audio_cnt} tracks)")
         path_lbl.setStyleSheet("color: #888; font-size: 11px;")
         info_h.addWidget(path_lbl, 1)
 
@@ -3291,7 +3318,7 @@ class SyncManagerDialog(QDialog):
                 if w.property("sync_code") == str(sync_code):
                     lbl = w.property("host_activity_lbl")
                     if lbl:
-                        lbl.setText(f"🟢 Active Sync Event: {activity} ({client_ip})")
+                        lbl.setText(f"Active Sync Event: {activity} ({client_ip})")
                         lbl.setStyleSheet("color: #1abd33; font-size: 11px; font-weight: bold;")
                         def _reset(_l=lbl):
                             try:
@@ -3329,12 +3356,12 @@ class SyncManagerDialog(QDialog):
         # Pause / Resume Sync Controls
         is_paused, pause_until = is_client_chain_paused(cc)
         if is_paused:
-            resume_btn = QPushButton("▶️ Resume Sync")
+            resume_btn = QPushButton("Resume Sync")
             resume_btn.setStyleSheet("background: #3B8ED0; color: white; font-size: 11px; padding: 3px 8px; border-radius: 4px;")
             resume_btn.clicked.connect(lambda chk=False, cid=cid_val: self._resume_chain_sync(cid))
             header.addWidget(resume_btn)
         else:
-            pause_btn = QPushButton("⏸️ Pause Sync ▾")
+            pause_btn = QPushButton("Pause Sync ▾")
             pause_btn.setStyleSheet("font-size: 11px; padding: 3px 8px;")
             pause_menu = QMenu(self)
             durations = [
@@ -3355,7 +3382,7 @@ class SyncManagerDialog(QDialog):
 
         # Wi-Fi SSID Auto-Sync Binding Control
         wifi_ssid = cc.get('wifi_ssid', '')
-        wifi_btn = QPushButton(f"📶 Wi-Fi: {wifi_ssid}" if wifi_ssid else "📶 Bind Wi-Fi ▾")
+        wifi_btn = QPushButton(f"Wi-Fi: {wifi_ssid}" if wifi_ssid else "Bind Wi-Fi ▾")
         wifi_btn.setStyleSheet("font-size: 11px; padding: 3px 8px;" + (" background: rgba(59, 142, 208, 0.25);" if wifi_ssid else ""))
         wifi_menu = QMenu(self)
         curr_ssid = get_current_wifi_ssid()
@@ -3371,7 +3398,7 @@ class SyncManagerDialog(QDialog):
         wifi_btn.setMenu(wifi_menu)
         header.addWidget(wifi_btn)
 
-        sync_btn = QPushButton("🔄 Sync Now")
+        sync_btn = QPushButton("Sync Now")
         sync_btn.clicked.connect(lambda chk=False, c=cc: self._sync_single_client_chain(c))
         header.addWidget(sync_btn)
 
@@ -3398,11 +3425,11 @@ class SyncManagerDialog(QDialog):
         if is_paused:
             if pause_until > 0:
                 p_time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(pause_until))
-                pause_info = f"  |  <span style='color: #FF8C00; font-weight: bold;'>⏸️ Paused until {p_time_str}</span>"
+                pause_info = f"  |  <span style='color: #FF8C00; font-weight: bold;'>Paused until {p_time_str}</span>"
             else:
-                pause_info = "  |  <span style='color: #FF8C00; font-weight: bold;'>⏸️ Paused Forever</span>"
+                pause_info = "  |  <span style='color: #FF8C00; font-weight: bold;'>Paused Forever</span>"
 
-        wifi_info = f"  |  <span style='color: #3B8ED0;'>📶 Wi-Fi: {wifi_ssid}</span>" if wifi_ssid else ""
+        wifi_info = f"  |  <span style='color: #3B8ED0;'>Wi-Fi: {wifi_ssid}</span>" if wifi_ssid else ""
 
         status_lbl = QLabel(f"Status: {cc.get('status', 'Idle')}  |  Last Synced: {last_sync_str}  |  Mode: {del_mode}{pause_info}{wifi_info}")
         status_lbl.setStyleSheet("color: #888; font-size: 11px;")
@@ -3415,7 +3442,7 @@ class SyncManagerDialog(QDialog):
         l.addWidget(progress_lbl)
 
         info_h = QHBoxLayout()
-        path_lbl = QLabel(f"📁 {folder_str}")
+        path_lbl = QLabel(f"Path: {folder_str}")
         path_lbl.setStyleSheet("color: #888; font-size: 11px;")
         info_h.addWidget(path_lbl, 1)
 
@@ -3452,7 +3479,7 @@ class SyncManagerDialog(QDialog):
 
         header.addStretch()
 
-        sync_btn = QPushButton("🔄 Sync Now")
+        sync_btn = QPushButton("Sync Now")
         sync_btn.clicked.connect(lambda chk=False, r=rc: self._sync_single_removable_chain(r))
         header.addWidget(sync_btn)
 
@@ -3487,7 +3514,7 @@ class SyncManagerDialog(QDialog):
         l.addWidget(progress_lbl)
 
         info_h = QHBoxLayout()
-        path_lbl = QLabel(f"💾 {folder_str}")
+        path_lbl = QLabel(f"Path: {folder_str}")
         path_lbl.setStyleSheet("color: #888; font-size: 11px;")
         info_h.addWidget(path_lbl, 1)
 
@@ -3584,13 +3611,6 @@ class SyncManagerDialog(QDialog):
         if hasattr(self.parent_app, '_auto_sync_removable_chain'):
             self.parent_app._auto_sync_removable_chain(rc)
             self.refresh_cards()
-
-        thread=ClientSyncThread(rc)
-        
-        thread.status_signal.connect(_on_status)
-        thread.progress_signal.connect(_on_progress)
-        thread.finished_signal.connect(_on_finish)
-        thread.start()
 
     def _update_client_card_label(self, chain_id: str, prop_name: str, text: str):
         """Update a visible card's label (status_lbl or progress_lbl) by chain_id."""
@@ -3697,8 +3717,12 @@ class SettingsDialog(QDialog):
         self.args_cb.setChecked(parent.use_custom_args)
         self.args_cb.toggled.connect(self._toggle_args)
         arg_h.addWidget(self.args_cb)
-        self.args_edit = QLineEdit(parent.custom_args)
-        self.args_edit.setPlaceholderText("Arguments...")
+        _fmt = parent.format_combo.currentText() if hasattr(parent, 'format_combo') else getattr(parent, 'audio_format', 'mp3')
+        _brate = parent.bitrate_combo.currentText() if hasattr(parent, 'bitrate_combo') else getattr(parent, 'bitrate', '320')
+        _default_args = f"--format bestaudio/best --audio-format {_fmt} --audio-quality {_brate} --retries 15 --fragment-retries 15"
+        _initial_args = parent.custom_args if parent.custom_args else _default_args
+        self.args_edit = QLineEdit(_initial_args)
+        self.args_edit.setPlaceholderText("e.g. --format bestaudio/best --audio-format mp3 --audio-quality 320")
         self.args_edit.setEnabled(parent.use_custom_args)
         self.args_edit.textChanged.connect(self._update_args)
         arg_h.addWidget(self.args_edit, 1)
@@ -3871,7 +3895,7 @@ class SettingsDialog(QDialog):
         self.reset_btn.clicked.connect(self._reset_defaults)
         footer.addWidget(self.reset_btn)
 
-        self.sync_btn = QPushButton("🔗 Sync Chains Manager")
+        self.sync_btn = QPushButton("Sync Chains Manager")
         self.sync_btn.clicked.connect(self._open_sync_manager)
         footer.addWidget(self.sync_btn)
 
@@ -4058,6 +4082,88 @@ class PlaylistDialog(QDialog):
         h.addWidget(open_btn)
         l.addLayout(h)
 
+class TrayProgressPopup(QWidget):
+    """Custom frameless floating popup near system tray displaying current track and playback progress."""
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.ToolTip | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.SubWindow)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        
+        self.hide_timer = QTimer(self)
+        self.hide_timer.setSingleShot(True)
+        self.hide_timer.timeout.connect(self.hide)
+
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.frame = QFrame()
+        self.frame.setObjectName("trayPopupFrame")
+        self.frame.setStyleSheet("""
+            QFrame#trayPopupFrame {
+                background-color: #1e1e1e;
+                border: 1px solid rgba(255, 255, 255, 0.18);
+                border-radius: 8px;
+            }
+        """)
+        frame_layout = QVBoxLayout(self.frame)
+        frame_layout.setContentsMargins(14, 12, 14, 12)
+        frame_layout.setSpacing(6)
+
+        # Header row
+        header_h = QHBoxLayout()
+        header_h.setContentsMargins(0, 0, 0, 0)
+        header_lbl = QLabel("NOW PLAYING")
+        header_lbl.setStyleSheet("color: #3B8ED0; font-weight: bold; font-size: 11px; letter-spacing: 0.5px;")
+        header_h.addWidget(header_lbl)
+        header_h.addStretch()
+        
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(18, 18)
+        close_btn.setStyleSheet("background: transparent; color: #888; font-size: 11px; border: none; font-weight: bold;")
+        close_btn.clicked.connect(self.hide)
+        header_h.addWidget(close_btn)
+        frame_layout.addLayout(header_h)
+
+        # Song Title
+        self.title_lbl = QLabel("No track currently playing")
+        self.title_lbl.setStyleSheet("color: #ffffff; font-size: 13px; font-weight: bold;")
+        self.title_lbl.setWordWrap(True)
+        frame_layout.addWidget(self.title_lbl)
+
+        # Progress info
+        self.progress_lbl = QLabel("")
+        self.progress_lbl.setStyleSheet("color: #aaaaaa; font-size: 12px;")
+        frame_layout.addWidget(self.progress_lbl)
+
+        main_layout.addWidget(self.frame)
+        self.setFixedWidth(320)
+
+    def mousePressEvent(self, event):
+        self.hide()
+
+    def show_track_info(self, title: str, progress_txt: str):
+        if not title:
+            self.title_lbl.setText("No track currently playing")
+            self.progress_lbl.setText("")
+        else:
+            self.title_lbl.setText(title)
+            if progress_txt and progress_txt != "0:00 / 0:00":
+                self.progress_lbl.setText(progress_txt)
+            else:
+                self.progress_lbl.setText("Playing")
+
+        self.adjustSize()
+        
+        # Position in bottom right above taskbar
+        screen = QApplication.primaryScreen().availableGeometry()
+        x = screen.right() - self.width() - 16
+        y = screen.bottom() - self.height() - 16
+        self.move(x, y)
+        self.show()
+        self.raise_()
+        self.hide_timer.start(3500)
+
+
 class MainApp(QMainWindow):
     status_signal = Signal(str, bool, str)
     search_results_signal = Signal(list, bool)
@@ -4069,6 +4175,7 @@ class MainApp(QMainWindow):
     dl_progress_signal = Signal(str)
     renamer_finished_signal = Signal()
     host_activity_signal = Signal(str, str, str)
+    _drives_scanned_signal = Signal(list)  # emitted from bg thread with list of rc dicts
 
     def __init__(self):
         super().__init__()
@@ -4167,6 +4274,7 @@ class MainApp(QMainWindow):
         self.dl_progress_signal.connect(lambda txt: self.dl_progress_label.setText(txt))
         self.renamer_finished_signal.connect(self._on_renamer_finished)
         self.host_activity_signal.connect(self._on_host_activity)
+        self._drives_scanned_signal.connect(self._apply_scanned_drives)
 
         self.player_timer = QTimer(self)
         self.player_timer.timeout.connect(self.update_player_ui)
@@ -4413,14 +4521,28 @@ class MainApp(QMainWindow):
                     self._on_status_update(f"Connected to Wi-Fi '{curr}': Auto-syncing bound sync chain(s)...", False, "#1abd33")
                     self._auto_sync_client_chains()
 
-    def _get_current_system_drives(self) -> set[str]:
+    def _get_current_system_drives(self) -> set:
         drives = set()
+        _skip_drives = {'C:\\'}  # Never scan the system drive
         if sys.platform == 'win32':
-            import string
-            for letter in string.ascii_uppercase:
-                drive = f"{letter}:\\"
-                if drive.upper() != "C:\\" and os.path.exists(drive):
-                    drives.add(drive)
+            try:
+                import ctypes
+                bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+                for i in range(26):
+                    if bitmask & (1 << i):
+                        drive = f"{chr(65 + i)}:\\"
+                        if drive.upper() in _skip_drives:
+                            continue
+                        if os.path.exists(drive):
+                            drives.add(drive)
+            except Exception:
+                import string
+                for letter in string.ascii_uppercase:
+                    drive = f"{letter}:\\"
+                    if drive.upper() in _skip_drives:
+                        continue
+                    if os.path.exists(drive):
+                        drives.add(drive)
         return drives
 
     def _check_removable_drives_change(self):
@@ -4443,45 +4565,65 @@ class MainApp(QMainWindow):
                     pass
 
             def _scan_and_sync():
-                changed = False
+                scanned_drives = []
+                _skip = {'C:\\'}
                 for drive in current_drives:
+                    if drive.upper() in _skip or not os.path.exists(drive):
+                        continue
                     tagged_folders = find_tagged_sync_folders_on_drive(drive)
                     for folder_path, tag_data in tagged_folders:
-                        sync_code = str(tag_data.get('sync_code', ''))
+                        sync_code = str(tag_data.get('sync_code', '')).strip()
                         if not sync_code:
                             continue
-                        is_hosted = any(str(hc.get('sync_code')) == sync_code for hc in self.sync_config_manager.hosted_chains)
-                        is_client = any(str(cc.get('sync_code')) == sync_code for cc in self.sync_config_manager.client_chains)
-                        if is_hosted or is_client:
-                            f_str = str(folder_path)
-                            if f_str not in self.active_removable_drives:
-                                del_mode = tag_data.get('deletion_mode', 'mirror')
-                                chain_name = (tag_data.get('chain_name', '') or
-                                              folder_path.name or
-                                              f"Drive ({drive[0]}:)")
-                                cid = f"rc_{sync_code}_{abs(hash(f_str)) % 100000}"
-                                rc = {
-                                    'id': cid,
-                                    'sync_code': sync_code,
-                                    'name': chain_name,
-                                    'folder_path': f_str,
-                                    'deletion_mode': del_mode,
-                                    'last_synced': tag_data.get('last_synced', ''),
-                                    'status': 'Ready',
-                                    'drive_root': drive,
-                                }
-                                self.active_removable_drives[f_str] = rc
-                                changed = True
-                                self._auto_sync_removable_chain(rc)
-                if changed and self.sync_manager_dialog:
-                    try:
-                        QTimer.singleShot(0, self.sync_manager_dialog.refresh_cards)
-                    except RuntimeError:
-                        pass
+                        f_str = str(folder_path)
+                        del_mode = tag_data.get('deletion_mode', 'mirror')
+                        chain_name = (tag_data.get('chain_name', '') or
+                                      folder_path.name or
+                                      f"Drive ({drive[0]}:)")
+                        cid = f"rc_{sync_code}_{abs(hash(f_str)) % 100000}"
+                        rc = {
+                            'id': cid,
+                            'sync_code': sync_code,
+                            'name': chain_name,
+                            'folder_path': f_str,
+                            'deletion_mode': del_mode,
+                            'last_synced': tag_data.get('last_synced', ''),
+                            'status': 'Ready',
+                            'drive_root': drive,
+                        }
+                        scanned_drives.append(rc)
+                # Use signal to safely deliver results to main thread
+                self._drives_scanned_signal.emit(scanned_drives)
 
             threading.Thread(target=_scan_and_sync, daemon=True).start()
         except Exception:
             pass
+
+    def _apply_scanned_drives(self, drives: list):
+        """Main-thread slot: registers scanned removable drives and refreshes the sync manager cards."""
+        changed = False
+        for rc in drives:
+            f_str = rc['folder_path']
+            sync_code = rc['sync_code']
+            is_hosted = any(str(hc.get('sync_code', '')).strip() == sync_code
+                            for hc in self.sync_config_manager.hosted_chains)
+            is_client = any(str(cc.get('sync_code', '')).strip() == sync_code
+                            for cc in self.sync_config_manager.client_chains)
+            if f_str not in self.active_removable_drives:
+                self.active_removable_drives[f_str] = rc
+                changed = True
+                if is_hosted or is_client:
+                    self._auto_sync_removable_chain(rc)
+            else:
+                self.active_removable_drives[f_str]['name'] = rc['name']
+                self.active_removable_drives[f_str]['drive_root'] = rc['drive_root']
+        # Always refresh cards if the dialog is open and we have removables registered
+        has_removables = bool(self.active_removable_drives)
+        if (changed or has_removables) and self.sync_manager_dialog and self.sync_manager_dialog.isVisible():
+            try:
+                self.sync_manager_dialog.refresh_cards()
+            except RuntimeError:
+                pass
 
     def _auto_sync_removable_chain(self, rc: dict):
         """Launch a background removable chain sync via RemovableSyncThread so it shows in the sync manager."""
@@ -4493,7 +4635,7 @@ class MainApp(QMainWindow):
 
         chain_name = rc.get('name', 'Removable Media')
         rc['status'] = 'Syncing...'
-        self.sync_progress_state[cid] = {'status': 'Syncing...', 'progress': ''}
+        self.sync_progress_state[cid] = {'status': 'Status: Syncing...  |  Last Synced: Syncing...', 'progress': ''}
         self.status_signal.emit(f"Removable media detected for '{chain_name}'. Starting auto-sync...", False, "#3B8ED0")
         if self.sync_manager_dialog and self.sync_manager_dialog.isVisible():
             try:
@@ -4505,11 +4647,12 @@ class MainApp(QMainWindow):
         self.sync_threads[cid] = thread
 
         def _on_status(txt):
-            self.sync_progress_state.setdefault(cid, {})['status'] = txt
+            status_text = f"Status: {txt}  |  Last Synced: Syncing..."
+            self.sync_progress_state.setdefault(cid, {})['status'] = status_text
             if hasattr(self, 'dl_progress_signal'):
                 self.dl_progress_signal.emit(f"[USB Sync: {chain_name}] {txt}")
             if self.sync_manager_dialog and self.sync_manager_dialog.isVisible():
-                self.sync_manager_dialog._update_client_card_label(cid, "status_lbl", txt)
+                self.sync_manager_dialog._update_client_card_label(cid, "status_lbl", status_text)
 
         def _on_progress(done, total, fname, idx, total_items):
             pct = int(done / total * 100) if total > 0 else 0
@@ -4711,6 +4854,12 @@ class MainApp(QMainWindow):
         except: pass
 
     def setup_tray(self):
+        self.tray_popup = TrayProgressPopup()
+        self.tray_click_timer = QTimer(self)
+        self.tray_click_timer.setSingleShot(True)
+        self.tray_click_timer.setInterval(250)
+        self.tray_click_timer.timeout.connect(self._show_tray_progress_popup)
+
         self.tray_icon = QSystemTrayIcon(self)
         
         # Generate Icon safely
@@ -4731,44 +4880,55 @@ class MainApp(QMainWindow):
         self.tray_icon.activated.connect(self._tray_activated)
         self.tray_icon.show()
 
+    def _truncate_title(self, title: str, max_chars: int = 24) -> str:
+        title = title.strip()
+        if len(title) > max_chars:
+            return title[:max_chars - 3].rstrip() + "..."
+        return title
+
     def _build_tray_menu(self):
         self.tray_menu.clear()
         
-        # Current song header
+        # Current song header (compact, truncated title)
         title = getattr(self, 'current_playing_title', '').strip()
         time_txt = self.time_label.text().strip() if hasattr(self, 'time_label') else ""
         if title:
-            header_text = f"🎵 {title}"
+            trunc_t = self._truncate_title(title, 24)
             if time_txt and time_txt != "0:00 / 0:00":
-                header_text += f" | {time_txt}"
-            header_action = self.tray_menu.addAction(header_text)
-            header_action.setEnabled(False)
-            self.tray_menu.addSeparator()
+                header_text = f"{trunc_t} | {time_txt}"
+            else:
+                header_text = trunc_t
+        else:
+            header_text = "No Track Playing"
+        
+        self.tray_header_action = self.tray_menu.addAction(header_text)
+        self.tray_header_action.setEnabled(False)
+        self.tray_menu.addSeparator()
 
         # Play / Pause Action
         is_playing = getattr(self, 'is_playing', False)
-        play_label = "⏸️ Pause" if is_playing else "▶️ Play"
+        play_label = "Pause" if is_playing else "Play"
         play_action = self.tray_menu.addAction(play_label)
         play_action.triggered.connect(self.toggle_playback)
 
         # Prev / Next Track Actions
-        prev_action = self.tray_menu.addAction("⏮️ Previous Track")
+        prev_action = self.tray_menu.addAction("Previous Track")
         prev_action.triggered.connect(self.play_previous)
-        next_action = self.tray_menu.addAction("⏭️ Next Track")
+        next_action = self.tray_menu.addAction("Next Track")
         next_action.triggered.connect(self.play_next)
 
         self.tray_menu.addSeparator()
 
         # Volume Controls Submenu
-        vol_menu = self.tray_menu.addMenu(f"🔊 Volume ({self.volume_val}%)")
+        vol_menu = self.tray_menu.addMenu(f"Volume ({self.volume_val}%)")
         
-        vol_up = vol_menu.addAction("🔊 Volume Up (+10%)")
+        vol_up = vol_menu.addAction("Volume Up (+10%)")
         vol_up.triggered.connect(lambda: self._set_tray_volume(self.volume_val + 10))
         
-        vol_down = vol_menu.addAction("🔉 Volume Down (-10%)")
+        vol_down = vol_menu.addAction("Volume Down (-10%)")
         vol_down.triggered.connect(lambda: self._set_tray_volume(self.volume_val - 10))
         
-        mute_act = vol_menu.addAction("🔇 Mute (0%)")
+        mute_act = vol_menu.addAction("Mute (0%)")
         mute_act.triggered.connect(lambda: self._set_tray_volume(0))
         
         vol_menu.addSeparator()
@@ -4780,10 +4940,10 @@ class MainApp(QMainWindow):
 
         self.tray_menu.addSeparator()
         
-        restore_action = self.tray_menu.addAction("🖥️ Restore Window")
+        restore_action = self.tray_menu.addAction("Restore Window")
         restore_action.triggered.connect(self._restore_from_tray)
         
-        exit_action = self.tray_menu.addAction("❌ Exit")
+        exit_action = self.tray_menu.addAction("Exit")
         exit_action.triggered.connect(self.close)
 
     def _set_tray_volume(self, val: int):
@@ -4798,23 +4958,22 @@ class MainApp(QMainWindow):
         self.raise_()
         self.activateWindow()
 
+    def _show_tray_progress_popup(self):
+        title = getattr(self, 'current_playing_title', '').strip()
+        time_txt = self.time_label.text().strip() if hasattr(self, 'time_label') else ""
+        if hasattr(self, 'tray_popup') and self.tray_popup:
+            self.tray_popup.show_track_info(title, time_txt)
+
     def _tray_activated(self, reason):
         if reason == QSystemTrayIcon.DoubleClick:
+            if hasattr(self, 'tray_click_timer'):
+                self.tray_click_timer.stop()
+            if hasattr(self, 'tray_popup') and self.tray_popup and self.tray_popup.isVisible():
+                self.tray_popup.hide()
             self._restore_from_tray()
         elif reason == QSystemTrayIcon.Trigger:
-            # Single click: show track title and current progress
-            title = getattr(self, 'current_playing_title', '').strip()
-            time_txt = self.time_label.text().strip() if hasattr(self, 'time_label') else ""
-            if title:
-                if time_txt and time_txt != "0:00 / 0:00":
-                    msg = f"{title} | {time_txt}"
-                else:
-                    msg = title
-            else:
-                msg = "No track currently playing"
-            
-            self.tray_icon.setToolTip(f"yt-msd - {msg}")
-            self.tray_icon.showMessage("yt-msd Playback", msg, QSystemTrayIcon.Information, 3000)
+            if hasattr(self, 'tray_click_timer'):
+                self.tray_click_timer.start()
 
     def changeEvent(self, event):
         if event.type() == event.Type.WindowStateChange:
@@ -4831,6 +4990,12 @@ class MainApp(QMainWindow):
         try:
             if hasattr(self, 'sync_config_manager') and self.sync_config_manager:
                 self.sync_config_manager.save()
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, 'tray_popup') and self.tray_popup:
+                self.tray_popup.hide()
         except Exception:
             pass
 
@@ -6747,30 +6912,60 @@ class MainApp(QMainWindow):
             self.vol_slider.style().polish(self.vol_slider)
 
     def update_player_ui(self):
-        if not self.vlc_player or not self.current_video_id: return
-        
-        state = self.vlc_player.get_state()
-        if state == vlc.State.Playing:
-            self._has_played_current = True
-            self._ended_trigger = False
-        elif state == vlc.State.Ended:
-            # ONLY trigger auto-advance if this track actually played and hasn't triggered ended yet
-            if getattr(self, '_has_played_current', False) and not getattr(self, '_ended_trigger', False) and getattr(self, 'is_playing', False):
-                self._ended_trigger = True
-                self._has_played_current = False
-                self.play_next()
-            
-        pos = self.vlc_player.get_position() * 10000
-        ms = self.vlc_player.get_time()
-        total_ms = self.vlc_player.get_length()
-        if total_ms > 0:
-            cur_str = f"{int(ms/60000)}:{int((ms%60000)/1000):02d}"
-            tot_str = f"{int(total_ms/60000)}:{int((total_ms%60000)/1000):02d}"
-            self.time_label.setText(f"{cur_str} / {tot_str}")
-            if not self.progress_slider.isSliderDown():
-                self.progress_slider.blockSignals(True)
-                self.progress_slider.setValue(int(pos))
-                self.progress_slider.blockSignals(False)
+        title = getattr(self, 'current_playing_title', '').strip()
+        time_txt = ""
+
+        if self.vlc_player and self.current_video_id:
+            state = self.vlc_player.get_state()
+            if state == vlc.State.Playing:
+                self._has_played_current = True
+                self._ended_trigger = False
+            elif state == vlc.State.Ended:
+                # ONLY trigger auto-advance if this track actually played and hasn't triggered ended yet
+                if getattr(self, '_has_played_current', False) and not getattr(self, '_ended_trigger', False) and getattr(self, 'is_playing', False):
+                    self._ended_trigger = True
+                    self._has_played_current = False
+                    self.play_next()
+                
+            pos = self.vlc_player.get_position() * 10000
+            ms = self.vlc_player.get_time()
+            total_ms = self.vlc_player.get_length()
+            if total_ms > 0:
+                cur_str = f"{int(ms/60000)}:{int((ms%60000)/1000):02d}"
+                tot_str = f"{int(total_ms/60000)}:{int((total_ms%60000)/1000):02d}"
+                time_txt = f"{cur_str} / {tot_str}"
+                self.time_label.setText(time_txt)
+                if not self.progress_slider.isSliderDown():
+                    self.progress_slider.blockSignals(True)
+                    self.progress_slider.setValue(int(pos))
+                    self.progress_slider.blockSignals(False)
+
+        # Update hover tooltip continuously
+        if hasattr(self, 'tray_icon') and self.tray_icon:
+            if title:
+                if not time_txt and hasattr(self, 'time_label'):
+                    time_txt = self.time_label.text().strip()
+                if time_txt and time_txt != "0:00 / 0:00":
+                    self.tray_icon.setToolTip(f"yt-msd - {title} | {time_txt}")
+                else:
+                    self.tray_icon.setToolTip(f"yt-msd - {title}")
+            else:
+                self.tray_icon.setToolTip("yt-msd")
+
+        # Dynamic right-click tray menu track progress
+        if hasattr(self, 'tray_menu') and self.tray_menu and self.tray_menu.isVisible():
+            if hasattr(self, 'tray_header_action') and self.tray_header_action:
+                if title:
+                    if not time_txt and hasattr(self, 'time_label'):
+                        time_txt = self.time_label.text().strip()
+                    trunc_t = self._truncate_title(title, 24)
+                    if time_txt and time_txt != "0:00 / 0:00":
+                        hdr = f"{trunc_t} | {time_txt}"
+                    else:
+                        hdr = trunc_t
+                    self.tray_header_action.setText(hdr)
+                else:
+                    self.tray_header_action.setText("No Track Playing")
 
     def _on_thumbnail_loaded(self, vid_id, pixmap):
         if hasattr(self, '_thumbnail_labels') and vid_id in self._thumbnail_labels:
