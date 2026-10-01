@@ -33,9 +33,7 @@ The GUI version is currently "complete" at v1.0, (and "improved" at v2.5) but fu
 - MusicBee Plugin version - Will be released once the program has completely matured. This will be when all features have been added, and will probably just be the entire yt-msd program wrapped in C++. (Yeah, very optimized, I know)
 
 ### Support for other operating systems
-**MacOS**: Exe files don't run on MacOS, but you can still use the python file and install the dependencies. Unfortunately due to the migration to Pyside6, I can no longer make a pex file properly (At least in my windows development environment). You could also use WINE to emulate windows functionality with the exe. I don't plan on releasing any additional files supporting MacOS, both because I don't have a Mac to test on, and also because MacOS sucks ass.
-
-**Linux**: Support is coming for linux, in the form of an appimage file, but that will not be created until the final feature update. For now, you can do the same things as MacOS: Either the python file, or WINE.
+I had previously planned for at least Linux support, but as the program has gotten further on in development, there are a lot of features that just won't work on Linux, and would require separate handling. I don't want to bloat up the main program, and having a dedicated Linux version isn't something I have time to support. Therefore, support for other operating systems does not exist, and if you run yt-msd on other operating systems, a great deal of features most likely will not work, due to dependency on windows. If you want to use yt-msd on other platforms, use the pyw version, but don't expect sync to work at all, and expect bugs.
 
 # CLI Version Readme
 
