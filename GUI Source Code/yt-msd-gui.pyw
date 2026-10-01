@@ -1395,17 +1395,20 @@ def set_run_on_startup(enable: bool) -> bool:
         return False
 
 
-def is_client_chain_paused(cc: dict) -> bool:
-    """Returns True if the client sync chain is currently paused."""
+def is_client_chain_paused(cc: dict) -> tuple[bool, int]:
+    """Returns (is_paused, pause_until) for the client sync chain."""
     paused_until = cc.get('paused_until', 0)
+
     if paused_until == -1:
-        return True
+        return True, -1
+
     if paused_until > 0:
         if paused_until > time.time():
-            return True
+            return True, paused_until
         else:
             cc['paused_until'] = 0
-    return False
+
+    return False, 0
 
 
 _CACHED_LOCAL_IP = None
@@ -2361,7 +2364,7 @@ class SyncConfigManager:
             'host_port': host_port,
             'deletion_mode': deletion_mode,
             'paused_until': 0,
-            'bound_wifi_ssid': bound_wifi_ssid,
+            'wifi_ssid': bound_wifi_ssid,
             'created_at': time.time(),
             'last_synced': 0,
             'status': 'Pending Sync'
