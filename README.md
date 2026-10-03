@@ -31,6 +31,7 @@ The GUI version is currently "complete" at v1.0, (and "improved" at v2.5) but fu
 - Music player only mode (hiding all download features)
 - Various QOL changes and bug fixes
 - MusicBee Plugin version - Will be released once the program has completely matured. This will be when all features have been added, and will probably just be the entire yt-msd program wrapped in C++. (Yeah, very optimized, I know)
+- Possibly winget or chocolatey package - We'll see, but it would be nice to be able to run a single winget command for everything. This will only happen once the program is for sure done.
 
 ### Support for other operating systems
 I had previously planned for at least Linux support, but as the program has gotten further on in development, there are a lot of features that just won't work on Linux, and would require separate handling. I don't want to bloat up the main program, and having a dedicated Linux version isn't something I have time to support. Therefore, support for other operating systems does not exist, and if you run yt-msd on other operating systems, a great deal of features most likely will not work, due to dependency on windows. If you want to use yt-msd on other platforms, use the pyw version, but don't expect sync to work at all, and expect bugs.
