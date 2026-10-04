@@ -3955,9 +3955,8 @@ class SettingsDialog(QDialog):
         self.eq_edit.setEnabled(parent.use_custom_eq)
         self.eq_edit.textChanged.connect(self._update_eq)
         eq_h.addWidget(self.eq_edit, 1)
+        eq_h.addWidget(self._make_info_btn("Appended to the ffmpeg filter chain during normalization."))
         right_layout.addLayout(eq_h)
-        right_layout.addWidget(QLabel("Appended to the ffmpeg filter chain during normalization.",
-                                      font=QFont("Segoe UI", 8)))
 
         # Custom normalization command override (replaces built-in filter chain)
         right_layout.addWidget(QLabel("CUSTOM NORM/TRIM COMMAND OVERRIDE (ADVANCED)", font=QFont("Segoe UI Semibold", 10)))
@@ -3972,9 +3971,35 @@ class SettingsDialog(QDialog):
         self.norm_cmd_edit.setEnabled(parent.use_custom_norm_cmd)
         self.norm_cmd_edit.textChanged.connect(self._update_norm_cmd)
         norm_cmd_h.addWidget(self.norm_cmd_edit, 1)
+        norm_cmd_h.addWidget(self._make_info_btn("Replaces the entire -af filter chain for normalization AND silence trim."))
         right_layout.addLayout(norm_cmd_h)
-        right_layout.addWidget(QLabel("Replaces the entire -af filter chain for normalization AND silence trim.",
-                                      font=QFont("Segoe UI", 8)))
+
+        # Run a custom file after a download batch finishes
+        right_layout.addWidget(QLabel("CUSTOM SCRIPT ON DOWNLOAD FINISH", font=QFont("Segoe UI Semibold", 10)))
+        cs_h = QHBoxLayout()
+        self.custom_script_cb = QCheckBox()
+        self.custom_script_cb.setToolTip("Run a chosen script or executable after each download batch finishes")
+        self.custom_script_cb.setChecked(parent.run_custom_script)
+        self.custom_script_cb.toggled.connect(self._toggle_custom_script)
+        cs_h.addWidget(self.custom_script_cb)
+        self.custom_script_edit = QLineEdit(parent.custom_script_path)
+        self.custom_script_edit.setPlaceholderText("Path to a script or executable to run after downloads")
+        self.custom_script_edit.textChanged.connect(self._update_custom_script)
+        cs_h.addWidget(self.custom_script_edit, 1)
+        self.custom_script_browse_btn = QPushButton("\uE8B7")
+        self.custom_script_browse_btn.setObjectName("topIconBtn")
+        self.custom_script_browse_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 16px; padding: 0px;")
+        self.custom_script_browse_btn.setFixedSize(36, 30)
+        self.custom_script_browse_btn.setToolTip("Browse for the file to run")
+        self.custom_script_browse_btn.clicked.connect(self._browse_custom_script)
+        cs_h.addWidget(self.custom_script_browse_btn)
+        cs_h.addWidget(self._make_info_btn(
+            "Runs one file after a download batch finishes.\n"
+            "Supports .py, .exe, .bat/.cmd, .ps1, and any file type Windows can open.\n"
+            "It receives the download folder as its first argument,\n"
+            "then the path of each downloaded file."))
+        right_layout.addLayout(cs_h)
+
         right_layout.addSpacing(10)
         version_lbl = QLabel(APP_VERSION)
         version_lbl.setFont(QFont("Segoe UI", 8))
@@ -4140,6 +4165,50 @@ class SettingsDialog(QDialog):
         if self.parent.use_custom_norm_cmd:
             CUSTOM_NORM_CMD = text
         self.parent.save_config()
+
+    def _toggle_custom_script(self, state):
+        # The checkbox only gates whether the script runs after a download; the
+        # path field and browse button stay usable so a path can always be set.
+        self.parent.run_custom_script = state
+        self.parent.save_config()
+
+    def _update_custom_script(self, text):
+        self.parent.custom_script_path = text.strip()
+        self.parent.save_config()
+
+    def _browse_custom_script(self):
+        start = self.custom_script_edit.text().strip() or ""
+        f, _ = QFileDialog.getOpenFileName(
+            self, "Select File To Run After Download", start,
+            "All files (*);;Python (*.py);;Executable (*.exe);;Batch (*.bat *.cmd);;PowerShell (*.ps1)"
+        )
+        if f:
+            self.custom_script_edit.setText(f)
+            self.parent.custom_script_path = f
+            self.parent.save_config()
+
+    def _make_info_btn(self, text):
+        """Small 'i' info button; the description is shown as a hover tooltip."""
+        mode = self.parent.appearance_mode
+        if mode == "System":
+            mode = get_system_appearance_mode()
+        is_light = (mode == "Light")
+        fg = "#1a1a1a" if is_light else "#ffffff"
+        border = "#ccc" if is_light else "#555"
+        accent = get_accent_color(self.parent.accent_color_name)
+        btn = QPushButton("i")
+        btn.setObjectName("infoBtn")
+        btn.setFixedSize(24, 24)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setToolTip(text)
+        btn.setStyleSheet(
+            f"QPushButton#infoBtn {{ background: transparent; color: {fg}; "
+            f"border: 1px solid {border}; border-radius: 12px; "
+            f"font-family: 'Segoe UI'; font-weight: bold; font-size: 13px; padding: 0px; }}"
+            f"QPushButton#infoBtn:hover {{ border-color: {accent}; color: {accent}; }}"
+            "QToolTip { font-size: 11px; }"
+        )
+        return btn
 
     def _open_sync_manager(self):
         # Leave the settings dialog open in the background, open sync manager in foreground
@@ -4426,6 +4495,9 @@ class MainApp(QMainWindow):
         self.last_search = ""
         self.run_renamer = False
         self.renamer_path = ""
+        self.run_custom_script = False
+        self.custom_script_path = ""
+        self._last_downloaded_files = []
         self.normalization_mode = "ask"  # "on" | "off" | "ask"
         self.auto_rename = False
         self.silence_pad_dur = 2.0
@@ -5145,6 +5217,8 @@ class MainApp(QMainWindow):
                     self.save_place = c.get('save_place', False)
                     self.run_renamer = c.get('run_renamer', False)
                     self.renamer_path = c.get('renamer_path', '')
+                    self.run_custom_script = c.get('run_custom_script', False)
+                    self.custom_script_path = c.get('custom_script_path', '')
                     self.normalization_mode = c.get('normalization_mode', 'ask')
                     self.auto_rename = c.get('auto_rename', False)
                     self.silence_pad_dur = c.get('silence_pad_dur', 2.0)
@@ -5197,6 +5271,8 @@ class MainApp(QMainWindow):
             'save_place': self.save_place,
             'run_renamer': self.run_renamer_cb.isChecked() if hasattr(self, 'run_renamer_cb') else self.run_renamer,
             'renamer_path': getattr(self, 'renamer_path', ''),
+            'run_custom_script': getattr(self, 'run_custom_script', False),
+            'custom_script_path': getattr(self, 'custom_script_path', ''),
             'normalization_mode': self.normalization_mode,
             'auto_rename': self.auto_rename,
             'silence_pad_dur': self.silence_pad_dur,
@@ -5392,6 +5468,9 @@ class MainApp(QMainWindow):
         self.minimize_to_tray = False
         self.run_renamer = False
         self.renamer_path = ""
+        self.run_custom_script = False
+        self.custom_script_path = ""
+        self._last_downloaded_files = []
         self.normalization_mode = "ask"
         self.auto_rename = False
         self.silence_pad_dur = 2.0
@@ -5944,7 +6023,7 @@ class MainApp(QMainWindow):
             " }"
         )
 
-        self.setStyleSheet("""
+        full_css = """
             QMainWindow, QDialog {{ background-color: {bg}; }}
             QWidget {{ color: {fg}; font-family: 'Segoe UI'; font-size: 13px; }}
             QWidget#scrollContent, DraggableQueueWidget#scrollContent {{ background-color: {scroll_bg}; }}
@@ -6075,10 +6154,12 @@ class MainApp(QMainWindow):
             btn_hover=btn_hover, checkmark_path=checkmark_path, downarrow_path=downarrow_path,
             main_btn_border=main_btn_border, secondary_fg=secondary_fg,
             tooltip_css=tooltip_css
-        ))
+        )
         _app = QApplication.instance()
         if _app is not None:
-            _app.setStyleSheet(tooltip_css)
+            _app.setStyleSheet(full_css)
+        else:
+            self.setStyleSheet(full_css)
         self.update_shuffle_btn_style()
 
     # --- Local Folder Logic ---
@@ -6895,6 +6976,8 @@ class MainApp(QMainWindow):
                     if os.path.exists(f):
                         _remove_placeholder_tag(f)
             
+            self._last_downloaded_files = list(downloaded_filepaths)
+
             if getattr(self, 'cancel_download', False):
                 self.status_signal.emit("Download cancelled.", False, "#E31E24")
             else:
@@ -6916,6 +6999,8 @@ class MainApp(QMainWindow):
         self.cancel_btn.setEnabled(True)
         if hasattr(self, 'run_renamer_cb') and self.run_renamer_cb.isChecked():
             self.run_mp3_renamer()
+        if getattr(self, 'run_custom_script', False):
+            self._run_custom_post_download_script()
 
     def copy_download_path_to_clipboard(self):
         path = self.path_combo.currentText()
@@ -6971,6 +7056,59 @@ class MainApp(QMainWindow):
             threading.Thread(target=_wait_renamer, daemon=True).start()
         except Exception as e:
             self._on_status_update(f"Failed to launch MP3 Renamer: {str(e)}", False, "red")
+
+    def _console_python(self):
+        """Return a console-capable python executable (python.exe) so scripts can print/interact."""
+        exe = sys.executable
+        if getattr(sys, 'frozen', False):
+            return "python"
+        idx = exe.lower().rfind("pythonw")
+        if idx != -1:
+            exe = exe[:idx] + "python" + exe[idx + 7:]
+        return exe
+
+    def _run_custom_post_download_script(self):
+        """Run the user-chosen file after a download batch finishes.
+        Supports .py, .exe, .bat/.cmd, .ps1, and any file type Windows can open.
+        The file receives the download folder as its first argument (when available),
+        followed by the path of each downloaded file."""
+        script = getattr(self, 'custom_script_path', '').strip()
+        if not script:
+            return
+        if not os.path.isfile(script):
+            self._on_status_update(f"Custom script not found: {script}", False, "#E31E24")
+            return
+
+        script = os.path.abspath(script)
+        ext = os.path.splitext(script)[1].lower()
+        folder = self.path_combo.currentText() if hasattr(self, 'path_combo') else ""
+        if not folder or not os.path.isdir(folder):
+            folder = ""
+        files = [f for f in getattr(self, '_last_downloaded_files', []) if os.path.exists(f)]
+        payload = ([folder] if folder else []) + files
+        cwd = folder or os.path.dirname(script)
+
+        interp_map = {
+            '.py': [self._console_python()],
+            '.bat': ['cmd.exe', '/c'],
+            '.cmd': ['cmd.exe', '/c'],
+            '.ps1': ['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File'],
+        }
+
+        try:
+            if ext in interp_map:
+                cmd = interp_map[ext] + [script] + payload
+                flags = 0x00000010 if sys.platform == "win32" else 0  # CREATE_NEW_CONSOLE
+                subprocess.Popen(cmd, cwd=cwd, creationflags=flags)
+            elif ext == '.exe':
+                subprocess.Popen([script] + payload, cwd=cwd)
+            else:
+                # Unknown type: let Windows resolve it through its file associations.
+                quoted = ' '.join(f'"{a}"' for a in payload)
+                subprocess.Popen(f'"{script}" {quoted}'.strip(), shell=True, cwd=cwd)
+            self._on_status_update(f"Ran custom script: {os.path.basename(script)}", False, "#1abd33")
+        except Exception as e:
+            self._on_status_update(f"Failed to run custom script: {e}", False, "#E31E24")
 
     def browse_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Download Folder", self.path_combo.currentText() or "")
