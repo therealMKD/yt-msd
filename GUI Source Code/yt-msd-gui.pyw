@@ -50,7 +50,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QSizePolicy, QStyle, QToolTip, QStyleOption, QSpinBox, QProgressBar, QInputDialog)
 from PySide6.QtCore import Qt, Signal, QTimer, Slot, QPoint, QRect, QMargins, QThread, QEvent, QObject
 from PySide6.QtGui import QIcon, QPixmap, QImage, QAction, QColor, QPalette, QPainter, QBrush, QFont, QDrag, QFontMetrics
-from PySide6.QtCore import QMimeData
+from PySide6.QtCore import QMimeData, QUrl
 
 # ============================================================
 # INTEGRATED MP3 RENAMER, TAGGER & LOUDNESS NORMALIZER
@@ -1211,8 +1211,13 @@ class ClickableSlider(QSlider):
 
 
 class DoubleClickButton(QPushButton):
-    """QPushButton that only triggers its primary action on double-click."""
+    """QPushButton that only triggers its primary action on double-click.
+
+    A single left-click is reported through `singleClicked` instead of the
+    standard `clicked` signal, so callers can use single clicks for selection
+    (the way File Explorer does) while double clicks open or play the item."""
     doubleClicked = Signal()
+    singleClicked = Signal()
 
     def mouseDoubleClickEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -1222,6 +1227,9 @@ class DoubleClickButton(QPushButton):
     def mousePressEvent(self, event):
         # Absorb single click so it doesn't trigger clicked signal for playback
         # (still allow default visual press styling)
+        if event.button() == Qt.LeftButton:
+            self.setFocus()
+            self.singleClicked.emit()
         event.accept()
 
 
@@ -4448,6 +4456,187 @@ class UpdateReadyDialog(QDialog):
         layout.addLayout(btn_h)
 
 
+def _sanitize_filename(name: str) -> str:
+    """Strip characters that Windows filenames cannot contain."""
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name)
+    return re.sub(r'\s+', ' ', cleaned).strip(' .')
+
+
+def _split_artist_title(stem: str) -> Tuple[str, str]:
+    """Best-effort 'Artist - Title' split, used to pre-fill the renamer when a
+    file has no tags but is already named in that format."""
+    if " - " in stem:
+        artist, title = stem.split(" - ", 1)
+        return artist.strip(), title.strip()
+    return "", stem.strip()
+
+
+class MetadataRenameDialog(QDialog):
+    """Metadata renamer used by the local file editor.
+
+    Reads the artist/title tags embedded in each selected track, lets the user
+    correct them inline, then renames every file to 'Artist - Title' from that
+    metadata. The (possibly edited) tags can also be written back into the file.
+    """
+
+    def __init__(self, parent_window, file_paths):
+        super().__init__(parent_window)
+        self.parent_window = parent_window
+        self.file_paths = list(file_paths)
+        self.results = []
+        self.rows = []
+        self.setWindowTitle("Rename From Metadata")
+        self.setWindowFlags(self.windowFlags() | Qt.Tool)
+
+        row_h = 30
+        max_visible_rows = 8
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(6)
+
+        title_lbl = QLabel(f"RENAME {len(self.file_paths)} FILE(S) FROM METADATA")
+        title_lbl.setFont(QFont("Segoe UI Semibold", 10))
+        title_lbl.setToolTip("Artist and title are read from each file's tags. Correct them here and the "
+                            "file is renamed to 'Artist - Title'.")
+        layout.addWidget(title_lbl)
+
+        # One compact line per file: current name, editable artist, editable
+        # title, and the resulting 'Artist - Title' name.
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(3)
+        grid.setColumnMinimumWidth(0, 168)
+        grid.setColumnMinimumWidth(3, 168)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 1)
+        for col, header in enumerate(("Current File", "Artist", "Title", "New Name")):
+            head = QLabel(header)
+            head.setFont(QFont("Segoe UI Semibold", 8))
+            head.setStyleSheet("color: #888; font-size: 10px;")
+            grid.addWidget(head, 0, col)
+
+        for row_idx, path in enumerate(self.file_paths, start=1):
+            p = Path(path)
+            artist, title = read_metadata_tags(p)
+            if not title:
+                guess_artist, guess_title = _split_artist_title(p.stem)
+                artist = artist or guess_artist
+                title = title or guess_title
+            artist_edit = QLineEdit(artist or "")
+            title_edit = QLineEdit(title or "")
+            # The app-wide line edit style uses generous padding, which clips the
+            # text inside a one-line-tall row; trim it and give the row enough
+            # height for the full glyph height of the UI font.
+            for edit in (artist_edit, title_edit):
+                edit.setObjectName("renameField")
+                edit.setStyleSheet("padding: 2px 4px;")
+                edit.setFixedHeight(row_h)
+            old_lbl = QLabel(self._elide(p.name, 164))
+            old_lbl.setToolTip(path)
+            new_lbl = QLabel("")
+            new_lbl.setObjectName("durationLabel")
+            row = {'path': str(p), 'artist_edit': artist_edit, 'title_edit': title_edit, 'new_lbl': new_lbl}
+            artist_edit.textChanged.connect(lambda _, r=row: self._update_preview(r))
+            title_edit.textChanged.connect(lambda _, r=row: self._update_preview(r))
+            self._update_preview(row)
+            grid.addWidget(old_lbl, row_idx, 0)
+            grid.addWidget(artist_edit, row_idx, 1)
+            grid.addWidget(title_edit, row_idx, 2)
+            grid.addWidget(new_lbl, row_idx, 3)
+            self.rows.append(row)
+
+        # Only very large selections scroll, and even then the dialog stays short.
+        if len(self.rows) > max_visible_rows:
+            body = QWidget()
+            body.setLayout(grid)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.NoFrame)
+            scroll.setWidget(body)
+            layout.addWidget(scroll, 1)
+        else:
+            layout.addLayout(grid)
+        self.resize(700, 108 + min(len(self.rows), max_visible_rows) * (row_h + 3))
+
+        self.write_tags_cb = QCheckBox("Write tags back into the file (MP3, M4A)")
+        self.write_tags_cb.setChecked(True)
+        self.write_tags_cb.setToolTip("Update the embedded tags so they match the new file name")
+        self.write_tags_cb.setStyleSheet("font-size: 11px;")
+        layout.addWidget(self.write_tags_cb)
+
+        btn_h = QHBoxLayout()
+        btn_h.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setToolTip("Close without renaming anything")
+        cancel_btn.clicked.connect(self.reject)
+        rename_btn = QPushButton("Rename")
+        rename_btn.setToolTip("Rename the selected files to 'Artist - Title'")
+        rename_btn.clicked.connect(self._apply_renames)
+        accent = get_accent_color(parent_window.accent_color_name if parent_window else "Blue")
+        r = int(accent[1:3], 16); g = int(accent[3:5], 16); b = int(accent[5:7], 16)
+        accent_fg = "black" if (r * 299 + g * 587 + b * 114) / 1000 > 150 else "white"
+        rename_btn.setStyleSheet(f"background-color: {accent}; color: {accent_fg}; border-radius: 4px; padding: 4px 10px; font-weight: bold;")
+        cancel_btn.setStyleSheet("background-color: #555555; color: white; border-radius: 4px; padding: 4px 10px; font-weight: bold;")
+        btn_h.addWidget(cancel_btn)
+        btn_h.addWidget(rename_btn)
+        layout.addLayout(btn_h)
+        if self.rows:
+            self.rows[0]['title_edit'].setFocus()
+
+    def _elide(self, text: str, width: int) -> str:
+        fm = QFontMetrics(QFont("Segoe UI", 10))
+        return fm.elidedText(text, Qt.ElideRight, width)
+
+    def _new_stem_for(self, row) -> str:
+        artist = row['artist_edit'].text().strip()
+        title = row['title_edit'].text().strip()
+        combined = f"{artist} - {title}" if artist and title else (title or artist)
+        return _sanitize_filename(combined)
+
+    def _update_preview(self, row):
+        stem = self._new_stem_for(row)
+        suffix = Path(row['path']).suffix
+        text = f"{stem}{suffix}" if stem else "(enter an artist or a title)"
+        row['new_lbl'].setText(self._elide(text, 164))
+        row['new_lbl'].setToolTip(text)
+
+    def _apply_renames(self):
+        write_tags = self.write_tags_cb.isChecked()
+        for row in self.rows:
+            old = Path(row['path'])
+            artist = row['artist_edit'].text().strip()
+            title = row['title_edit'].text().strip()
+            if not old.exists():
+                self.results.append({'old': str(old), 'new': str(old), 'name': old.name,
+                                     'status': 'missing', 'message': 'File no longer exists'})
+                continue
+            stem = self._new_stem_for(row)
+            if not stem:
+                self.results.append({'old': str(old), 'new': str(old), 'name': old.name,
+                                     'status': 'skipped', 'message': 'Artist and title are both empty'})
+                continue
+            new_path = old.with_name(f"{stem}{old.suffix}")
+            if new_path == old:
+                status = 'unchanged'
+            elif new_path.exists():
+                self.results.append({'old': str(old), 'new': str(new_path), 'name': old.name,
+                                     'status': 'conflict', 'message': f"'{new_path.name}' already exists"})
+                continue
+            try:
+                old.rename(new_path)
+                status = 'renamed'
+            except Exception as e:
+                self.results.append({'old': str(old), 'new': str(old), 'name': old.name,
+                                     'status': 'failed', 'message': str(e)})
+                continue
+            if write_tags and artist and title:
+                write_metadata_tags(new_path, artist, title)
+            self.results.append({'old': str(old), 'new': str(new_path), 'name': old.name,
+                                 'status': status, 'message': new_path.name})
+        self.accept()
+
 class MainApp(QMainWindow):
     status_signal = Signal(str, bool, str)
     search_results_signal = Signal(list, bool)
@@ -4474,6 +4663,12 @@ class MainApp(QMainWindow):
         self.local_folders = []
         self.recent_folders = []
         self.recent_playlists = []
+        # Local file editor state: File Explorer style multi-selection.
+        self.local_selected_paths = set()
+        self.local_rows = []
+        self.local_row_by_path = {}
+        self.local_selection_anchor = None
+        self.current_local_file_path = ""
         self.splitter_sizes = [300, 800, 300]
         self.thumbnail_cache = {}
         self.thumbnail_cache_size = 0
@@ -5831,10 +6026,20 @@ class MainApp(QMainWindow):
         h.addSpacing(6)
         l.addLayout(h)
         
+        meta_row = QHBoxLayout()
+        meta_row.setContentsMargins(0, 0, 0, 0)
+        meta_row.setSpacing(8)
         self.local_meta_cb = QCheckBox("Show Metadata")
         self.local_meta_cb.setChecked(getattr(self, 'show_local_metadata', False))
         self.local_meta_cb.stateChanged.connect(self.toggle_local_metadata)
-        l.addWidget(self.local_meta_cb)
+        meta_row.addWidget(self.local_meta_cb)
+        meta_row.addStretch()
+        self.local_sel_label = QLabel("")
+        self.local_sel_label.setStyleSheet("border: none; background: transparent; font-size: 11px; font-weight: bold;")
+        meta_row.addWidget(self.local_sel_label)
+        l.addLayout(meta_row)
+        
+        # Rename / copy / delete actions live in the right-click menu on a row.
         
         self.local_list = QScrollArea()
         self.local_list.setWidgetResizable(True)
@@ -6093,6 +6298,42 @@ class MainApp(QMainWindow):
             QPushButton#transparentBtn:hover {{
                 background-color: {btn_hover};
             }}
+            QWidget#localRow {{
+                background-color: transparent;
+                border-radius: 4px;
+            }}
+            QWidget#localRow[selected="true"] {{
+                background-color: {accent};
+            }}
+            QPushButton#transparentBtn[selected="true"] {{
+                background-color: transparent;
+                color: {accent_fg};
+            }}
+            QPushButton#transparentBtn[selected="true"]:hover {{
+                background-color: {btn_hover};
+            }}
+            QLabel#durationLabel[selected="true"] {{ color: {accent_fg}; }}
+            QMenu#localContextMenu {{
+                background-color: {frame_bg};
+                color: {fg};
+                border: 1px solid {input_border};
+                border-radius: 4px;
+                padding: 4px;
+            }}
+            QMenu#localContextMenu::item {{
+                padding: 6px 28px 6px 12px;
+                border-radius: 3px;
+            }}
+            QMenu#localContextMenu::item:selected {{
+                background-color: {accent};
+                color: {accent_fg};
+            }}
+            QMenu#localContextMenu::item:disabled {{ color: {secondary_fg}; }}
+            QMenu#localContextMenu::separator {{
+                height: 1px;
+                background: {input_border};
+                margin: 4px 6px;
+            }}
             QPushButton#iconBtn {{
                 background-color: transparent;
                 color: {fg};
@@ -6192,58 +6433,93 @@ class MainApp(QMainWindow):
             item = self.local_vbox.takeAt(0)
             if item.widget(): item.widget().deleteLater()
             
-        if not self.local_current_path or not os.path.exists(self.local_current_path): return
+        self.local_rows = []
+        self.local_row_by_path = {}
+        self.local_selection_anchor = None
+        if not self.local_current_path or not os.path.exists(self.local_current_path):
+            self.local_selected_paths = set()
+            self._update_local_selection_ui()
+            return
         
         items = []
         try:
             parent = os.path.dirname(self.local_current_path)
             if parent and parent != self.local_current_path:
-                items.append({'name': ".. (Back)", 'path': parent, 'is_dir': True})
+                items.append({'name': ".. (Back)", 'path': parent, 'is_dir': True, 'selectable': False})
             with os.scandir(self.local_current_path) as current_dir:
                 for entry in current_dir:
                     if entry.is_dir():
-                        items.append({'name': entry.name, 'path': entry.path, 'is_dir': True})
+                        items.append({'name': entry.name, 'path': entry.path, 'is_dir': True, 'selectable': True})
                     elif entry.is_file():
                         ext = os.path.splitext(entry.name)[1].lower()
                         if ext in AUDIO_EXTENSIONS:
-                            items.append({'name': entry.name, 'path': entry.path, 'is_dir': False})
+                            items.append({'name': entry.name, 'path': entry.path, 'is_dir': False, 'selectable': True})
         except: pass
         
         items.sort(key=lambda x: (not x['is_dir'], x['name'].lower()))
         self.current_local_items = items
         
         self.local_btns = []
-        for item in items:
+        for idx, item in enumerate(items):
             raw_title = item.get('meta_name', item['name']) if getattr(self, 'show_local_metadata', False) else item['name']
             escaped_title = raw_title.replace('&', '&&')
+
+            # Every row is wrapped in a styled container so a selection can be
+            # highlighted across the whole row, the way File Explorer does it.
+            row_w = QWidget()
+            row_w.setObjectName("localRow")
+            row_w.setAttribute(Qt.WA_StyledBackground, True)
+            row_l = QHBoxLayout(row_w)
+            row_l.setContentsMargins(2, 1, 2, 1)
+            row_l.setSpacing(4)
+
             if item['is_dir']:
-                btn = QPushButton(f"📁  {escaped_title}")
+                full_title = f"📁  {escaped_title}"
+                btn = DoubleClickButton(full_title)
                 btn.setObjectName("transparentBtn")
-                btn.setToolTip("Open folder")
-                btn.clicked.connect(lambda checked=False, i=item: self._on_local_click(i))
-                self.local_vbox.addWidget(btn)
+                btn.setToolTip("Click to select | Double-click to open folder")
+                btn._elide = _ElideTextFilter(full_title, reserve=12).attach(btn)
+                if item.get('selectable', True):
+                    btn.singleClicked.connect(lambda i=item, k=idx: self._on_local_select(i, k))
+                else:
+                    btn.singleClicked.connect(lambda i=item: self._on_local_click(i))
+                btn.doubleClicked.connect(lambda i=item: self._on_local_click(i))
+                dur_lbl = None
             else:
-                row_w = QWidget()
-                row_l = QHBoxLayout(row_w)
-                row_l.setContentsMargins(0, 0, 0, 0)
-                row_l.setSpacing(4)
-                
                 full_title = f"🎵  {escaped_title}"
                 btn = DoubleClickButton(full_title)
                 btn.setObjectName("transparentBtn")
-                btn.setToolTip("Double-click to play")
+                btn.setToolTip("Click to select | Double-click to play")
                 btn.doubleClicked.connect(lambda i=item: self._on_local_click(i))
+                btn.singleClicked.connect(lambda i=item, k=idx: self._on_local_select(i, k))
                 btn._elide = _ElideTextFilter(full_title, reserve=12).attach(btn)
-                row_l.addWidget(btn, 1)
-                
+
                 dur_lbl = QLabel(item.get('duration_str', ''))
                 dur_lbl.setObjectName("durationLabel")
                 dur_lbl.setStyleSheet("border: none; background: transparent; padding-right: 6px;")
+
+            row_l.addWidget(btn, 1)
+            if dur_lbl is not None:
                 row_l.addWidget(dur_lbl)
-                
-                self.local_vbox.addWidget(row_w)
+            self.local_vbox.addWidget(row_w)
+
+            # Right-click menu on the row, the way File Explorer does it.
+            for menu_target in (row_w, btn):
+                menu_target.setContextMenuPolicy(Qt.CustomContextMenu)
+                menu_target.customContextMenuRequested.connect(
+                    lambda pos, w=menu_target, i=item, k=idx: self._show_local_context_menu(w, pos, i, k))
+
+            self.local_rows.append((row_w, btn, dur_lbl, item, idx))
+            self.local_row_by_path[item['path']] = len(self.local_rows) - 1
+            if not item['is_dir']:
                 self.local_btns.append((btn, dur_lbl, item))
-                
+
+        # Drop any selection that no longer points at something in this folder.
+        previous_selection = set(getattr(self, 'local_selected_paths', ()))
+        self.local_selected_paths = {p for p in previous_selection if p in self.local_row_by_path}
+        self._apply_local_selection_styles()
+        self._update_local_selection_ui()
+
         if self.local_btns:
             self._fetch_local_metadata_bg()
             
@@ -6326,6 +6602,7 @@ class MainApp(QMainWindow):
             url = item['path'].replace("\\", "/")
             if not url.startswith("file:///"): url = "file:///" + url
             self.current_video_id = "local"
+            self.current_local_file_path = item['path']
             
             audio_files = [x for x in getattr(self, 'current_local_items', []) if x.get('is_dir') is False]
             for i, af in enumerate(audio_files):
@@ -6350,6 +6627,230 @@ class MainApp(QMainWindow):
             else:
                 self.vlc_player.play()
             self.playback_started_signal.emit(display_name, "local", paused_at_start)
+
+    # --- Local file editor: selection, delete, rename ---
+    def _on_local_select(self, item, index):
+        """Single-click selection for a local list row, mirroring File Explorer:
+        a plain click selects only that row, Ctrl+click toggles rows in and out
+        of the selection, and Shift+click selects everything between the row that
+        was selected before and this one."""
+        if not item.get('selectable', True):
+            self._on_local_click(item)
+            return
+        mods = QApplication.keyboardModifiers()
+        ctrl = bool(mods & (Qt.ControlModifier | Qt.MetaModifier))
+        shift = bool(mods & Qt.ShiftModifier)
+        path = item['path']
+
+        if shift and getattr(self, 'local_selection_anchor', None) is not None:
+            lo, hi = sorted((self.local_selection_anchor, index))
+            for _, _, _, row_item, row_idx in self.local_rows:
+                if lo <= row_idx <= hi and row_item.get('selectable', True):
+                    self.local_selected_paths.add(row_item['path'])
+        elif ctrl:
+            if path in self.local_selected_paths:
+                self.local_selected_paths.discard(path)
+            else:
+                self.local_selected_paths.add(path)
+            self.local_selection_anchor = index
+        else:
+            self.local_selected_paths = {path}
+            self.local_selection_anchor = index
+
+        self._apply_local_selection_styles()
+        self._update_local_selection_ui()
+
+    def _selected_local_items(self):
+        return [row_item for _, _, _, row_item, _ in getattr(self, 'local_rows', [])
+                if row_item.get('selectable', True) and row_item['path'] in self.local_selected_paths]
+
+    def select_all_local_files(self):
+        if not getattr(self, 'local_rows', []):
+            return
+        self.local_selected_paths = {row_item['path'] for _, _, _, row_item, _ in self.local_rows
+                                     if row_item.get('selectable', True)}
+        self._apply_local_selection_styles()
+        self._update_local_selection_ui()
+
+    def clear_local_selection(self):
+        self.local_selected_paths = set()
+        self.local_selection_anchor = None
+        self._apply_local_selection_styles()
+        self._update_local_selection_ui()
+
+    def _open_local_selection(self):
+        items = self._selected_local_items()
+        if len(items) == 1:
+            self._on_local_click(items[0])
+
+    def _focus_is_in_local_pane(self, widget=None) -> bool:
+        w = widget if widget is not None else QApplication.focusWidget()
+        if w is None or not hasattr(self, 'local_list'):
+            return False
+        while w is not None:
+            if w is self.local_list or w is self.local_content:
+                return True
+            w = w.parent()
+        return False
+
+    def _apply_local_selection_styles(self):
+        selected_paths = getattr(self, 'local_selected_paths', set())
+        for row_w, btn, dur_lbl, row_item, _ in getattr(self, 'local_rows', []):
+            selected = row_item.get('selectable', True) and row_item['path'] in selected_paths
+            targets = [row_w, btn] + ([dur_lbl] if dur_lbl is not None else [])
+            for w in targets:
+                if w.property('selected') == selected:
+                    continue
+                w.setProperty('selected', selected)
+                try:
+                    w.style().unpolish(w)
+                    w.style().polish(w)
+                except Exception:
+                    pass
+                w.update()
+
+    def _update_local_selection_ui(self):
+        count = len(self._selected_local_items())
+        if hasattr(self, 'local_sel_label'):
+            self.local_sel_label.setText(f"{count} selected" if count else "")
+
+    def _show_local_context_menu(self, source_widget, pos, item, index):
+        """Right-click menu for a row of the local file list, like File Explorer.
+        Right-clicking a row that is not part of the selection selects it first."""
+        if not item.get('selectable', True):
+            menu = QMenu(self)
+            menu.setObjectName("localContextMenu")
+            open_act = menu.addAction("Open")
+            open_act.triggered.connect(lambda checked=False, i=item: self._on_local_click(i))
+            menu.exec(source_widget.mapToGlobal(pos))
+            menu.deleteLater()
+            return
+
+        if item['path'] not in getattr(self, 'local_selected_paths', set()):
+            self._on_local_select(item, index)
+
+        # Keep the keyboard shortcuts (Ctrl+C, Del, F2) live after a right-click.
+        try:
+            self.local_rows[self.local_row_by_path[item['path']]][1].setFocus()
+        except Exception:
+            pass
+
+        selected = self._selected_local_items()
+        files = [i for i in selected if not i['is_dir']]
+
+        menu = QMenu(self)
+        menu.setObjectName("localContextMenu")
+        if len(selected) == 1:
+            only = selected[0]
+            open_act = menu.addAction("Play" if not only['is_dir'] else "Open")
+            open_act.setToolTip("Open this folder" if only['is_dir'] else "Play this file")
+            open_act.triggered.connect(lambda checked=False, i=only: self._on_local_click(i))
+        rename_act = menu.addAction("Rename from metadata\tF2")
+        rename_act.setToolTip("Rename the selected files from their artist / title tags")
+        rename_act.setEnabled(bool(files))
+        rename_act.triggered.connect(lambda checked=False: self.rename_local_selected())
+        copy_act = menu.addAction("Copy\tCtrl+C")
+        copy_act.setToolTip("Copy the selected files so they can be pasted into File Explorer")
+        copy_act.setEnabled(bool(selected))
+        copy_act.triggered.connect(lambda checked=False: self.copy_local_selected())
+        menu.addSeparator()
+        delete_act = menu.addAction("Delete\tDel")
+        delete_act.setToolTip("Delete the selected files")
+        delete_act.setEnabled(bool(selected))
+        delete_act.triggered.connect(lambda checked=False: self.delete_local_selected())
+        menu.exec(source_widget.mapToGlobal(pos))
+        menu.deleteLater()
+
+    def copy_local_selected(self):
+        """Copy the selected files to the clipboard as real file references, so
+        they can be pasted into File Explorer or any other file-aware target."""
+        items = self._selected_local_items()
+        if not items:
+            self._on_status_update("Nothing selected to copy.", False, "#E31E24")
+            return
+        paths = [i['path'] for i in items]
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(p) for p in paths])
+        mime.setText("\n".join(paths))
+        QApplication.clipboard().setMimeData(mime)
+        label = Path(paths[0]).name if len(paths) == 1 else f"{len(paths)} files"
+        self._on_status_update(f"Copied {label} to the clipboard.", False, "#3B8ED0")
+
+    def delete_local_selected(self):
+        """Delete the selected files (and empty folders) after a confirmation."""
+        items = self._selected_local_items()
+        if not items:
+            self._on_status_update("Nothing selected to delete.", False, "#E31E24")
+            return
+        names = [i['name'] for i in items]
+        preview = "\n".join(names[:10]) + ("\n..." if len(names) > 10 else "")
+        answer = QMessageBox.question(
+            self, "Delete Selected",
+            f"Permanently delete {len(items)} item(s)?\n\n{preview}\n\n"
+            "Folders are only deleted when they are empty.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return
+        deleted_files = 0
+        deleted_folders = 0
+        problems = []
+        playing = getattr(self, 'current_local_file_path', '')
+        for it in items:
+            target = it['path']
+            try:
+                if it['is_dir']:
+                    if os.listdir(target):
+                        problems.append(f"{it['name']} (folder not empty)")
+                        continue
+                    os.rmdir(target)
+                    deleted_folders += 1
+                else:
+                    os.remove(target)
+                    deleted_files += 1
+            except Exception as e:
+                problems.append(f"{it['name']} ({e})")
+                continue
+            if playing and os.path.abspath(target) == os.path.abspath(playing):
+                player = getattr(self, 'vlc_player', None)
+                if player is not None:
+                    try:
+                        player.stop()
+                    except Exception:
+                        pass
+                self.current_local_file_path = ""
+        self.clear_local_selection()
+        self.refresh_local_list()
+        msg = f"Deleted {deleted_files} file(s)"
+        if deleted_folders:
+            msg += f" and {deleted_folders} folder(s)"
+        if problems:
+            msg += ". Skipped: " + ", ".join(problems[:4])
+        self._on_status_update(msg, False, "#1abd33" if not problems else "#E31E24")
+
+    def rename_local_selected(self):
+        """Open the metadata renamer for the selected tracks, then rename every
+        one of them to 'Artist - Title' built from the tags they carry."""
+        files = [i for i in self._selected_local_items() if not i['is_dir']]
+        if not files:
+            self._on_status_update("Rename: select at least one audio file.", False, "#E31E24")
+            return
+        dlg = MetadataRenameDialog(self, [i['path'] for i in files])
+        results = dlg.results if dlg.exec() == QDialog.Accepted else []
+        renamed = [r for r in results if r['status'] == 'renamed']
+        skipped = [r for r in results if r['status'] in ('conflict', 'failed')]
+        playing = getattr(self, 'current_local_file_path', '')
+        for r in renamed:
+            if playing and os.path.abspath(r['old']) == os.path.abspath(playing):
+                self.current_local_file_path = r['new']
+                break
+        self.clear_local_selection()
+        self.refresh_local_list()
+        if not results:
+            return
+        msg = f"Renamed {len(renamed)} file(s) to 'Artist - Title' from metadata."
+        if skipped:
+            msg += f" Skipped {len(skipped)}: " + ", ".join(s['message'] for s in skipped[:3])
+        self._on_status_update(msg, False, "#1abd33" if not skipped else "#E31E24")
 
     def toggle_thumbnails(self, state):
         self.show_thumbnails = state == Qt.Checked.value
@@ -7285,11 +7786,32 @@ class MainApp(QMainWindow):
             self._on_status_update(f"Playing: {title}", True, "gray")
 
     def eventFilter(self, obj, event):
-        if event.type() == event.Type.KeyPress and event.key() == Qt.Key_Space:
+        if event.type() == event.Type.KeyPress:
             fw = QApplication.focusWidget()
-            if not isinstance(fw, QLineEdit):
+            if event.key() == Qt.Key_Space and not isinstance(fw, QLineEdit):
                 self.toggle_playback()
                 return True
+            # File Explorer style keys, but only while the local file list has focus.
+            if self._focus_is_in_local_pane(fw):
+                if event.key() == Qt.Key_Escape:
+                    self.clear_local_selection()
+                    return True
+                if not isinstance(fw, (QLineEdit, QComboBox)):
+                    if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+                        self.delete_local_selected()
+                        return True
+                    if event.key() == Qt.Key_F2:
+                        self.rename_local_selected()
+                        return True
+                    if event.key() == Qt.Key_A and event.modifiers() & Qt.ControlModifier:
+                        self.select_all_local_files()
+                        return True
+                    if event.key() == Qt.Key_C and event.modifiers() & Qt.ControlModifier:
+                        self.copy_local_selected()
+                        return True
+                    if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                        self._open_local_selection()
+                        return True
         return super().eventFilter(obj, event)
 
     def open_search_on_youtube(self):

@@ -28,11 +28,6 @@ __pycache__/
 *.spec
 ffmpeg.zip
 
-# Icon Files
-*.pxo
-*.bmp
-*.png
-
 # Test Files
 mp3renamer5000legacy.py
 GUI Source Code/mp3renamer5000.py
