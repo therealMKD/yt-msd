@@ -15,7 +15,34 @@ try:
     import winreg
 except ImportError:
     winreg = None
-import yt_dlp
+_lazy_import_lock = threading.Lock()
+
+
+class _LazyModule:
+    """Import a heavy dependency the first time it is actually used.
+
+    yt-dlp is only needed when searching or downloading, but importing it costs
+    hundreds of milliseconds (over a second on a cold cache), which would delay
+    the window appearing. Attribute access transparently triggers the import.
+    """
+
+    def __init__(self, module_name):
+        self._module_name = module_name
+        self._module = None
+
+    def _resolve(self):
+        if self._module is None:
+            with _lazy_import_lock:
+                if self._module is None:
+                    import importlib
+                    self._module = importlib.import_module(self._module_name)
+        return self._module
+
+    def __getattr__(self, item):
+        return getattr(self._resolve(), item)
+
+
+yt_dlp = _LazyModule("yt_dlp")
 import webbrowser
 import urllib.request
 import io
@@ -4651,11 +4678,12 @@ class MainApp(QMainWindow):
     _drives_scanned_signal = Signal(list)  # emitted from bg thread with list of rc dicts
     update_available_signal = Signal(str, str, str, str)  # tag, release_name, download_url, asset_name
     update_downloaded_signal = Signal(str, str)  # new_file_path, tag (emitted from the download bg thread)
+    missing_deps_signal = Signal(str)  # html fragment of missing dependencies (emitted from the VLC init thread)
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("yt-msd | YouTube Media Downloader")
-        self.resize(1640, 850)
+        self.resize(1804, 935)
         
         # State Arrays
         self.search_results = []
@@ -4764,6 +4792,7 @@ class MainApp(QMainWindow):
         self._drives_scanned_signal.connect(self._apply_scanned_drives)
         self.update_available_signal.connect(self._show_update_dialog)
         self.update_downloaded_signal.connect(self._prompt_swap_dialog)
+        self.missing_deps_signal.connect(self._show_missing_dependencies)
 
         self.player_timer = QTimer(self)
         self.player_timer.timeout.connect(self.update_player_ui)
@@ -4785,8 +4814,8 @@ class MainApp(QMainWindow):
         self.drive_monitor_timer.start(3000)
         QTimer.singleShot(600, self._check_removable_drives_change)
 
-        # Startup dependency validation check
-        QTimer.singleShot(400, self._check_dependencies_on_startup)
+        # Startup dependency validation runs inside the VLC init thread below,
+        # so it never blocks the UI thread while the window is appearing.
 
         # Update check on startup (runs again with every local-folder rescan)
         QTimer.singleShot(1500, self._check_for_updates)
@@ -5204,38 +5233,21 @@ class MainApp(QMainWindow):
         self.sync_manager_dialog.raise_()
         self.sync_manager_dialog.activateWindow()
 
-    def _check_dependencies_on_startup(self):
-        """Checks for VLC and FFmpeg availability on startup and notifies the user with instructions if missing."""
-        missing = []
-
-        vlc_ok, vlc_err = check_vlc_available()
-        if not vlc_ok:
-            missing.append(
-                "• <b>VLC Media Player (libvlc.dll)</b><br>"
-                "Audio playback requires VLC Media Player (64-bit).<br>"
-                "Please download and install 64-bit VLC from: <a href='https://www.videolan.org/vlc/'>https://www.videolan.org/vlc/</a>"
-            )
-
-        if not check_ffmpeg_available():
-            missing.append(
-                "• <b>FFmpeg (ffmpeg.exe)</b><br>"
-                "Audio extraction, conversion, and loudness normalization require FFmpeg.<br>"
-                "Please install FFmpeg and make sure <code>ffmpeg.exe</code> is in your system PATH or placed in the application folder."
-            )
-
-        if missing:
-            msg = QMessageBox(self)
-            msg.setWindowTitle("Missing Required Dependencies - yt-msd")
-            msg.setIcon(QMessageBox.Warning)
-            msg.setTextFormat(Qt.RichText)
-            msg.setText(
-                "<h3>Required Dependencies Missing</h3>"
-                "yt-msd detected that the following components are not installed or could not be found:<br><br>"
-                + "<br><br>".join(missing)
-                + "<br><br>Some features (music playback, audio conversion, normalization) will not function until installed."
-            )
-            msg.setStandardButtons(QMessageBox.Ok)
-            msg.exec()
+    def _show_missing_dependencies(self, missing_html: str):
+        """Show the startup dependency warning. Runs on the GUI thread; the probing
+        itself happens in the background VLC-init thread (see _init_vlc_background)."""
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Missing Required Dependencies - yt-msd")
+        msg.setIcon(QMessageBox.Warning)
+        msg.setTextFormat(Qt.RichText)
+        msg.setText(
+            "<h3>Required Dependencies Missing</h3>"
+            "yt-msd detected that the following components are not installed or could not be found:<br><br>"
+            + missing_html
+            + "<br><br>Some features (music playback, audio conversion, normalization) will not function until installed."
+        )
+        msg.setStandardButtons(QMessageBox.Ok)
+        msg.exec()
 
     def _check_for_updates(self):
         """Query the GitHub releases page and notify the user if the newest release is newer than this build."""
@@ -5364,25 +5376,48 @@ class MainApp(QMainWindow):
             pass
 
     def _init_vlc_background(self):
-        """Initialize libVLC in a background thread to avoid blocking the UI during plugin scanning."""
+        """Initialize libVLC in a background thread to avoid blocking the UI during plugin scanning.
+        The startup dependency check rides along here: it reuses this libvlc instance instead of
+        creating a second one, and it never touches the UI thread."""
+        vlc_error = ""
         if not _VLC_MODULE_AVAILABLE or vlc is None:
             self.vlc_instance = None
             self.vlc_player = None
             self._vlc_ready = True
-            return
-        try:
-            instance = vlc.Instance('--quiet', '--no-video')
-            player = instance.media_player_new() if instance else None
-            # Switch to main-thread ownership safely
-            self.vlc_instance = instance
-            self.vlc_player = player
-            if self.vlc_player:
-                self.vlc_player.audio_set_volume(self.volume_val)
-            self._vlc_ready = True
-        except Exception:
-            self.vlc_instance = None
-            self.vlc_player = None
-            self._vlc_ready = True  # Still mark ready so playback attempts don't hang
+            vlc_error = getattr(sys.modules[__name__], '_VLC_IMPORT_ERROR', 'python-vlc not available')
+        else:
+            try:
+                instance = vlc.Instance('--quiet', '--no-video')
+                player = instance.media_player_new() if instance else None
+                # Switch to main-thread ownership safely
+                self.vlc_instance = instance
+                self.vlc_player = player
+                if self.vlc_player:
+                    self.vlc_player.audio_set_volume(self.volume_val)
+                self._vlc_ready = True
+                if player is None:
+                    vlc_error = "libvlc.dll not found."
+            except Exception as e:
+                self.vlc_instance = None
+                self.vlc_player = None
+                self._vlc_ready = True  # Still mark ready so playback attempts don't hang
+                vlc_error = str(e)
+
+        missing = []
+        if vlc_error:
+            missing.append(
+                "• <b>VLC Media Player (libvlc.dll)</b><br>"
+                "Audio playback requires VLC Media Player (64-bit).<br>"
+                "Please download and install 64-bit VLC from: <a href='https://www.videolan.org/vlc/'>https://www.videolan.org/vlc/</a>"
+            )
+        if not check_ffmpeg_available():
+            missing.append(
+                "• <b>FFmpeg (ffmpeg.exe)</b><br>"
+                "Audio extraction, conversion, and loudness normalization require FFmpeg.<br>"
+                "Please install FFmpeg and make sure <code>ffmpeg.exe</code> is in your system PATH or placed in the application folder."
+            )
+        if missing:
+            self.missing_deps_signal.emit("<br><br>".join(missing))
 
 
     def load_config(self):
