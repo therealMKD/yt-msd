@@ -48,8 +48,8 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QSplitter, QSplitterHandle, QFileDialog, QMessageBox, QDialog,
                                QSystemTrayIcon, QMenu, QFrame, QGridLayout,
                                QSizePolicy, QStyle, QToolTip, QStyleOption, QSpinBox, QProgressBar, QInputDialog)
-from PySide6.QtCore import Qt, Signal, QTimer, Slot, QPoint, QRect, QMargins, QThread
-from PySide6.QtGui import QIcon, QPixmap, QImage, QAction, QColor, QPalette, QPainter, QBrush, QFont, QDrag
+from PySide6.QtCore import Qt, Signal, QTimer, Slot, QPoint, QRect, QMargins, QThread, QEvent, QObject
+from PySide6.QtGui import QIcon, QPixmap, QImage, QAction, QColor, QPalette, QPainter, QBrush, QFont, QDrag, QFontMetrics
 from PySide6.QtCore import QMimeData
 
 # ============================================================
@@ -1201,6 +1201,49 @@ class DoubleClickButton(QPushButton):
         # Absorb single click so it doesn't trigger clicked signal for playback
         # (still allow default visual press styling)
         event.accept()
+
+
+class _ElideTextFilter(QObject):
+    """Event filter that lets a title widget shrink so sibling badge widgets
+    (duration / channel labels) always keep their full width. The title text is
+    elided with an ellipsis to whatever width the layout actually gives it."""
+
+    def __init__(self, full_text, reserve=12):
+        super().__init__()
+        self._full = full_text
+        self._reserve = reserve
+        self._widget = None
+
+    def attach(self, widget):
+        self._widget = widget
+        widget.installEventFilter(self)
+        sp = widget.sizePolicy()
+        sp.setHorizontalPolicy(QSizePolicy.Ignored)
+        sp.setHorizontalStretch(1)
+        widget.setSizePolicy(sp)
+        widget.setMinimumWidth(0)
+        self._relayout(widget)
+        return self
+
+    def set_full_text(self, text):
+        self._full = text
+        if self._widget is not None:
+            self._relayout(self._widget)
+
+    def eventFilter(self, obj, event):
+        if obj is self._widget and event.type() in (QEvent.Resize, QEvent.Show):
+            self._relayout(obj)
+        return False
+
+    def _relayout(self, widget):
+        avail = widget.width() - self._reserve
+        if avail <= 0:
+            return
+        fm = QFontMetrics(widget.font())
+        full = self._full
+        new_text = full if fm.horizontalAdvance(full) <= avail else fm.elidedText(full, Qt.ElideRight, avail)
+        if new_text != widget.text():
+            widget.setText(new_text)
 
 
 class DraggableQueueWidget(QWidget):
@@ -5832,10 +5875,12 @@ class MainApp(QMainWindow):
                 row_l.setContentsMargins(0, 0, 0, 0)
                 row_l.setSpacing(4)
                 
-                btn = DoubleClickButton(f"🎵  {escaped_title}")
+                full_title = f"🎵  {escaped_title}"
+                btn = DoubleClickButton(full_title)
                 btn.setObjectName("transparentBtn")
                 btn.setToolTip("Double-click to play")
                 btn.doubleClicked.connect(lambda i=item: self._on_local_click(i))
+                btn._elide = _ElideTextFilter(full_title, reserve=12).attach(btn)
                 row_l.addWidget(btn, 1)
                 
                 dur_lbl = QLabel(item.get('duration_str', ''))
@@ -5857,7 +5902,7 @@ class MainApp(QMainWindow):
         self._meta_worker = MetaWorker()
         self._meta_worker.meta_done.connect(
             lambda b, d_lbl, i: (
-                b.setText(f"🎵  {(i.get('meta_name', i['name']) if getattr(self, 'show_local_metadata', False) else i['name']).replace('&', '&&')}"),
+                b._elide.set_full_text(f"🎵  {(i.get('meta_name', i['name']) if getattr(self, 'show_local_metadata', False) else i['name']).replace('&', '&&')}"),
                 d_lbl.setText(i.get('duration_str', ''))
             )
         )
@@ -6151,7 +6196,6 @@ class MainApp(QMainWindow):
             l.addWidget(pbtn)
             
         title = video.get('title', 'Unknown')
-        if len(title) > 55: title = title[:52] + "..."
         cb = QCheckBox(f"{title.replace('&', '&&')}")
         cb.setProperty("video_id", video.get('id', ''))
         
@@ -6159,6 +6203,7 @@ class MainApp(QMainWindow):
         cb.setChecked(video.get('id') in queue_ids)
             
         cb.stateChanged.connect(lambda state, v=video: self.toggle_queue(v, state))
+        cb._elide = _ElideTextFilter(f"{title.replace('&', '&&')}", reserve=28).attach(cb)
         l.addWidget(cb, 1)
         
         # Channel name (to the left of duration/timestamp)
