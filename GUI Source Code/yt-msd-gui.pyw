@@ -6155,11 +6155,13 @@ class MainApp(QMainWindow):
             main_btn_border=main_btn_border, secondary_fg=secondary_fg,
             tooltip_css=tooltip_css
         )
-        _app = QApplication.instance()
-        if _app is not None:
-            _app.setStyleSheet(full_css)
-        else:
-            self.setStyleSheet(full_css)
+        # Apply the theme at the widget level (as in 2.3). A single
+        # self.setStyleSheet re-polishes only this window's subtree; routing it
+        # through QApplication.setStyleSheet instead re-polishes every widget in
+        # every top-level window, which is what made theme switching laggy. The
+        # tooltip rules are embedded in full_css above and propagate to child
+        # dialogs through this stylesheet, so no app-level call is required.
+        self.setStyleSheet(full_css)
         self.update_shuffle_btn_style()
 
     # --- Local Folder Logic ---
