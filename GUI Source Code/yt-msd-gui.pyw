@@ -1616,6 +1616,55 @@ def filter_audio_files(folder_path: Path) -> List[Path]:
     return sorted(files, key=lambda p: p.name.lower())
 
 
+# ---------------------------------------------------------------------------
+# Slow-device helpers
+#
+# A sluggish USB stick or MP3 player can stall a single directory call for
+# several seconds while it is busy. Anything running on the GUI thread must
+# therefore never touch one of those devices directly - it reads the cached
+# results produced by the background probe instead, and every real file
+# operation happens inside a worker thread.
+# ---------------------------------------------------------------------------
+
+_DRIVE_IO_LOCKS: Dict[str, threading.RLock] = {}
+_DRIVE_IO_LOCKS_GUARD = threading.Lock()
+
+
+def get_drive_io_lock(path: Union[str, Path]) -> threading.RLock:
+    """Per-drive lock so only one sync ever hammers a given device at a time.
+
+    Reentrant: a removable chain may sync a client folder that lives on the
+    very same device, and nested acquisition must not deadlock.
+    """
+    try:
+        anchor = str(Path(path).anchor) or str(path)
+    except Exception:
+        anchor = str(path)
+    with _DRIVE_IO_LOCKS_GUARD:
+        lock = _DRIVE_IO_LOCKS.get(anchor)
+        if lock is None:
+            lock = threading.RLock()
+            _DRIVE_IO_LOCKS[anchor] = lock
+        return lock
+
+
+def make_throttled_progress_cb(progress_cb: Optional[Callable[[int, int, str, int, int], None]],
+                              min_interval: float = 0.15):
+    """Coalesce progress callbacks so a long sync cannot flood the GUI queue."""
+    if progress_cb is None:
+        return None
+    last = [0.0]
+
+    def _emit(done, total, name, idx, total_items):
+        now = time.monotonic()
+        is_final = total > 0 and done >= total
+        if is_final or (now - last[0]) >= min_interval:
+            last[0] = now
+            progress_cb(done, total, name, idx, total_items)
+
+    return _emit
+
+
 def send_json_msg(sock: socket.socket, data: dict) -> None:
     raw = json.dumps(data).encode('utf-8')
     header = struct.pack('!I', len(raw))
@@ -2153,6 +2202,10 @@ class SyncClientWorker:
         host_port = int(chain_config.get('host_port', 63350))
         deletion_mode = chain_config.get('deletion_mode', 'mirror')
 
+        # Progress is reported at a bounded rate no matter how fast the device
+        # is, so a sync can never starve the UI event loop.
+        progress_cb = make_throttled_progress_cb(progress_cb)
+
         if status_cb:
             status_cb(f"Connecting to host for Sync Code {sync_code}...")
 
@@ -2183,6 +2236,10 @@ class SyncClientWorker:
 
         transferred = 0
         deleted = 0
+        # Everything below reads and writes dest_folder, which may be a slow
+        # device: hold the per-drive lock so only one sync works it over.
+        drive_lock = get_drive_io_lock(dest_folder)
+        drive_lock.acquire()
         try:
             sock.settimeout(SYNC_SOCKET_TIMEOUT)
             send_json_msg(sock, {'cmd': 'AUTH', 'sync_code': sync_code, 'client_ip': get_local_ip()})
@@ -2274,6 +2331,7 @@ class SyncClientWorker:
         except Exception as e:
             return False, f"Sync error: {e}", transferred, deleted
         finally:
+            drive_lock.release()
             if sock:
                 try:
                     sock.close()
@@ -2549,6 +2607,7 @@ class SyncRemovableWorker:
                            status_cb: Optional[Callable[[str], None]] = None,
                            progress_cb: Optional[Callable[[int, int, str, int, int], None]] = None) -> Tuple[bool, str, int, int]:
         import shutil
+        progress_cb = make_throttled_progress_cb(progress_cb)
         if not src_dir.is_dir():
             return False, f"Source directory '{src_dir}' does not exist.", 0, 0
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -2627,9 +2686,45 @@ class SyncRemovableWorker:
         del_mode = removable_chain.get('deletion_mode', 'mirror')
         chain_name = removable_chain.get('name', 'Removable Media')
 
-        # Find matching hosted chain or client chain
+        # Find the chain that supplies the source files. Its folder lives on a
+        # second drive that also gets worked over, so take every drive lock this
+        # chain may touch in a fixed (sorted) order - that way two chains that
+        # point at each other's drives cannot deadlock. The inner worker
+        # re-acquires the same locks reentrantly.
         matching_hc = next((hc for hc in config_manager.hosted_chains if str(hc.get('sync_code')) == sync_code), None)
         matching_cc = next((cc for cc in config_manager.client_chains if str(cc.get('sync_code')) == sync_code), None)
+        src_chain = matching_hc or matching_cc or {}
+        anchors = set()
+        for p in (dest_path, Path(src_chain.get('folder_path', ''))):
+            try:
+                anchor = str(p.anchor)
+            except Exception:
+                anchor = ''
+            if anchor:
+                anchors.add(anchor)
+        drive_locks = [get_drive_io_lock(a) for a in sorted(anchors)]
+        for lock in drive_locks:
+            lock.acquire()
+        try:
+            return SyncRemovableWorker._sync_removable_chain_locked(
+                sync_code, dest_path, del_mode, chain_name, config_manager, status_cb, progress_cb,
+                matching_hc, matching_cc)
+        finally:
+            for lock in reversed(drive_locks):
+                lock.release()
+
+    @staticmethod
+    def _sync_removable_chain_locked(sync_code: str, dest_path: Path, del_mode: str,
+                                     chain_name: str, config_manager: SyncConfigManager,
+                                     status_cb: Optional[Callable[[str], None]],
+                                     progress_cb: Optional[Callable[[int, int, str, int, int], None]],
+                                     matching_hc: Optional[dict] = None,
+                                     matching_cc: Optional[dict] = None) -> Tuple[bool, str, int, int]:
+        # Find matching hosted chain or client chain (the wrapper normally passes
+        # these in already; the lookup is only a fallback for direct callers)
+        if matching_hc is None and matching_cc is None:
+            matching_hc = next((hc for hc in config_manager.hosted_chains if str(hc.get('sync_code')) == sync_code), None)
+            matching_cc = next((cc for cc in config_manager.client_chains if str(cc.get('sync_code')) == sync_code), None)
 
         if matching_hc:
             src_dir = Path(matching_hc.get('folder_path', ''))
@@ -2922,6 +3017,47 @@ class ConnectClientChainDialog(QDialog):
         self.accept()
 
 
+class RemovableInitThread(QThread):
+    """Creates the target folder and writes the initial TAG.yaml off the GUI thread."""
+    done_signal = Signal(bool, str, str)  # ok, error message, folder path
+
+    def __init__(self, dest_path: Path, sync_code: str, chain_name: str,
+                 del_mode: str, last_synced_by: str, parent_folder: str):
+        super().__init__()
+        self.dest_path = dest_path
+        self.sync_code = sync_code
+        self.chain_name = chain_name
+        self.del_mode = del_mode
+        self.last_synced_by = last_synced_by
+        self.parent_folder = parent_folder
+
+    def run(self):
+        drive_lock = get_drive_io_lock(self.dest_path)
+        drive_lock.acquire()
+        try:
+            try:
+                self.dest_path.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                self.done_signal.emit(False, f"Could not create folder on drive:\n{e}", "")
+                return
+
+            # Write the initial TAG.yaml (all config lives here, not in local config)
+            ok = write_sync_tag_file(
+                self.dest_path,
+                sync_code=self.sync_code,
+                chain_name=self.chain_name,
+                sync_style='Mirror' if self.del_mode == 'mirror' else 'Additive',
+                last_synced_by=self.last_synced_by,
+                parent_sync_folder=self.parent_folder
+            )
+            if ok:
+                self.done_signal.emit(True, "", str(self.dest_path))
+            else:
+                self.done_signal.emit(False, f"Failed to write TAG.yaml file to {self.dest_path}.", "")
+        finally:
+            drive_lock.release()
+
+
 class ConnectRemovableMediaDialog(QDialog):
     """Dialog to configure and sync a chain onto a Removable Storage Drive (USB/SD Card/MP3 Player)."""
     def __init__(self, parent_window, config_manager: SyncConfigManager):
@@ -2978,9 +3114,16 @@ class ConnectRemovableMediaDialog(QDialog):
         folder_h.addWidget(browse_btn)
         layout.addLayout(folder_h)
 
-        # Detected removable drives quick buttons
+        # Detected removable drives quick buttons. The list comes from the
+        # background drive probe's cache: probing all 26 letters here would stat
+        # every root on the GUI thread, and a busy MP3 player can sit on one of
+        # those calls for seconds.
         detected_drives = []
-        if sys.platform == 'win32':
+        app = getattr(self.parent_window, 'parent_app', None)
+        cached_drives = getattr(app, 'known_connected_drives', None) if app is not None else None
+        if cached_drives:
+            detected_drives = sorted(d for d in cached_drives if d.upper() != "C:\\")
+        elif sys.platform == 'win32':
             import string
             for letter in string.ascii_uppercase:
                 d = f"{letter}:\\"
@@ -3065,34 +3208,17 @@ class ConnectRemovableMediaDialog(QDialog):
         if subfolder:
             dest_path = dest_path / subfolder
 
-        try:
-            dest_path.mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            QMessageBox.warning(self, "Invalid Path", f"Could not create folder on drive:\n{e}")
-            return
-
         name = subfolder or chain.get('name', 'Removable Drive')
         parent_folder = chain.get('folder_path', '')
         sync_code = str(chain.get('sync_code', ''))
         chain_name = chain.get('name', name)
 
-        # Write the initial TAG.yaml (all config lives here, not in local config)
-        ok = write_sync_tag_file(
-            dest_path,
-            sync_code=sync_code,
-            chain_name=chain_name,
-            sync_style='Mirror' if del_mode == 'mirror' else 'Additive',
-            last_synced_by=c_type,
-            parent_sync_folder=parent_folder
-        )
-        if not ok:
-            QMessageBox.warning(self, "Error", f"Failed to write TAG.yaml file to {dest_path}.")
-            return
+        app = getattr(self.parent_window, 'parent_app', None)
+        if app is None:
+            app = self.parent_window  # SyncManagerDialog -> parent_app
 
-        # Register in the runtime active drives dict and immediately sync
-        cid = make_removable_chain_id(sync_code, str(dest_path))
         rc = {
-            'id': cid,
+            'id': make_removable_chain_id(sync_code, str(dest_path)),
             'sync_code': sync_code,
             'name': chain_name,
             'folder_path': str(dest_path),
@@ -3101,10 +3227,34 @@ class ConnectRemovableMediaDialog(QDialog):
             'status': 'Ready',
             'drive_root': str(Path(base_dir).anchor),
         }
-        app = getattr(self.parent_window, 'parent_app', None)
-        if app is None:
-            app = self.parent_window  # SyncManagerDialog -> parent_app
-        app.active_removable_drives[str(dest_path)] = rc
+
+        # Creating the folder and writing TAG.yaml means talking to the drive.
+        # That happens on a worker thread so a slow player cannot freeze this
+        # dialog - or the rest of the app - while it thinks about it.
+        self._pending_rc = rc
+        self._pending_app = app
+        self.connect_btn.setEnabled(False)
+        self.connect_btn.setText("Initializing drive...")
+
+        thread = RemovableInitThread(dest_path, sync_code, chain_name, del_mode, c_type, parent_folder)
+        self._init_thread = thread
+        thread.done_signal.connect(self._on_drive_initialized)
+        thread.start()
+
+    def _on_drive_initialized(self, ok: bool, msg: str, dest_path: str):
+        if not ok:
+            self.connect_btn.setEnabled(True)
+            self.connect_btn.setText("Connect & Initialize Drive")
+            QMessageBox.warning(self, "Invalid Path", msg)
+            return
+
+        rc = self._pending_rc
+        app = self._pending_app
+        # Register in the runtime active drives dict and immediately sync
+        with app._runtime_state_lock:
+            app.active_removable_drives[str(rc['folder_path'])] = rc
+            if hasattr(app, 'mount_state'):
+                app.mount_state[str(rc['folder_path'])] = True
         self.accept()
         if hasattr(app, '_auto_sync_removable_chain'):
             QTimer.singleShot(50, lambda r=rc: app._auto_sync_removable_chain(r))
@@ -3302,7 +3452,48 @@ class SyncManagerDialog(QDialog):
             # Defer refresh to ensure dialog destruction is completed
             QTimer.singleShot(50, self.refresh_cards)
 
-    def refresh_cards(self):
+    def _cards_signature(self) -> tuple:
+        """Cheap, I/O-free description of everything the cards currently show."""
+        mount_state = getattr(self.parent_app, 'mount_state', {})
+        counts = getattr(self.parent_app, 'chain_track_counts', {}) or {}
+        hosted = tuple(
+            (hc.get('id'), hc.get('name'), str(hc.get('sync_code', '')), hc.get('folder_path'),
+             counts.get(hc.get('id')))
+            for hc in self.config_manager.hosted_chains
+        )
+        clients = tuple(
+            (cc.get('id'), cc.get('name'), str(cc.get('sync_code', '')), cc.get('last_known_host_ip', ''),
+             bool(is_client_chain_paused(cc)[0]), cc.get('wifi_ssid', ''), cc.get('status', ''))
+            for cc in self.config_manager.client_chains
+        )
+        removables = tuple(
+            (rc.get('id'), rc.get('name'), rc.get('folder_path'), rc.get('status', ''),
+             str(rc.get('last_synced', '')), bool(mount_state.get(rc.get('folder_path'), True)))
+            for rc in getattr(self.parent_app, 'active_removable_drives', {}).values()
+        )
+        return (hosted, clients, removables)
+
+    def _open_folder(self, folder_str: str):
+        """Hand the path straight to the shell instead of stat()ing a drive that
+        may be busy with a sync right now."""
+        if not folder_str:
+            return
+        try:
+            os.startfile(folder_str)
+        except Exception:
+            pass
+
+    def refresh_cards(self, force: bool = False):
+        # The background drive probe runs every few seconds. Tearing down and
+        # rebuilding every card on each pass is pure churn, so skip the rebuild
+        # whenever nothing about the chains has actually changed.
+        signature = self._cards_signature()
+        if (not force and self.cards_layout.count()
+                and signature == getattr(self, '_cards_signature_state', None)):
+            self._restore_in_progress_labels()
+            return
+        self._cards_signature_state = signature
+
         # Preserve scroll position so rescans don't jump back to the top
         scroll_bar = self.cards_scroll.verticalScrollBar()
         saved_scroll = scroll_bar.value() if scroll_bar else 0
@@ -3408,8 +3599,11 @@ class SyncManagerDialog(QDialog):
         l.addLayout(header)
 
         folder_str = hc.get('folder_path', '')
-        folder_path = Path(folder_str)
-        audio_cnt = len(filter_audio_files(folder_path)) if folder_path.is_dir() else 0
+        # Track counts come from the background probe's cache: counting files
+        # here would scan the folder on the GUI thread.
+        counts = getattr(self.parent_app, 'chain_track_counts', {}) or {}
+        audio_cnt = counts.get(hc.get('id'))
+        cnt_str = f" ({audio_cnt} tracks)" if audio_cnt is not None else ""
 
         host_activity_lbl = QLabel("Status: Ready (Serving clients)")
         host_activity_lbl.setStyleSheet("color: #888; font-size: 11px;")
@@ -3417,14 +3611,14 @@ class SyncManagerDialog(QDialog):
         l.addWidget(host_activity_lbl)
 
         info_h = QHBoxLayout()
-        path_lbl = QLabel(f"Path: {folder_str} ({audio_cnt} tracks)")
+        path_lbl = QLabel(f"Path: {folder_str}{cnt_str}")
         path_lbl.setStyleSheet("color: #888; font-size: 11px;")
         info_h.addWidget(path_lbl, 1)
 
         open_btn = QPushButton("Open Folder")
         open_btn.setToolTip("Open this folder in File Explorer")
         open_btn.setFixedWidth(115)
-        open_btn.clicked.connect(lambda chk=False, f=folder_str: os.startfile(f) if Path(f).exists() else None)
+        open_btn.clicked.connect(lambda chk=False, f=folder_str: self._open_folder(f))
         info_h.addWidget(open_btn)
 
         l.addLayout(info_h)
@@ -3509,7 +3703,11 @@ class SyncManagerDialog(QDialog):
         wifi_btn.setToolTip("Bind this chain to a Wi-Fi network")
         wifi_btn.setStyleSheet("font-size: 11px; padding: 3px 8px;" + (" background: rgba(59, 142, 208, 0.25);" if wifi_ssid else ""))
         wifi_menu = QMenu(self)
-        curr_ssid = get_current_wifi_ssid()
+        # Reuse the Wi-Fi monitor's cached SSID: shelling out to netsh for every
+        # card built would make the sync window crawl.
+        curr_ssid = getattr(self.parent_app, 'last_wifi_ssid', None)
+        if curr_ssid is None:
+            curr_ssid = get_current_wifi_ssid()
         if curr_ssid:
             act_cur = wifi_menu.addAction(f"Bind to current network: '{curr_ssid}'")
             act_cur.triggered.connect(lambda chk=False, cid=cid_val, s=curr_ssid: self._bind_chain_wifi(cid, s))
@@ -3574,7 +3772,7 @@ class SyncManagerDialog(QDialog):
         open_btn = QPushButton("Open Folder")
         open_btn.setToolTip("Open this folder in File Explorer")
         open_btn.setFixedWidth(115)
-        open_btn.clicked.connect(lambda chk=False, f=folder_str: os.startfile(f) if Path(f).exists() else None)
+        open_btn.clicked.connect(lambda chk=False, f=folder_str: self._open_folder(f))
         info_h.addWidget(open_btn)
 
         l.addLayout(info_h)
@@ -3627,7 +3825,10 @@ class SyncManagerDialog(QDialog):
             last_sync_str = last_sync.strip()
         else:
             last_sync_str = "Never"
-        is_mounted = Path(folder_str).exists()
+        # Mount state comes from the background probe's cache. Calling
+        # exists() here would block this thread on a drive that is busy
+        # syncing somewhere else.
+        is_mounted = getattr(self.parent_app, 'mount_state', {}).get(folder_str, True)
         mount_str = "Mounted" if is_mounted else "Drive Not Connected"
 
         status_lbl = QLabel(f"Status: {rc.get('status', 'Ready')} ({mount_str})  |  Last Synced: {last_sync_str}")
@@ -3648,7 +3849,7 @@ class SyncManagerDialog(QDialog):
         open_btn = QPushButton("Open Folder")
         open_btn.setToolTip("Open this folder in File Explorer")
         open_btn.setFixedWidth(115)
-        open_btn.clicked.connect(lambda chk=False, f=folder_str: os.startfile(f) if Path(f).exists() else None)
+        open_btn.clicked.connect(lambda chk=False, f=folder_str: self._open_folder(f))
         info_h.addWidget(open_btn)
 
         l.addLayout(info_h)
@@ -3675,19 +3876,27 @@ class SyncManagerDialog(QDialog):
         if QMessageBox.question(self, "Confirm Removal", "Are you sure you want to remove this sync chain? (Audio files on disk will remain untouched)") == QMessageBox.Yes:
             # Check if removable chain
             removables_dict = getattr(self.parent_app, 'active_removable_drives', {})
-            for f_str, rc in list(removables_dict.items()):
-                if rc.get('id') == chain_id:
-                    removables_dict.pop(f_str, None)
-                    tag_file = Path(rc.get('folder_path', '')) / SYNC_TAG_FILENAME
-                    try:
-                        if tag_file.exists():
-                            tag_file.unlink()
-                    except Exception:
-                        pass
+            with self.parent_app._runtime_state_lock:
+                for f_str, rc in list(removables_dict.items()):
+                    if rc.get('id') == chain_id:
+                        removables_dict.pop(f_str, None)
+                        if hasattr(self.parent_app, 'mount_state'):
+                            self.parent_app.mount_state.pop(f_str, None)
+                        tag_path = str(Path(rc.get('folder_path', '')) / SYNC_TAG_FILENAME)
+                        # Deleting TAG.yaml means talking to the drive, so it is
+                        # done in a worker thread rather than in this click handler.
+                        def _remove_tag(path=tag_path):
+                            try:
+                                p = Path(path)
+                                if p.exists():
+                                    p.unlink()
+                            except Exception:
+                                pass
+                        threading.Thread(target=_remove_tag, daemon=True).start()
             self.config_manager.remove_chain(chain_id)
             if hasattr(self.parent_app, 'refresh_sync_watchers'):
                 self.parent_app.refresh_sync_watchers()
-            self.refresh_cards()
+            self.refresh_cards(force=True)
 
     def _sync_single_client_chain(self, cc: dict):
         cid = cc.get('id')
@@ -3726,7 +3935,9 @@ class SyncManagerDialog(QDialog):
             self._update_client_card_label(cid, "progress_lbl", "")
             self.refresh_cards()
             if self.parent_app.local_current_path == cc.get('folder_path'):
-                self.parent_app.refresh_local_list()
+                # The synced folder may be a slow device: scan it on a worker
+                # thread instead of in front of the UI.
+                self.parent_app._refresh_local_list_async()
             if hasattr(self.parent_app, 'dl_progress_signal'):
                 self.parent_app.dl_progress_signal.emit("")
 
@@ -3771,17 +3982,22 @@ class SyncManagerDialog(QDialog):
         # 1. Sync all subscribed client chains
         for cc in self.config_manager.client_chains:
             self._sync_single_client_chain(cc)
-        # 2. Sync all removable media chains whose drives are currently connected
-        for rc in getattr(self.parent_app, 'active_removable_drives', {}).values():
-            if Path(rc.get('folder_path', '')).exists():
+        # 2. Sync all removable media chains whose drives are currently
+        #    connected. Mount state is read from the background probe's cache so
+        #    this click never waits on a busy drive.
+        mount_state = getattr(self.parent_app, 'mount_state', {})
+        for rc in list(getattr(self.parent_app, 'active_removable_drives', {}).values()):
+            if mount_state.get(rc.get('folder_path', ''), True):
                 self._sync_single_removable_chain(rc)
         # 3. Push update notification to clients of our hosted chains (force clients to sync)
         port = getattr(self.parent_app.sync_host_server, 'active_port', 0)
         if port > 0:
-            for hc in self.config_manager.hosted_chains:
-                code = hc.get('sync_code')
-                if code:
-                    send_lan_update_notification(str(code), port)
+            codes = [str(hc.get('sync_code')) for hc in self.config_manager.hosted_chains if hc.get('sync_code')]
+
+            def _notify(codes=codes, port=port):
+                for code in codes:
+                    send_lan_update_notification(code, port)
+            threading.Thread(target=_notify, daemon=True).start()
         if hasattr(self.parent_app, 'status_signal'):
             self.parent_app.status_signal.emit("Force Sync initiated: syncing clients & removable drives, notified LAN peers.", False, "#1abd33")
 
@@ -4675,7 +4891,9 @@ class MainApp(QMainWindow):
     dl_progress_signal = Signal(str)
     renamer_finished_signal = Signal()
     host_activity_signal = Signal(str, str, str)
-    _drives_scanned_signal = Signal(list)  # emitted from bg thread with list of rc dicts
+    _probe_results_signal = Signal(dict)  # cached drive/chain state from the drive probe thread
+    local_list_refresh_signal = Signal()  # ask for a non-blocking local folder rescan
+    _local_items_signal = Signal(object)  # (folder_path, scanned items) from the folder scan thread
     update_available_signal = Signal(str, str, str, str)  # tag, release_name, download_url, asset_name
     update_downloaded_signal = Signal(str, str)  # new_file_path, tag (emitted from the download bg thread)
     missing_deps_signal = Signal(str)  # html fragment of missing dependencies (emitted from the VLC init thread)
@@ -4757,6 +4975,18 @@ class MainApp(QMainWindow):
         self.sync_progress_state = {}  # chain_id -> {'status': str, 'progress': str}
         # Runtime-only registry of currently connected removable drives (not persisted)
         self.active_removable_drives: dict = {}  # folder_path_str -> rc dict
+        # Cached answers about the filesystem. Only the background probe thread
+        # ever touches a drive; the GUI reads these instead, so a slow USB stick
+        # or MP3 player can never stall the interface.
+        self.known_connected_drives: set = set()  # drive roots seen by the last probe
+        self.mount_state: dict = {}  # folder_path_str -> bool (mounted?)
+        self.chain_track_counts: dict = {}  # chain_id -> audio file count
+        self._drive_probe_lock = threading.Lock()
+        self._drive_probe_busy = False
+        self._drive_probe_pending = False
+        # Guards the cached drive/chain state above: the probe thread reads it,
+        # the GUI thread writes it.
+        self._runtime_state_lock = threading.RLock()
         
         if getattr(sys, 'frozen', False):
             self.config_dir = os.path.dirname(os.path.abspath(sys.executable))
@@ -4789,7 +5019,9 @@ class MainApp(QMainWindow):
         self.dl_progress_signal.connect(lambda txt: self.dl_progress_label.setText(txt))
         self.renamer_finished_signal.connect(self._on_renamer_finished)
         self.host_activity_signal.connect(self._on_host_activity)
-        self._drives_scanned_signal.connect(self._apply_scanned_drives)
+        self._probe_results_signal.connect(self._apply_probe_results)
+        self.local_list_refresh_signal.connect(self._refresh_local_list_async)
+        self._local_items_signal.connect(self._apply_local_items)
         self.update_available_signal.connect(self._show_update_dialog)
         self.update_downloaded_signal.connect(self._prompt_swap_dialog)
         self.missing_deps_signal.connect(self._show_missing_dependencies)
@@ -4806,9 +5038,10 @@ class MainApp(QMainWindow):
         self.wifi_monitor_timer.timeout.connect(self._check_wifi_network_change)
         self.wifi_monitor_timer.start(15000)
 
-        # Removable drive auto-detect timer (checks every 3s for plugged drives with TAG.yaml)
-        self.known_connected_drives = self._get_current_system_drives()
-        self.active_removable_drives = {}  # folder_path_str -> rc dict (runtime only)
+        # Removable drive auto-detect timer (checks every 3s for plugged drives with TAG.yaml).
+        # The very first probe is deferred: enumerating drives at startup would
+        # stat every root on the UI thread, including a slow player that happens
+        # to be plugged in.
         self.drive_monitor_timer = QTimer(self)
         self.drive_monitor_timer.timeout.connect(self._check_removable_drives_change)
         self.drive_monitor_timer.start(3000)
@@ -4902,8 +5135,9 @@ class MainApp(QMainWindow):
             self.local_rescan_timer.stop()
 
     def _auto_rescan_local_folder(self):
-        if self.local_current_path and os.path.exists(self.local_current_path):
-            self.refresh_local_list()
+        # Hourly auto-rescan: the folder scan runs on a worker thread so a slow
+        # drive cannot freeze the window when the timer fires.
+        self._refresh_local_list_async()
         # Every local-folder scan (startup + the hourly auto-rescan) also checks for updates.
         self._check_for_updates()
 
@@ -4925,10 +5159,11 @@ class MainApp(QMainWindow):
             threading.Thread(target=_bg, daemon=True).start()
 
     def _on_hosted_folder_changed(self, sync_code: str):
-        """Called when a hosted folder has changed after the debounce timer elapses."""
+        """Called from the folder watcher's debounce thread when a hosted folder changes."""
         port = self.sync_host_server.active_port if hasattr(self, 'sync_host_server') else 63350
         send_lan_update_notification(sync_code, port)
-        self._on_status_update(f"Sync Chain (Code {sync_code}) updated. Notified clients on LAN.", False, "#1abd33")
+        # Emitted, not called directly: this runs on a watcher thread.
+        self.status_signal.emit(f"Sync Chain (Code {sync_code}) updated. Notified clients on LAN.", False, "#1abd33")
 
     def _update_sync_timer(self):
         if hasattr(self, 'sync_config_manager') and hasattr(self, 'sync_timer'):
@@ -4943,9 +5178,10 @@ class MainApp(QMainWindow):
         if not hasattr(self, 'sync_config_manager') or not self.sync_config_manager.client_chains:
             return
 
-        curr_wifi = get_current_wifi_ssid()
-
         def _bg():
+            # Asked for here rather than before the thread starts: this is a
+            # subprocess call and it has no business running on the UI thread.
+            curr_wifi = get_current_wifi_ssid()
             for cc in list(self.sync_config_manager.client_chains):
                 # Respect pause duration
                 paused, _ = is_client_chain_paused(cc)
@@ -4980,7 +5216,7 @@ class MainApp(QMainWindow):
                     if transferred > 0 or deleted > 0:
                         self.status_signal.emit(f"Sync Chain '{cc.get('name')}': {transferred} updated, {deleted} removed.", False, "#1abd33")
                         if self.local_current_path == cc.get('folder_path'):
-                            QTimer.singleShot(0, self.refresh_local_list)
+                            self.local_list_refresh_signal.emit()
                 else:
                     cc['status'] = f"Host Offline"
             self.sync_config_manager.save()
@@ -4988,26 +5224,30 @@ class MainApp(QMainWindow):
         threading.Thread(target=_bg, daemon=True).start()
 
     def _on_lan_chain_updated(self, sync_code: str):
-        """Called when a UDP broadcast notifies of a host update on the LAN (pushes clients to sync)."""
+        """Called from the UDP beacon thread when a host announces an update."""
         if not hasattr(self, 'sync_config_manager') or not self.sync_config_manager.client_chains:
             return
         matching = [cc for cc in self.sync_config_manager.client_chains if str(cc.get('sync_code')) == str(sync_code)]
         if not matching:
             return
 
-        curr_wifi = get_current_wifi_ssid()
         for cc in matching:
-            paused, _ = is_client_chain_paused(cc)
-            if paused:
-                continue
-            req_wifi = cc.get('wifi_ssid', '').strip()
-            if req_wifi and curr_wifi and req_wifi.lower() != curr_wifi.lower():
-                continue
-
-            chain_name = cc.get('name', 'Sync')
-            self._on_status_update(f"Sync Chain '{chain_name}': Push notification received from host. Syncing...", False, "#3B8ED0")
-
             def _bg(c=cc):
+                # Pause checks, the Wi-Fi lookup and the status line all belong
+                # in the worker: this callback arrives on the beacon thread.
+                paused, _ = is_client_chain_paused(c)
+                if paused:
+                    return
+                req_wifi = c.get('wifi_ssid', '').strip()
+                if req_wifi:
+                    curr_wifi = get_current_wifi_ssid()
+                    if curr_wifi and req_wifi.lower() != curr_wifi.lower():
+                        return
+
+                self.status_signal.emit(
+                    f"Sync Chain '{c.get('name', 'Sync')}': Push notification received from host. Syncing...",
+                    False, "#3B8ED0")
+
                 ok, msg, transferred, deleted = SyncClientWorker.sync_chain(
                     c,
                     status_cb=lambda t: self.dl_progress_signal.emit(f"[Sync: {c.get('name', 'Sync')}] {t}") if hasattr(self, 'dl_progress_signal') else None,
@@ -5023,26 +5263,28 @@ class MainApp(QMainWindow):
                     if transferred > 0 or deleted > 0:
                         self.status_signal.emit(f"Sync Chain '{c.get('name')}': {transferred} updated, {deleted} removed.", False, "#1abd33")
                         if self.local_current_path == c.get('folder_path'):
-                            QTimer.singleShot(0, self.refresh_local_list)
+                            self.local_list_refresh_signal.emit()
                 self.sync_config_manager.save()
             threading.Thread(target=_bg, daemon=True).start()
 
     def _check_wifi_network_change(self):
         """Monitors for Wi-Fi SSID changes and triggers auto-sync for bound sync chains."""
-        curr = get_current_wifi_ssid()
-        if not curr:
-            return
-        last = getattr(self, 'last_wifi_ssid', None)
-        if curr != last:
-            self.last_wifi_ssid = curr
-            if hasattr(self, 'sync_config_manager') and self.sync_config_manager.client_chains:
-                bound = [
-                    cc for cc in self.sync_config_manager.client_chains
-                    if cc.get('wifi_ssid', '').strip().lower() == curr.lower() and not is_client_chain_paused(cc)[0]
-                ]
-                if bound:
-                    self._on_status_update(f"Connected to Wi-Fi '{curr}': Auto-syncing bound sync chain(s)...", False, "#1abd33")
-                    self._auto_sync_client_chains()
+        def _bg():
+            curr = get_current_wifi_ssid()
+            if not curr:
+                return
+            last = getattr(self, 'last_wifi_ssid', None)
+            if curr != last:
+                self.last_wifi_ssid = curr
+                if hasattr(self, 'sync_config_manager') and self.sync_config_manager.client_chains:
+                    bound = [
+                        cc for cc in self.sync_config_manager.client_chains
+                        if cc.get('wifi_ssid', '').strip().lower() == curr.lower() and not is_client_chain_paused(cc)[0]
+                    ]
+                    if bound:
+                        self.status_signal.emit(f"Connected to Wi-Fi '{curr}': Auto-syncing bound sync chain(s)...", False, "#1abd33")
+                        self._auto_sync_client_chains()
+        threading.Thread(target=_bg, daemon=True).start()
 
     def _get_current_system_drives(self) -> set:
         drives = set()
@@ -5069,31 +5311,63 @@ class MainApp(QMainWindow):
         return drives
 
     def _check_removable_drives_change(self):
-        """Detects drive connect/disconnect events and auto-syncs any folder tagged with TAG.yaml."""
+        """Starts a drive probe. Performs no filesystem work on the GUI thread."""
         if not hasattr(self, 'sync_config_manager'):
             return
+        with self._drive_probe_lock:
+            if self._drive_probe_busy:
+                # A slow device can keep a probe busy for a while. Instead of
+                # stacking threads on top of the same busy drive, ask the one
+                # that is already running to do one more pass when it finishes.
+                self._drive_probe_pending = True
+                return
+            self._drive_probe_busy = True
+            # Whether the sync manager is open is decided here, on the GUI
+            # thread, so the probe thread never has to ask a widget anything.
+            collect_counts = bool(self.sync_manager_dialog and self.sync_manager_dialog.isVisible())
+        threading.Thread(target=self._probe_drives_background, args=(collect_counts,), daemon=True).start()
+
+    def _probe_drives_background(self, collect_counts: bool = False):
+        """Every drive touch the sync monitor makes happens here, off the UI thread."""
         try:
-            current_drives = self._get_current_system_drives()
-            self.known_connected_drives = current_drives
+            while True:
+                with self._drive_probe_lock:
+                    self._drive_probe_pending = False
 
-            # Handle disconnections — remove entries whose folder path is gone
-            removed_keys = [fp for fp in list(self.active_removable_drives.keys())
-                            if not os.path.exists(fp)]
-            for key in removed_keys:
-                self.active_removable_drives.pop(key, None)
-            if removed_keys and self.sync_manager_dialog:
+                payload = {'drives': set(), 'mount_updates': {}, 'removed': [],
+                           'scanned': [], 'counts': {}}
                 try:
-                    QTimer.singleShot(0, self.sync_manager_dialog.refresh_cards)
-                except RuntimeError:
-                    pass
+                    current_drives = self._get_current_system_drives()
+                except Exception:
+                    current_drives = set()
+                payload['drives'] = current_drives
 
-            def _scan_and_sync():
-                scanned_drives = []
+                # Mount state for the removable chains already registered
+                with self._runtime_state_lock:
+                    registered_paths = list(self.active_removable_drives.keys())
+                for fp in registered_paths:
+                    try:
+                        mounted = os.path.exists(fp)
+                    except Exception:
+                        mounted = False
+                    payload['mount_updates'][fp] = mounted
+                    if not mounted:
+                        payload['removed'].append(fp)
+
+                # Look for TAG.yaml folders on the remaining drives
+                busy_roots = self._busy_drive_roots()
                 _skip = {'C:\\'}
-                for drive in current_drives:
-                    if drive.upper() in _skip or not os.path.exists(drive):
+                for drive in sorted(current_drives):
+                    if drive.upper() in _skip:
                         continue
-                    tagged_folders = find_tagged_sync_folders_on_drive(drive)
+                    if str(Path(drive).anchor) in busy_roots:
+                        # A sync is mid-transfer on this device; its contents
+                        # are already known, so do not interrupt it with a scan.
+                        continue
+                    try:
+                        tagged_folders = find_tagged_sync_folders_on_drive(drive)
+                    except Exception:
+                        continue
                     for folder_path, tag_data in tagged_folders:
                         sync_code = str(tag_data.get('sync_code', '')).strip()
                         if not sync_code:
@@ -5114,35 +5388,94 @@ class MainApp(QMainWindow):
                             'status': 'Ready',
                             'drive_root': drive,
                         }
-                        scanned_drives.append(rc)
-                # Use signal to safely deliver results to main thread
-                self._drives_scanned_signal.emit(scanned_drives)
+                        payload['scanned'].append(rc)
+                        payload['mount_updates'][f_str] = True
 
-            threading.Thread(target=_scan_and_sync, daemon=True).start()
+                payload['counts'] = self._collect_chain_track_counts(collect_counts)
+                # Deliver the cached results to the main thread
+                self._probe_results_signal.emit(payload)
+
+                with self._drive_probe_lock:
+                    if not self._drive_probe_pending:
+                        break
+        finally:
+            with self._drive_probe_lock:
+                self._drive_probe_busy = False
+
+    def _busy_drive_roots(self) -> set:
+        """Drive roots that a sync thread is currently working on."""
+        roots = set()
+        with self._runtime_state_lock:
+            running = list(self.sync_threads.values())
+        for thread in running:
+            try:
+                if not thread.isRunning():
+                    continue
+            except (RuntimeError, AttributeError):
+                continue
+            cfg = getattr(thread, 'removable_config', None) or getattr(thread, 'chain_config', None)
+            if not cfg:
+                continue
+            try:
+                roots.add(str(Path(cfg.get('folder_path', '')).anchor))
+            except Exception:
+                pass
+        return roots
+
+    def _collect_chain_track_counts(self, collect_counts: bool = False) -> dict:
+        """Track counts for the hosted cards, computed off the UI thread and only
+        while the sync manager is actually open (the caller decides that on the
+        GUI thread and passes the answer in)."""
+        counts = {}
+        if not collect_counts:
+            return counts
+        try:
+            for hc in list(self.sync_config_manager.hosted_chains):
+                cid = hc.get('id')
+                folder = hc.get('folder_path', '')
+                if not cid or not folder:
+                    continue
+                counts[cid] = len(filter_audio_files(Path(folder)))
         except Exception:
             pass
+        return counts
 
-    def _apply_scanned_drives(self, drives: list):
-        """Main-thread slot: registers scanned removable drives and refreshes the sync manager cards."""
-        changed = False
-        for rc in drives:
-            f_str = rc['folder_path']
-            sync_code = rc['sync_code']
-            is_hosted = any(str(hc.get('sync_code', '')).strip() == sync_code
-                            for hc in self.sync_config_manager.hosted_chains)
-            is_client = any(str(cc.get('sync_code', '')).strip() == sync_code
-                            for cc in self.sync_config_manager.client_chains)
-            if f_str not in self.active_removable_drives:
-                self.active_removable_drives[f_str] = rc
-                changed = True
-                if is_hosted or is_client:
-                    self._auto_sync_removable_chain(rc)
-            else:
-                self.active_removable_drives[f_str]['name'] = rc['name']
-                self.active_removable_drives[f_str]['drive_root'] = rc['drive_root']
-        # Always refresh cards if the dialog is open and we have removables registered
-        has_removables = bool(self.active_removable_drives)
-        if (changed or has_removables) and self.sync_manager_dialog and self.sync_manager_dialog.isVisible():
+    def _apply_probe_results(self, payload: dict):
+        """Main-thread slot. Reads cached results only - never touches a drive."""
+        if not isinstance(payload, dict):
+            return
+        new_chains = []
+        with self._runtime_state_lock:
+            self.known_connected_drives = payload.get('drives') or set()
+            for fp, mounted in (payload.get('mount_updates') or {}).items():
+                self.mount_state[fp] = bool(mounted)
+            for fp in payload.get('removed') or []:
+                self.active_removable_drives.pop(fp, None)
+                self.mount_state.pop(fp, None)
+            self.chain_track_counts = payload.get('counts') or {}
+
+            for rc in payload.get('scanned') or []:
+                f_str = rc['folder_path']
+                sync_code = rc['sync_code']
+                is_hosted = any(str(hc.get('sync_code', '')).strip() == sync_code
+                                for hc in self.sync_config_manager.hosted_chains)
+                is_client = any(str(cc.get('sync_code', '')).strip() == sync_code
+                                for cc in self.sync_config_manager.client_chains)
+                if f_str not in self.active_removable_drives:
+                    self.active_removable_drives[f_str] = rc
+                    self.mount_state[f_str] = True
+                    if is_hosted or is_client:
+                        new_chains.append(rc)
+                else:
+                    self.active_removable_drives[f_str]['name'] = rc['name']
+                    self.active_removable_drives[f_str]['drive_root'] = rc['drive_root']
+
+        for rc in new_chains:
+            self._auto_sync_removable_chain(rc)
+
+        # refresh_cards() skips the rebuild itself when nothing about the chains
+        # changed, so this stays cheap even though the monitor runs every 3s.
+        if self.sync_manager_dialog and self.sync_manager_dialog.isVisible():
             try:
                 self.sync_manager_dialog.refresh_cards()
             except RuntimeError:
@@ -6464,24 +6797,40 @@ class MainApp(QMainWindow):
         self.refresh_local_list()
 
     def refresh_local_list(self):
-        while self.local_vbox.count():
-            item = self.local_vbox.takeAt(0)
-            if item.widget(): item.widget().deleteLater()
-            
-        self.local_rows = []
-        self.local_row_by_path = {}
-        self.local_selection_anchor = None
-        if not self.local_current_path or not os.path.exists(self.local_current_path):
-            self.local_selected_paths = set()
-            self._update_local_selection_ui()
-            return
-        
+        self._build_local_rows(self._scan_local_items(self.local_current_path))
+
+    def _refresh_local_list_async(self):
+        """Rescan the open folder on a worker thread. Used for every refresh that
+        was not caused by the user directly (a sync finishing, the hourly
+        auto-rescan), so a slow drive never holds the UI hostage."""
+        path = self.local_current_path
+
+        def _bg():
+            items = self._scan_local_items(path)
+            try:
+                self._local_items_signal.emit((path, items))
+            except RuntimeError:
+                pass
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _apply_local_items(self, payload):
+        path, items = payload
+        if path != self.local_current_path:
+            return  # the folder changed while the scan was running
+        self._build_local_rows(items)
+
+    def _scan_local_items(self, folder_path: str):
+        """All filesystem work for the local file list. Returns None when the
+        folder is unavailable, otherwise the rows that should be displayed."""
+        if not folder_path or not os.path.exists(folder_path):
+            return None
         items = []
         try:
-            parent = os.path.dirname(self.local_current_path)
-            if parent and parent != self.local_current_path:
+            parent = os.path.dirname(folder_path)
+            if parent and parent != folder_path:
                 items.append({'name': ".. (Back)", 'path': parent, 'is_dir': True, 'selectable': False})
-            with os.scandir(self.local_current_path) as current_dir:
+            with os.scandir(folder_path) as current_dir:
                 for entry in current_dir:
                     if entry.is_dir():
                         items.append({'name': entry.name, 'path': entry.path, 'is_dir': True, 'selectable': True})
@@ -6489,9 +6838,25 @@ class MainApp(QMainWindow):
                         ext = os.path.splitext(entry.name)[1].lower()
                         if ext in AUDIO_EXTENSIONS:
                             items.append({'name': entry.name, 'path': entry.path, 'is_dir': False, 'selectable': True})
-        except: pass
-        
+        except Exception:
+            pass
         items.sort(key=lambda x: (not x['is_dir'], x['name'].lower()))
+        return items
+
+    def _build_local_rows(self, items):
+        while self.local_vbox.count():
+            item = self.local_vbox.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+            
+        self.local_rows = []
+        self.local_row_by_path = {}
+        self.local_selection_anchor = None
+        if items is None:
+            self.current_local_items = []
+            self.local_selected_paths = set()
+            self._update_local_selection_ui()
+            return
+        
         self.current_local_items = items
         
         self.local_btns = []
