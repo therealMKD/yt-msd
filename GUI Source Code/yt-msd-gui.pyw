@@ -84,6 +84,10 @@ SILENCE_PAD_DUR = 2.0
 CUSTOM_EQ_STRING = ""
 CUSTOM_NORM_CMD = ""  # Optional full ffmpeg -af override for normalization/trim
 
+# Internal version number — keep this in sync with the latest GitHub release tag.
+# (Matches the latest published release: GUI-BETA v2.5)
+APP_VERSION = "2.5"
+
 from mutagen.easyid3 import EasyID3
 from mutagen.id3 import ID3, COMM, ID3NoHeaderError
 from mutagen.easymp4 import EasyMP4
@@ -1289,6 +1293,7 @@ class ThumbnailWidget(QWidget):
         
         accent = get_accent_color(parent_app.accent_color_name)
         self.play_btn = QPushButton("\uE768", self)
+        self.play_btn.setToolTip("Play this track")
         self.play_btn.setFixedSize(30, 30)
         self.play_btn.move(30, 10)
         self.play_btn.setStyleSheet(f"background: rgba(0,0,0,180); color: {accent}; border-radius: 15px; font-weight: bold; font-family: 'Segoe MDL2 Assets'; font-size: 14px; padding: 0px;")
@@ -2267,6 +2272,17 @@ def find_tagged_sync_folders_on_drive(drive_root: str) -> List[Tuple[Path, dict]
     return results
 
 
+def make_removable_chain_id(sync_code: str, folder_path: str) -> str:
+    """Stable, collision-resistant id for a runtime removable-media chain."""
+    digest = hashlib.md5(str(folder_path).encode('utf-8')).hexdigest()[:8]
+    return f"rc_{sync_code}_{digest}"
+
+
+# Shared lock so the two writers of gui_config.json (MainApp.save_config and
+# SyncConfigManager.save) never interleave partial reads/writes and clobber each other.
+_CONFIG_WRITE_LOCK = threading.Lock()
+
+
 class SyncConfigManager:
     """Manages persistence of sync configuration within the unified gui_config.json."""
     def __init__(self, config_dir: str):
@@ -2311,23 +2327,24 @@ class SyncConfigManager:
             self.save()
 
     def save(self):
-        data = {}
-        if os.path.exists(self.config_file):
+        with _CONFIG_WRITE_LOCK:
+            data = {}
+            if os.path.exists(self.config_file):
+                try:
+                    with open(self.config_file, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                except Exception:
+                    data = {}
+
+            data['sync_settings'] = self.settings
+            data['hosted_chains'] = self.hosted_chains
+            data['client_chains'] = self.client_chains
+
             try:
-                with open(self.config_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
+                with open(self.config_file, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=4)
             except Exception:
-                data = {}
-
-        data['sync_settings'] = self.settings
-        data['hosted_chains'] = self.hosted_chains
-        data['client_chains'] = self.client_chains
-
-        try:
-            with open(self.config_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=4)
-        except Exception:
-            pass
+                pass
 
     def generate_unique_sync_code(self) -> str:
         used = {str(c.get('sync_code')) for c in self.hosted_chains}
@@ -2370,23 +2387,6 @@ class SyncConfigManager:
             'status': 'Pending Sync'
         }
         self.client_chains.append(chain)
-        self.save()
-        return chain
-
-    def add_removable_chain(self, name: str, folder_path: str, sync_code: str, deletion_mode: str = 'mirror') -> dict:
-        cid = f'rc_{sync_code}_{hashlib.md5(folder_path.encode()).hexdigest()[:6]}'
-        chain = {
-            'id': cid,
-            'sync_code': sync_code,
-            'name': name,
-            'folder_path': folder_path,
-            'deletion_mode': deletion_mode,
-            'created_at': time.time(),
-            'last_synced': 0,
-            'status': 'Ready'
-        }
-        self.removable_chains = [c for c in self.removable_chains if c.get('folder_path') != folder_path]
-        self.removable_chains.append(chain)
         self.save()
         return chain
 
@@ -2636,6 +2636,7 @@ class CreateHostChainDialog(QDialog):
         folder_h.addWidget(self.folder_edit, 1)
 
         browse_btn = QPushButton("Browse...")
+        browse_btn.setToolTip("Browse for the master audio folder to sync")
         browse_btn.clicked.connect(self._browse_folder)
         folder_h.addWidget(browse_btn)
         layout.addLayout(folder_h)
@@ -2665,10 +2666,12 @@ class CreateHostChainDialog(QDialog):
         btn_h = QHBoxLayout()
         btn_h.addStretch()
         cancel_btn = QPushButton("Cancel")
+        cancel_btn.setToolTip("Cancel")
         cancel_btn.clicked.connect(self.reject)
         btn_h.addWidget(cancel_btn)
 
         create_btn = QPushButton("Create Chain")
+        create_btn.setToolTip("Create the sync chain and start hosting")
         create_btn.clicked.connect(self._create_chain)
         btn_h.addWidget(create_btn)
         layout.addLayout(btn_h)
@@ -2751,6 +2754,7 @@ class ConnectClientChainDialog(QDialog):
         folder_h.addWidget(self.folder_edit, 1)
 
         browse_btn = QPushButton("Browse...")
+        browse_btn.setToolTip("Browse for the local folder to sync into")
         browse_btn.clicked.connect(self._browse_base_folder)
         folder_h.addWidget(browse_btn)
         layout.addLayout(folder_h)
@@ -2772,10 +2776,12 @@ class ConnectClientChainDialog(QDialog):
         btn_h.addStretch()
 
         cancel_btn = QPushButton("Cancel")
+        cancel_btn.setToolTip("Cancel")
         cancel_btn.clicked.connect(self.reject)
         btn_h.addWidget(cancel_btn)
 
         connect_btn = QPushButton("Connect & Join")
+        connect_btn.setToolTip("Connect to the remote sync chain")
         connect_btn.clicked.connect(self._connect_chain)
         btn_h.addWidget(connect_btn)
         layout.addLayout(btn_h)
@@ -2867,6 +2873,7 @@ class ConnectRemovableMediaDialog(QDialog):
         folder_h.addWidget(self.folder_edit, 1)
 
         browse_btn = QPushButton("Browse...")
+        browse_btn.setToolTip("Browse for the removable drive or folder")
         browse_btn.clicked.connect(self._browse_folder)
         folder_h.addWidget(browse_btn)
         layout.addLayout(folder_h)
@@ -2888,6 +2895,7 @@ class ConnectRemovableMediaDialog(QDialog):
             for d in detected_drives:
                 d_btn = QPushButton(d)
                 d_btn.setFixedHeight(22)
+                d_btn.setToolTip(f"Use drive {d}")
                 d_btn.setStyleSheet("font-size: 11px; padding: 2px 6px;")
                 d_btn.clicked.connect(lambda chk=False, drv=d: self._set_drive(drv))
                 quick_h.addWidget(d_btn)
@@ -2913,10 +2921,12 @@ class ConnectRemovableMediaDialog(QDialog):
         btn_h = QHBoxLayout()
         btn_h.addStretch()
         cancel_btn = QPushButton("Cancel")
+        cancel_btn.setToolTip("Cancel")
         cancel_btn.clicked.connect(self.reject)
         btn_h.addWidget(cancel_btn)
 
         self.connect_btn = QPushButton("Connect & Initialize Drive")
+        self.connect_btn.setToolTip("Connect and initialize the removable drive")
         self.connect_btn.clicked.connect(self._connect_removable)
         btn_h.addWidget(self.connect_btn)
         layout.addLayout(btn_h)
@@ -2980,7 +2990,7 @@ class ConnectRemovableMediaDialog(QDialog):
             return
 
         # Register in the runtime active drives dict and immediately sync
-        cid = f"rc_{sync_code}_{abs(hash(str(dest_path))) % 100000}"
+        cid = make_removable_chain_id(sync_code, str(dest_path))
         rc = {
             'id': cid,
             'sync_code': sync_code,
@@ -3027,24 +3037,29 @@ class SyncManagerDialog(QDialog):
 
         copy_ip_btn = QPushButton("Copy IP")
         copy_ip_btn.setFixedWidth(75)
+        copy_ip_btn.setToolTip("Copy your local IP address")
         copy_ip_btn.clicked.connect(lambda: QApplication.clipboard().setText(local_ip))
         top_bar.addWidget(copy_ip_btn)
 
         top_bar.addStretch()
 
         create_btn = QPushButton("Create Chain (Host)")
+        create_btn.setToolTip("Host a folder as a sync chain")
         create_btn.clicked.connect(self._open_create_dialog)
         top_bar.addWidget(create_btn)
 
         connect_btn = QPushButton("Connect Chain (Client)")
+        connect_btn.setToolTip("Connect to an existing sync chain")
         connect_btn.clicked.connect(self._open_connect_dialog)
         top_bar.addWidget(connect_btn)
 
         removable_btn = QPushButton("Connect Removable Drive (USB)")
+        removable_btn.setToolTip("Sync a playlist to a USB / SD drive")
         removable_btn.clicked.connect(self._open_removable_dialog)
         top_bar.addWidget(removable_btn)
 
         sync_all_btn = QPushButton("Force Sync All")
+        sync_all_btn.setToolTip("Force a sync of all chains now")
         sync_all_btn.clicked.connect(self._force_sync_all)
         top_bar.addWidget(sync_all_btn)
 
@@ -3085,6 +3100,7 @@ class SyncManagerDialog(QDialog):
         footer.addStretch()
         close_btn = QPushButton("Close")
         close_btn.setFixedWidth(100)
+        close_btn.setToolTip("Close this window")
         close_btn.clicked.connect(self.accept)
         footer.addWidget(close_btn)
         main_layout.addLayout(footer)
@@ -3276,6 +3292,7 @@ class SyncManagerDialog(QDialog):
 
         copy_code_btn = QPushButton("Copy Code")
         copy_code_btn.setFixedWidth(105)
+        copy_code_btn.setToolTip("Copy the sync code")
         code_val = str(hc.get('sync_code', ''))
         copy_code_btn.clicked.connect(lambda chk=False, c=code_val: QApplication.clipboard().setText(c))
         header.addWidget(copy_code_btn)
@@ -3305,6 +3322,7 @@ class SyncManagerDialog(QDialog):
         info_h.addWidget(path_lbl, 1)
 
         open_btn = QPushButton("Open Folder")
+        open_btn.setToolTip("Open this folder in File Explorer")
         open_btn.setFixedWidth(115)
         open_btn.clicked.connect(lambda chk=False, f=folder_str: os.startfile(f) if Path(f).exists() else None)
         info_h.addWidget(open_btn)
@@ -3360,11 +3378,13 @@ class SyncManagerDialog(QDialog):
         is_paused, pause_until = is_client_chain_paused(cc)
         if is_paused:
             resume_btn = QPushButton("Resume Sync")
+            resume_btn.setToolTip("Resume syncing for this chain")
             resume_btn.setStyleSheet("background: #3B8ED0; color: white; font-size: 11px; padding: 3px 8px; border-radius: 4px;")
             resume_btn.clicked.connect(lambda chk=False, cid=cid_val: self._resume_chain_sync(cid))
             header.addWidget(resume_btn)
         else:
             pause_btn = QPushButton("Pause Sync ▾")
+            pause_btn.setToolTip("Pause syncing for this chain")
             pause_btn.setStyleSheet("font-size: 11px; padding: 3px 8px;")
             pause_menu = QMenu(self)
             durations = [
@@ -3386,6 +3406,7 @@ class SyncManagerDialog(QDialog):
         # Wi-Fi SSID Auto-Sync Binding Control
         wifi_ssid = cc.get('wifi_ssid', '')
         wifi_btn = QPushButton(f"Wi-Fi: {wifi_ssid}" if wifi_ssid else "Bind Wi-Fi ▾")
+        wifi_btn.setToolTip("Bind this chain to a Wi-Fi network")
         wifi_btn.setStyleSheet("font-size: 11px; padding: 3px 8px;" + (" background: rgba(59, 142, 208, 0.25);" if wifi_ssid else ""))
         wifi_menu = QMenu(self)
         curr_ssid = get_current_wifi_ssid()
@@ -3402,6 +3423,7 @@ class SyncManagerDialog(QDialog):
         header.addWidget(wifi_btn)
 
         sync_btn = QPushButton("Sync Now")
+        sync_btn.setToolTip("Sync this chain now")
         sync_btn.clicked.connect(lambda chk=False, c=cc: self._sync_single_client_chain(c))
         header.addWidget(sync_btn)
 
@@ -3450,6 +3472,7 @@ class SyncManagerDialog(QDialog):
         info_h.addWidget(path_lbl, 1)
 
         open_btn = QPushButton("Open Folder")
+        open_btn.setToolTip("Open this folder in File Explorer")
         open_btn.setFixedWidth(115)
         open_btn.clicked.connect(lambda chk=False, f=folder_str: os.startfile(f) if Path(f).exists() else None)
         info_h.addWidget(open_btn)
@@ -3483,6 +3506,7 @@ class SyncManagerDialog(QDialog):
         header.addStretch()
 
         sync_btn = QPushButton("Sync Now")
+        sync_btn.setToolTip("Sync this chain now")
         sync_btn.clicked.connect(lambda chk=False, r=rc: self._sync_single_removable_chain(r))
         header.addWidget(sync_btn)
 
@@ -3522,6 +3546,7 @@ class SyncManagerDialog(QDialog):
         info_h.addWidget(path_lbl, 1)
 
         open_btn = QPushButton("Open Folder")
+        open_btn.setToolTip("Open this folder in File Explorer")
         open_btn.setFixedWidth(115)
         open_btn.clicked.connect(lambda chk=False, f=folder_str: os.startfile(f) if Path(f).exists() else None)
         info_h.addWidget(open_btn)
@@ -3688,6 +3713,7 @@ class SettingsDialog(QDialog):
         self.mode_btns = {}
         for mode in ["System", "Light", "Dark"]:
             btn = QPushButton(mode)
+            btn.setToolTip(f"Switch to {mode.lower()} appearance")
             btn.setCheckable(True)
             if parent.appearance_mode == mode: btn.setChecked(True)
             btn.clicked.connect(lambda checked=False, m=mode: self._change_mode(m))
@@ -3811,6 +3837,7 @@ class SettingsDialog(QDialog):
         self.norm_btns = {}
         for mode, label in [("on", "ON"), ("off", "OFF"), ("ask", "ASK")]:
             btn = QPushButton(label)
+            btn.setToolTip({"on": "Always normalize after download", "off": "Never normalize after download", "ask": "Ask before normalizing each download"}[mode])
             btn.setCheckable(True)
             btn.setChecked(parent.normalization_mode == mode)
             btn.clicked.connect(lambda checked=False, m=mode: self._set_norm_mode(m))
@@ -3883,6 +3910,12 @@ class SettingsDialog(QDialog):
         right_layout.addLayout(norm_cmd_h)
         right_layout.addWidget(QLabel("Replaces the entire -af filter chain for normalization AND silence trim.",
                                       font=QFont("Segoe UI", 8)))
+        right_layout.addSpacing(10)
+        version_lbl = QLabel(f"v{APP_VERSION}")
+        version_lbl.setFont(QFont("Segoe UI", 8))
+        version_lbl.setAlignment(Qt.AlignRight)
+        version_lbl.setStyleSheet("background: transparent; border: none;")
+        right_layout.addWidget(version_lbl)
         right_layout.addStretch()
         
         columns_layout.addWidget(left_widget, 1)
@@ -3895,16 +3928,19 @@ class SettingsDialog(QDialog):
         footer = QHBoxLayout()
         self.reset_btn = QPushButton("Reset to Default Config")
         self.reset_btn.setObjectName("topIconBtn")
+        self.reset_btn.setToolTip("Reset all settings to their defaults")
         self.reset_btn.clicked.connect(self._reset_defaults)
         footer.addWidget(self.reset_btn)
 
         self.sync_btn = QPushButton("Sync Chains Manager")
+        self.sync_btn.setToolTip("Open the Sync Chains Manager")
         self.sync_btn.clicked.connect(self._open_sync_manager)
         footer.addWidget(self.sync_btn)
 
         footer.addStretch()
         ok_btn = QPushButton("OK")
         ok_btn.setFixedWidth(100)
+        ok_btn.setToolTip("Close settings")
         ok_btn.clicked.connect(self.accept)
         footer.addWidget(ok_btn)
         
@@ -4072,8 +4108,10 @@ class PlaylistDialog(QDialog):
         h = QHBoxLayout()
         h.addStretch()
         cancel_btn = QPushButton("Cancel")
+        cancel_btn.setToolTip("Cancel")
         cancel_btn.clicked.connect(self.reject)
         open_btn = QPushButton("Open Playlist")
+        open_btn.setToolTip("Open the selected playlist")
         open_btn.clicked.connect(self.accept)
         # Assuming app aesthetic injection
         accent = get_accent_color(parent.accent_color_name if parent else "Blue")
@@ -4122,6 +4160,7 @@ class TrayProgressPopup(QWidget):
         
         close_btn = QPushButton("✕")
         close_btn.setFixedSize(18, 18)
+        close_btn.setToolTip("Close")
         close_btn.setStyleSheet("background: transparent; color: #888; font-size: 11px; border: none; font-weight: bold;")
         close_btn.clicked.connect(self.hide)
         header_h.addWidget(close_btn)
@@ -4583,7 +4622,7 @@ class MainApp(QMainWindow):
                         chain_name = (tag_data.get('chain_name', '') or
                                       folder_path.name or
                                       f"Drive ({drive[0]}:)")
-                        cid = f"rc_{sync_code}_{abs(hash(f_str)) % 100000}"
+                        cid = make_removable_chain_id(sync_code, f_str)
                         rc = {
                             'id': cid,
                             'sync_code': sync_code,
@@ -4814,7 +4853,19 @@ class MainApp(QMainWindow):
             self.recent_folders = [default_dl]; self.download_path = default_dl
 
     def save_config(self):
-        c = {
+        # Merge into the existing file instead of overwriting it, so keys owned by
+        # other subsystems (hosted_chains / client_chains / sync_settings written by
+        # SyncConfigManager.save) are preserved. The whole read-modify-write runs
+        # under a shared lock so it never interleaves with SyncConfigManager.save().
+        with _CONFIG_WRITE_LOCK:
+            c = {}
+            try:
+                if os.path.exists(self.config_path):
+                    with open(self.config_path, 'r') as f:
+                        c = json.load(f)
+            except Exception:
+                c = {}
+            c.update({
             'format': self.format_combo.currentText(),
             'bitrate': self.bitrate_combo.currentText(),
             'mode': self.appearance_mode,
@@ -4851,10 +4902,10 @@ class MainApp(QMainWindow):
                 'local_current_path': self.local_current_path,
                 'local_playback_index': getattr(self, 'local_playback_index', -1)
             }
-        }
-        try:
-            with open(self.config_path, 'w') as f: json.dump(c, f, indent=4)
-        except: pass
+            })
+            try:
+                with open(self.config_path, 'w') as f: json.dump(c, f, indent=4)
+            except: pass
 
     def setup_tray(self):
         self.tray_popup = TrayProgressPopup()
@@ -5380,6 +5431,7 @@ class MainApp(QMainWindow):
         h.addWidget(self.local_path_combo, 1)
         local_browse_btn = QPushButton("\uE8B7")
         local_browse_btn.setObjectName("topIconBtn")
+        local_browse_btn.setToolTip("Browse for a local folder")
         local_browse_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 16px; padding: 0px;")
         local_browse_btn.setFixedSize(36, 30)
         local_browse_btn.clicked.connect(lambda: self.load_local_folder(QFileDialog.getExistingDirectory(self)))
@@ -5562,6 +5614,23 @@ class MainApp(QMainWindow):
 
         secondary_fg = "#777777" if mode == "Light" else "#999999"
 
+        # Canonical tooltip style. Applied to the whole application (see below) so
+        # every window — the main window and all dialogs — shows identical tooltips
+        # with the same font size and appearance as the playback controls.
+        tooltip_css = (
+            "QToolTip {"
+            f" background-color: {frame_bg};"
+            f" color: {fg};"
+            f" border: 1px solid {input_border};"
+            " padding: 2px 6px;"
+            " border-radius: 4px;"
+            " font-family: 'Segoe UI';"
+            " font-size: 10px;"
+            " font-weight: normal;"
+            " show-delay: 4000ms;"
+            " }"
+        )
+
         self.setStyleSheet("""
             QMainWindow, QDialog {{ background-color: {bg}; }}
             QWidget {{ color: {fg}; font-family: 'Segoe UI'; font-size: 13px; }}
@@ -5684,25 +5753,19 @@ class MainApp(QMainWindow):
             QPushButton#playerPlayBtn:hover {{
                 background-color: {btn_hover};
             }}
-            QToolTip {{
-                background-color: {frame_bg};
-                color: {fg};
-                border: 1px solid {input_border};
-                padding: 2px 6px;
-                border-radius: 4px;
-                font-family: 'Segoe UI';
-                font-size: 10px;
-                font-weight: normal;
-                show-delay: 4000ms;
-            }}
+            {tooltip_css}
         """.format(
             bg=bg, fg=fg, frame_bg=frame_bg, input_bg=input_bg, input_border=input_border,
             scroll_bg=scroll_bg, splitter_handle=splitter_handle, slider_bg=slider_bg,
             hover_bg=hover_bg, hover_fg=hover_fg, accent=accent, accent_fg=accent_fg,
             queue_item_bg=queue_item_bg, queue_item_bg_finished=queue_item_bg_finished,
             btn_hover=btn_hover, checkmark_path=checkmark_path, downarrow_path=downarrow_path,
-            main_btn_border=main_btn_border, secondary_fg=secondary_fg
+            main_btn_border=main_btn_border, secondary_fg=secondary_fg,
+            tooltip_css=tooltip_css
         ))
+        _app = QApplication.instance()
+        if _app is not None:
+            _app.setStyleSheet(tooltip_css)
         self.update_shuffle_btn_style()
 
     # --- Local Folder Logic ---
@@ -6080,6 +6143,7 @@ class MainApp(QMainWindow):
             threading.Thread(target=self._fetch_thumbnail, args=(video,), daemon=True).start()
         else:
             pbtn = QPushButton("\uE768")
+            pbtn.setToolTip("Play this track")
             pbtn.setFixedWidth(40)
             pbtn.setObjectName("iconBtn")
             pbtn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 16px;")
@@ -7004,7 +7068,6 @@ if __name__ == "__main__":
     else:
         QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
         app = QApplication(sys.argv)
-        QToolTip.setFont(QFont("Segoe UI", 9))
         window = MainApp()
         window.show()
         ret = app.exec()
