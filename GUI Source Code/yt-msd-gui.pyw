@@ -4332,6 +4332,53 @@ class UpdateAvailableDialog(QDialog):
         self.reject()
 
 
+class UpdateReadyDialog(QDialog):
+    """Shown after a successful download; asks whether to auto-swap to the new version."""
+    def __init__(self, parent_window, new_path, old_path, tag):
+        super().__init__(parent_window)
+        self.parent_window = parent_window
+        self.setWindowTitle("Launch Update? - yt-msd")
+        self.setFixedWidth(520)
+        self.setWindowFlags(self.windowFlags() | Qt.Tool)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+
+        title_lbl = QLabel("UPDATE DOWNLOADED")
+        title_lbl.setFont(QFont("Segoe UI Semibold", 11))
+        layout.addWidget(title_lbl)
+
+        desc = QLabel(
+            f"The new version ({tag}) has been downloaded to:\n{new_path}\n\n"
+            "Would you like to automatically close this version, delete the old file, and launch the new version? "
+            "Choosing Cancel keeps both files so you can swap them yourself."
+        )
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        old_lbl = QLabel(f"Old version file that would be removed: {old_path}")
+        old_lbl.setWordWrap(True)
+        old_lbl.setStyleSheet("color: #888; font-size: 11px;")
+        layout.addWidget(old_lbl)
+
+        layout.addStretch()
+
+        btn_h = QHBoxLayout()
+        btn_h.addStretch()
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setToolTip("Keep both files; swap them manually")
+        cancel_btn.clicked.connect(self.reject)
+        btn_h.addWidget(cancel_btn)
+
+        ok_btn = QPushButton("OK")
+        ok_btn.setToolTip("Close this version, delete the old file, and launch the new version")
+        ok_btn.clicked.connect(self.accept)
+        btn_h.addWidget(ok_btn)
+        layout.addLayout(btn_h)
+
+
 class MainApp(QMainWindow):
     status_signal = Signal(str, bool, str)
     search_results_signal = Signal(list, bool)
@@ -4345,6 +4392,7 @@ class MainApp(QMainWindow):
     host_activity_signal = Signal(str, str, str)
     _drives_scanned_signal = Signal(list)  # emitted from bg thread with list of rc dicts
     update_available_signal = Signal(str, str, str, str)  # tag, release_name, download_url, asset_name
+    update_downloaded_signal = Signal(str, str)  # new_file_path, tag (emitted from the download bg thread)
 
     def __init__(self):
         super().__init__()
@@ -4448,6 +4496,7 @@ class MainApp(QMainWindow):
         self.host_activity_signal.connect(self._on_host_activity)
         self._drives_scanned_signal.connect(self._apply_scanned_drives)
         self.update_available_signal.connect(self._show_update_dialog)
+        self.update_downloaded_signal.connect(self._prompt_swap_dialog)
 
         self.player_timer = QTimer(self)
         self.player_timer.timeout.connect(self.update_player_ui)
@@ -4981,10 +5030,71 @@ class MainApp(QMainWindow):
                     out.write(payload)
                 self._downloaded_update_tag = tag
                 self.status_signal.emit(f"Update {tag} downloaded to: {dest_path}", False, "#1abd33")
+                self.update_downloaded_signal.emit(dest_path, tag)
             except Exception as e:
                 self.status_signal.emit(f"Update download failed: {e}", False, "#E31E24")
 
         threading.Thread(target=_bg, daemon=True).start()
+
+    def _current_executable_path(self):
+        """Absolute path of the file this instance is currently running from."""
+        if getattr(sys, 'frozen', False):
+            return os.path.abspath(sys.executable)
+        return os.path.abspath(__file__)
+
+    def _prompt_swap_dialog(self, new_path, tag):
+        """After a successful download, offer to auto-close, delete the old file, and launch the new version."""
+        old_path = self._current_executable_path()
+        dlg = UpdateReadyDialog(self, new_path, old_path, tag)
+        choice = dlg.exec()
+        if choice == QDialog.Accepted:
+            self._launch_swap_helper(new_path, old_path)
+            # closeEvent() saves config, hides the tray, and hard-exits the process (os._exit).
+            self.close()
+        else:
+            self.status_signal.emit(
+                f"Update ready. New file: {new_path} (old file kept: {old_path}). Swap them manually to finish.",
+                False, "#FF8C00"
+            )
+
+    def _launch_swap_helper(self, new_path, old_path):
+        """Write a temporary helper script that waits for this process to exit, deletes the old file,
+        launches the new version, then deletes itself."""
+        pid = os.getpid()
+        if getattr(sys, 'frozen', False):
+            launch_cmd = f'"{new_path}"'
+        else:
+            interp = os.path.abspath(sys.executable)
+            # Prefer the windowless interpreter so the relaunched app doesn't open a console.
+            if os.path.basename(interp).lower() == "python.exe":
+                candidate = os.path.join(os.path.dirname(interp), "pythonw.exe")
+                if os.path.exists(candidate):
+                    interp = candidate
+            launch_cmd = f'"{interp}" "{new_path}"'
+
+        swap_path = os.path.join(tempfile.gettempdir(), f"ytmsd_swap_{pid}.bat")
+        bat = (
+            "@echo off\r\n"
+            f'set "PID={pid}"\r\n'
+            f'set "OLD={old_path}"\r\n'
+            f'set "NEW={new_path}"\r\n'
+            'powershell -NoProfile -Command "while (Get-Process -Id %PID% -ErrorAction SilentlyContinue) { Start-Sleep -Milliseconds 300 }"\r\n'
+            'if not "%OLD%"=="%NEW%" (\r\n'
+            '  if exist "%OLD%" del /F /Q "%OLD%"\r\n'
+            ')\r\n'
+            f'start "" {launch_cmd}\r\n'
+            'del /F /Q "%~f0"\r\n'
+        )
+        try:
+            with open(swap_path, "w", encoding="utf-8") as f:
+                f.write(bat)
+        except Exception:
+            return
+        try:
+            # CREATE_NO_WINDOW (0x08000000) keeps the helper itself invisible.
+            subprocess.Popen(["cmd.exe", "/c", swap_path], creationflags=0x08000000)
+        except Exception:
+            pass
 
     def _init_vlc_background(self):
         """Initialize libVLC in a background thread to avoid blocking the UI during plugin scanning."""
