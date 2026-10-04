@@ -29,7 +29,7 @@ The GUI version is currently "complete" at v1.0, (and "improved" at v2.5) but fu
 - Automatic update checking (!)
 - An icon that isn't a single-color circle
 - Various QOL changes and bug fixes
-- MusicBee Plugin version - Will be released once the program has completely matured. This will be when all features have been added, and will probably just be the entire yt-msd program wrapped in C++. (Yeah, very optimized, I know)
+- MusicBee Plugin version - Will be released once the program has completely matured. This will be when all features have been added, and will be the Cython build wrapped in C#
 - Possibly winget or chocolatey package - We'll see, but it would be nice to be able to run a single winget command for everything. This will only happen once the program is for sure done.
 
 ### Support for other operating systems
