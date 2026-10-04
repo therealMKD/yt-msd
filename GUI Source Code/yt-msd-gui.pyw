@@ -85,8 +85,30 @@ CUSTOM_EQ_STRING = ""
 CUSTOM_NORM_CMD = ""  # Optional full ffmpeg -af override for normalization/trim
 
 # Internal version number — keep this in sync with the latest GitHub release tag.
-# (Matches the latest published release: GUI-BETA v2.5)
-APP_VERSION = "2.5"
+# (Matches the latest published release tag exactly: GUI-BETA2.5)
+APP_VERSION = "GUI-BETA2.5"
+
+# GitHub repository whose releases page is polled for newer versions.
+UPDATE_REPO = "therealMKD/yt-msd"
+
+
+def _extract_version_number(text):
+    """Isolate the full numeric version (including decimals) from a tag like 'GUI-BETA2.5' -> (2, 5)."""
+    tokens = re.findall(r"\d+(?:\.\d+)*", text or "")
+    if not tokens:
+        return (0,)
+    # Prefer the token that looks most like a complete version (most dots, then longest).
+    token = max(tokens, key=lambda s: (s.count("."), len(s)))
+    parts = [int(p) for p in token.split(".") if p.isdigit()]
+    return tuple(parts) if parts else (0,)
+
+
+def _version_is_newer(latest, current):
+    """Return True if 'latest' is a greater version than 'current' (shorter tuple zero-padded)."""
+    n = max(len(latest), len(current))
+    latest = tuple(list(latest) + [0] * (n - len(latest)))
+    current = tuple(list(current) + [0] * (n - len(current)))
+    return latest > current
 
 from mutagen.easyid3 import EasyID3
 from mutagen.id3 import ID3, COMM, ID3NoHeaderError
@@ -3954,7 +3976,7 @@ class SettingsDialog(QDialog):
         right_layout.addWidget(QLabel("Replaces the entire -af filter chain for normalization AND silence trim.",
                                       font=QFont("Segoe UI", 8)))
         right_layout.addSpacing(10)
-        version_lbl = QLabel(f"v{APP_VERSION}")
+        version_lbl = QLabel(APP_VERSION)
         version_lbl.setFont(QFont("Segoe UI", 8))
         version_lbl.setAlignment(Qt.AlignRight)
         version_lbl.setStyleSheet("background: transparent; border: none;")
@@ -4249,6 +4271,67 @@ class TrayProgressPopup(QWidget):
         self.hide_timer.start(3500)
 
 
+class UpdateAvailableDialog(QDialog):
+    """Notifies the user that a newer yt-msd release is available and offers to download it."""
+    def __init__(self, parent_window, latest_tag, release_name, current_version):
+        super().__init__(parent_window)
+        self.parent_window = parent_window
+        self.never_notify = False
+        self.setWindowTitle("Update Available - yt-msd")
+        self.setFixedWidth(470)
+        self.setWindowFlags(self.windowFlags() | Qt.Tool)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+
+        title_lbl = QLabel("A NEW UPDATE IS AVAILABLE")
+        title_lbl.setFont(QFont("Segoe UI Semibold", 11))
+        layout.addWidget(title_lbl)
+
+        desc = QLabel(
+            f"A newer version of yt-msd ({latest_tag}) is available.\n"
+            f"You are currently running {current_version}."
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color: #888; font-size: 11px;")
+        layout.addWidget(desc)
+
+        if release_name and release_name != latest_tag:
+            name_lbl = QLabel(f"Release: {release_name}")
+            name_lbl.setWordWrap(True)
+            name_lbl.setStyleSheet("color: #888; font-size: 11px;")
+            layout.addWidget(name_lbl)
+
+        self.never_cb = QCheckBox("Never notify me again about updates")
+        self.never_cb.setToolTip("Stop checking for updates entirely")
+        layout.addWidget(self.never_cb)
+
+        layout.addStretch()
+
+        btn_h = QHBoxLayout()
+        btn_h.addStretch()
+
+        ignore_btn = QPushButton("Ignore")
+        ignore_btn.setToolTip("Skip this update until the next check")
+        ignore_btn.clicked.connect(self._on_ignore)
+        btn_h.addWidget(ignore_btn)
+
+        dl_btn = QPushButton("Download update")
+        dl_btn.setToolTip("Download the new version into the folder yt-msd is running from")
+        dl_btn.clicked.connect(self._on_download)
+        btn_h.addWidget(dl_btn)
+        layout.addLayout(btn_h)
+
+    def _on_download(self):
+        self.never_notify = self.never_cb.isChecked()
+        self.accept()
+
+    def _on_ignore(self):
+        self.never_notify = self.never_cb.isChecked()
+        self.reject()
+
+
 class MainApp(QMainWindow):
     status_signal = Signal(str, bool, str)
     search_results_signal = Signal(list, bool)
@@ -4261,6 +4344,7 @@ class MainApp(QMainWindow):
     renamer_finished_signal = Signal()
     host_activity_signal = Signal(str, str, str)
     _drives_scanned_signal = Signal(list)  # emitted from bg thread with list of rc dicts
+    update_available_signal = Signal(str, str, str, str)  # tag, release_name, download_url, asset_name
 
     def __init__(self):
         super().__init__()
@@ -4304,6 +4388,9 @@ class MainApp(QMainWindow):
         self.download_threads = 3
         self.normalization_threads = max(1, os.cpu_count() // 2)
         self.local_rescan_interval = 60  # minutes (default 1 hour)
+        self.disable_update_checks = False  # True once the user opts out of update notifications
+        self._update_check_running = False  # guards against overlapping network update checks
+        self._downloaded_update_tag = None  # tag already downloaded this session (avoid re-prompting)
         self.local_rescan_timer = QTimer(self)
         self.local_rescan_timer.timeout.connect(self._auto_rescan_local_folder)
         
@@ -4360,6 +4447,7 @@ class MainApp(QMainWindow):
         self.renamer_finished_signal.connect(self._on_renamer_finished)
         self.host_activity_signal.connect(self._on_host_activity)
         self._drives_scanned_signal.connect(self._apply_scanned_drives)
+        self.update_available_signal.connect(self._show_update_dialog)
 
         self.player_timer = QTimer(self)
         self.player_timer.timeout.connect(self.update_player_ui)
@@ -4383,6 +4471,9 @@ class MainApp(QMainWindow):
 
         # Startup dependency validation check
         QTimer.singleShot(400, self._check_dependencies_on_startup)
+
+        # Update check on startup (runs again with every local-folder rescan)
+        QTimer.singleShot(1500, self._check_for_updates)
 
         # Initialize VLC in a background thread (plugin scanning can take seconds)
         threading.Thread(target=self._init_vlc_background, daemon=True).start()
@@ -4468,6 +4559,8 @@ class MainApp(QMainWindow):
     def _auto_rescan_local_folder(self):
         if self.local_current_path and os.path.exists(self.local_current_path):
             self.refresh_local_list()
+        # Every local-folder scan (startup + the hourly auto-rescan) also checks for updates.
+        self._check_for_updates()
 
     def refresh_sync_watchers(self):
         """Registers all hosted sync chains with the watchdog monitor in a background thread."""
@@ -4828,6 +4921,71 @@ class MainApp(QMainWindow):
             msg.setStandardButtons(QMessageBox.Ok)
             msg.exec()
 
+    def _check_for_updates(self):
+        """Query the GitHub releases page and notify the user if the newest release is newer than this build."""
+        if getattr(self, 'disable_update_checks', False):
+            return
+        if getattr(self, '_update_check_running', False):
+            return
+        self._update_check_running = True
+
+        def _bg():
+            try:
+                api_url = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
+                req = urllib.request.Request(api_url, headers={"User-Agent": "yt-msd-updater"})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                tag = (data.get("tag_name") or "").strip()
+                release_name = (data.get("name") or tag).strip()
+                assets = data.get("assets") or []
+                download_url = (assets[0].get("browser_download_url") or "") if assets else ""
+                asset_name = (assets[0].get("name") or "") if assets else ""
+                if not tag:
+                    return
+                if tag == getattr(self, '_downloaded_update_tag', None):
+                    return  # already downloaded this session; don't nag again
+                if _version_is_newer(_extract_version_number(tag), _extract_version_number(APP_VERSION)):
+                    self.update_available_signal.emit(tag, release_name, download_url, asset_name)
+            except Exception:
+                pass
+            finally:
+                self._update_check_running = False
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _show_update_dialog(self, tag, release_name, download_url, asset_name):
+        """Show the update dialog on the GUI thread and act on the user's choice."""
+        dlg = UpdateAvailableDialog(self, tag, release_name, APP_VERSION)
+        choice = dlg.exec()
+        if dlg.never_notify:
+            self.disable_update_checks = True
+            self.save_config()
+        if choice == QDialog.Accepted:
+            filename = asset_name or f"yt-msd-{tag}.pyw"
+            self._download_update(download_url, filename, tag)
+
+    def _download_update(self, url, filename, tag):
+        """Download the newest release asset into the folder yt-msd is currently running from."""
+        if not url:
+            self.status_signal.emit("Update has no downloadable file to fetch.", False, "#E31E24")
+            return
+        dest_path = os.path.join(self.config_dir, filename)
+        self.status_signal.emit(f"Downloading update {tag}...", False, "#3B8ED0")
+
+        def _bg():
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "yt-msd-updater"})
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    payload = resp.read()
+                with open(dest_path, "wb") as out:
+                    out.write(payload)
+                self._downloaded_update_tag = tag
+                self.status_signal.emit(f"Update {tag} downloaded to: {dest_path}", False, "#1abd33")
+            except Exception as e:
+                self.status_signal.emit(f"Update download failed: {e}", False, "#E31E24")
+
+        threading.Thread(target=_bg, daemon=True).start()
+
     def _init_vlc_background(self):
         """Initialize libVLC in a background thread to avoid blocking the UI during plugin scanning."""
         if not _VLC_MODULE_AVAILABLE or vlc is None:
@@ -4887,6 +5045,7 @@ class MainApp(QMainWindow):
                     self.download_threads = c.get('download_threads', 3)
                     self.normalization_threads = c.get('normalization_threads', max(1, os.cpu_count() // 2))
                     self.local_rescan_interval = c.get('local_rescan_interval', 60)
+                    self.disable_update_checks = c.get('disable_update_checks', False)
                     if hasattr(self, 'local_rescan_timer'):
                         self._update_local_rescan_timer()
                     if self.save_place:
@@ -4938,6 +5097,7 @@ class MainApp(QMainWindow):
             'download_threads': self.download_threads,
             'normalization_threads': self.normalization_threads,
             'local_rescan_interval': getattr(self, 'local_rescan_interval', 60),
+            'disable_update_checks': getattr(self, 'disable_update_checks', False),
             'session_data': {
                 'search_results': self.search_results,
                 'playback_index': self.playback_index,
