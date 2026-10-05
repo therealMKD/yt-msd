@@ -42,17 +42,23 @@ needs no plugin. The plugin is the on-demand version, tied to when yt-msd finish
 ## Install
 
 The compiled plugin is committed in `MusicBee Plugin\release\`, so installing needs no
-Python and no compiler - copy these two files:
+Python and no compiler - copy this one file:
 
 ```
 mb_YtMsd.dll    the plugin
-mb_YtMsd.ini    its settings (which yt-msd program to open, which folders to scan)
 ```
 
 into `%APPDATA%\MusicBee\Plugins`, then start MusicBee, enable **yt-msd** in
-**Options > Plugins**, restart. That copy of `mb_YtMsd.ini` is the one the plugin
-reads, so changing the one in this repo does not change what MusicBee does until it
-is copied over.
+**Options > Plugins**, restart. That is the whole install. With no settings file the
+plugin looks for yt-msd in `%LOCALAPPDATA%\Programs\yt-msd`, where
+`yt-msd-setup.exe` puts it, and rescans MusicBee's own download folder and your
+Music folder.
+
+`mb_YtMsd.ini` beside the plugin is optional settings. The one committed here has
+every line commented out, because it is the file that gets copied to other machines
+and a path from one machine is a dead path on the next. The plugin reads the copy
+sitting next to the `mb_YtMsd.dll` **MusicBee actually loaded**, so editing the one
+in this repo changes nothing until it is copied over.
 
 The settings are plain text:
 
@@ -61,14 +67,34 @@ exe=C:\Users\you\yt-msd\GUI Source Code\yt-msd-gui\yt-msd-gui.exe   the program 
 dir=C:\Users\you\yt-msd\GUI Source Code                             a folder to search for it
 ```
 
-`exe=` names the program outright. `dir=` names a folder to look for it in, and it
-is what to use when the location is the thing that changes: the plugin searches that
-folder and the folders inside it for `yt-msd-gui.exe`, `yt-msd.exe`, `yt-msd-gui.pyw`
-or `yt-msd.pyw`. If `exe=` points at a file that is not there, the folder it used to
-be in is searched too, along with `%LOCALAPPDATA%\Programs\yt-msd` where
-`yt-msd-setup.exe` installs, so a rebuild that moved the program is picked up on its
-own. When nothing is found the plugin says which places it searched, in a message and
-in `mb_YtMsd.log` next to the plugin.
+`exe=` names the program outright. `dir=` names a folder to look for it in. When
+there is no `exe=`, or the one there points at a file that is not there, the plugin
+searches in this order:
+
+1. every `dir=` in the ini, in the order written;
+2. the folder the old `exe=` pointed at - a rebuild that moved the program inside
+   the same tree is the usual reason for a stale `exe=`;
+3. `%LOCALAPPDATA%\Programs\yt-msd`, where `yt-msd-setup.exe` installs.
+
+Each search looks in that folder, then one level below it, for `yt-msd-gui.exe` or
+`yt-msd.exe` first and only then for `yt-msd-gui.pyw` or `yt-msd.pyw`, so a built
+program is never passed over in favour of a source script. `_internal`, `build`,
+`dist` and hidden folders are skipped.
+
+Nothing outside those folders is searched, so a yt-msd kept somewhere else - a
+checkout on `D:\`, a portable copy on a drive - needs one line:
+
+```
+dir=D:\yt-msd
+```
+
+That is also how a source checkout run from the `.pyw` is used: point `dir=` at the
+folder holding `yt-msd-gui.pyw`, or `exe=` straight at the file. The plugin launches
+it through Windows' own file association with that folder as the working directory,
+so the script's modules and its own settings file are found as usual.
+
+When nothing is found the plugin says which places it searched, in a message and in
+`mb_YtMsd.log` next to the plugin.
 
 ## Build
 
@@ -85,9 +111,11 @@ machine - Roslyn from Visual Studio / Build Tools, or the .NET Framework's own
 `csc.exe`. The plugin is AnyCPU (MusicBee is 32-bit) and targets .NET Framework 4.x,
 which is what MusicBee runs on.
 
-`--install` copies `mb_YtMsd.dll` and `mb_YtMsd.ini` into
-`%APPDATA%\MusicBee\Plugins`. `C:\Program Files (x86)\MusicBee\Plugins` also works
-but needs an elevated prompt:
+`--install` copies `mb_YtMsd.dll` into `%APPDATA%\MusicBee\Plugins` and writes a
+settings file there using this machine's real paths. An existing settings file is
+left alone - delete it first if you want it replaced. `release\mb_YtMsd.ini` stays
+the path-free template either way. `C:\Program Files (x86)\MusicBee\Plugins` also
+works but needs an elevated prompt:
 
 ```
 python "MusicBee Plugin\build_mb_plugin.py" --install --plugin-dir "C:\Program Files (x86)\MusicBee\Plugins"

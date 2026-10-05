@@ -19,8 +19,11 @@ MusicBee itself runs on.
     python "MusicBee Plugin/build_mb_plugin.py" --folder PATH  folder to rescan (repeat this)
 
 The compiled plugin is committed in MusicBee Plugin\\release\\, so installing on another
-machine is just copying mb_YtMsd.dll and mb_YtMsd.ini into MusicBee's plugin folder -
-this script is only needed to rebuild after the C# sources change.
+machine is just copying mb_YtMsd.dll into MusicBee's plugin folder. The mb_YtMsd.ini
+committed there is a commented template with no paths in it - the plugin works without
+an ini at all, finding the yt-msd the installer put there and rescanning MusicBee's own
+folders. --install writes an ini with the real paths of the machine it is run on. This
+script is only needed to rebuild after the C# sources change.
 """
 
 import argparse
@@ -155,16 +158,57 @@ def compile_plugin(csc):
     return out
 
 
-def write_config(exe, search_dirs, folders, max_files, interval):
-    path = os.path.join(BUILD_DIR, CONFIG_NAME)
-    lines = [
-        "# yt-msd MusicBee plugin settings.",
-        "# exe    = the yt-msd program the Tools > yt-msd menu entry opens",
-        "# dir    = a folder to search for it in if exe= is missing or wrong (repeat as needed)",
-        "# folder = a folder to scan for new files (repeat as needed)",
-        "# maxfiles = safety limit on how many files one scan will look at",
-        "# interval = seconds between scans while yt-msd is open (0 = only after it closes)",
-    ]
+HEADER = [
+    "# yt-msd MusicBee plugin settings.",
+    "# exe    = the yt-msd program the Tools > yt-msd menu entry opens",
+    "# dir    = a folder to search for it in (repeat as needed)",
+    "# folder = a folder to scan for new files after yt-msd closes (repeat as needed)",
+    "# maxfiles = safety limit on how many files one scan will look at",
+    "# interval = seconds between scans while yt-msd is open (0 = only after it closes)",
+]
+
+# The ini committed in MusicBee Plugin\release\: every setting explained, no paths.
+# It is the file that gets copied to other machines, and a path from this one is a
+# dead path on the next, so it stays commented out. --install writes an ini with the
+# real paths of the machine it is run on instead.
+TEMPLATE = HEADER + [
+    "#",
+    "# Nothing here is required. With no uncommented lines the plugin looks for",
+    "# yt-msd in the folder yt-msd-setup.exe installs into",
+    "# (%LOCALAPPDATA%\\Programs\\yt-msd) and rescans MusicBee's own download folder",
+    "# and your Music folder.",
+    "#",
+    "# Uncomment to point at a yt-msd that lives somewhere else - a source checkout",
+    "# run from the .pyw, a copy on another drive:",
+    "#",
+    "# exe=C:\\Users\\you\\yt-msd\\GUI Source Code\\yt-msd-gui\\yt-msd-gui.exe",
+    "# dir=C:\\Users\\you\\yt-msd\\GUI Source Code",
+    "#",
+    "# A dir= is searched before the installed folder. A search looks inside the",
+    "# folder and one level below it for yt-msd-gui.exe or yt-msd.exe first, then",
+    "# for yt-msd-gui.pyw or yt-msd.pyw.",
+    "#",
+    "# folder=C:\\Users\\you\\Music",
+    "# maxfiles=3000",
+    "# interval=30",
+]
+
+
+def write_lines(lines, path):
+    with open(path, "w", encoding="utf-8", newline="\r\n") as handle:
+        handle.write("\n".join(lines) + "\n")
+    print("wrote: " + path)
+    return path
+
+
+def write_template():
+    """Write the path-free settings template into MusicBee Plugin\\release\\."""
+    return write_lines(TEMPLATE, os.path.join(BUILD_DIR, CONFIG_NAME))
+
+
+def config_lines(exe, search_dirs, folders, max_files, interval):
+    """Settings for the machine being built on, with its real paths in them."""
+    lines = list(HEADER)
     if exe:
         lines.append("exe=" + exe)
     for search_dir in search_dirs:
@@ -173,20 +217,24 @@ def write_config(exe, search_dirs, folders, max_files, interval):
         lines.append("folder=" + folder)
     lines.append("maxfiles=%d" % max_files)
     lines.append("interval=%d" % interval)
-    with open(path, "w", encoding="utf-8", newline="\r\n") as handle:
-        handle.write("\n".join(lines) + "\n")
-    print("wrote: " + path)
-    return path
+    return lines
 
 
-def install(plugin_dir):
+def install(plugin_dir, ini_lines):
+    """Put the plugin, and a settings file for this machine, into a MusicBee folder."""
     os.makedirs(plugin_dir, exist_ok=True)
-    for name in (DLL_NAME, CONFIG_NAME):
-        source = os.path.join(BUILD_DIR, name)
-        if not os.path.isfile(source):
-            raise SystemExit("not built yet: " + name + " (run without --install first)")
-        shutil.copy2(source, os.path.join(plugin_dir, name))
-        print("installed: " + os.path.join(plugin_dir, name))
+    source = os.path.join(BUILD_DIR, DLL_NAME)
+    if not os.path.isfile(source):
+        raise SystemExit("not built yet: " + DLL_NAME + " (run this script without --install first)")
+    shutil.copy2(source, os.path.join(plugin_dir, DLL_NAME))
+    print("installed: " + os.path.join(plugin_dir, DLL_NAME))
+
+    target = os.path.join(plugin_dir, CONFIG_NAME)
+    if os.path.isfile(target):
+        print("kept the settings already in " + target)
+        print("      delete that file and run --install again to replace them")
+    else:
+        write_lines(ini_lines, target)
 
 
 def main():
@@ -222,26 +270,27 @@ def main():
         print("workload) or a .NET SDK, then run this script again.")
         return 1
 
-    exe = args.exe or default_exe()
-    search_dirs = list(args.dir) if args.dir else default_search_dirs()
-    if exe and os.path.isfile(exe):
-        parent = os.path.dirname(exe)
-        if parent and parent not in search_dirs:
-            search_dirs.insert(0, parent)
-    else:
-        print("note: no yt-msd program at " + str(exe) + " - the plugin will search")
-        print("      the dir= folders below for it instead, so the menu entry works.")
-        exe = None
-
     compile_plugin(csc)
-    write_config(exe, search_dirs,
-                 args.folder or default_folders(),
-                 args.maxfiles,
-                 args.interval)
+    write_template()
 
     if args.install:
+        exe = args.exe or default_exe()
+        search_dirs = list(args.dir) if args.dir else default_search_dirs()
+        if exe and os.path.isfile(exe):
+            parent = os.path.dirname(exe)
+            if parent and parent not in search_dirs:
+                search_dirs.insert(0, parent)
+        else:
+            print("note: no yt-msd program at " + str(exe) + " - the settings written")
+            print("      below name folders to search instead, so it still works.")
+            exe = None
+
         try:
-            install(args.plugin_dir)
+            install(args.plugin_dir,
+                    config_lines(exe, search_dirs,
+                                 args.folder or default_folders(),
+                                 args.maxfiles,
+                                 args.interval))
         except (PermissionError, OSError) as exc:
             print("Cannot write to " + args.plugin_dir + " (" + str(exc) + ")")
             print("Run this from an elevated prompt, or in MusicBee use")
@@ -253,6 +302,11 @@ def main():
     print("  1. start MusicBee, open Options > Plugins")
     print("  2. enable the 'yt-msd' plugin, restart MusicBee")
     print("  3. Tools > yt-msd opens yt-msd; the library refreshes while it is open")
+    if not args.install:
+        print("     Copy " + os.path.join(BUILD_DIR, DLL_NAME) + " into a plugin folder first.")
+        print("     The mb_YtMsd.ini written into " + BUILD_DIR + " is a template with no")
+        print("     paths in it - the plugin needs no settings file at all, and --install")
+        print("     writes one with this machine's real paths.")
     print("Plugin folders MusicBee accepts: " + MUSICBEE_APPDATA_PLUGINS)
     print("                          or also: " + MUSICBEE_PROGRAMS_PLUGINS + " (needs admin)")
     return 0
