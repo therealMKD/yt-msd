@@ -54,6 +54,19 @@ plugin looks for yt-msd in `%LOCALAPPDATA%\Programs\yt-msd`, where
 `yt-msd-setup.exe` puts it, and rescans MusicBee's own download folder and your
 Music folder.
 
+**One thing has to be true for that to work: the plugin has to be able to find
+yt-msd.** It only knows three places to look - the `dir=` lines in the settings
+file, the folder an existing `exe=` points at, and the folder the installer uses by
+default. So either:
+
+* install yt-msd with `yt-msd-setup.exe` and accept the folder it suggests, and the
+  DLL alone is the entire install; or
+* if yt-msd lives anywhere else - you changed the folder on the installer's second
+  page, a checkout on `D:\`, a portable copy on a drive - you need the settings file
+  beside the DLL with one `dir=` line pointing at it.
+
+Nothing else about the plugin needs configuring.
+
 `mb_YtMsd.ini` beside the plugin is optional settings. The one committed here has
 every line commented out, because it is the file that gets copied to other machines
 and a path from one machine is a dead path on the next. The plugin reads the copy
@@ -81,8 +94,9 @@ Each search looks in that folder, then one level below it, for `yt-msd-gui.exe` 
 program is never passed over in favour of a source script. `_internal`, `build`,
 `dist` and hidden folders are skipped.
 
-Nothing outside those folders is searched, so a yt-msd kept somewhere else - a
-checkout on `D:\`, a portable copy on a drive - needs one line:
+Nothing outside those folders is searched, so a yt-msd kept somewhere else - an
+install into a folder you picked in the wizard, a checkout on `D:\`, a portable copy
+on a drive - needs one line:
 
 ```
 dir=D:\yt-msd
@@ -140,16 +154,22 @@ started normally yt-msd is unchanged - its usual window size, and no window size
 
 ## Settings
 
-`mb_YtMsd.ini` sits next to `mb_YtMsd.dll` (the build script writes it):
+`mb_YtMsd.ini` sits next to `mb_YtMsd.dll`. Every line in it is optional - the only
+line most people would ever need is `dir=`, and only when yt-msd is not in the
+folder the installer uses by default:
 
 ```ini
 exe=C:\Users\you\yt-msd\GUI Source Code\yt-msd-gui\yt-msd-gui.exe
+dir=C:\Users\you\yt-msd\GUI Source Code
 folder=C:\Users\you\Music
 maxfiles=3000
 interval=30
 ```
 
-* `exe` - the program the menu entry opens.
+* `exe` - the program the menu entry opens, named outright.
+* `dir` - a folder to search for the program in; repeat the line for more folders.
+  Used when there is no `exe=`, or when the `exe=` there points at a file that is
+  gone. See the search order under Install.
 * `folder` - a folder to scan for new files; repeat the line for more folders.
   With no `folder=` lines the plugin falls back to MusicBee's download folder and
   your Music folder.
