@@ -77,21 +77,21 @@ from PySide6.QtCore import QMimeData, QUrl
 
 # ============================================================
 # APPLICATION ICON (title bar, taskbar, system tray)
-# icon.ico sits next to this file in the source tree and is bundled into the
-# compiled exe, which unpacks it into its own application folder at startup.
+# icon-256x256.ico sits next to this file in the source tree and is bundled into
+# the compiled exe, which unpacks it into its own application folder at startup.
 # ============================================================
 
 def _app_icon_path():
-    """Absolute path to icon.ico: inside the packaged app when frozen, next to this file otherwise."""
+    """Absolute path to icon-256x256.ico: inside the packaged app when frozen, next to this file otherwise."""
     if getattr(sys, "frozen", False):
         base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.executable)))
     else:
         base = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base, "icon.ico")
+    return os.path.join(base, "icon-256x256.ico")
 
 
 def app_icon():
-    """The application icon, or None when icon.ico is missing or unreadable."""
+    """The application icon, or None when icon-256x256.ico is missing or unreadable."""
     path = _app_icon_path()
     if os.path.isfile(path):
         icon = QIcon(path)
@@ -7037,7 +7037,7 @@ class MainApp(QMainWindow):
 
         self.tray_icon = QSystemTrayIcon(self)
         
-        # The program icon, or the drawn circle if icon.ico is not available
+        # The program icon, or the drawn circle if icon-256x256.ico is not available
         tray_qicon = app_icon()
         if tray_qicon is None:
             pixmap = QPixmap(64, 64)
