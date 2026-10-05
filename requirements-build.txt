@@ -15,11 +15,17 @@
 #   python -m cython --version
 #   python -m PyInstaller --version
 #
-# Source-name requirement (verified): Cython rejects "yt-msd-gui.pyw" because
-# 'yt-msd-gui' is not a valid module name. The build must first copy the source to a
-# valid module name, e.g.  copy "GUI Source Code\yt-msd-gui.pyw" -> "build_dir_cython\yt_msd_gui.pyx"
-# and cythonize that file (language_level=3). Verified: Cython 3.3.0 transpiles the current
-# GUI source with no errors or warnings.
+# Source-name requirement (verified): Cython rejects "yt-msd-gui" because it is not a valid
+# module name, and it will not read a .pyw at all. The Cython source therefore lives at
+#   GUI Source Code\yt_msd_gui.pyx
+# which is the text of GUI Source Code\yt-msd-gui.pyw with only a header of Cython directives on
+# top, so the compiled build behaves exactly like the script and the .pyw stays the master copy.
+# build_gui_cython.py (repo root) keeps the two in step:
+#   python build_gui_cython.py sync     rewrite the .pyx from the .pyw
+#   python build_gui_cython.py verify   prove the .pyx body is byte-identical to the .pyw
+#   python build_gui_cython.py c        write build_dir_cython\yt_msd_gui.c  (add --embed for a main())
+#   python build_gui_cython.py check    transpile into a temp folder and report warnings only
+# Verified: Cython 3.3.0 transpiles the current 9900-line GUI source with no errors or warnings.
 
 Cython==3.3.0
 pyinstaller==6.22.3
