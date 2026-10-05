@@ -9,6 +9,7 @@ import json
 import threading
 import tempfile
 import subprocess
+import zipfile
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 try:
@@ -4002,6 +4003,643 @@ class SyncManagerDialog(QDialog):
             self.parent_app.status_signal.emit("Force Sync initiated: syncing clients & removable drives, notified LAN peers.", False, "#1abd33")
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# EXPORT / IMPORT PACKAGES
+#
+# An export package is a single .zip containing:
+#   export.yaml             manifest describing everything inside the package
+#   config/gui-config.json  GUI settings (never contains sync chain keys unless
+#                           "Sync Chains" was checked when exporting)
+#   sync/sync-chains.json   hosted chains, client chains and sync settings
+#   music/<folder>/...      copies of the music folders that were selected
+#
+# PyYAML is not a dependency of this app (TAG.yaml is hand-formatted too), so
+# the manifest is written and read by the small YAML helpers below. They cover
+# exactly the shapes export.yaml needs: nested mappings, lists of scalars, and
+# lists of flat mappings.
+# ═════════════════════════════════════════════════════════════════════════════
+
+EXPORT_MANIFEST_NAME = "export.yaml"
+EXPORT_CONFIG_ENTRY = "config/gui-config.json"
+EXPORT_SYNC_ENTRY = "sync/sync-chains.json"
+EXPORT_FORMAT_VERSION = 1
+SYNC_ONLY_CONFIG_KEYS = ("sync_settings", "hosted_chains", "client_chains")
+EXPORT_SKIP_DIRS = {"$recycle.bin", "system volume information", "__pycache__", ".git"}
+
+
+def _yaml_scalar_repr(value) -> str:
+    """Render a single scalar the way the export manifest writes it."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    if value is None:
+        return "null"
+    text = str(value)
+    needs_quotes = (
+        text == ""
+        or text != text.strip()
+        or any(ch in text for ch in ("#", "\n", "\r", '"', "'", "\\"))
+        or ": " in text
+        or text.endswith(":")
+        or text[0] in "-?&*!|>%@`{}[]"
+        or text.lower() in ("true", "false", "null", "yes", "no", "on", "off")
+    )
+    return json.dumps(text) if needs_quotes else text
+
+
+def yaml_dump(data, indent: int = 0) -> str:
+    """Serialize the small YAML subset used by export.yaml."""
+    pad = " " * indent
+    lines: List[str] = []
+    if not isinstance(data, dict):
+        return "\n".join(lines)
+    for key, value in data.items():
+        key = str(key)
+        if isinstance(value, dict):
+            if value:
+                lines.append(f"{pad}{key}:")
+                lines.append(yaml_dump(value, indent + 2))
+            else:
+                lines.append(f"{pad}{key}: {{}}")
+        elif isinstance(value, list):
+            if value:
+                lines.append(f"{pad}{key}:")
+                lines.append(_yaml_dump_list(value, indent + 2))
+            else:
+                lines.append(f"{pad}{key}: []")
+        else:
+            lines.append(f"{pad}{key}: {_yaml_scalar_repr(value)}")
+    return "\n".join(lines)
+
+
+def _yaml_dump_list(items: List, indent: int) -> str:
+    pad = " " * indent
+    lines: List[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            if not item:
+                lines.append(f"{pad}- {{}}")
+            elif any(isinstance(value, (dict, list)) for value in item.values()):
+                lines.append(f"{pad}-")
+                lines.append(yaml_dump(item, indent + 2))
+            else:
+                pairs = list(item.items())
+                first_key, first_value = pairs[0]
+                lines.append(f"{pad}- {first_key}: {_yaml_scalar_repr(first_value)}")
+                for key, value in pairs[1:]:
+                    lines.append(f"{pad}  {key}: {_yaml_scalar_repr(value)}")
+        elif isinstance(item, list):
+            if item:
+                lines.append(f"{pad}-")
+                lines.append(_yaml_dump_list(item, indent + 2))
+            else:
+                lines.append(f"{pad}- []")
+        else:
+            lines.append(f"{pad}- {_yaml_scalar_repr(item)}")
+    return "\n".join(lines)
+
+
+def _yaml_scalar_parse(body: str):
+    """Inverse of _yaml_scalar_repr for the scalar shapes export.yaml uses."""
+    body = body.strip()
+    if body == "[]":
+        return []
+    if body == "{}":
+        return {}
+    if body.startswith('"'):
+        try:
+            return json.loads(body)
+        except Exception:
+            return body.strip('"')
+    lowered = body.lower()
+    if lowered in ("true", "yes", "on"):
+        return True
+    if lowered in ("false", "no", "off"):
+        return False
+    if lowered in ("null", "~", ""):
+        return None
+    if re.fullmatch(r"-?\d+", body):
+        return int(body)
+    if re.fullmatch(r"-?\d+\.\d+", body):
+        return float(body)
+    return body
+
+
+def yaml_load(text: str) -> dict:
+    """Parse export.yaml back into a dict (comments and blank lines are ignored)."""
+    lines: List[Tuple[int, str]] = []
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        lines.append((len(raw_line) - len(raw_line.lstrip(" ")), stripped))
+    if not lines:
+        return {}
+
+    pos = 0
+
+    def parse_mapping(indent: int) -> dict:
+        nonlocal pos
+        result: dict = {}
+        while pos < len(lines):
+            current_indent, content = lines[pos]
+            if current_indent < indent or content.startswith("-"):
+                break
+            if current_indent > indent:
+                pos += 1
+                continue
+            key, _, rest = content.partition(":")
+            key = key.strip().strip('"')
+            rest = rest.strip()
+            pos += 1
+            if rest:
+                result[key] = _yaml_scalar_parse(rest)
+                continue
+            if pos < len(lines) and lines[pos][0] > indent:
+                child_indent = lines[pos][0]
+                if lines[pos][1].startswith("-"):
+                    result[key] = parse_sequence(child_indent)
+                else:
+                    result[key] = parse_mapping(child_indent)
+            else:
+                result[key] = None
+        return result
+
+    def parse_sequence(indent: int) -> list:
+        nonlocal pos
+        result: list = []
+        while pos < len(lines):
+            current_indent, content = lines[pos]
+            if current_indent != indent or not content.startswith("-"):
+                break
+            body = content[1:].strip()
+            pos += 1
+            if not body:
+                if pos < len(lines) and lines[pos][0] > indent:
+                    child_indent = lines[pos][0]
+                    if lines[pos][1].startswith("-"):
+                        result.append(parse_sequence(child_indent))
+                    else:
+                        result.append(parse_mapping(child_indent))
+                else:
+                    result.append(None)
+            elif ":" in body and not body.startswith('"'):
+                key, _, rest = body.partition(":")
+                item = {key.strip(): _yaml_scalar_parse(rest) if rest.strip() else None}
+                if pos < len(lines) and lines[pos][0] > indent:
+                    item.update(parse_mapping(lines[pos][0]))
+                result.append(item)
+            else:
+                result.append(_yaml_scalar_parse(body))
+        return result
+
+    top_indent = lines[0][0]
+    if lines[0][1].startswith("-"):
+        return {"items": parse_sequence(top_indent)}
+    return parse_mapping(top_indent)
+
+
+def default_export_config() -> dict:
+    """A fresh default GUI config, used when only sync chains are exported."""
+    default_dl = os.path.join(os.path.expanduser("~"), "Downloads")
+    return {
+        'format': 'mp3',
+        'bitrate': '192',
+        'folders': [default_dl],
+        'accent': 'System',
+        'mode': 'Dark',
+        'volume': 100,
+        'local_folders': [],
+        'local_current_path': '',
+        'show_thumbnails': False,
+        'show_local_metadata': False,
+        'minimize_to_tray': False,
+        'recent_playlists': [],
+        'splitter_sizes': [300, 800, 300],
+        'use_custom_args': False,
+        'custom_args': '',
+        'last_search': '',
+        'save_place': False,
+        'session_data': {},
+        'run_renamer': False,
+        'renamer_path': '',
+        'run_custom_script': False,
+        'custom_script_path': '',
+        'normalization_mode': 'ask',
+        'auto_rename': False,
+        'silence_pad_dur': 2.0,
+        'use_custom_eq': False,
+        'custom_eq_string': '',
+        'use_custom_norm_cmd': False,
+        'custom_norm_cmd': '',
+        'download_threads': 3,
+        'normalization_threads': max(1, os.cpu_count() // 2),
+        'local_rescan_interval': 60,
+        'disable_update_checks': False,
+    }
+
+
+def build_exported_config(current_config: dict, include_config: bool,
+                          include_chains: bool, sync_payload: dict) -> dict:
+    """Build the gui-config.json copy that goes inside the package.
+
+    Config only   -> the live settings, with every sync chain key removed.
+    Chains only   -> a default config with the current sync chains added to it.
+    Both          -> the live settings, including the current sync chains.
+    """
+    base = dict(current_config) if include_config else default_export_config()
+    for key in SYNC_ONLY_CONFIG_KEYS:
+        base.pop(key, None)
+    if include_chains and sync_payload:
+        base.update(sync_payload)
+    return base
+
+
+def build_export_manifest_text(include_config: bool, include_chains: bool, include_music: bool,
+                              music_entries: List[dict]) -> str:
+    """The export.yaml text: what is in the package, and where it lives."""
+    manifest = {
+        'format_version': EXPORT_FORMAT_VERSION,
+        'created': time.strftime("%m-%d-%Y %H:%M:%S"),
+        'app_version': APP_VERSION,
+        'includes': {
+            'config': bool(include_config),
+            'sync_chains': bool(include_chains),
+            'music': bool(include_music),
+        },
+        'files': {
+            'manifest': EXPORT_MANIFEST_NAME,
+            'config': EXPORT_CONFIG_ENTRY,
+            'sync_chains': EXPORT_SYNC_ENTRY if include_chains else "",
+        },
+        'music_folders': list(music_entries or []),
+    }
+    header = (
+        "# yt-msd export package manifest. DO NOT EDIT.\n"
+        "# yt-msd reads this file to know what is inside this .zip and how to restore it.\n\n"
+    )
+    return header + yaml_dump(manifest) + "\n"
+
+
+def sanitize_archive_name(raw_name: str, fallback: str = "Music") -> str:
+    """Make a folder name safe to use as a folder name inside the zip."""
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(raw_name or "")).strip().strip(".")
+    return name or fallback
+
+
+def unique_music_archive_name(folder: str, used_names: set) -> Tuple[str, str]:
+    """Archive path and folder name for a music folder, kept unique inside the zip."""
+    name = sanitize_archive_name(os.path.basename(os.path.abspath(folder).rstrip("\\/")))
+    candidate = name
+    counter = 2
+    while candidate.lower() in used_names:
+        candidate = f"{name}-{counter}"
+        counter += 1
+    used_names.add(candidate.lower())
+    return f"music/{candidate}", candidate
+
+
+def iter_folder_files(folder: str, include_subfolders: bool):
+    """Yield (absolute path, path relative to the folder) for the files to package."""
+    root = os.path.abspath(folder)
+    if include_subfolders:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d.lower() not in EXPORT_SKIP_DIRS]
+            for filename in filenames:
+                full_path = os.path.join(dirpath, filename)
+                yield full_path, os.path.relpath(full_path, root)
+        return
+    try:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_file():
+                        yield entry.path, entry.name
+                except OSError:
+                    continue
+    except OSError:
+        pass
+
+
+def zip_folder_into(zf, folder: str, archive_root: str, include_subfolders: bool) -> int:
+    """Copy one folder into the zip. Returns how many files were written."""
+    written = 0
+    for full_path, relative_path in iter_folder_files(folder, include_subfolders):
+        arcname = f"{archive_root}/{relative_path.replace(os.sep, '/')}"
+        try:
+            zf.write(full_path, arcname)
+            written += 1
+        except Exception:
+            continue
+    return written
+
+
+def read_import_package(zip_path: str) -> dict:
+    """Read export.yaml plus the config / sync payloads out of an export package."""
+    with zipfile.ZipFile(zip_path, 'r') as zf:
+        names = set(zf.namelist())
+        if EXPORT_MANIFEST_NAME not in names:
+            raise ValueError("it has no export.yaml manifest, so it is not a yt-msd package")
+        manifest = yaml_load(zf.read(EXPORT_MANIFEST_NAME).decode('utf-8', errors='ignore'))
+        files = manifest.get('files') if isinstance(manifest.get('files'), dict) else {}
+        config_name = str(files.get('config') or EXPORT_CONFIG_ENTRY)
+        sync_name = str(files.get('sync_chains') or EXPORT_SYNC_ENTRY)
+        config_payload = None
+        sync_payload = None
+        if config_name in names:
+            try:
+                config_payload = json.loads(zf.read(config_name).decode('utf-8', errors='ignore'))
+            except Exception:
+                config_payload = None
+        if sync_name in names:
+            try:
+                sync_payload = json.loads(zf.read(sync_name).decode('utf-8', errors='ignore'))
+            except Exception:
+                sync_payload = None
+        return {'manifest': manifest, 'config': config_payload, 'sync': sync_payload}
+
+
+def music_import_destination(source_path: str, folder_name: str) -> str:
+    """Where a packaged music folder should be restored to.
+
+    The original location is used when its parent folder still exists (same
+    machine, or the same share on a new one). Otherwise the folder lands in
+    Downloads/yt-msd Import.
+    """
+    source_path = str(source_path or "").strip()
+    if source_path:
+        absolute = os.path.abspath(source_path)
+        parent = os.path.dirname(absolute)
+        if parent and os.path.isdir(parent):
+            return absolute
+    return os.path.join(os.path.expanduser("~"), "Downloads", "yt-msd Import",
+                        sanitize_archive_name(folder_name))
+
+
+def extract_package_music(zf, manifest: dict,
+                         status_cb: Optional[Callable[[str], None]] = None) -> List[dict]:
+    """Unpack every music folder the manifest says is in the package."""
+    results: List[dict] = []
+    names = zf.namelist()
+    for entry in manifest.get('music_folders') or []:
+        if not isinstance(entry, dict):
+            continue
+        archive_path = str(entry.get('archive_path') or "").strip().strip("/")
+        folder_name = str(entry.get('name') or "") or (archive_path.rsplit("/", 1)[-1] if archive_path else "")
+        prefix = ""
+        members: List[str] = []
+        for candidate in [p for p in (archive_path, f"music/{folder_name}") if p]:
+            candidate = candidate.rstrip("/") + "/"
+            found = [n for n in names if n.startswith(candidate) and not n.endswith("/")]
+            if found:
+                prefix, members = candidate, found
+                break
+        dest_dir = music_import_destination(str(entry.get('source_path') or ""), folder_name)
+        dest_root = os.path.normpath(dest_dir)
+        written = 0
+        error = ""
+        for member in members:
+            relative = member[len(prefix):].replace("/", os.sep)
+            target = os.path.normpath(os.path.join(dest_root, relative))
+            if target != dest_root and not target.startswith(dest_root + os.sep):
+                continue
+            try:
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with zf.open(member) as packed_file:
+                    data = packed_file.read()
+                with open(target, 'wb') as out_file:
+                    out_file.write(data)
+                written += 1
+            except Exception as exc:
+                error = str(exc)
+        results.append({'name': folder_name or os.path.basename(dest_root), 'dest': dest_dir,
+                        'files': written, 'error': error})
+        if status_cb:
+            status_cb(f"Restored {written} files to {dest_dir}")
+    return results
+
+
+class ExportDialog(QDialog):
+    """Choose what goes into a yt-msd export package (.zip)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent = parent
+        self.setWindowTitle("Export Package")
+        self.setMinimumWidth(620)
+        self.music_rows: List[dict] = []      # {'path': str, 'check': QCheckBox, 'row': QWidget}
+        # How small the window was before the Music section first grew it, so
+        # unchecking Music can put the dialog back to that size.
+        self._collapsed_size = None
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        title_lbl = QLabel("EXPORT PACKAGE")
+        title_lbl.setFont(QFont("Segoe UI Semibold", 11))
+        layout.addWidget(title_lbl)
+        desc_lbl = QLabel("Everything checked here is packed into one .zip file, described by an export.yaml manifest.\n"
+                          "Import that file on another machine to put it all back.")
+        desc_lbl.setFont(QFont("Segoe UI", 9))
+        desc_lbl.setWordWrap(True)
+        layout.addWidget(desc_lbl)
+
+        self.config_cb = QCheckBox("Config")
+        self.config_cb.setToolTip("Copy your settings (gui-config.json) without any sync chain information.")
+        self.config_cb.setChecked(True)
+        self.config_cb.toggled.connect(self._update_state)
+        layout.addWidget(self.config_cb)
+
+        self.chains_cb = QCheckBox("Sync Chains")
+        self.chains_cb.setToolTip("Copy your hosted chains, client chains, and sync settings.")
+        self.chains_cb.setChecked(True)
+        self.chains_cb.toggled.connect(self._update_state)
+        layout.addWidget(self.chains_cb)
+
+        self.music_cb = QCheckBox("Music")
+        self.music_cb.setToolTip("Copy the music folders you choose into the package.")
+        self.music_cb.toggled.connect(self._toggle_music_section)
+        layout.addWidget(self.music_cb)
+
+        # ── MUSIC SECTION (only shown when Music is checked) ──
+        self.music_widget = QWidget()
+        music_layout = QVBoxLayout(self.music_widget)
+        music_layout.setContentsMargins(26, 0, 0, 0)
+        music_layout.setSpacing(8)
+
+        folder_row = QHBoxLayout()
+        self.add_folder_btn = QPushButton("Add Folder...")
+        self.add_folder_btn.setToolTip("Browse for a folder to copy into the package")
+        self.add_folder_btn.clicked.connect(self._add_music_folder)
+        folder_row.addWidget(self.add_folder_btn)
+        folder_row.addStretch()
+        music_layout.addLayout(folder_row)
+
+        self.music_rows_widget = QWidget()
+        self.music_rows_layout = QVBoxLayout(self.music_rows_widget)
+        self.music_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self.music_rows_layout.setSpacing(4)
+        self.music_rows_layout.addStretch()
+        music_layout.addWidget(self._make_row_scroll(self.music_rows_widget, 140))
+
+        layout.addWidget(self.music_widget)
+        self.music_widget.setVisible(False)
+
+        # ── FOOTER ──
+        footer = QHBoxLayout()
+        self.summary_lbl = QLabel("Nothing selected to export.")
+        self.summary_lbl.setFont(QFont("Segoe UI", 9))
+        footer.addWidget(self.summary_lbl)
+        footer.addStretch()
+        self.export_btn = QPushButton("Export Package...")
+        self.export_btn.setToolTip("Choose where to save the .zip package")
+        self.export_btn.clicked.connect(self._choose_export_file)
+        footer.addWidget(self.export_btn)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        footer.addWidget(cancel_btn)
+        layout.addLayout(footer)
+
+        self._update_state()
+
+
+    def _make_row_scroll(self, inner_widget: QWidget, max_height: int) -> QScrollArea:
+        """A bounded, frameless scroll area for the folder rows."""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(inner_widget)
+        scroll.setMaximumHeight(max_height)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        return scroll
+
+    def _toggle_music_section(self, state: bool):
+        state = bool(state)
+        if state and self._collapsed_size is None:
+            # The checkbox changes before the section is shown, so this is still
+            # the size the window had without the Music rows.
+            self._collapsed_size = self.size()
+        self.music_widget.setVisible(state)
+        if not state and self._collapsed_size is not None:
+            # Hiding a section never shrinks a Qt window by itself, and the layout
+            # keeps reporting the expanded minimum size until it is recomputed, so
+            # recompute it first and then go back to the size Music was added at.
+            dialog_layout = self.layout()
+            if dialog_layout is not None:
+                dialog_layout.invalidate()
+                dialog_layout.activate()
+            if self.size() != self._collapsed_size:
+                self.resize(self._collapsed_size)
+            if self.size() != self._collapsed_size:
+                # A layout pass that was already queued can push the window back
+                # open, so try once more after the event loop has settled.
+                QTimer.singleShot(0, lambda: self.resize(self._collapsed_size))
+        self._update_state()
+
+    def _add_music_folder(self):
+        start = ""
+        if self.music_rows:
+            last = self.music_rows[-1]['path']
+            start = os.path.dirname(last) or last
+        folder = QFileDialog.getExistingDirectory(self, "Choose a Music Folder", start)
+        if not folder:
+            return
+        self._add_music_row(os.path.abspath(folder))
+        self._update_state()
+
+    def _add_music_row(self, folder_path: str):
+        row_widget = QWidget()
+        row_layout = QHBoxLayout(row_widget)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(6)
+
+        path_lbl = QLabel(folder_path)
+        path_lbl.setFont(QFont("Segoe UI", 9))
+        path_lbl.setToolTip(folder_path)
+        row_layout.addWidget(path_lbl, 1)
+
+        sub_cb = QCheckBox("subfolders")
+        sub_cb.setToolTip("Include everything inside this folder's subfolders")
+        sub_cb.setChecked(True)
+        sub_cb.toggled.connect(self._update_state)
+        row_layout.addWidget(sub_cb)
+
+        remove_btn = QPushButton("Remove")
+        remove_btn.setToolTip("Do not include this folder")
+        remove_btn.clicked.connect(lambda checked=False, path=folder_path: self._remove_row(self.music_rows, path, 'path'))
+        row_layout.addWidget(remove_btn)
+
+        # Keep the trailing stretch last so rows stay top-aligned.
+        self.music_rows_layout.insertWidget(self.music_rows_layout.count() - 1, row_widget)
+        self.music_rows.append({'path': folder_path, 'check': sub_cb, 'row': row_widget})
+
+    def _remove_row(self, rows: List[dict], key_value: str, key_name: str):
+        for entry in list(rows):
+            if entry.get(key_name) == key_value:
+                rows.remove(entry)
+                self.music_rows_layout.removeWidget(entry['row'])
+                entry['row'].deleteLater()
+                break
+        self._update_state()
+
+
+    def build_options(self, require_selection: bool = False):
+        """What the user picked, in the shape MainApp.start_export expects."""
+        include_config = self.config_cb.isChecked()
+        include_chains = self.chains_cb.isChecked()
+        want_music = self.music_cb.isChecked()
+        folders: List[dict] = []
+        if want_music:
+            folders = [{'path': entry['path'], 'subfolders': bool(entry['check'].isChecked())}
+                       for entry in self.music_rows]
+        include_music = bool(folders)
+        if require_selection and not (include_config or include_chains or include_music):
+            return None
+        return {
+            'include_config': include_config,
+            'include_chains': include_chains,
+            'include_music': include_music,
+            'music_folders': folders,
+        }
+
+    def _update_state(self):
+        options = self.build_options(require_selection=True)
+        parts: List[str] = []
+        if options:
+            if options['include_config']:
+                parts.append("config")
+            if options['include_chains']:
+                parts.append("sync chains")
+            if options['include_music']:
+                parts.append(f"{len(options['music_folders'])} music folder(s)")
+        if parts:
+            self.summary_lbl.setText("Will export: " + ", ".join(parts))
+            self.export_btn.setEnabled(True)
+        else:
+            self.summary_lbl.setText("Nothing selected to export.")
+            self.export_btn.setEnabled(False)
+
+    def _choose_export_file(self):
+        options = self.build_options(require_selection=True)
+        if options is None:
+            return
+        default_name = f"yt-msd-export-{time.strftime('%Y-%m-%d')}.zip"
+        start_dir = getattr(self.parent, 'download_path', '') or os.path.expanduser("~")
+        target, _ = QFileDialog.getSaveFileName(self, "Save Export Package",
+                                               os.path.join(start_dir, default_name),
+                                               "yt-msd Package (*.zip)")
+        if not target:
+            return
+        if not target.lower().endswith(".zip"):
+            target += ".zip"
+        options['zip_path'] = target
+        self.parent.start_export(options)
+        self.accept()
+
+
 class SettingsDialog(QDialog):
     def __init__(self, parent):
         super().__init__(parent)
@@ -4278,6 +4916,16 @@ class SettingsDialog(QDialog):
         self.sync_btn.clicked.connect(self._open_sync_manager)
         footer.addWidget(self.sync_btn)
 
+        self.export_btn = QPushButton("Export...")
+        self.export_btn.setToolTip("Pack your config, sync chains, and music into a single .zip file")
+        self.export_btn.clicked.connect(self._open_export_dialog)
+        footer.addWidget(self.export_btn)
+
+        self.import_btn = QPushButton("Import...")
+        self.import_btn.setToolTip("Restore a yt-msd export package from a .zip file")
+        self.import_btn.clicked.connect(self._open_import_package)
+        footer.addWidget(self.import_btn)
+
         footer.addStretch()
         ok_btn = QPushButton("OK")
         ok_btn.setFixedWidth(100)
@@ -4460,6 +5108,15 @@ class SettingsDialog(QDialog):
             "QToolTip { font-size: 11px; }"
         )
         return btn
+
+    def _open_export_dialog(self):
+        """Pack the selected pieces into a .zip export package."""
+        dialog = ExportDialog(self.parent)
+        dialog.exec()
+
+    def _open_import_package(self):
+        """Pick a .zip export package and restore it."""
+        self.parent.open_import_dialog()
 
     def _open_sync_manager(self):
         # Leave the settings dialog open in the background, open sync manager in foreground
@@ -4897,6 +5554,8 @@ class MainApp(QMainWindow):
     update_available_signal = Signal(str, str, str, str)  # tag, release_name, download_url, asset_name
     update_downloaded_signal = Signal(str, str)  # new_file_path, tag (emitted from the download bg thread)
     missing_deps_signal = Signal(str)  # html fragment of missing dependencies (emitted from the VLC init thread)
+    import_finished_signal = Signal(object)  # prepared export package, read on the import thread
+    import_failed_signal = Signal(str)  # import problem, reported from the import thread
 
     def __init__(self):
         super().__init__()
@@ -4984,6 +5643,8 @@ class MainApp(QMainWindow):
         self._drive_probe_lock = threading.Lock()
         self._drive_probe_busy = False
         self._drive_probe_pending = False
+        # Only one import or export at a time: both do heavy filesystem work.
+        self._export_import_busy = False
         # Guards the cached drive/chain state above: the probe thread reads it,
         # the GUI thread writes it.
         self._runtime_state_lock = threading.RLock()
@@ -5025,6 +5686,8 @@ class MainApp(QMainWindow):
         self.update_available_signal.connect(self._show_update_dialog)
         self.update_downloaded_signal.connect(self._prompt_swap_dialog)
         self.missing_deps_signal.connect(self._show_missing_dependencies)
+        self.import_finished_signal.connect(self._apply_import_results)
+        self.import_failed_signal.connect(self._on_import_failed)
 
         self.player_timer = QTimer(self)
         self.player_timer.timeout.connect(self.update_player_ui)
@@ -6061,6 +6724,345 @@ class MainApp(QMainWindow):
         self.save_config()
         self._on_status_update("Settings reset to defaults.", False, "#3B8ED0")
 
+    # ── EXPORT / IMPORT PACKAGES ──────────────────────────────────────────────
+    def open_export_dialog(self):
+        dialog = ExportDialog(self)
+        dialog.exec()
+
+    def start_export(self, options: dict):
+        """Build the .zip package on a worker thread: copying music or reading a
+        config off a slow drive must never block the window."""
+        if self._export_import_busy:
+            self._on_status_update("Please wait: an import or export is already running.", False, "#d9822b")
+            return
+        self._export_import_busy = True
+        threading.Thread(target=self._export_worker, args=(dict(options),), daemon=True).start()
+        self._on_status_update("Exporting package...", False, "#3B8ED0")
+
+    def _export_worker(self, options: dict):
+        zip_path = str(options.get('zip_path') or "")
+        include_config = bool(options.get('include_config'))
+        include_chains = bool(options.get('include_chains'))
+        include_music = bool(options.get('include_music'))
+        file_count = 0
+        try:
+            if not zip_path:
+                raise ValueError("no destination file was chosen")
+            parent_dir = os.path.dirname(os.path.abspath(zip_path))
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
+
+            # Read the config under the shared lock: MainApp.save_config and
+            # SyncConfigManager.save both write this file.
+            with _CONFIG_WRITE_LOCK:
+                current_config = {}
+                if os.path.exists(self.config_path):
+                    with open(self.config_path, 'r', encoding='utf-8') as config_file:
+                        current_config = json.load(config_file)
+
+            sync_payload: dict = {}
+            if include_chains:
+                manager = self.sync_config_manager
+                sync_payload = {
+                    'sync_settings': dict(manager.settings),
+                    'hosted_chains': [dict(chain) for chain in manager.hosted_chains],
+                    'client_chains': [dict(chain) for chain in manager.client_chains],
+                }
+
+            exported_config = build_exported_config(current_config, include_config, include_chains, sync_payload)
+            music_entries: List[dict] = []
+
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr(EXPORT_CONFIG_ENTRY, json.dumps(exported_config, indent=4))
+                file_count += 1
+                if include_chains:
+                    archive.writestr(EXPORT_SYNC_ENTRY, json.dumps(sync_payload, indent=4))
+                    file_count += 1
+                if include_music:
+                    used_names: set = set()
+                    for entry in options.get('music_folders') or []:
+                        folder = str((entry or {}).get('path') or "").strip()
+                        if not folder or not os.path.isdir(folder):
+                            continue
+                        archive_path, folder_name = unique_music_archive_name(folder, used_names)
+                        self.status_signal.emit(f"Exporting music: {folder_name}...", False, "#3B8ED0")
+                        with_subfolders = bool((entry or {}).get('subfolders'))
+                        written = zip_folder_into(archive, folder, archive_path, with_subfolders)
+                        music_entries.append({
+                            'name': folder_name,
+                            'archive_path': archive_path,
+                            'source_path': os.path.abspath(folder),
+                            'subfolders': with_subfolders,
+                            'files': written,
+                        })
+                        file_count += written
+                archive.writestr(EXPORT_MANIFEST_NAME, build_export_manifest_text(
+                    include_config, include_chains, include_music, music_entries))
+        except Exception as exc:
+            self._export_import_busy = False
+            self.status_signal.emit(f"Export failed: {exc}", False, "#d9822b")
+            return
+
+        self._export_import_busy = False
+        self.status_signal.emit(f"Exported {file_count} files to {zip_path}", False, "#1abd33")
+
+    def open_import_dialog(self):
+        """Pick a .zip export package; everything else follows export.yaml."""
+        if self._export_import_busy:
+            self._on_status_update("Please wait: an import or export is already running.", False, "#d9822b")
+            return
+        start_dir = getattr(self, 'download_path', '') or os.path.expanduser("~")
+        zip_path, _ = QFileDialog.getOpenFileName(self, "Import yt-msd Package", start_dir,
+                                                  "yt-msd Package (*.zip);;All Files (*)")
+        if not zip_path:
+            return
+        self._export_import_busy = True
+        self._on_status_update("Importing package...", False, "#3B8ED0")
+        threading.Thread(target=self._import_worker, args=(zip_path,), daemon=True).start()
+
+    def _import_worker(self, zip_path: str):
+        """Read the manifest and unpack any music off the GUI thread."""
+        try:
+            package = read_import_package(zip_path)
+        except Exception as exc:
+            self.import_failed_signal.emit(f"Could not read {os.path.basename(zip_path)}: {exc}")
+            return
+
+        manifest = package.get('manifest') if isinstance(package.get('manifest'), dict) else {}
+        includes = manifest.get('includes') if isinstance(manifest.get('includes'), dict) else {}
+        music_results: List[dict] = []
+        try:
+            if includes.get('music'):
+                with zipfile.ZipFile(zip_path, 'r') as archive:
+                    music_results = extract_package_music(
+                        archive, manifest,
+                        status_cb=lambda text: self.status_signal.emit(text, False, "#3B8ED0"))
+        except Exception as exc:
+            self.import_failed_signal.emit(f"Import failed while unpacking: {exc}")
+            return
+
+        self.import_finished_signal.emit({
+            'config': package.get('config') if includes.get('config') else None,
+            'sync': package.get('sync') if includes.get('sync_chains') else None,
+            'music': music_results,
+        })
+
+    def _on_import_failed(self, message: str):
+        self._export_import_busy = False
+        self._on_status_update(message, False, "#d9822b")
+
+    def _apply_import_results(self, plan: dict):
+        """Restore an imported package on the GUI thread: settings, chains, music."""
+        plan = plan if isinstance(plan, dict) else {}
+        summary: List[str] = []
+
+        config_payload = plan.get('config')
+        needs_local_rescan = False
+        if isinstance(config_payload, dict) and config_payload:
+            needs_local_rescan = bool(self._apply_imported_config(config_payload))
+            summary.append("settings")
+
+        sync_payload = plan.get('sync')
+        if isinstance(sync_payload, dict) and sync_payload:
+            hosted_count, client_count = self._apply_imported_sync_chains(sync_payload)
+            summary.append(f"{hosted_count} hosted / {client_count} client chains")
+
+        music_results = [result for result in (plan.get('music') or []) if isinstance(result, dict)]
+        if music_results:
+            restored_files = sum(int(result.get('files') or 0) for result in music_results)
+            summary.append(f"{restored_files} music files")
+            for result in music_results:
+                if result.get('error'):
+                    self._on_status_update(f"Could not fully restore {result.get('name')}: {result['error']}",
+                                           False, "#d9822b")
+
+        # Refresh the local list last: files restored by this same import have to
+        # be on disk before the folder is scanned. The scan itself runs on a
+        # worker thread, not here.
+        if needs_local_rescan:
+            self.local_list_refresh_signal.emit()
+
+        self._export_import_busy = False
+        if summary:
+            self._on_status_update("Imported package: " + ", ".join(summary), False, "#1abd33")
+        else:
+            self._on_status_update("Imported package: nothing in it to restore.", False, "#d9822b")
+
+    def _apply_imported_sync_chains(self, payload: dict) -> Tuple[int, int]:
+        """Add imported chains, skipping any chain this machine already has."""
+        manager = self.sync_config_manager
+        settings = payload.get('sync_settings')
+        if isinstance(settings, dict) and settings:
+            merged = dict(manager.settings)
+            merged.update(settings)
+            manager.settings = merged
+
+        hosted_ids = {str(chain.get('id')) for chain in manager.hosted_chains}
+        hosted_codes = {str(chain.get('sync_code')) for chain in manager.hosted_chains}
+        client_ids = {str(chain.get('id')) for chain in manager.client_chains}
+        client_codes = {str(chain.get('sync_code')) for chain in manager.client_chains}
+        added_hosted = 0
+        added_clients = 0
+
+        for chain in payload.get('hosted_chains') or []:
+            if not isinstance(chain, dict):
+                continue
+            if str(chain.get('id')) in hosted_ids or str(chain.get('sync_code')) in hosted_codes:
+                continue
+            manager.hosted_chains.append(dict(chain))
+            hosted_ids.add(str(chain.get('id')))
+            hosted_codes.add(str(chain.get('sync_code')))
+            added_hosted += 1
+
+        for chain in payload.get('client_chains') or []:
+            if not isinstance(chain, dict):
+                continue
+            if str(chain.get('id')) in client_ids or str(chain.get('sync_code')) in client_codes:
+                continue
+            manager.client_chains.append(dict(chain))
+            client_ids.add(str(chain.get('id')))
+            client_codes.add(str(chain.get('sync_code')))
+            added_clients += 1
+
+        manager.save()
+        self._update_sync_timer()
+        self.refresh_sync_watchers()
+        dialog = getattr(self, 'sync_manager_dialog', None)
+        if dialog is not None and dialog.isVisible():
+            dialog.refresh_cards(force=True)
+        return added_hosted, added_clients
+
+    def _apply_imported_config(self, cfg: dict):
+        """Apply an imported config payload to the running app, then save it.
+        Anything the package does not mention is left exactly as it was.
+        Returns True when the package changed the local folder, so the caller
+        knows the local file list has to be rescanned."""
+        if 'format' in cfg and hasattr(self, 'format_combo'):
+            self.format_combo.setCurrentText(str(cfg.get('format')))
+        if 'bitrate' in cfg and hasattr(self, 'bitrate_combo'):
+            self.bitrate_combo.setCurrentText(str(cfg.get('bitrate')))
+        if 'mode' in cfg:
+            self.appearance_mode = str(cfg.get('mode'))
+        if 'accent' in cfg:
+            self.accent_color_name = str(cfg.get('accent'))
+        if 'volume' in cfg:
+            try:
+                self.volume_val = int(cfg.get('volume'))
+            except (TypeError, ValueError):
+                self.volume_val = 100
+            if hasattr(self, 'vol_slider'):
+                self.vol_slider.setValue(self.volume_val)
+        if isinstance(cfg.get('folders'), list) and cfg.get('folders'):
+            self.recent_folders = [str(folder) for folder in cfg['folders']]
+            self.download_path = self.recent_folders[0]
+        touched_local = isinstance(cfg.get('local_folders'), list) or 'local_current_path' in cfg
+        if isinstance(cfg.get('local_folders'), list):
+            self.local_folders = [str(folder) for folder in cfg['local_folders']]
+        if 'local_current_path' in cfg:
+            self.local_current_path = str(cfg.get('local_current_path') or "")
+        if touched_local:
+            # The address bar is filled once at startup, so an imported folder
+            # list has to be pushed into it here or it stays stale until relaunch.
+            self.set_local_explorer_address(self.local_current_path,
+                                           add_to_recent=os.path.isdir(self.local_current_path or ""))
+        if 'show_thumbnails' in cfg:
+            self.show_thumbnails = bool(cfg.get('show_thumbnails'))
+        if 'show_local_metadata' in cfg:
+            self.show_local_metadata = bool(cfg.get('show_local_metadata'))
+        if 'minimize_to_tray' in cfg:
+            self.minimize_to_tray = bool(cfg.get('minimize_to_tray'))
+        if 'use_custom_args' in cfg:
+            self.use_custom_args = bool(cfg.get('use_custom_args'))
+        if 'custom_args' in cfg:
+            self.custom_args = str(cfg.get('custom_args') or "")
+        if isinstance(cfg.get('recent_playlists'), list):
+            self.recent_playlists = [entry for entry in cfg['recent_playlists']
+                                     if isinstance(entry, dict)][:5]
+        if 'last_search' in cfg and hasattr(self, 'search_entry'):
+            self.last_search = str(cfg.get('last_search') or "")
+            self.search_entry.setText(self.last_search)
+        if isinstance(cfg.get('splitter_sizes'), list) and len(cfg.get('splitter_sizes')) == 3:
+            try:
+                sizes = [int(value) for value in cfg['splitter_sizes']]
+            except (TypeError, ValueError):
+                sizes = [300, 800, 300]
+            self.splitter_sizes = sizes
+            if hasattr(self, 'main_splitter'):
+                self.main_splitter.setSizes([sizes[0], sizes[1] + sizes[2]])
+            if hasattr(self, 'content_splitter'):
+                self.content_splitter.setSizes([sizes[1], sizes[2]])
+
+        if 'save_place' in cfg:
+            self.save_place = bool(cfg.get('save_place'))
+        if isinstance(cfg.get('session_data'), dict):
+            self.session_data = cfg['session_data']
+        if 'run_renamer' in cfg:
+            self.run_renamer = bool(cfg.get('run_renamer'))
+            if hasattr(self, 'run_renamer_cb'):
+                self.run_renamer_cb.blockSignals(True)
+                self.run_renamer_cb.setChecked(self.run_renamer)
+                self.run_renamer_cb.blockSignals(False)
+        if 'renamer_path' in cfg:
+            self.renamer_path = str(cfg.get('renamer_path') or "")
+        if 'run_custom_script' in cfg:
+            self.run_custom_script = bool(cfg.get('run_custom_script'))
+        if 'custom_script_path' in cfg:
+            self.custom_script_path = str(cfg.get('custom_script_path') or "")
+        if cfg.get('normalization_mode') in ("on", "off", "ask"):
+            self.normalization_mode = str(cfg.get('normalization_mode'))
+        if 'auto_rename' in cfg:
+            self.auto_rename = bool(cfg.get('auto_rename'))
+        if 'silence_pad_dur' in cfg:
+            try:
+                self.silence_pad_dur = float(cfg.get('silence_pad_dur'))
+            except (TypeError, ValueError):
+                self.silence_pad_dur = 2.0
+        if 'use_custom_eq' in cfg:
+            self.use_custom_eq = bool(cfg.get('use_custom_eq'))
+        if 'custom_eq_string' in cfg:
+            self.custom_eq_string = str(cfg.get('custom_eq_string') or "")
+        if 'use_custom_norm_cmd' in cfg:
+            self.use_custom_norm_cmd = bool(cfg.get('use_custom_norm_cmd'))
+        if 'custom_norm_cmd' in cfg:
+            self.custom_norm_cmd = str(cfg.get('custom_norm_cmd') or "")
+        global CUSTOM_NORM_CMD
+        CUSTOM_NORM_CMD = self.custom_norm_cmd.strip() if (self.use_custom_norm_cmd and self.custom_norm_cmd.strip()) else ""
+        if 'download_threads' in cfg:
+            try:
+                self.download_threads = max(1, int(cfg.get('download_threads')))
+            except (TypeError, ValueError):
+                self.download_threads = 3
+        if 'normalization_threads' in cfg:
+            try:
+                self.normalization_threads = max(1, int(cfg.get('normalization_threads')))
+            except (TypeError, ValueError):
+                self.normalization_threads = max(1, os.cpu_count() // 2)
+        if 'local_rescan_interval' in cfg:
+            try:
+                self.local_rescan_interval = int(cfg.get('local_rescan_interval'))
+            except (TypeError, ValueError):
+                self.local_rescan_interval = 60
+            self._update_local_rescan_timer()
+        if 'disable_update_checks' in cfg:
+            self.disable_update_checks = bool(cfg.get('disable_update_checks'))
+
+        self.apply_theme()
+        if 'show_thumbnails' in cfg and getattr(self, 'search_results', None):
+            self._on_search_results(self.search_results, False)
+        # The settings dialog reads these values when it is built, so the cached
+        # one is dropped: reopening it shows the imported settings.
+        settings_dialog = getattr(self, 'settings_dialog', None)
+        if settings_dialog is not None:
+            try:
+                settings_dialog.close()
+            except Exception:
+                pass
+            self.settings_dialog = None
+        self.save_config()
+        # The caller refreshes the local list once everything the package carries
+        # has been restored, so the scan sees the imported files too.
+        return touched_local and os.path.isdir(self.local_current_path or "")
+
     def setup_ui(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -6774,20 +7776,31 @@ class MainApp(QMainWindow):
         self.update_shuffle_btn_style()
 
     # --- Local Folder Logic ---
+    def set_local_explorer_address(self, path: str = "", add_to_recent: bool = False):
+        """Show a folder in the local file explorer's address bar. This only
+        rebuilds the address bar and its recent list; scanning the folder is a
+        separate step, so a slow drive never holds the GUI thread hostage."""
+        if not hasattr(self, 'local_path_combo'):
+            return
+        path = os.path.abspath(path) if path else ""
+        if add_to_recent and path and path not in self.local_folders:
+            self.local_folders.insert(0, path)
+            self.local_folders = self.local_folders[:5]
+        # The whole list is rebuilt rather than just appended to, because an
+        # imported config can bring a different set of recent folders with it.
+        self.local_path_combo.blockSignals(True)
+        self.local_path_combo.clear()
+        self.local_path_combo.addItems([str(folder) for folder in self.local_folders])
+        if path:
+            self.local_path_combo.setCurrentText(path)
+        self.local_path_combo.blockSignals(False)
+
     def load_local_folder(self, path):
         if not path or not os.path.exists(path): return
         path = os.path.abspath(path)
         self.local_current_path = path
-        
-        self.local_path_combo.blockSignals(True)
-        if path not in self.local_folders:
-            self.local_folders.insert(0, path)
-            self.local_folders = self.local_folders[:5]
-            self.local_path_combo.clear()
-            self.local_path_combo.addItems(self.local_folders)
-            
-        self.local_path_combo.setCurrentText(path)
-        self.local_path_combo.blockSignals(False)
+
+        self.set_local_explorer_address(path, add_to_recent=True)
         self.save_config()
         self.refresh_local_list()
 
