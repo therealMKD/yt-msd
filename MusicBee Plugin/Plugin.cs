@@ -92,6 +92,14 @@ namespace MusicBeePlugin
             // yt-msd runs in its own process, so there is nothing to shut down here.
         }
 
+        // MusicBee checks that this entry point exists when it loads the plugin, even
+        // for a plugin that only asks for the startup notification - without it the
+        // plugin is rejected with "Dll entry point: ReceiveNotification was not found".
+        // yt-msd does its work in its own process, so there is nothing to react to.
+        public void ReceiveNotification(string sourceFileUrl, NotificationType type)
+        {
+        }
+
         private void OnOpenClick(object sender, EventArgs e)
         {
             if (busy)

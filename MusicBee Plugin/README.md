@@ -109,6 +109,22 @@ interval=30
 * `interval` - seconds between scans while yt-msd is open. `0` means only scan once
   yt-msd has been closed.
 
+## Entry points MusicBee requires
+
+When MusicBee loads a plugin assembly it checks for three methods on
+`MusicBeePlugin.Plugin`:
+
+```
+PluginInfo Initialise(IntPtr apiInterfacePtr)
+void Close(PluginCloseReason reason)
+void ReceiveNotification(string sourceFileUrl, NotificationType type)
+```
+
+`ReceiveNotification` is required even for a plugin that only asks for the startup
+notification - without it MusicBee refuses the plugin with *"Unable to initialise
+plugin: mb_YtMsd.dll. Dll entry point: ReceiveNotification was not found"*. It is a
+no-op here because yt-msd does its work in its own process.
+
 ## Files
 
 | File | |
