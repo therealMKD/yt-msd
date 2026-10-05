@@ -71,7 +71,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QSplitter, QSplitterHandle, QFileDialog, QMessageBox, QDialog,
                                QSystemTrayIcon, QMenu, QFrame, QGridLayout,
                                QSizePolicy, QStyle, QToolTip, QStyleOption, QSpinBox, QProgressBar, QInputDialog)
-from PySide6.QtCore import Qt, Signal, QTimer, Slot, QPoint, QRect, QMargins, QThread, QEvent, QObject
+from PySide6.QtCore import Qt, Signal, QTimer, Slot, QPoint, QRect, QMargins, QThread, QEvent, QObject, QByteArray
 from PySide6.QtGui import QIcon, QPixmap, QImage, QAction, QColor, QPalette, QPainter, QBrush, QFont, QDrag, QFontMetrics
 from PySide6.QtCore import QMimeData, QUrl
 
@@ -5904,7 +5904,14 @@ class MainApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("yt-msd | YouTube Media Downloader")
-        self.resize(1804, 935)
+        # Started by the MusicBee plugin (it passes --from-musicbee, see
+        # MusicBee Plugin/Plugin.cs): open compact, and come back at whatever size
+        # and position it was last closed at. Started normally, nothing changes.
+        self.launched_by_host = "--from-musicbee" in sys.argv
+        if self.launched_by_host:
+            self.resize(1100, 700)
+        else:
+            self.resize(1804, 935)
         
         # State Arrays
         self.search_results = []
@@ -5919,6 +5926,9 @@ class MainApp(QMainWindow):
         self.local_selection_anchor = None
         self.current_local_file_path = ""
         self.splitter_sizes = [300, 800, 300]
+        # Qt's own serialisation of the window frame, kept only for windows that
+        # were opened from MusicBee. See _apply_host_window_geometry.
+        self.host_window_geometry = ""
         self.thumbnail_cache = {}
         self.thumbnail_cache_size = 0
         
@@ -6118,6 +6128,9 @@ class MainApp(QMainWindow):
             QTimer.singleShot(2500, self._auto_sync_client_chains)
 
         QTimer.singleShot(150, _deferred_sync_startup)
+
+        if self.launched_by_host:
+            self._apply_host_window_geometry()
 
         QApplication.instance().installEventFilter(self)
 
@@ -6938,6 +6951,7 @@ class MainApp(QMainWindow):
                     self.minimize_to_tray = c.get('minimize_to_tray', False)
                     self.recent_playlists = c.get('recent_playlists', [])
                     self.splitter_sizes = c.get('splitter_sizes', [300, 800, 300])
+                    self.host_window_geometry = c.get('host_window_geometry', '')
                     self.use_custom_args = c.get('use_custom_args', False)
                     self.custom_args = c.get('custom_args', '')
                     self.appearance_mode = c.get('mode', 'Dark')
@@ -7024,9 +7038,40 @@ class MainApp(QMainWindow):
                 'local_playback_index': getattr(self, 'local_playback_index', -1)
             }
             })
+            if getattr(self, 'launched_by_host', False):
+                # Only a window opened from MusicBee keeps its own size; a normal
+                # launch still opens at its fixed default. Leaving the key out here
+                # means the read-modify-write above does not clear a saved value.
+                try:
+                    c['host_window_geometry'] = bytes(self.saveGeometry().toBase64()).decode('ascii')
+                except Exception:
+                    pass
             try:
                 with open(self.config_path, 'w') as f: json.dump(c, f, indent=4)
             except: pass
+
+    def _apply_host_window_geometry(self):
+        # Opened from MusicBee: come back at the size and place it was closed at,
+        # or at the compact default if this is the first time. restoreGeometry is
+        # given exactly what saveGeometry wrote, base64-encoded for the JSON file.
+        if not getattr(self, 'launched_by_host', False) or not self.host_window_geometry:
+            return
+        try:
+            geometry = QByteArray.fromBase64(self.host_window_geometry.encode('ascii'))
+            if geometry.isEmpty():
+                return
+            self.restoreGeometry(geometry)
+            # A size remembered on a monitor that has since been unplugged would come
+            # back off-screen and impossible to grab, so a window that lands outside
+            # every screen falls back to the compact default, centred.
+            desktop = QApplication.primaryScreen().virtualGeometry()
+            if not self.geometry().intersects(desktop):
+                available = QApplication.primaryScreen().availableGeometry()
+                self.resize(1100, 700)
+                centre = available.center()
+                self.move(centre.x() - 550, centre.y() - 350)
+        except Exception:
+            pass
 
     def setup_tray(self):
         self.tray_popup = TrayProgressPopup()

@@ -3,8 +3,9 @@
 // Everything yt-msd does (downloading, renaming, tagging, loudness) stays inside the
 // yt-msd program. This plugin only:
 //
-//   1. adds "Tools > yt-msd" (plus a hotkey-assignable "yt-msd" command) so the
-//      program can be opened from inside MusicBee instead of being hunted for, and
+//   1. adds "Tools > yt-msd" to MusicBee's menu bar - which also gives a
+//      hotkey-assignable command - so the program can be opened from inside
+//      MusicBee instead of being hunted for, and
 //   2. once that program is closed, walks the configured music folders and hands
 //      every file MusicBee does not already know about to Library_AddFileToLibrary.
 //
@@ -25,8 +26,11 @@ namespace MusicBeePlugin
     public partial class Plugin
     {
         private const string PluginName = "yt-msd";
-        private const string MenuPath = "Tools\\yt-msd";
-        private const string CommandName = "yt-msd";
+        // MusicBee menu paths are '/' separated and use MusicBee's own menu node
+        // names (mnuTools, mnuAdvanced, mnuView, mnuLayout, mnuTagTools). Only one
+        // level is read, so the item always lands directly in that menu.
+        private const string MenuPath = "mnuTools/yt-msd";
+        private const string HotkeyName = "Open yt-msd";
 
         private MusicBeeApiInterface mb = new MusicBeeApiInterface();
         private PluginInfo about = new PluginInfo();
@@ -66,23 +70,10 @@ namespace MusicBeePlugin
             }
             taskOwner = uiHost as Form;
 
-            try
-            {
-                mb.MB_AddMenuItem(MenuPath, "Tools: Open yt-msd", new EventHandler(this.OnOpenClick));
-            }
-            catch
-            {
-                // Another layout may not expose that menu; the command registered
-                // below still gives the same action a keyboard shortcut.
-            }
+            Log("Initialise: interface=" + mb.InterfaceVersion + " api=" + mb.ApiRevision +
+                " window=" + (mb.MB_GetWindowHandle() != IntPtr.Zero));
 
-            try
-            {
-                mb.MB_RegisterCommand(CommandName, new EventHandler(this.OnOpenClick));
-            }
-            catch
-            {
-            }
+            RegisterMenu();
 
             return about;
         }
@@ -98,6 +89,35 @@ namespace MusicBeePlugin
         // yt-msd does its work in its own process, so there is nothing to react to.
         public void ReceiveNotification(string sourceFileUrl, NotificationType type)
         {
+        }
+
+        private void RegisterMenu()
+        {
+            try
+            {
+                ToolStripItem item = mb.MB_AddMenuItem(
+                    MenuPath, HotkeyName, new EventHandler(this.OnOpenClick));
+                Log("menu " + (item != null ? "added" : "returned null") + ": path=" + MenuPath);
+            }
+            catch (Exception ex)
+            {
+                Log("menu failed: path=" + MenuPath + " " + ex.GetType().Name + ": " + ex.Message);
+            }
+        }
+
+        // Verification helper: mb_YtMsd.log is written next to the loaded plugin so a
+        // menu registration can be confirmed without a debugger attached.
+        private void Log(string message)
+        {
+            try
+            {
+                File.AppendAllText(
+                    Path.Combine(Path.GetDirectoryName(typeof(Plugin).Assembly.Location), "mb_YtMsd.log"),
+                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " " + message + Environment.NewLine);
+            }
+            catch
+            {
+            }
         }
 
         private void OnOpenClick(object sender, EventArgs e)
@@ -149,6 +169,11 @@ namespace MusicBeePlugin
                 ProcessStartInfo start = new ProcessStartInfo(config.ExePath);
                 start.WorkingDirectory = Path.GetDirectoryName(config.ExePath);
                 start.UseShellExecute = true;
+                // yt-msd opens windows at a fixed size when you start it yourself.
+                // Opened from here it gets this flag instead, and the GUI starts
+                // compact and remembers the size it was closed at. Nothing about a
+                // normal launch of yt-msd changes.
+                start.Arguments = "--from-musicbee";
 
                 Process process = Process.Start(start);
 
@@ -181,12 +206,15 @@ namespace MusicBeePlugin
                         break;
                     }
 
-                    added += (int)OnUi(new Func<int>(delegate { return Rescan(config); }));
+                    added += Rescan(config);
                 }
 
                 process.WaitForExit();
 
-                added += (int)OnUi(new Func<int>(delegate { return Rescan(config); }));
+                // yt-msd has gone; this is the pass that used to freeze MusicBee.
+                // The folder walk happens here on the plugin's own thread and only
+                // the library calls are handed to MusicBee.
+                added += Rescan(config);
             }
             catch (Exception ex)
             {

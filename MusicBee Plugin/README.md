@@ -83,12 +83,16 @@ If neither folder is picked up, use **Options > Plugins > Add** in MusicBee and 
 ## Use
 
 1. Start MusicBee, open **Options > Plugins**, enable **yt-msd**, restart MusicBee.
-2. **Tools > yt-msd** opens yt-msd. The same action is also registered as a command
-   named `yt-msd`, so it can be given a keyboard shortcut in Options > Hotkeys.
+2. **Tools > yt-msd** opens yt-msd. That menu entry is itself a command listed as
+   "Open yt-msd" in **Options > Hotkey**, so it can be given a keyboard shortcut.
 3. Close yt-msd when you are done. The plugin reports how many new files it added.
 
 While yt-msd is open the plugin waits for it to exit, so the menu entry does nothing
 until the previous run has finished.
+
+Opened from here yt-msd starts at a smaller window and comes back at whatever size and
+position it was last closed at. The plugin asks for that by passing `--from-musicbee`;
+started normally yt-msd is unchanged - its usual window size, and no window size kept.
 
 ## Settings
 
@@ -108,6 +112,23 @@ interval=30
 * `maxfiles` - safety limit on how many files one scan will look at.
 * `interval` - seconds between scans while yt-msd is open. `0` means only scan once
   yt-msd has been closed.
+
+## Menu paths
+
+`MB_AddMenuItem(menuPath, hotkeyDescription, handler)` does not take the text shown in
+the menu bar. `menuPath` is ** '/' separated** and names MusicBee's internal menu
+nodes - the ones that exist in `MusicBee.exe` are `mnuTools`, `mnuAdvanced`,
+`mnuView`, `mnuLayout` and `mnuTagTools`. The Tools entry therefore needs:
+
+```csharp
+mb.MB_AddMenuItem("mnuTools/yt-msd", "Open yt-msd", handler);
+```
+
+`"Tools\\yt-msd"` is accepted without throwing and does create the hotkey-assignable
+command (it shows up in Options > Hotkey), but no item ever reaches the menu - which
+is why the plugin initialised cleanly, appeared in the hotkey list, and still had
+nothing under Tools. Only one level of the path is read, so a nested path such as
+`mnuTools/yt-msd/open` is not worth trying.
 
 ## Entry points MusicBee requires
 
