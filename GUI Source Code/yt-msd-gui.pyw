@@ -9235,6 +9235,10 @@ class MainApp(QMainWindow):
                         # Appended last, so the advanced field wins over the GUI picks
                         # exactly like the Settings dialog says it should.
                         cli_args.extend(shlex.split(self.custom_args))
+                    # The track itself: yt-dlp takes URLs positionally, so it goes
+                    # after every option. Without it yt-dlp exits with
+                    # "You must provide at least one URL" and nothing downloads.
+                    cli_args.append(f"https://www.youtube.com/watch?v={vid_id}")
 
                     downloaded_file = run_yt_dlp_download(
                         cli_args,
