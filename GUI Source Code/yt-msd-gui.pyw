@@ -10,40 +10,13 @@ import threading
 import tempfile
 import subprocess
 import zipfile
+import shutil
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 try:
     import winreg
 except ImportError:
     winreg = None
-_lazy_import_lock = threading.Lock()
-
-
-class _LazyModule:
-    """Import a heavy dependency the first time it is actually used.
-
-    yt-dlp is only needed when searching or downloading, but importing it costs
-    hundreds of milliseconds (over a second on a cold cache), which would delay
-    the window appearing. Attribute access transparently triggers the import.
-    """
-
-    def __init__(self, module_name):
-        self._module_name = module_name
-        self._module = None
-
-    def _resolve(self):
-        if self._module is None:
-            with _lazy_import_lock:
-                if self._module is None:
-                    import importlib
-                    self._module = importlib.import_module(self._module_name)
-        return self._module
-
-    def __getattr__(self, item):
-        return getattr(self._resolve(), item)
-
-
-yt_dlp = _LazyModule("yt_dlp")
 import webbrowser
 import urllib.request
 import io
@@ -113,15 +86,15 @@ CUSTOM_EQ_STRING = ""
 CUSTOM_NORM_CMD = ""  # Optional full ffmpeg -af override for normalization/trim
 
 # Internal version number — keep this in sync with the latest GitHub release tag.
-# (Matches the latest published release tag exactly: GUI-BETA2.5)
-APP_VERSION = "GUI-BETA2.5"
+# (Matches the latest published release tag exactly: RELEASE-3.0)
+APP_VERSION = "RELEASE-3.0"
 
 # GitHub repository whose releases page is polled for newer versions.
 UPDATE_REPO = "therealMKD/yt-msd"
 
 
 def _extract_version_number(text):
-    """Isolate the full numeric version (including decimals) from a tag like 'GUI-BETA2.5' -> (2, 5)."""
+    """Isolate the full numeric version (including decimals) from a tag like 'RELEASE-3.0' -> (3, 0)."""
     tokens = re.findall(r"\d+(?:\.\d+)*", text or "")
     if not tokens:
         return (0,)
@@ -693,6 +666,221 @@ def check_ffmpeg_available():
         return True
     except Exception:
         return False
+
+# ============================================================
+# SYSTEM yt-dlp: installed and updated with winget, never bundled in the exe
+# ============================================================
+# yt-dlp is updated almost weekly, so the packaged build does not carry its own
+# copy inside the executable. yt-dlp is a normal Windows program (winget id
+# "yt-dlp.yt-dlp") and yt-msd drives it through its command line instead of the
+# Python API. Whether a newer yt-dlp exists is answered by GitHub; installing and
+# updating it is done by winget, which is already part of Windows 10/11. No pip,
+# no bundled copy that goes stale, and nothing to rebuild when yt-dlp ships a fix.
+YTDLP_WINGET_ID = "yt-dlp.yt-dlp"
+YTDLP_GITHUB_REPO = "yt-dlp/yt-dlp"
+YTDLP_UPDATE_CHECK_INTERVAL = 7 * 24 * 60 * 60  # seconds between "is yt-dlp current?" checks
+YTDLP_INSTALL_TIMEOUT = 1200  # winget installs can be slow
+YTDLP_EXTRACT_TIMEOUT = 300  # search / stream-info extraction
+
+_ytdlp_exe_cache = None
+_ytdlp_exe_cache_lock = threading.Lock()
+
+
+class YtDlpMissingError(RuntimeError):
+    """Raised when yt-dlp is needed but no yt-dlp exists on this system."""
+
+
+def _hidden_window_kwargs():
+    """subprocess kwargs that stop helper programs from flashing a console window."""
+    if sys.platform != "win32":
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    return {"startupinfo": startupinfo, "creationflags": 0x08000000}
+
+
+def _child_utf8_env():
+    """Ask child programs for UTF-8 so titles and JSON survive non-ASCII text."""
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
+
+def _yt_dlp_lookup_paths():
+    """Places to look for yt-dlp.exe before falling back to PATH.
+
+    The winget copy comes first on purpose: it is the copy yt-msd can keep up
+    to date. A copy placed next to the program, or one only reachable through
+    PATH, is still used when there is no winget copy.
+    """
+    candidates = []
+    local = os.environ.get("LOCALAPPDATA") or ""
+    if local:
+        candidates.append(os.path.join(local, "Microsoft", "WinGet", "Links", "yt-dlp.exe"))
+        packages = os.path.join(local, "Microsoft", "WinGet", "Packages")
+        if os.path.isdir(packages):
+            try:
+                for unpacked in Path(packages).glob("yt-dlp.yt-dlp*"):
+                    candidates.append(str(unpacked / "yt-dlp.exe"))
+            except Exception:
+                pass
+    try:
+        if getattr(sys, 'frozen', False):
+            base_dir = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(sys.executable)))
+        else:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        candidates.append(os.path.join(base_dir, "yt-dlp.exe"))
+    except Exception:
+        pass
+    return candidates
+
+
+def find_yt_dlp_executable(refresh=False):
+    """Path of the yt-dlp to use, or None. Resolved once and cached."""
+    global _ytdlp_exe_cache
+    with _ytdlp_exe_cache_lock:
+        cached = _ytdlp_exe_cache
+        if cached and not refresh and os.path.isfile(cached):
+            return cached
+        found = None
+        for candidate in _yt_dlp_lookup_paths():
+            if candidate and os.path.isfile(candidate):
+                found = candidate
+                break
+        if not found:
+            for name in ("yt-dlp", "yt-dlp.exe"):
+                candidate = shutil.which(name)
+                if candidate:
+                    found = candidate
+                    break
+        _ytdlp_exe_cache = found
+        return found
+
+
+def get_yt_dlp_version(exe_path=None):
+    """The version yt-dlp reports (e.g. '2026.08.19'), or '' when unavailable."""
+    exe = exe_path or find_yt_dlp_executable()
+    if not exe:
+        return ""
+    try:
+        result = subprocess.run([exe, "--version"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, encoding="utf-8", errors="replace",
+                                timeout=30, env=_child_utf8_env(), **_hidden_window_kwargs())
+        text = (result.stdout or "").strip()
+        return text.splitlines()[0] if text else ""
+    except Exception:
+        return ""
+
+def find_winget_executable():
+    """winget.exe, the package manager that ships with Windows. None if absent."""
+    found = shutil.which("winget")
+    if found:
+        return found
+    local = os.environ.get("LOCALAPPDATA") or ""
+    if local:
+        candidate = os.path.join(local, "Microsoft", "WindowsApps", "winget.exe")
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def run_winget(args, timeout=YTDLP_INSTALL_TIMEOUT):
+    """Run winget with these arguments. Returns (returncode, output, error)."""
+    winget = find_winget_executable()
+    if not winget:
+        return None, "", "winget was not found on this system."
+    try:
+        result = subprocess.run([winget] + list(args), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, encoding="utf-8", errors="replace",
+                                timeout=timeout, **_hidden_window_kwargs())
+        return result.returncode, (result.stdout or ""), ""
+    except Exception as e:
+        return None, "", str(e)
+
+
+def latest_yt_dlp_release():
+    """Newest published yt-dlp release tag from GitHub ('' if it cannot be read)."""
+    try:
+        api_url = f"https://api.github.com/repos/{YTDLP_GITHUB_REPO}/releases/latest"
+        req = urllib.request.Request(api_url, headers={"User-Agent": "yt-msd-updater"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return (data.get("tag_name") or "").strip()
+    except Exception:
+        return ""
+
+
+def run_yt_dlp_json(args, timeout=YTDLP_EXTRACT_TIMEOUT):
+    """Run yt-dlp with -J and return the info dictionary it prints."""
+    exe = find_yt_dlp_executable()
+    if not exe:
+        raise YtDlpMissingError("yt-dlp is not installed on this system")
+    result = subprocess.run([exe] + list(args), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, encoding="utf-8", errors="replace",
+                            timeout=timeout, env=_child_utf8_env(), **_hidden_window_kwargs())
+    if result.returncode != 0:
+        tail = [line for line in (result.stderr or "").splitlines() if line.strip()]
+        raise RuntimeError(tail[-1] if tail else f"yt-dlp exited with code {result.returncode}")
+    return json.loads(result.stdout or "")
+
+
+def run_yt_dlp_download(args, progress_cb=None, cancelled_cb=None):
+    """Run a real yt-dlp download and report its progress while it runs.
+
+    Returns the path of the finished file (None when yt-dlp reported nothing).
+    Raises when yt-dlp is missing, when the download failed, or when the user
+    cancelled - the same contract the old progress hooks had.
+    """
+    exe = find_yt_dlp_executable()
+    if not exe:
+        raise YtDlpMissingError("yt-dlp is not installed on this system")
+    # stderr is folded into stdout: two pipes would let ffmpeg's chatter fill a
+    # full buffer and stall the download.
+    proc = subprocess.Popen([exe] + list(args), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, encoding="utf-8", errors="replace",
+                            bufsize=1, env=_child_utf8_env(), **_hidden_window_kwargs())
+    final_path = None
+    staged_path = None
+    errors = []
+    cancelled = False
+    while True:
+        line = proc.stdout.readline()
+        if not line:
+            break
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("[ExtractAudio] Destination:"):
+            final_path = line.split(":", 1)[1].strip()
+        elif line.startswith("[ExtractAudio] Not converting audio "):
+            final_path = line[len("[ExtractAudio] Not converting audio "):].split(";")[0].strip()
+        elif line.startswith("[download] Destination:"):
+            staged_path = line.split(":", 1)[1].strip()
+        elif line.startswith("[download] ") and line.endswith(" has already been downloaded"):
+            final_path = line[len("[download] "): -len(" has already been downloaded")].strip('"')
+        elif line.startswith("[download]"):
+            match = re.search(r"\[download\]\s+([0-9.]+%|N/A)", line)
+            if match and progress_cb:
+                progress_cb(match.group(1))
+        elif line.startswith("ERROR:"):
+            errors.append(line)
+        if cancelled_cb and cancelled_cb():
+            cancelled = True
+            proc.kill()
+            break
+    try:
+        proc.stdout.close()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=30)
+    except Exception:
+        pass
+    if cancelled:
+        raise RuntimeError("Download cancelled by user")
+    if proc.returncode != 0:
+        raise RuntimeError(errors[-1] if errors else f"yt-dlp exited with code {proc.returncode}")
+    return final_path or staged_path
 
 def check_vlc_available():
     if not _VLC_MODULE_AVAILABLE or vlc is None:
@@ -4239,6 +4427,7 @@ def default_export_config() -> dict:
         'normalization_threads': max(1, os.cpu_count() // 2),
         'local_rescan_interval': 60,
         'disable_update_checks': False,
+        'disable_ytdlp_updates': False,
     }
 
 
@@ -4889,6 +5078,37 @@ class SettingsDialog(QDialog):
             "then the path of each downloaded file."))
         right_layout.addLayout(cs_h)
 
+        # SYSTEM YT-DLP
+        right_layout.addWidget(QLabel("YT-DLP (ON THIS SYSTEM)", font=QFont("Segoe UI Semibold", 10)))
+        ytdlp_h = QHBoxLayout()
+        known_version = getattr(parent, 'ytdlp_version', '')
+        self.ytdlp_version_lbl = QLabel(f"Version: {known_version}" if known_version else "Version: checking...")
+        self.ytdlp_version_lbl.setFont(QFont("Segoe UI", 9))
+        ytdlp_h.addWidget(self.ytdlp_version_lbl)
+        ytdlp_h.addStretch()
+        self.ytdlp_update_btn = QPushButton("Update with winget")
+        self.ytdlp_update_btn.setObjectName("topIconBtn")
+        self.ytdlp_update_btn.setToolTip("Run: winget upgrade --id yt-dlp.yt-dlp")
+        self.ytdlp_update_btn.clicked.connect(self._update_yt_dlp)
+        ytdlp_h.addWidget(self.ytdlp_update_btn)
+        ytdlp_h.addWidget(self._make_info_btn(
+            "yt-msd searches and downloads with the yt-dlp installed on this system,\n"
+            "not a copy bundled inside yt-msd, so yt-dlp can be kept current without\n"
+            "a new yt-msd build. This button runs winget, which ships with Windows 10\n"
+            "and 11. yt-msd also asks GitHub once a week whether a newer yt-dlp exists."))
+        right_layout.addLayout(ytdlp_h)
+
+        self.ytdlp_never_cb = QCheckBox("Never notify me about yt-dlp updates")
+        self.ytdlp_never_cb.setToolTip("Stop the weekly yt-dlp version check (yt-msd updates are not affected)")
+        self.ytdlp_never_cb.setChecked(getattr(parent, 'disable_ytdlp_updates', False))
+        self.ytdlp_never_cb.toggled.connect(self._toggle_ytdlp_updates)
+        right_layout.addWidget(self.ytdlp_never_cb)
+
+        if not known_version:
+            # The startup lookup may still be running; ask for the version again so
+            # this row is never left showing "checking...".
+            parent.refresh_yt_dlp_version()
+
         right_layout.addSpacing(10)
         version_lbl = QLabel(APP_VERSION)
         version_lbl.setFont(QFont("Segoe UI", 8))
@@ -4984,6 +5204,19 @@ class SettingsDialog(QDialog):
         
     def _update_args(self, text):
         self.parent.custom_args = text
+        self.parent.save_config()
+        
+    def set_ytdlp_version(self, version):
+        """Show the yt-dlp version found by a background thread in the main window."""
+        if version and hasattr(self, 'ytdlp_version_lbl'):
+            self.ytdlp_version_lbl.setText(f"Version: {version}")
+
+    def _update_yt_dlp(self):
+        """Ask the main window to run the winget upgrade for yt-dlp."""
+        self.parent.update_yt_dlp_now()
+
+    def _toggle_ytdlp_updates(self, state):
+        self.parent.disable_ytdlp_updates = state
         self.parent.save_config()
         
     def _toggle_startup(self, state):
@@ -5356,6 +5589,62 @@ class UpdateReadyDialog(QDialog):
         layout.addLayout(btn_h)
 
 
+class YtDlpUpdateDialog(QDialog):
+    """Notifies the user that the system yt-dlp is behind and offers to update it."""
+    def __init__(self, parent_window, installed_version, latest_version):
+        super().__init__(parent_window)
+        self.parent_window = parent_window
+        self.never_notify = False
+        self.setWindowTitle("yt-dlp Update Available - yt-msd")
+        self.setFixedWidth(470)
+        self.setWindowFlags(self.windowFlags() | Qt.Tool)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+
+        title_lbl = QLabel("A NEW YT-DLP VERSION IS AVAILABLE")
+        title_lbl.setFont(QFont("Segoe UI Semibold", 11))
+        layout.addWidget(title_lbl)
+
+        desc = QLabel(
+            f"yt-msd searches and downloads with the yt-dlp installed on this system.\n"
+            f"Installed: {installed_version}    Newest: {latest_version}\n"
+            "yt-msd can run winget to bring it up to date."
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color: #888; font-size: 11px;")
+        layout.addWidget(desc)
+
+        self.never_cb = QCheckBox("Never notify me about yt-dlp updates")
+        self.never_cb.setToolTip("Stop checking for yt-dlp updates (yt-msd updates are not affected)")
+        layout.addWidget(self.never_cb)
+
+        layout.addStretch()
+
+        btn_h = QHBoxLayout()
+        btn_h.addStretch()
+
+        ignore_btn = QPushButton("Ignore")
+        ignore_btn.setToolTip("Keep the current yt-dlp until the next check")
+        ignore_btn.clicked.connect(self._on_ignore)
+        btn_h.addWidget(ignore_btn)
+
+        update_btn = QPushButton("Update with winget")
+        update_btn.setToolTip("Run: winget upgrade --id yt-dlp.yt-dlp")
+        update_btn.clicked.connect(self._on_update)
+        btn_h.addWidget(update_btn)
+        layout.addLayout(btn_h)
+
+    def _on_update(self):
+        self.never_notify = self.never_cb.isChecked()
+        self.accept()
+
+    def _on_ignore(self):
+        self.never_notify = self.never_cb.isChecked()
+        self.reject()
+
+
 def _sanitize_filename(name: str) -> str:
     """Strip characters that Windows filenames cannot contain."""
     cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name)
@@ -5556,6 +5845,9 @@ class MainApp(QMainWindow):
     missing_deps_signal = Signal(str)  # html fragment of missing dependencies (emitted from the VLC init thread)
     import_finished_signal = Signal(object)  # prepared export package, read on the import thread
     import_failed_signal = Signal(str)  # import problem, reported from the import thread
+    ytdlp_missing_signal = Signal(str)  # yt-dlp absent or not installable (from a bg thread)
+    ytdlp_update_signal = Signal(str, str)  # installed yt-dlp version, newest yt-dlp version
+    ytdlp_version_signal = Signal(str)  # yt-dlp version found by a bg thread, shown on the GUI thread
 
     def __init__(self):
         super().__init__()
@@ -5611,6 +5903,10 @@ class MainApp(QMainWindow):
         self.disable_update_checks = False  # True once the user opts out of update notifications
         self._update_check_running = False  # guards against overlapping network update checks
         self._downloaded_update_tag = None  # tag already downloaded this session (avoid re-prompting)
+        self.ytdlp_version = ""  # version the system yt-dlp reported, "" until it is known
+        self.disable_ytdlp_updates = False  # True once the user opts out of yt-dlp update prompts
+        self.ytdlp_last_update_check = 0.0  # epoch seconds of the last yt-dlp version check
+        self._ytdlp_update_check_running = False  # guards against overlapping yt-dlp checks
         self.local_rescan_timer = QTimer(self)
         self.local_rescan_timer.timeout.connect(self._auto_rescan_local_folder)
         
@@ -5688,6 +5984,9 @@ class MainApp(QMainWindow):
         self.missing_deps_signal.connect(self._show_missing_dependencies)
         self.import_finished_signal.connect(self._apply_import_results)
         self.import_failed_signal.connect(self._on_import_failed)
+        self.ytdlp_missing_signal.connect(self._show_ytdlp_missing_dialog)
+        self.ytdlp_update_signal.connect(self._show_ytdlp_update_dialog)
+        self.ytdlp_version_signal.connect(self._apply_ytdlp_version)
 
         self.player_timer = QTimer(self)
         self.player_timer.timeout.connect(self.update_player_ui)
@@ -5718,6 +6017,11 @@ class MainApp(QMainWindow):
 
         # Initialize VLC in a background thread (plugin scanning can take seconds)
         threading.Thread(target=self._init_vlc_background, daemon=True).start()
+
+        # yt-dlp lives outside the executable: find it, and install it with winget
+        # on the first run. This stays in a background thread so the window still
+        # appears exactly as fast as before.
+        threading.Thread(target=self._ensure_yt_dlp_background, daemon=True).start()
 
         # Defer local folder load until after the window is shown
         if self.local_current_path:
@@ -5803,6 +6107,9 @@ class MainApp(QMainWindow):
         self._refresh_local_list_async()
         # Every local-folder scan (startup + the hourly auto-rescan) also checks for updates.
         self._check_for_updates()
+        # ... and the same pass checks whether the yt-dlp on this system is out of
+        # date (that check throttles itself, so it is not a network call every hour).
+        self._check_yt_dlp_updates()
 
     def refresh_sync_watchers(self):
         """Registers all hosted sync chains with the watchdog monitor in a background thread."""
@@ -6371,6 +6678,149 @@ class MainApp(QMainWindow):
         except Exception:
             pass
 
+    def _ensure_yt_dlp_background(self):
+        """First-run setup for yt-dlp: use the copy on this system, or install it.
+
+        yt-dlp is not inside the yt-msd executable, so the first run has to put it
+        on the machine. winget ships with Windows 10/11, so it is asked for the
+        official yt-dlp package: nothing is installed into the yt-msd folder and
+        nothing is installed through pip.
+        """
+        exe = find_yt_dlp_executable()
+        version = get_yt_dlp_version(exe) if exe else ""
+        if version:
+            self.ytdlp_version_signal.emit(version)
+            return
+
+        self.status_signal.emit("yt-dlp not found - installing it with winget...", False, "#3B8ED0")
+        rc, out, err = run_winget(["install", "--id", YTDLP_WINGET_ID, "-e",
+                                   "--accept-package-agreements", "--accept-source-agreements",
+                                   "--disable-interactivity"])
+        exe = find_yt_dlp_executable(refresh=True)
+        version = get_yt_dlp_version(exe) if exe else ""
+        if version:
+            self.ytdlp_version_signal.emit(version)
+            self.status_signal.emit(f"yt-dlp {version} installed with winget.", False, "#1abd33")
+            return
+
+        lines = [line for line in (err or out or "").strip().splitlines() if line.strip()]
+        self.ytdlp_missing_signal.emit(
+            "yt-msd could not install yt-dlp automatically."
+            + (f"<br><br>winget said: <code>{lines[-1]}</code>" if lines else "")
+        )
+
+    def _check_yt_dlp_updates(self):
+        """Ask GitHub whether the yt-dlp on this system is behind, at most once per interval."""
+        if getattr(self, 'disable_update_checks', False) or getattr(self, 'disable_ytdlp_updates', False):
+            return
+        if getattr(self, '_ytdlp_update_check_running', False):
+            return
+        last_check = float(getattr(self, 'ytdlp_last_update_check', 0.0) or 0.0)
+        if last_check and (time.time() - last_check) < YTDLP_UPDATE_CHECK_INTERVAL:
+            return
+        self._ytdlp_update_check_running = True
+
+        def _bg():
+            try:
+                installed = getattr(self, 'ytdlp_version', '') or get_yt_dlp_version()
+                if not installed:
+                    return
+                self.ytdlp_version_signal.emit(installed)
+                latest = latest_yt_dlp_release()
+                # Remembered so the hourly rescan does not ask GitHub again for a week.
+                self.ytdlp_last_update_check = time.time()
+                if not latest:
+                    return
+                if _version_is_newer(_extract_version_number(latest), _extract_version_number(installed)):
+                    self.ytdlp_update_signal.emit(installed, latest)
+            except Exception:
+                pass
+            finally:
+                self._ytdlp_update_check_running = False
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _show_ytdlp_missing_dialog(self, reason):
+        """Explain how to get yt-dlp when it is missing and could not be installed."""
+        msg = QMessageBox(self)
+        msg.setWindowTitle("yt-dlp Not Installed - yt-msd")
+        msg.setIcon(QMessageBox.Warning)
+        msg.setTextFormat(Qt.RichText)
+        msg.setText(
+            "<h3>yt-dlp Is Not Installed</h3>"
+            + reason
+            + "<br><br>yt-msd drives yt-dlp as a separate program so it can be kept current "
+            "without rebuilding yt-msd. Install it with:<br><br>"
+            "<code>winget install --id yt-dlp.yt-dlp -e</code><br><br>"
+            "If winget is unavailable, download <code>yt-dlp.exe</code> from "
+            "<a href='https://github.com/yt-dlp/yt-dlp/releases/latest'>github.com/yt-dlp/yt-dlp</a> "
+            "and put it in the yt-msd folder or anywhere on your PATH. Then restart yt-msd."
+        )
+        msg.setStandardButtons(QMessageBox.Ok)
+        msg.exec()
+
+    def _show_ytdlp_update_dialog(self, installed, latest):
+        """Show the yt-dlp update dialog on the GUI thread and act on the choice."""
+        dlg = YtDlpUpdateDialog(self, installed, latest)
+        choice = dlg.exec()
+        if dlg.never_notify:
+            self.disable_ytdlp_updates = True
+            self.save_config()
+        if choice == QDialog.Accepted:
+            self.update_yt_dlp_now()
+
+    def update_yt_dlp_now(self):
+        """Update the yt-dlp installed on this system, in place, with winget.
+
+        Used both by the yt-dlp update dialog and by the Settings dialog button. If
+        winget does not manage this copy of yt-dlp (it was placed in the folder by
+        hand, for example), it is installed properly instead, so the next update is
+        an ordinary winget upgrade.
+        """
+        self.status_signal.emit("Updating yt-dlp with winget...", False, "#3B8ED0")
+
+        def _bg():
+            winget_args = ["--id", YTDLP_WINGET_ID, "-e",
+                           "--accept-package-agreements", "--accept-source-agreements",
+                           "--disable-interactivity"]
+            rc, out, err = run_winget(["upgrade"] + winget_args)
+            if rc is None:
+                self.ytdlp_missing_signal.emit("winget is not available, so yt-msd cannot update yt-dlp for you.")
+                return
+            if rc != 0:
+                rc, out, err = run_winget(["install"] + winget_args)
+            exe = find_yt_dlp_executable(refresh=True)
+            version = get_yt_dlp_version(exe) if exe else ""
+            if version:
+                self.ytdlp_version_signal.emit(version)
+                self.status_signal.emit(f"yt-dlp is now at {version}.", False, "#1abd33")
+                return
+            lines = [line for line in (err or out or "").strip().splitlines() if line.strip()]
+            detail = lines[-1] if lines else "winget could not complete the update."
+            self.status_signal.emit(f"yt-dlp update failed: {detail}", False, "#E31E24")
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _apply_ytdlp_version(self, version):
+        """Store a yt-dlp version found in a background thread, and show it in Settings."""
+        if not version:
+            return
+        self.ytdlp_version = version
+        settings_dialog = getattr(self, 'settings_dialog', None)
+        if settings_dialog is not None and hasattr(settings_dialog, 'set_ytdlp_version'):
+            settings_dialog.set_ytdlp_version(version)
+
+    def refresh_yt_dlp_version(self):
+        """Look for yt-dlp again on a worker thread (the Settings dialog asks for it)."""
+        def _bg():
+            exe = find_yt_dlp_executable(refresh=True)
+            version = get_yt_dlp_version(exe) if exe else ""
+            if version:
+                self.ytdlp_version_signal.emit(version)
+            else:
+                self.ytdlp_missing_signal.emit("No yt-dlp was found on this system.")
+        threading.Thread(target=_bg, daemon=True).start()
+
     def _init_vlc_background(self):
         """Initialize libVLC in a background thread to avoid blocking the UI during plugin scanning.
         The startup dependency check rides along here: it reuses this libvlc instance instead of
@@ -6456,6 +6906,8 @@ class MainApp(QMainWindow):
                     self.normalization_threads = c.get('normalization_threads', max(1, os.cpu_count() // 2))
                     self.local_rescan_interval = c.get('local_rescan_interval', 60)
                     self.disable_update_checks = c.get('disable_update_checks', False)
+                    self.disable_ytdlp_updates = c.get('disable_ytdlp_updates', False)
+                    self.ytdlp_last_update_check = float(c.get('ytdlp_last_update_check', 0.0) or 0.0)
                     if hasattr(self, 'local_rescan_timer'):
                         self._update_local_rescan_timer()
                     if self.save_place:
@@ -6510,6 +6962,8 @@ class MainApp(QMainWindow):
             'normalization_threads': self.normalization_threads,
             'local_rescan_interval': getattr(self, 'local_rescan_interval', 60),
             'disable_update_checks': getattr(self, 'disable_update_checks', False),
+            'disable_ytdlp_updates': getattr(self, 'disable_ytdlp_updates', False),
+            'ytdlp_last_update_check': getattr(self, 'ytdlp_last_update_check', 0.0),
             'session_data': {
                 'search_results': self.search_results,
                 'playback_index': self.playback_index,
@@ -7045,6 +7499,8 @@ class MainApp(QMainWindow):
             self._update_local_rescan_timer()
         if 'disable_update_checks' in cfg:
             self.disable_update_checks = bool(cfg.get('disable_update_checks'))
+        if 'disable_ytdlp_updates' in cfg:
+            self.disable_ytdlp_updates = bool(cfg.get('disable_ytdlp_updates'))
 
         self.apply_theme()
         if 'show_thumbnails' in cfg and getattr(self, 'search_results', None):
@@ -8301,13 +8757,9 @@ class MainApp(QMainWindow):
         def bg_search():
             try:
                 if "youtube.com" in query or "youtu.be" in query or "http" in query:
-                    ydl_opts = {
-                        'quiet': True,
-                        'extract_flat': True,
-                        'playlist_items': '1-100'
-                    }
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        info = ydl.extract_info(query, download=False)
+                    info = run_yt_dlp_json([
+                        "--flat-playlist", "-J", "--playlist-items", "1-100", query,
+                    ])
                     
                     if info and 'entries' in info:
                         res = [e for e in info['entries'] if e]
@@ -8316,28 +8768,25 @@ class MainApp(QMainWindow):
                             chunk_size = 100
                             while True:
                                 self.status_signal.emit(f"Searching... (Retrieved {len(res)} items)", False, "#3B8ED0")
-                                ydl_opts_chunk = {
-                                    'quiet': True,
-                                    'extract_flat': True,
-                                    'playlist_items': f"{start_idx}-{start_idx + chunk_size - 1}"
-                                }
-                                with yt_dlp.YoutubeDL(ydl_opts_chunk) as ydl_chunk:
-                                    chunk_info = ydl_chunk.extract_info(query, download=False)
-                                    if not chunk_info or 'entries' not in chunk_info:
-                                        break
-                                    entries = [e for e in chunk_info['entries'] if e]
-                                    if not entries:
-                                        break
-                                    res.extend(entries)
-                                    if len(chunk_info['entries']) < chunk_size:
-                                        break
-                                    start_idx += chunk_size
+                                chunk_info = run_yt_dlp_json([
+                                    "--flat-playlist", "-J",
+                                    "--playlist-items", f"{start_idx}-{start_idx + chunk_size - 1}",
+                                    query,
+                                ])
+                                if not chunk_info or 'entries' not in chunk_info:
+                                    break
+                                entries = [e for e in chunk_info['entries'] if e]
+                                if not entries:
+                                    break
+                                res.extend(entries)
+                                if len(chunk_info['entries']) < chunk_size:
+                                    break
+                                start_idx += chunk_size
                     else:
                         res = [info] if info else []
                 else:
-                    with yt_dlp.YoutubeDL({'quiet': True, 'extract_flat': True}) as ydl:
-                        info = ydl.extract_info(f"ytsearch15:{query}", download=False)
-                        res = [e for e in info['entries'] if e.get('id')]
+                    info = run_yt_dlp_json(["--flat-playlist", "-J", f"ytsearch15:{query}"])
+                    res = [e for e in info['entries'] if e.get('id')]
                         
                 if is_playlist and ('youtube.com' in query or 'youtu.be' in query):
                     title = info.get('title', query) if isinstance(info, dict) else query
@@ -8354,8 +8803,10 @@ class MainApp(QMainWindow):
                         self.recent_playlists = self.recent_playlists[:5]
                     
                 self.search_results_signal.emit(res, False)
-            except Exception:
+            except Exception as exc:
                 self.search_failed_signal.emit()
+                if isinstance(exc, YtDlpMissingError):
+                    self.ytdlp_missing_signal.emit("Searching and downloading both need yt-dlp.")
                 
         threading.Thread(target=bg_search, daemon=True).start()
 
@@ -8766,40 +9217,41 @@ class MainApp(QMainWindow):
                 success = False
                 downloaded_file = None
                 try:
-                    ydl_opts = {
-                        'format': 'bestaudio/best',
-                        'outtmpl': f"{folder}/%(title)s.%(ext)s",
-                        'postprocessors': [{
-                            'key': 'FFmpegExtractAudio',
-                            'preferredcodec': target_format,
-                            'preferredquality': self.bitrate_combo.currentText(),
-                        }],
-                        'progress_hooks': [self._dl_progress_hook],
-                        'quiet': True,
-                        'retries': 15,
-                        'fragment_retries': 15,
-                        'file_access_retries': 10,
-                        'ignoreerrors': False,
-                    }
+                    # The options the Python API used, written as yt-dlp CLI flags.
+                    cli_args = [
+                        "--newline",
+                        "--format", "bestaudio/best",
+                        "--extract-audio",
+                        "--audio-format", target_format,
+                        "--audio-quality", str(self.bitrate_combo.currentText()),
+                        "--retries", "15",
+                        "--fragment-retries", "15",
+                        "--file-access-retries", "10",
+                        "--output", f"{folder}/%(title)s.%(ext)s",
+                    ]
                     if getattr(sys, 'frozen', False):
-                        ydl_opts['ffmpeg_location'] = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
-                        
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid_id}", download=True)
-                        if info:
-                            raw_name = ydl.prepare_filename(info)
-                            base, _ = os.path.splitext(raw_name)
-                            candidate = f"{base}.{target_format}"
-                            if os.path.exists(candidate) and os.path.getsize(candidate) > 1024:
-                                downloaded_file = candidate
-                                success = True
-                            else:
-                                matching = glob.glob(f"{glob.escape(base)}.*")
-                                for m in matching:
-                                    if os.path.exists(m) and os.path.getsize(m) > 1024:
-                                        downloaded_file = m
-                                        success = True
-                                        break
+                        cli_args.extend(["--ffmpeg-location", getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))])
+                    if getattr(self, 'use_custom_args', False) and getattr(self, 'custom_args', ''):
+                        # Appended last, so the advanced field wins over the GUI picks
+                        # exactly like the Settings dialog says it should.
+                        cli_args.extend(shlex.split(self.custom_args))
+
+                    downloaded_file = run_yt_dlp_download(
+                        cli_args,
+                        progress_cb=lambda pct: self._dl_progress_percent(vid_id, pct),
+                        cancelled_cb=lambda: getattr(self, 'cancel_download', False),
+                    )
+                    if not downloaded_file:
+                        # Nothing reported (already downloaded, or an older yt-dlp):
+                        # match the title on disk the way prepare_filename used to.
+                        title_stem = _sanitize_filename(q['video'].get('title', '') or '')
+                        if title_stem:
+                            for m in glob.glob(glob.escape(os.path.join(folder, title_stem)) + ".*"):
+                                if os.path.exists(m) and os.path.getsize(m) > 1024:
+                                    downloaded_file = m
+                                    break
+                    if downloaded_file and os.path.exists(downloaded_file) and os.path.getsize(downloaded_file) > 1024:
+                        success = True
                 except Exception as e:
                     print(f"Download exception for {vid_id}: {e}")
                     success = False
@@ -9051,44 +9503,22 @@ class MainApp(QMainWindow):
         else:
             self._on_status_update("Local folder path does not exist.", False, "red")
 
-    def _dl_progress_hook(self, d):
-        if getattr(self, 'cancel_download', False):
-            raise Exception("Download cancelled by user")
-            
-        info = d.get('info_dict') or {}
-        vid_id = info.get('id') if isinstance(info, dict) else None
-        if not vid_id:
+    def _dl_progress_percent(self, vid_id, percent):
+        """Push one yt-dlp percentage onto the queue progress line."""
+        if not vid_id or not percent:
             return
 
         finished_cnt = len([q for q in getattr(self, 'queue_items', []) if q.get('status') == "Finished"])
         total_cnt = getattr(self, '_batch_total_count', len(getattr(self, 'queue_items', [])))
         prog_prefix = f"({finished_cnt}/{total_cnt}) " if total_cnt > 0 else ""
-            
-        if d['status'] == 'downloading':
-            p = d.get('_percent_str', '').strip()
-            p = re.sub(r'\x1b\[[0-9;]*m', '', p)
-            if p:
-                with self.active_downloads_lock:
-                    self.active_downloads[vid_id] = p
-                    vals = list(self.active_downloads.values())
-                    if len(vals) > 5:
-                        self.dl_progress_signal.emit(
-                            f"{prog_prefix}Downloading: {', '.join(vals[:5])} (+{len(vals)-5} more)")
-                    else:
-                        self.dl_progress_signal.emit(f"{prog_prefix}Downloading: {', '.join(vals)}")
-        elif d['status'] == 'finished':
-            with self.active_downloads_lock:
-                if vid_id in self.active_downloads:
-                    del self.active_downloads[vid_id]
-                if self.active_downloads:
-                    vals = list(self.active_downloads.values())
-                    if len(vals) > 5:
-                        self.dl_progress_signal.emit(
-                            f"{prog_prefix}Downloading: {', '.join(vals[:5])} (+{len(vals)-5} more)")
-                    else:
-                        self.dl_progress_signal.emit(f"{prog_prefix}Downloading: {', '.join(vals)}")
-                else:
-                    self.dl_progress_signal.emit(f"{prog_prefix}Processing...")
+
+        with self.active_downloads_lock:
+            self.active_downloads[vid_id] = percent
+            vals = list(self.active_downloads.values())
+            if len(vals) > 5:
+                self.dl_progress_signal.emit(f"{prog_prefix}Downloading: {', '.join(vals[:5])} (+{len(vals)-5} more)")
+            else:
+                self.dl_progress_signal.emit(f"{prog_prefix}Downloading: {', '.join(vals)}")
 
     # --- Player Logic ---
     def _on_status_update(self, text, is_playing, color):
@@ -9134,51 +9564,49 @@ class MainApp(QMainWindow):
                 
         def bg_fetch():
             try:
-                ydl_opts = {
-                    'quiet': True,
-                    'format': 'bestaudio/best',
-                    'extractor_args': {'youtube': {'player_client': ['android']}},
-                    'noplaylist': True
-                }
+                cli_args = [
+                    "-J",
+                    "--format", "bestaudio/best",
+                    "--extractor-args", "youtube:player_client=android",
+                    "--no-playlist",
+                ]
                 if getattr(sys, 'frozen', False):
-                    ydl_opts['ffmpeg_location'] = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
-                    
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid_id}", download=False)
-                    url = info.get('url') if info else None
-                    if not url and info and 'formats' in info:
-                        for f in reversed(info['formats']):
-                            if f.get('url') and (f.get('acodec') != 'none' or f.get('vcodec') == 'none'):
-                                url = f['url']
-                                break
-                        if not url and info['formats']:
-                            url = info['formats'][-1].get('url')
-                            
-                    if not url:
-                        raise Exception("No playable audio stream URL found")
-                    
-                    headers = info.get('http_headers', {}) if info else {}
-                    user_agent = headers.get('User-Agent', 'com.google.android.youtube/19.29.37 (Linux; U; Android 11)')
-                    
-                    # If another stream request started while fetching, ignore this one
-                    if getattr(self, '_pending_fetch_id', None) != vid_id:
-                        return
-                        
-                    media = self.vlc_instance.media_new(url)
-                    media.add_option(f':http-user-agent={user_agent}')
-                    self.vlc_player.set_media(media)
-                    if paused_at_start:
-                        self.vlc_player.audio_set_mute(True)
-                        self.vlc_player.play()
-                        import time
-                        time.sleep(0.25)
-                        self.vlc_player.set_pause(1)
-                        self.vlc_player.set_position(0)
-                        self.vlc_player.audio_set_mute(False)
-                    else:
-                        self.vlc_player.play()
-                    self._is_loading_stream = False
-                    self.playback_started_signal.emit(video.get('title', 'Unknown'), vid_id, paused_at_start)
+                    cli_args.extend(["--ffmpeg-location", getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))])
+                info = run_yt_dlp_json(cli_args + [f"https://www.youtube.com/watch?v={vid_id}"])
+                url = info.get('url') if info else None
+                if not url and info and 'formats' in info:
+                    for f in reversed(info['formats']):
+                        if f.get('url') and (f.get('acodec') != 'none' or f.get('vcodec') == 'none'):
+                            url = f['url']
+                            break
+                    if not url and info['formats']:
+                        url = info['formats'][-1].get('url')
+
+                if not url:
+                    raise Exception("No playable audio stream URL found")
+
+                headers = info.get('http_headers', {}) if info else {}
+                user_agent = headers.get('User-Agent', 'com.google.android.youtube/19.29.37 (Linux; U; Android 11)')
+
+                # If another stream request started while fetching, ignore this one
+                if getattr(self, '_pending_fetch_id', None) != vid_id:
+                    return
+
+                media = self.vlc_instance.media_new(url)
+                media.add_option(f':http-user-agent={user_agent}')
+                self.vlc_player.set_media(media)
+                if paused_at_start:
+                    self.vlc_player.audio_set_mute(True)
+                    self.vlc_player.play()
+                    import time
+                    time.sleep(0.25)
+                    self.vlc_player.set_pause(1)
+                    self.vlc_player.set_position(0)
+                    self.vlc_player.audio_set_mute(False)
+                else:
+                    self.vlc_player.play()
+                self._is_loading_stream = False
+                self.playback_started_signal.emit(video.get('title', 'Unknown'), vid_id, paused_at_start)
             except Exception as e:
                 print(f"Stream error: {e}")
                 if getattr(self, '_pending_fetch_id', None) == vid_id:
