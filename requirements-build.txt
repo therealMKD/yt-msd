@@ -1,0 +1,29 @@
+# yt-msd build toolchain for the Cython -> .exe release build
+# Install with:  python -m pip install -r requirements-build.txt
+#
+# Non-pip requirement (already installed on this machine):
+#   Visual Studio Build Tools 2022  ->  MSVC 14.44 (cl.exe 19.44) + Windows SDK 10.0.26100
+#   Verified working with Cython 3.3.0 on Python 3.14 (both .pyd extension builds and
+#   standalone "cython --embed" executables), using either toolset:
+#     VS 2026 BuildTools -> MSVC 14.50.35717 (cl 19.50)  <- auto-selected by setuptools
+#     VS 2022 BuildTools -> MSVC 14.44.35207 (cl 19.44)
+#   No Developer Command Prompt is required: setuptools auto-detects MSVC + the Windows SDK
+#   (10.0.26100.0) from a plain PowerShell prompt. If you ever want to force a toolset, call:
+#     call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+#
+# Run the tools as modules so you do not depend on the Scripts folder being on PATH:
+#   python -m cython --version
+#   python -m PyInstaller --version
+#
+# Source-name requirement (verified): Cython rejects "yt-msd-gui.pyw" because
+# 'yt-msd-gui' is not a valid module name. The build must first copy the source to a
+# valid module name, e.g.  copy "GUI Source Code\yt-msd-gui.pyw" -> "build_dir_cython\yt_msd_gui.pyx"
+# and cythonize that file (language_level=3). Verified: Cython 3.3.0 transpiles the current
+# GUI source with no errors or warnings.
+
+Cython==3.3.0
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.8
+setuptools==84.0.0
+wheel==0.48.0
+pip==26.2.1

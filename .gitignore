@@ -32,4 +32,11 @@ ffmpeg.zip
 mp3renamer5000legacy.py
 GUI Source Code/mp3renamer5000.py
 GUI Source Code/mp3renamer5000_restored.py
+
 *.json
+
+# Cython build artifacts (generated C sources, compiled extensions, cythonize staging dir)
+build_dir_cython/
+*.pyd
+GUI Source Code/*.c
+CLI Source Code/*.c

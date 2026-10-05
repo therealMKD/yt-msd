@@ -1,0 +1,15 @@
+# yt-msd runtime dependencies (GUI Source Code/yt-msd-gui.pyw)
+# Pinned to the versions verified working on the release machine (Python 3.14, Windows x64).
+# Install with:  python -m pip install -r requirements.txt
+#
+# Notes:
+#   - tkinter, ctypes, winreg, socket, zipfile are part of the Python standard library.
+#   - VLC Media Player must be installed separately (the player needs libvlc.dll at runtime).
+#   - ffmpeg/ffprobe are only needed by the (deprecated) CLI version.
+
+PySide6==6.11.2
+mutagen==1.48.1
+pillow==12.3.0
+watchdog==6.0.0
+python-vlc==3.0.21203
+yt-dlp==2026.8.19
