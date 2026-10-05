@@ -76,6 +76,30 @@ from PySide6.QtGui import QIcon, QPixmap, QImage, QAction, QColor, QPalette, QPa
 from PySide6.QtCore import QMimeData, QUrl
 
 # ============================================================
+# APPLICATION ICON (title bar, taskbar, system tray)
+# icon.ico sits next to this file in the source tree and is bundled into the
+# compiled exe, which unpacks it into its own application folder at startup.
+# ============================================================
+
+def _app_icon_path():
+    """Absolute path to icon.ico: inside the packaged app when frozen, next to this file otherwise."""
+    if getattr(sys, "frozen", False):
+        base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.executable)))
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "icon.ico")
+
+
+def app_icon():
+    """The application icon, or None when icon.ico is missing or unreadable."""
+    path = _app_icon_path()
+    if os.path.isfile(path):
+        icon = QIcon(path)
+        if not icon.isNull():
+            return icon
+    return None
+
+# ============================================================
 # INTEGRATED MP3 RENAMER, TAGGER & LOUDNESS NORMALIZER
 # (Ported from mp3renamer5000.py — interactive CLI mode & algorithms)
 # ============================================================
@@ -113,6 +137,12 @@ APP_VERSION = "RELEASE-3.0"
 
 # GitHub repository whose releases page is polled for newer versions.
 UPDATE_REPO = "therealMKD/yt-msd"
+
+# The packaged GUI has no console of its own, so the renamer is run by starting
+# a second copy of the same exe with --renamer (see run_mp3_renamer). The
+# launcher build_gui_exe.py puts inside the exe answers that flag by allocating a
+# console window for that copy before it runs the renamer CLI, which prints a
+# banner, uses colours and asks questions with input().
 
 
 def _extract_version_number(text):
@@ -7007,15 +7037,18 @@ class MainApp(QMainWindow):
 
         self.tray_icon = QSystemTrayIcon(self)
         
-        # Generate Icon safely
-        pixmap = QPixmap(64, 64)
-        pixmap.fill(QColor("transparent"))
-        painter = QPainter(pixmap)
-        painter.setBrush(QColor(get_accent_color(self.accent_color_name)))
-        painter.setPen(Qt.NoPen)
-        painter.drawEllipse(8, 8, 48, 48)
-        painter.end()
-        self.tray_icon.setIcon(QIcon(pixmap))
+        # The program icon, or the drawn circle if icon.ico is not available
+        tray_qicon = app_icon()
+        if tray_qicon is None:
+            pixmap = QPixmap(64, 64)
+            pixmap.fill(QColor("transparent"))
+            painter = QPainter(pixmap)
+            painter.setBrush(QColor(get_accent_color(self.accent_color_name)))
+            painter.setPen(Qt.NoPen)
+            painter.drawEllipse(8, 8, 48, 48)
+            painter.end()
+            tray_qicon = QIcon(pixmap)
+        self.tray_icon.setIcon(tray_qicon)
         self.tray_icon.setToolTip("yt-msd")
         
         self.tray_menu = QMenu(self)
@@ -9417,17 +9450,18 @@ class MainApp(QMainWindow):
             self._on_status_update("Renamer: Download folder path does not exist.", False, "red")
             return
 
-        executable = sys.executable
+        # The renamer is an interactive console program: it prints a banner and
+        # colours and asks questions with input(). Packaged, the exe is windowed
+        # and has no console of its own, so the renamer runs as a second copy of
+        # this same exe with --renamer: the launcher inside the exe sees that
+        # flag, allocates a console window for the copy and runs the CLI in it.
+        # Run from source, it is this file re-run under python.exe with
+        # --renamer: never pythonw.exe, which has no console to print into.
         if getattr(sys, 'frozen', False):
-            executable = "python"
+            args = [sys.executable, "--renamer", folder]
         else:
-            idx = executable.lower().rfind("pythonw")
-            if idx != -1:
-                executable = executable[:idx] + "python" + executable[idx+7:]
+            args = [self._console_python(), os.path.abspath(__file__), "--renamer", folder]
 
-        gui_script = os.path.abspath(__file__)
-
-        args = [executable, gui_script, "--renamer", folder]
         args.append(f'--norm={self.normalization_mode}')
         if self.auto_rename:
             args.append('--auto')
@@ -9912,6 +9946,11 @@ if __name__ == "__main__":
     else:
         QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
         app = QApplication(sys.argv)
+        # Title bar + taskbar icon for every window of the app (Qt uses the
+        # application icon for any window that does not set its own).
+        _window_icon = app_icon()
+        if _window_icon is not None:
+            app.setWindowIcon(_window_icon)
         window = MainApp()
         window.show()
         ret = app.exec()
