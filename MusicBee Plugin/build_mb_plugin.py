@@ -15,6 +15,7 @@ MusicBee itself runs on.
     python "MusicBee Plugin/build_mb_plugin.py" --install    compile and copy into MusicBee's plugin folder
     python "MusicBee Plugin/build_mb_plugin.py" --clean      delete the release folder and stop
     python "MusicBee Plugin/build_mb_plugin.py" --exe PATH   which yt-msd program the menu entry opens
+    python "MusicBee Plugin/build_mb_plugin.py" --dir PATH   folder the plugin may search for it in (repeat this)
     python "MusicBee Plugin/build_mb_plugin.py" --folder PATH  folder to rescan (repeat this)
 
 The compiled plugin is committed in MusicBee Plugin\\release\\, so installing on another
@@ -89,6 +90,23 @@ def default_exe():
     return candidates[0]
 
 
+def default_search_dirs():
+    """Folders the plugin may search for the program when exe= names nothing.
+
+    The plugin looks in each dir= folder and one level below it, so naming the
+    folder above the program survives the layout underneath it changing - a one-file
+    build becoming a folder build, for instance.
+    """
+    dirs = []
+    for candidate in (
+        os.path.join(REPO, "GUI Source Code"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "yt-msd"),
+    ):
+        if candidate and os.path.isdir(candidate) and candidate not in dirs:
+            dirs.append(candidate)
+    return dirs
+
+
 def default_folders():
     """Folders the plugin will walk after yt-msd closes."""
     folders = []
@@ -137,16 +155,20 @@ def compile_plugin(csc):
     return out
 
 
-def write_config(exe, folders, max_files, interval):
+def write_config(exe, search_dirs, folders, max_files, interval):
     path = os.path.join(BUILD_DIR, CONFIG_NAME)
     lines = [
         "# yt-msd MusicBee plugin settings.",
-        "# exe    = the program the Tools > yt-msd menu entry opens",
+        "# exe    = the yt-msd program the Tools > yt-msd menu entry opens",
+        "# dir    = a folder to search for it in if exe= is missing or wrong (repeat as needed)",
         "# folder = a folder to scan for new files (repeat as needed)",
         "# maxfiles = safety limit on how many files one scan will look at",
         "# interval = seconds between scans while yt-msd is open (0 = only after it closes)",
-        "exe=" + exe,
     ]
+    if exe:
+        lines.append("exe=" + exe)
+    for search_dir in search_dirs:
+        lines.append("dir=" + search_dir)
     for folder in folders:
         lines.append("folder=" + folder)
     lines.append("maxfiles=%d" % max_files)
@@ -174,6 +196,8 @@ def main():
     parser.add_argument("--plugin-dir", default=MUSICBEE_APPDATA_PLUGINS,
                         help="where --install copies the plugin (default: %s)" % MUSICBEE_APPDATA_PLUGINS)
     parser.add_argument("--exe", default=None, help="yt-msd program the menu entry opens")
+    parser.add_argument("--dir", action="append", default=None,
+                        help="folder the plugin may search for yt-msd in (repeatable)")
     parser.add_argument("--folder", action="append", default=None,
                         help="folder to rescan after yt-msd closes (repeatable)")
     parser.add_argument("--maxfiles", type=int, default=3000, help="scan safety limit")
@@ -198,8 +222,19 @@ def main():
         print("workload) or a .NET SDK, then run this script again.")
         return 1
 
+    exe = args.exe or default_exe()
+    search_dirs = list(args.dir) if args.dir else default_search_dirs()
+    if exe and os.path.isfile(exe):
+        parent = os.path.dirname(exe)
+        if parent and parent not in search_dirs:
+            search_dirs.insert(0, parent)
+    else:
+        print("note: no yt-msd program at " + str(exe) + " - the plugin will search")
+        print("      the dir= folders below for it instead, so the menu entry works.")
+        exe = None
+
     compile_plugin(csc)
-    write_config(args.exe or default_exe(),
+    write_config(exe, search_dirs,
                  args.folder or default_folders(),
                  args.maxfiles,
                  args.interval)

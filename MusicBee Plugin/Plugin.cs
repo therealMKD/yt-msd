@@ -130,14 +130,19 @@ namespace MusicBeePlugin
             Config config = Config.Load(this);
             if (config.ExePath.Length == 0 || !File.Exists(config.ExePath))
             {
+                Log("no program found. searched:" + Environment.NewLine + config.Tried);
                 MessageBox.Show(
-                    "yt-msd was not found at:" + Environment.NewLine + Environment.NewLine + config.ExePath +
+                    "yt-msd was not found." + Environment.NewLine + Environment.NewLine +
+                    "Places searched:" + Environment.NewLine + config.Tried +
                     Environment.NewLine + Environment.NewLine +
-                    "Point exe= at your yt-msd program inside:" + Environment.NewLine + config.FilePath,
+                    "In " + config.FilePath + " point exe= at yt-msd-gui.exe, or point" + Environment.NewLine +
+                    "dir= at a folder yt-msd is in - the plugin searches that folder and" + Environment.NewLine +
+                    "the folders inside it.",
                     "yt-msd plugin", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
+            Log("opening: " + config.ExePath);
             busy = true;
 
             if (taskOwner != null)

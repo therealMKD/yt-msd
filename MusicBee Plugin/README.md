@@ -50,11 +50,25 @@ mb_YtMsd.ini    its settings (which yt-msd program to open, which folders to sca
 ```
 
 into `%APPDATA%\MusicBee\Plugins`, then start MusicBee, enable **yt-msd** in
-**Options > Plugins**, restart. The `mb_YtMsd.ini` committed here points at this
-repo's `GUI Source Code\yt-msd-gui\yt-msd-gui.exe` and your `Music` folder - edit
-it if your paths differ. If yt-msd was installed with `yt-msd-setup.exe` instead,
-point the line at the installed copy:
-`C:\Users\you\AppData\Local\Programs\yt-msd\yt-msd-gui.exe`.
+**Options > Plugins**, restart. That copy of `mb_YtMsd.ini` is the one the plugin
+reads, so changing the one in this repo does not change what MusicBee does until it
+is copied over.
+
+The settings are plain text:
+
+```
+exe=C:\Users\you\yt-msd\GUI Source Code\yt-msd-gui\yt-msd-gui.exe   the program to open
+dir=C:\Users\you\yt-msd\GUI Source Code                             a folder to search for it
+```
+
+`exe=` names the program outright. `dir=` names a folder to look for it in, and it
+is what to use when the location is the thing that changes: the plugin searches that
+folder and the folders inside it for `yt-msd-gui.exe`, `yt-msd.exe`, `yt-msd-gui.pyw`
+or `yt-msd.pyw`. If `exe=` points at a file that is not there, the folder it used to
+be in is searched too, along with `%LOCALAPPDATA%\Programs\yt-msd` where
+`yt-msd-setup.exe` installs, so a rebuild that moved the program is picked up on its
+own. When nothing is found the plugin says which places it searched, in a message and
+in `mb_YtMsd.log` next to the plugin.
 
 ## Build
 
