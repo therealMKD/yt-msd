@@ -65,17 +65,28 @@ def find_csc():
 
 
 def default_exe():
-    """The yt-msd program the menu entry should open."""
-    preferred = os.path.join(REPO, "GUI Source Code", "yt-msd-gui.exe")
-    if os.path.isfile(preferred):
-        return preferred
-    found = glob.glob(os.path.join(REPO, "GUI Source Code", "*.exe"))
+    """The yt-msd program the menu entry should open.
+
+    yt-msd is built as a folder now (an exe plus its _internal folder) and shipped
+    as a single installer, so the two places it is normally found are this repo's
+    GUI Source Code\\yt-msd-gui\\ and the folder yt-msd-setup.exe installs into.
+    """
+    candidates = [
+        os.path.join(REPO, "GUI Source Code", "yt-msd-gui", "yt-msd-gui.exe"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "yt-msd", "yt-msd-gui.exe"),
+        os.path.join(REPO, "GUI Source Code", "yt-msd-gui.exe"),  # an older one-file build
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    found = [exe for exe in glob.glob(os.path.join(REPO, "GUI Source Code", "*", "*.exe"))
+             if "setup" not in os.path.basename(exe).lower()]
     if found:
         return max(found, key=os.path.getmtime)
     found = glob.glob(os.path.join(REPO, "GUI Version", "*.exe"))
     if found:
         return max(found, key=os.path.getmtime)
-    return preferred
+    return candidates[0]
 
 
 def default_folders():

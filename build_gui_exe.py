@@ -1,6 +1,7 @@
 # Open Source Software under the Apache License, Version 2.0
 #
-# Build the compiled Windows executable for the yt-msd GUI.
+# Build the compiled Windows program for the yt-msd GUI, and the installer that
+# ships it.
 #
 # This is the second half of the pipeline started by build_gui_cython.py:
 #
@@ -9,7 +10,9 @@
 #   build_dir_cython/yt_msd_gui.c             Cython's C output
 #   build_dir_cython/yt_msd_gui.pyd           that C, compiled with MSVC
 #   build_dir_cython/yt_msd_gui_launcher.py   entry point for both jobs (generated)
-#   GUI Source Code/yt-msd-gui.exe            the GUI and the renamer, in one exe
+#   GUI Source Code/yt-msd-gui/               the GUI and the renamer, in one folder
+#     yt-msd-gui.exe + _internal\               (PyInstaller's one-folder build)
+#   GUI Source Code/yt-msd-setup.exe          that folder packed as one installer
 #
 # One exe, two jobs. The GUI is windowed and must not drag a console window
 # along with it, while the MP3 renamer IS a console program (banner, colours,
@@ -25,11 +28,21 @@
 # ffmpeg.exe + ffprobe.exe, and icon-256x256.ico (the title bar / taskbar / tray icon -
 # the same file PyInstaller also embeds as the exe's own icon).
 #
+# Why a folder and an installer instead of one big exe: a one-file exe unpacks its
+# ~550 MB into a temporary "_MEI" folder before the window appears (about 4 seconds
+# here) and deletes that folder after the window closes, which keeps a hidden
+# launcher process alive for another 4 seconds after the GUI is gone. A one-folder
+# exe runs from the files that already sit beside it: window in about a second,
+# process gone in about a tenth of a second. The one-folder build is a folder, so
+# the last step packs it into a single installer - still one file to download, and
+# double-clicking that is all an end user has to do.
+#
 # Commands
 #   python build_gui_exe.py pyd       .pyx -> .c -> build_dir_cython/yt_msd_gui.pyd
 #   python build_gui_exe.py launcher  write the launcher and the PyInstaller .spec
-#   python build_gui_exe.py exe       build both exes into GUI Source Code/
-#   python build_gui_exe.py all       pyd + launchers + exes
+#   python build_gui_exe.py exe       build the one-folder app into GUI Source Code/
+#   python build_gui_exe.py installer pack that folder into GUI Source Code/yt-msd-setup.exe
+#   python build_gui_exe.py all       pyd + launchers + exe + installer
 #
 # Why a launcher exists: PyInstaller reads imports out of Python source, and a
 # compiled .pyd has none it can see. So the launcher restates the .pyw's own
@@ -43,6 +56,7 @@
 import ast
 import glob
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -60,10 +74,19 @@ EXE_NAME = "yt-msd-gui"
 LAUNCHER = os.path.join(BUILD_DIR, "%s_launcher.py" % MODULE_NAME)
 SPEC_PATH = os.path.join(BUILD_DIR, "%s.spec" % EXE_NAME)
 ICON = os.path.join(ROOT, "GUI Source Code", "icon-256x256.ico")
-# The exe is written next to the GUI source, which is where it is kept and run
-# from (".exe" is git-ignored, so the build output never lands in the repo).
+# The build output is written next to the GUI source, which is where it is kept and
+# run from (the exe, its _internal folder and the setup .exe are all git-ignored).
 DIST_DIR = os.path.join(ROOT, "GUI Source Code")
-EXE_PATH = os.path.join(DIST_DIR, "%s.exe" % EXE_NAME)
+# A one-folder build is an exe plus the "_internal" folder PyInstaller fills, and
+# the exe only runs while that folder sits beside it. So the app lives in a folder
+# of its own, and the installer step is what turns that folder into one file.
+APP_DIR = os.path.join(DIST_DIR, EXE_NAME)
+EXE_PATH = os.path.join(APP_DIR, "%s.exe" % EXE_NAME)
+# The one-file exe this script used to build, kept out of the way of the new layout.
+LEGACY_EXE_PATH = os.path.join(DIST_DIR, "%s.exe" % EXE_NAME)
+SETUP_NAME = "yt-msd-setup"
+SETUP_PATH = os.path.join(DIST_DIR, "%s.exe" % SETUP_NAME)
+ISS_PATH = os.path.join(BUILD_DIR, "%s.iss" % EXE_NAME)
 C_PATH = os.path.join(BUILD_DIR, "%s.c" % MODULE_NAME)
 
 
@@ -188,10 +211,10 @@ import os
 import sys
 
 if getattr(sys, "frozen", False):
-    # ffmpeg.exe, ffprobe.exe, libvlc.dll, libvlccore.dll and the VLC plugins
-    # are unpacked into the application folder. Putting that folder on PATH is
-    # how the plain "ffmpeg"/"ffprobe" calls, yt-dlp's --ffmpeg-location and
-    # python-vlc's libvlc.dll lookup all find them.
+    # ffmpeg.exe, ffprobe.exe, libvlc.dll, libvlccore.dll and the VLC plugins sit
+    # in sys._MEIPASS, which for a one-folder build is the "_internal" folder beside
+    # this exe. Putting that folder on PATH is how the plain "ffmpeg"/"ffprobe"
+    # calls, yt-dlp's --ffmpeg-location and python-vlc's libvlc.dll lookup find them.
     _app_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.executable)))
     os.environ["PATH"] = _app_dir + os.pathsep + os.environ.get("PATH", "")
 
@@ -368,14 +391,18 @@ def vlc_dir():
 
 
 SPEC_TEMPLATE = '''# Generated by build_gui_exe.py - do not edit by hand.
-# Onefile and windowed, carrying icon-256x256.ico and everything the GUI needs at run
-# time except yt-dlp.
+# One-folder and windowed, carrying icon-256x256.ico and everything the GUI needs at
+# run time except yt-dlp.
 #
 # Windowed means no console window sits behind the GUI. The interactive MP3
 # renamer - banner, colours, input() prompts - is this same exe called with
 # --renamer: the launcher allocates a console window for that copy, so one
 # program covers both jobs. See run_renamer in the launcher and run_mp3_renamer
 # in the .pyw.
+#
+# One-folder rather than one-file: the exe starts straight from the files beside it
+# instead of unpacking ~550 MB into a temporary folder first, and it has no
+# temporary folder to clean up after the window closes.
 
 block_cipher = None
 
@@ -397,16 +424,13 @@ gui_pyz = PYZ(gui.pure)
 gui_exe = EXE(
     gui_pyz,
     gui.scripts,
-    gui.binaries,
-    gui.datas,
     [],
+    exclude_binaries=True,
     name={name!r},
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    upx_exclude=[],
-    runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -414,6 +438,19 @@ gui_exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon={icon!r},
+)
+
+# Everything that is not the program itself is collected beside it, in the
+# "_internal" folder the exe reads when it starts. Nothing is unpacked to a
+# temporary folder, so there is nothing to delete after the window closes.
+gui_coll = COLLECT(
+    gui_exe,
+    gui.binaries,
+    gui.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name={name!r},
 )
 '''
 
@@ -452,8 +489,8 @@ def write_spec():
     )
     with open(SPEC_PATH, "w", encoding="utf-8") as fh:
         fh.write(spec)
-    print("  -> %s (builds %s.exe)" % (SPEC_PATH, EXE_NAME))
-    print("  bundled in it:")
+    print("  -> %s (builds the %s folder)" % (SPEC_PATH, EXE_NAME))
+    print("  bundled into it:")
     for path, _ in binaries:
         print("    %s (%.1f MB)" % (path, os.path.getsize(path) / 1048576.0))
     print("    %s (%.1f KB, the title bar / taskbar / tray icon)"
@@ -474,9 +511,11 @@ def cmd_exe():
         return 1
     if write_spec():
         return 1
-    print("packaging with PyInstaller (one exe carrying PySide6 + FFmpeg + VLC;")
-    print("onefile, a few minutes)...")
+    print("packaging with PyInstaller (one folder carrying PySide6 + FFmpeg + VLC;")
+    print("a few minutes)...")
     # No --specpath: PyInstaller takes the spec location from the .spec file itself.
+    # --distpath is the folder it writes into, and a one-folder build writes a
+    # folder of its own named after the program: "<distpath>/yt-msd-gui/".
     if run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
             "--distpath", DIST_DIR,
             "--workpath", os.path.join(BUILD_DIR, "pyinstaller"),
@@ -485,23 +524,183 @@ def cmd_exe():
     if not os.path.exists(EXE_PATH):
         print("  expected %s but it was not produced" % EXE_PATH)
         return 1
-    print("  -> %s (windowed GUI, and the renamer with --renamer, %.1f MB)"
-          % (EXE_PATH, os.path.getsize(EXE_PATH) / 1048576.0))
+    # The one-file exe this script used to build sits in the same place. It is the
+    # same program, only slower to start and slower to close, so it is not kept.
+    if os.path.isfile(LEGACY_EXE_PATH):
+        os.remove(LEGACY_EXE_PATH)
+        print("  removed the old one-file build: %s" % LEGACY_EXE_PATH)
+    carry_settings()
+    count, size = folder_stats(APP_DIR)
+    print("  -> %s (windowed GUI, and the renamer with --renamer)" % EXE_PATH)
+    print("     %s beside it: %d files, %.1f MB"
+          % (os.path.join(APP_DIR, "_internal"), count, size / 1048576.0))
+    return 0
+
+
+def carry_settings():
+    """Copy an existing gui_config.json next to the new exe.
+
+    yt-msd keeps its settings beside whichever copy of it is running, and the
+    one-folder build moved the program into a folder of its own. Without this a
+    rebuild would start the app with a blank configuration. The original is left in
+    place so running the .pyw directly is unaffected.
+    """
+    old = os.path.join(DIST_DIR, "gui_config.json")
+    new = os.path.join(APP_DIR, "gui_config.json")
+    if os.path.isfile(old) and not os.path.exists(new):
+        shutil.copy2(old, new)
+        print("  carried the settings across: %s -> %s" % (old, new))
+
+
+def folder_stats(folder):
+    """(file count, total bytes) for a built folder."""
+    count = 0
+    size = 0
+    for root, _, files in os.walk(folder):
+        for name in files:
+            count += 1
+            try:
+                size += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return count, size
+
+
+def find_iscc():
+    """The Inno Setup compiler, wherever it is. YTMSD_ISCC points at it by hand."""
+    candidates = [os.environ.get("YTMSD_ISCC"), shutil.which("iscc")]
+    for pattern in (
+        r"%LOCALAPPDATA%\Programs\Inno Setup *\iscc.exe",
+        r"%PROGRAMFILES%\Inno Setup *\iscc.exe",
+        r"%PROGRAMFILES(X86)%\Inno Setup *\iscc.exe",
+    ):
+        candidates.extend(sorted(glob.glob(os.path.expandvars(pattern)), reverse=True))
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def app_version():
+    """The version string the GUI carries, so the installer is labelled with it."""
+    match = re.search(r'^APP_VERSION\s*=\s*"([^"]*)"', source_text(), re.MULTILINE)
+    return match.group(1) if match else ""
+
+
+ISS_TEMPLATE = """; Generated by build_gui_exe.py - do not edit by hand.
+;
+; One file to download. This installer unpacks the one-folder build - yt-msd-gui.exe
+; and the _internal folder beside it - into one folder, and adds a Start menu
+; shortcut (and a desktop one if asked for).
+;
+; The default folder is per-user on purpose: yt-msd writes its gui_config.json next
+; to its own exe, and %LOCALAPPDATA% is writable without an administrator. The
+; folder can still be changed on the wizard's second page.
+;
+; gui_config.json is left out of the package on purpose - it holds whoever built the
+; installer's own settings (folders, playlists, window size). A new install starts at
+; the defaults, and an update over an existing install keeps the settings that install
+; already has, because nothing here deletes a file the package does not carry.
+
+[Setup]
+AppName=yt-msd
+AppVersion=@APP_VERSION@
+AppPublisher=therealMKD
+AppPublisherURL=https://github.com/therealMKD/yt-msd
+AppSupportURL=https://github.com/therealMKD/yt-msd/issues
+AppUpdatesURL=https://github.com/therealMKD/yt-msd/releases
+DefaultDirName={localappdata}\\Programs\\yt-msd
+DefaultGroupName=yt-msd
+DisableProgramGroupPage=yes
+PrivilegesRequired=lowest
+OutputDir=@OUTPUT_DIR@
+OutputBaseFilename=@OUTPUT_NAME@
+SetupIconFile=@ICON@
+UninstallDisplayIcon={app}\\@EXE_NAME@.exe
+UninstallDisplayName=yt-msd
+Compression=lzma2/max
+SolidCompression=yes
+WizardStyle=modern
+@VERSION_LINE@
+[Files]
+Source: "@APP_DIR@\\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "gui_config.json"
+
+[Icons]
+Name: "{autoprograms}\\yt-msd"; Filename: "{app}\\@EXE_NAME@.exe"
+Name: "{autodesktop}\\yt-msd"; Filename: "{app}\\@EXE_NAME@.exe"; Tasks: desktopicon
+
+[Tasks]
+Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional icons:"
+
+[Run]
+Filename: "{app}\\@EXE_NAME@.exe"; Description: "Start yt-msd"; Flags: nowait postinstall skipifsilent
+"""
+
+
+def write_iss():
+    version = app_version()
+    numbers = re.findall(r"\d+", version)
+    iss = (ISS_TEMPLATE
+           .replace("@APP_VERSION@", version or "development")
+           .replace("@VERSION_LINE@",
+                    ("VersionInfoVersion=%s" % ".".join(numbers[:4])) if numbers else "")
+           .replace("@APP_DIR@", APP_DIR)
+           .replace("@OUTPUT_DIR@", DIST_DIR)
+           .replace("@OUTPUT_NAME@", SETUP_NAME)
+           .replace("@EXE_NAME@", EXE_NAME)
+           .replace("@ICON@", ICON))
+    with open(ISS_PATH, "w", encoding="utf-8") as fh:
+        fh.write(iss)
+    print("  -> %s (installs %s)" % (ISS_PATH, APP_DIR))
+    return 0
+
+
+def cmd_installer():
+    if not os.path.isfile(EXE_PATH):
+        print("nothing to pack at %s - run 'python build_gui_exe.py exe' first" % EXE_PATH)
+        return 1
+    iscc = find_iscc()
+    if not iscc:
+        print("Inno Setup (iscc.exe) was not found, so no installer was built.")
+        print("  install it:  winget install --id JRSoftware.InnoSetup -e")
+        print("  or point at it:  set YTMSD_ISCC=C:\\path\\to\\iscc.exe")
+        print("  %s still runs as it is - it is just not one file yet." % APP_DIR)
+        return 1
+    if write_iss():
+        return 1
+    count, size = folder_stats(APP_DIR)
+    print("packing %d files (%.1f MB) into one installer with LZMA at its highest"
+          % (count, size / 1048576.0))
+    print("setting - a minute or two...")
+    if run([iscc, ISS_PATH]):
+        return 1
+    if not os.path.isfile(SETUP_PATH):
+        print("  expected %s but it was not produced" % SETUP_PATH)
+        return 1
+    print("  -> %s (%.1f MB, the one file an end user downloads)"
+          % (SETUP_PATH, os.path.getsize(SETUP_PATH) / 1048576.0))
+    print("     it installs into %LOCALAPPDATA%\\Programs\\yt-msd and adds a Start menu shortcut.")
     return 0
 
 
 USAGE = """usage: python build_gui_exe.py <command>
 
-  pyd       build build_dir_cython/yt_msd_gui.pyd from GUI Source Code/yt_msd_gui.pyx
-  launcher  write the launcher and the PyInstaller .spec
-  exe       build GUI Source Code/yt-msd-gui.exe (onefile, windowed, icon-256x256.ico)
-  all       pyd + launcher + exe
+  pyd        build build_dir_cython/yt_msd_gui.pyd from GUI Source Code/yt_msd_gui.pyx
+  launcher   write the launcher and the PyInstaller .spec
+  exe        build GUI Source Code/yt-msd-gui/ (one folder: the windowed exe + _internal)
+  installer  pack that folder into GUI Source Code/yt-msd-setup.exe (needs Inno Setup)
+  all        pyd + launcher + exe + installer
 
 That one exe is two programs: run it as it is and it opens the GUI window; run
 it with --renamer (or -r) and it opens a console and runs the MP3 renamer CLI.
 The GUI reaches its own renamer half the same way, by re-running itself.
 
+The exe only runs with its _internal folder beside it, which is why the last step
+exists: yt-msd-setup.exe is the single file an end user downloads, and running it
+puts the folder somewhere on their machine and gives them a Start menu shortcut.
+
 Environment: YTMSD_FFMPEG_DIR overrides the automatic FFmpeg lookup.
+           YTMSD_ISCC points at iscc.exe when it is not in one of the usual places.
 """
 
 
@@ -516,8 +715,10 @@ def main(argv):
         return cmd_launcher()
     if args[0] == "exe":
         return cmd_exe()
+    if args[0] == "installer":
+        return cmd_installer()
     if args[0] == "all":
-        for step in (cmd_pyd, cmd_exe):
+        for step in (cmd_pyd, cmd_exe, cmd_installer):
             if step():
                 return 1
         return 0

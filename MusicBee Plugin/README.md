@@ -51,8 +51,10 @@ mb_YtMsd.ini    its settings (which yt-msd program to open, which folders to sca
 
 into `%APPDATA%\MusicBee\Plugins`, then start MusicBee, enable **yt-msd** in
 **Options > Plugins**, restart. The `mb_YtMsd.ini` committed here points at this
-repo's `GUI Source Code\yt-msd-gui.exe` and your `Music` folder - edit it if your
-paths differ.
+repo's `GUI Source Code\yt-msd-gui\yt-msd-gui.exe` and your `Music` folder - edit
+it if your paths differ. If yt-msd was installed with `yt-msd-setup.exe` instead,
+point the line at the installed copy:
+`C:\Users\you\AppData\Local\Programs\yt-msd\yt-msd-gui.exe`.
 
 ## Build
 
@@ -99,7 +101,7 @@ started normally yt-msd is unchanged - its usual window size, and no window size
 `mb_YtMsd.ini` sits next to `mb_YtMsd.dll` (the build script writes it):
 
 ```ini
-exe=C:\Users\you\yt-msd\GUI Source Code\yt-msd-gui.exe
+exe=C:\Users\you\yt-msd\GUI Source Code\yt-msd-gui\yt-msd-gui.exe
 folder=C:\Users\you\Music
 maxfiles=3000
 interval=30

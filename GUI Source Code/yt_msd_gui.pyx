@@ -5596,7 +5596,7 @@ class UpdateAvailableDialog(QDialog):
 
 class UpdateReadyDialog(QDialog):
     """Shown after a successful download; asks whether to auto-swap to the new version."""
-    def __init__(self, parent_window, new_path, old_path, tag):
+    def __init__(self, parent_window, new_path, old_path, tag, replaces_folder=False):
         super().__init__(parent_window)
         self.parent_window = parent_window
         self.setWindowTitle("Launch Update? - yt-msd")
@@ -5611,18 +5611,30 @@ class UpdateReadyDialog(QDialog):
         title_lbl.setFont(QFont("Segoe UI Semibold", 11))
         layout.addWidget(title_lbl)
 
-        desc = QLabel(
-            f"The new version ({tag}) has been downloaded to:\n{new_path}\n\n"
-            "Would you like to automatically close this version, delete the old file, and launch the new version? "
-            "Choosing Cancel keeps both files so you can swap them yourself."
-        )
+        if replaces_folder:
+            # The download is an installer, not another copy of this program: it
+            # replaces the whole yt-msd folder, so this file is not the thing that
+            # gets removed.
+            desc = QLabel(
+                f"The new version ({tag}) has been downloaded to:\n{new_path}\n\n"
+                "Would you like to close this version and run that installer? It replaces "
+                "the whole yt-msd folder, so this file is left where it is until the "
+                "installer has finished. Choosing Cancel leaves both untouched."
+            )
+        else:
+            desc = QLabel(
+                f"The new version ({tag}) has been downloaded to:\n{new_path}\n\n"
+                "Would you like to automatically close this version, delete the old file, and launch the new version? "
+                "Choosing Cancel keeps both files so you can swap them yourself."
+            )
         desc.setWordWrap(True)
         layout.addWidget(desc)
 
-        old_lbl = QLabel(f"Old version file that would be removed: {old_path}")
-        old_lbl.setWordWrap(True)
-        old_lbl.setStyleSheet("color: #888; font-size: 11px;")
-        layout.addWidget(old_lbl)
+        if not replaces_folder:
+            old_lbl = QLabel(f"Old version file that would be removed: {old_path}")
+            old_lbl.setWordWrap(True)
+            old_lbl.setStyleSheet("color: #888; font-size: 11px;")
+            layout.addWidget(old_lbl)
 
         layout.addStretch()
 
@@ -6692,19 +6704,29 @@ class MainApp(QMainWindow):
     def _prompt_swap_dialog(self, new_path, tag):
         """After a successful download, offer to auto-close, delete the old file, and launch the new version."""
         old_path = self._current_executable_path()
-        dlg = UpdateReadyDialog(self, new_path, old_path, tag)
+        # A drop-in update arrives under this program's own name and is swapped file
+        # for file. Anything else - the installer a folder build ships - replaces the
+        # whole yt-msd folder, so this file is not the one that gets deleted.
+        replaces_folder = (os.path.basename(new_path).lower()
+                           != os.path.basename(old_path).lower())
+        dlg = UpdateReadyDialog(self, new_path, old_path, tag, replaces_folder)
         choice = dlg.exec()
         if choice == QDialog.Accepted:
-            self._launch_swap_helper(new_path, old_path)
+            self._launch_swap_helper(new_path, old_path, delete_old=not replaces_folder)
             # closeEvent() saves config, hides the tray, and hard-exits the process (os._exit).
             self.close()
+        elif replaces_folder:
+            self.status_signal.emit(
+                f"Update ready. Run {new_path} when you want to update yt-msd; this version is left as it is.",
+                False, "#FF8C00"
+            )
         else:
             self.status_signal.emit(
                 f"Update ready. New file: {new_path} (old file kept: {old_path}). Swap them manually to finish.",
                 False, "#FF8C00"
             )
 
-    def _launch_swap_helper(self, new_path, old_path):
+    def _launch_swap_helper(self, new_path, old_path, delete_old=True):
         """Write a temporary helper script that waits for this process to exit, deletes the old file,
         launches the new version, then deletes itself."""
         pid = os.getpid()
@@ -6720,15 +6742,20 @@ class MainApp(QMainWindow):
             launch_cmd = f'"{interp}" "{new_path}"'
 
         swap_path = os.path.join(tempfile.gettempdir(), f"ytmsd_swap_{pid}.bat")
+        # An installer replaces the whole folder, so the running copy is left alone
+        # and the installer overwrites it. A drop-in update is swapped file for file.
+        drop_old = (
+            'if not "%OLD%"=="%NEW%" (\r\n'
+            '  if exist "%OLD%" del /F /Q "%OLD%"\r\n'
+            ')\r\n'
+        ) if delete_old else ""
         bat = (
             "@echo off\r\n"
             f'set "PID={pid}"\r\n'
             f'set "OLD={old_path}"\r\n'
             f'set "NEW={new_path}"\r\n'
             'powershell -NoProfile -Command "while (Get-Process -Id %PID% -ErrorAction SilentlyContinue) { Start-Sleep -Milliseconds 300 }"\r\n'
-            'if not "%OLD%"=="%NEW%" (\r\n'
-            '  if exist "%OLD%" del /F /Q "%OLD%"\r\n'
-            ')\r\n'
+            + drop_old +
             f'start "" {launch_cmd}\r\n'
             'del /F /Q "%~f0"\r\n'
         )

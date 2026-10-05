@@ -24,6 +24,9 @@ __pycache__/
 *.exe
 *.pex
 
+# PyInstaller one-folder build output: the GUI exe plus the _internal folder it needs
+GUI Source Code/yt-msd-gui/
+
 # Python build residues
 *.spec
 ffmpeg.zip
