@@ -1,5 +1,5 @@
 # MusicBee plugin (yt-msd launcher)
-**AI Generated Overview**
+**AI Generated Overview - Strata really really likes to make readme files, I guess**
 
 A thin shim. It does not rename, tag or process anything - yt-msd still does all of
 that in its own window. The plugin only:
