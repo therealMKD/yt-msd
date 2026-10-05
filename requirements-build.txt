@@ -26,6 +26,19 @@
 #   python build_gui_cython.py c        write build_dir_cython\yt_msd_gui.c  (add --embed for a main())
 #   python build_gui_cython.py check    transpile into a temp folder and report warnings only
 # Verified: Cython 3.3.0 transpiles the current 9900-line GUI source with no errors or warnings.
+#
+# build_gui_exe.py (repo root) finishes the job - it drives build_gui_cython.py, MSVC and PyInstaller:
+#   python build_gui_exe.py pyd       .pyx -> .c -> build_dir_cython\yt_msd_gui.cp314-win_amd64.pyd
+#   python build_gui_exe.py launcher  write the launcher + build_dir_cython\yt-msd-gui.spec
+#   python build_gui_exe.py exe       build dist\yt-msd-gui.exe (onefile, windowed, GUI Source Code\icon.ico)
+#   python build_gui_exe.py all       pyd + launcher + exe
+# The exe carries everything the GUI needs at run time except yt-dlp: the compiled GUI itself, PySide6,
+# mutagen, Pillow, watchdog, python-vlc, libvlc.dll + libvlccore.dll + the VLC plugins folder (taken from
+# the VLC install found through the registry, i.e. the same one python-vlc would use) and ffmpeg.exe +
+# ffprobe.exe (found on PATH, then in the winget/chocolatey folders; set YTMSD_FFMPEG_DIR to force one).
+# The launcher exists because PyInstaller cannot read imports out of a compiled .pyd: it restates the .pyw's
+# own import lines so nothing is missing from the bundle, and it runs the .pyw's entry block inside the
+# compiled module. That keeps sys.modules[__name__] intact, which "cython --embed" would not.
 
 Cython==3.3.0
 pyinstaller==6.22.3
