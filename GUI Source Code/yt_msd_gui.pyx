@@ -876,10 +876,80 @@ def run_yt_dlp_json(args, timeout=YTDLP_EXTRACT_TIMEOUT):
     return json.loads(result.stdout or "")
 
 
+# The lines yt-dlp prints when it names the file it ended up with. Which of
+# them appear, and whether the path is wrapped in quotes, depends on the
+# yt-dlp version and on whether the audio needed converting: the "no conversion
+# needed" message is quoted in some releases and bare in others, and newer
+# releases dropped its [ExtractAudio] prefix. Every form is matched here and
+# the quotes are taken off afterwards. Getting this wrong looked exactly like a
+# song being skipped - the file was on disk, the GUI could not match it, and
+# the track was quietly queued up again for the next pass.
+_YTDLP_FINAL_PATH_PATTERNS = [
+    re.compile(r'^\[ExtractAudio\] Destination:\s*(.+)$'),
+    re.compile(r'^\[ExtractAudio\] Not converting audio\s+"(.+?)"\s*;'),
+    re.compile(r'^Not converting audio\s+"(.+?)"\s*;'),
+    re.compile(r'^\[ExtractAudio\] Not converting audio\s+(.+?);\s'),
+    re.compile(r'^Not converting audio\s+(.+?);\s'),
+    re.compile(r'^\[Merger\] Merging formats into "(.+?)"$'),
+    re.compile(r'^\[download\] "(.+?)" has already been downloaded$'),
+    re.compile(r'^\[download\] (.+?) has already been downloaded$'),
+]
+_YTDLP_STAGED_PATH_PATTERNS = [
+    re.compile(r'^\[download\] Destination:\s*(.+)$'),
+]
+
+
+def _clean_reported_path(text):
+    """Take off the quotes yt-dlp wraps around some of the paths it prints."""
+    text = (text or '').strip()
+    while len(text) >= 2 and text[0] == '"' and text[-1] == '"':
+        text = text[1:-1].strip()
+    return text
+
+
+def _match_reported_path(line):
+    """('final'|'staged', path) for a yt-dlp line naming a file, else (None, '')."""
+    for pattern in _YTDLP_FINAL_PATH_PATTERNS:
+        match = pattern.match(line)
+        if match:
+            return 'final', _clean_reported_path(match.group(1))
+    for pattern in _YTDLP_STAGED_PATH_PATTERNS:
+        match = pattern.match(line)
+        if match:
+            return 'staged', _clean_reported_path(match.group(1))
+    return None, ''
+
+
+def _title_match_key(text):
+    """A loose key for matching a queue title against the file it produced.
+
+    yt-dlp rewrites every character a Windows filename cannot hold, so a title
+    with a ':' or a '/' in it never matches the file it was downloaded to.
+    Comparing only the letters and digits ignores those rewrites.
+    """
+    return re.sub(r'[^0-9a-z]+', '', (text or '').lower())
+
+
+def _title_matches_filename(title, filename):
+    """True when 'filename' is the file a download of 'title' would have written."""
+    wanted = _title_match_key(title)
+    on_disk = _title_match_key(os.path.splitext(os.path.basename(filename))[0])
+    if not wanted or not on_disk:
+        return False
+    if wanted == on_disk:
+        return True
+    # yt-dlp shortens titles past its own filename limit, so a long enough
+    # prefix of the right shape still counts.
+    shorter, longer = (wanted, on_disk) if len(wanted) < len(on_disk) else (on_disk, wanted)
+    return len(shorter) >= 12 and longer.startswith(shorter)
+
+
 def run_yt_dlp_download(args, progress_cb=None, cancelled_cb=None):
     """Run a real yt-dlp download and report its progress while it runs.
 
-    Returns the path of the finished file (None when yt-dlp reported nothing).
+    Returns the path of the finished file. Returning None does NOT mean the
+    download failed - it means yt-dlp finished without naming a file this
+    version recognises, and the caller has to look the file up itself.
     Raises when yt-dlp is missing, when the download failed, or when the user
     cancelled - the same contract the old progress hooks had.
     """
@@ -902,14 +972,11 @@ def run_yt_dlp_download(args, progress_cb=None, cancelled_cb=None):
         line = line.strip()
         if not line:
             continue
-        if line.startswith("[ExtractAudio] Destination:"):
-            final_path = line.split(":", 1)[1].strip()
-        elif line.startswith("[ExtractAudio] Not converting audio "):
-            final_path = line[len("[ExtractAudio] Not converting audio "):].split(";")[0].strip()
-        elif line.startswith("[download] Destination:"):
-            staged_path = line.split(":", 1)[1].strip()
-        elif line.startswith("[download] ") and line.endswith(" has already been downloaded"):
-            final_path = line[len("[download] "): -len(" has already been downloaded")].strip('"')
+        kind, reported = _match_reported_path(line)
+        if kind == 'final':
+            final_path = reported
+        elif kind == 'staged':
+            staged_path = reported
         elif line.startswith("[download]"):
             match = re.search(r"\[download\]\s+([0-9.]+%|N/A)", line)
             if match and progress_cb:
@@ -932,7 +999,37 @@ def run_yt_dlp_download(args, progress_cb=None, cancelled_cb=None):
         raise RuntimeError("Download cancelled by user")
     if proc.returncode != 0:
         raise RuntimeError(errors[-1] if errors else f"yt-dlp exited with code {proc.returncode}")
+    # Return whichever path is really there: the converted file when there is
+    # one, the plain download when the conversion message was never printed.
+    # A half-parsed path is worse than no path at all.
+    for candidate in (final_path, staged_path):
+        if candidate and os.path.isfile(candidate):
+            return candidate
     return final_path or staged_path
+
+
+# A single track gets a few tries of its own before it is handed back to the
+# queue-wide re-check. Retrying one track is far cheaper than re-running the
+# whole queue, and the short waits between tries are what let a throttled
+# request recover. The queue-wide passes stay on top of this as the safety net.
+DOWNLOAD_ITEM_ATTEMPTS = 3
+
+# yt-dlp complaints another request cannot fix, so they are not retried.
+_PERMANENT_DOWNLOAD_ERROR_MARKERS = (
+    "video unavailable",
+    "private video",
+    "this video is not available",
+    "unsupported url",
+    "is not a valid url",
+    "requested format is not available",
+)
+
+
+def _is_permanent_download_error(message):
+    """True for a failure that a retry could never turn into a download."""
+    text = (message or '').lower()
+    return any(marker in text for marker in _PERMANENT_DOWNLOAD_ERROR_MARKERS)
+
 
 def check_vlc_available():
     if not _VLC_MODULE_AVAILABLE or vlc is None:
@@ -9306,7 +9403,7 @@ class MainApp(QMainWindow):
         if self.is_downloading: return
         pending = [q for q in self.queue_items if q['status'] == "Pending"]
         if not pending: return
-        
+
         self.is_downloading = True
         self.cancel_download = False
         self._batch_total_count = len(pending)
@@ -9316,92 +9413,203 @@ class MainApp(QMainWindow):
         self.cancel_btn.setEnabled(True)
         self.cancel_btn.setVisible(True)
         self.save_config()
+        # Everything read from a widget is read here, on the GUI thread. Qt
+        # objects belong to the thread that created them, and reading the
+        # settings once also stops a mid-batch change of format, bitrate or
+        # folder from splitting one queue across two different targets.
         folder = self.path_combo.currentText()
-        
+        target_format = self.format_combo.currentText().lower()
+        audio_quality = str(self.bitrate_combo.currentText())
+        ffmpeg_location = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable)) if getattr(sys, 'frozen', False) else None
+        extra_args = shlex.split(self.custom_args) if (getattr(self, 'use_custom_args', False) and getattr(self, 'custom_args', '')) else []
+
         def bg_download():
+            try:
+                _run_batch()
+            except Exception as e:
+                # Nothing here may end a batch without a final status line:
+                # that line is what re-enables the Download button, so one
+                # unhandled error used to leave the queue stuck on
+                # "Downloading..." with the rest of the list never attempted.
+                print(f"Batch download error: {e}")
+                self.status_signal.emit(f"Batch complete (stopped early: {e}).", False, "#E31E24")
+
+        def _run_batch():
+            import time
             from concurrent.futures import ThreadPoolExecutor
-            import time, glob
-            
+
             with self.active_downloads_lock:
                 self.active_downloads.clear()
-                
+
             threads_count = max(1, int(getattr(self, 'download_threads', 3)))
-            target_format = self.format_combo.currentText().lower()
             downloaded_filepaths = []
             downloaded_lock = threading.Lock()
-            
+            # id(queue item) -> the file that item produced. Kept out of the
+            # queue dicts so the verification pass can check each track on its
+            # own instead of guessing from counts.
+            produced_files = {}
+            # Two queue entries can be different videos that share a title, and
+            # yt-dlp names its output after the title. Left alone, two threads
+            # write the same .part file at the same moment and one of them
+            # fails or writes garbage - which is why the skipping used to get
+            # worse with every extra thread. Same-title tracks are downloaded
+            # one at a time instead.
+            title_locks = {}
+            title_locks_guard = threading.Lock()
+            start_slot_guard = threading.Lock()
+            start_slot = [0]
+
+            def title_lock_for(title):
+                key = _title_match_key(title) or title
+                with title_locks_guard:
+                    lock = title_locks.get(key)
+                    if lock is None:
+                        lock = threading.Lock()
+                        title_locks[key] = lock
+                    return lock
+
+            def reset_start_slots():
+                with start_slot_guard:
+                    start_slot[0] = 0
+
+            def take_start_slot():
+                with start_slot_guard:
+                    slot = start_slot[0]
+                    start_slot[0] += 1
+                return slot
+
+            def repaint(q):
+                """Repaint one queue row, looking up where that item is now.
+
+                The index a worker was handed goes stale the moment the queue is
+                reordered or something is taken out of it, and painting the wrong
+                row is part of how a finished track kept showing as pending.
+                """
+                for i, item in enumerate(getattr(self, 'queue_items', [])):
+                    if item is q:
+                        self.queue_status_changed_signal.emit(i)
+                        return
+
+            def find_downloaded_file(title, not_before=0.0):
+                """Find the file a successful yt-dlp run left behind, by its title."""
+                try:
+                    entries = list(os.scandir(folder))
+                except OSError:
+                    return None
+                best = None
+                for entry in entries:
+                    try:
+                        if not entry.is_file():
+                            continue
+                        if not _title_matches_filename(title, entry.name):
+                            continue
+                        info = entry.stat()
+                    except OSError:
+                        continue
+                    if info.st_size <= 1024 or info.st_mtime < not_before - 5:
+                        continue
+                    if best is None or info.st_mtime > best[1]:
+                        best = (entry.path, info.st_mtime)
+                return best[0] if best else None
+
             def download_single(item):
-                idx, q = item
+                _, q = item
                 vid_id = q['video'].get('id', '')
                 if not vid_id: return
+                title = q['video'].get('title', '') or ''
+                q.pop('permanent_failure', None)
                 if getattr(self, 'cancel_download', False):
                     q['status'] = "Pending"
-                    self.queue_status_changed_signal.emit(idx)
+                    repaint(q)
                     return
                 q['status'] = "Downloading"
-                self.queue_status_changed_signal.emit(idx)
-                
-                success = False
-                downloaded_file = None
-                try:
-                    # The options the Python API used, written as yt-dlp CLI flags.
-                    cli_args = [
-                        "--newline",
-                        "--format", "bestaudio/best",
-                        "--extract-audio",
-                        "--audio-format", target_format,
-                        "--audio-quality", str(self.bitrate_combo.currentText()),
-                        "--retries", "15",
-                        "--fragment-retries", "15",
-                        "--file-access-retries", "10",
-                        "--output", f"{folder}/%(title)s.%(ext)s",
-                    ]
-                    if getattr(sys, 'frozen', False):
-                        cli_args.extend(["--ffmpeg-location", getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))])
-                    if getattr(self, 'use_custom_args', False) and getattr(self, 'custom_args', ''):
-                        # Appended last, so the advanced field wins over the GUI picks
-                        # exactly like the Settings dialog says it should.
-                        cli_args.extend(shlex.split(self.custom_args))
-                    # The track itself: yt-dlp takes URLs positionally, so it goes
-                    # after every option. Without it yt-dlp exits with
-                    # "You must provide at least one URL" and nothing downloads.
-                    cli_args.append(f"https://www.youtube.com/watch?v={vid_id}")
+                repaint(q)
 
-                    downloaded_file = run_yt_dlp_download(
-                        cli_args,
-                        progress_cb=lambda pct: self._dl_progress_percent(vid_id, pct),
-                        cancelled_cb=lambda: getattr(self, 'cancel_download', False),
-                    )
-                    if not downloaded_file:
-                        # Nothing reported (already downloaded, or an older yt-dlp):
-                        # match the title on disk the way prepare_filename used to.
-                        title_stem = _sanitize_filename(q['video'].get('title', '') or '')
-                        if title_stem:
-                            for m in glob.glob(glob.escape(os.path.join(folder, title_stem)) + ".*"):
-                                if os.path.exists(m) and os.path.getsize(m) > 1024:
-                                    downloaded_file = m
-                                    break
-                    if downloaded_file and os.path.exists(downloaded_file) and os.path.getsize(downloaded_file) > 1024:
-                        success = True
-                except Exception as e:
-                    print(f"Download exception for {vid_id}: {e}")
-                    success = False
-                finally:
-                    with self.active_downloads_lock:
-                        if vid_id in self.active_downloads:
-                            del self.active_downloads[vid_id]
-                
-                if success and downloaded_file:
-                    _add_placeholder_tag(downloaded_file)
-                    with downloaded_lock:
-                        downloaded_filepaths.append(downloaded_file)
+                # The options the Python API used, written as yt-dlp CLI flags.
+                cli_args = [
+                    "--newline",
+                    "--format", "bestaudio/best",
+                    "--extract-audio",
+                    "--audio-format", target_format,
+                    "--audio-quality", audio_quality,
+                    "--retries", "15",
+                    "--fragment-retries", "15",
+                    "--file-access-retries", "10",
+                    "--output", f"{folder}/%(title)s.%(ext)s",
+                ]
+                if ffmpeg_location:
+                    cli_args.extend(["--ffmpeg-location", ffmpeg_location])
+                if extra_args:
+                    # Appended last, so the advanced field wins over the GUI picks
+                    # exactly like the Settings dialog says it should.
+                    cli_args.extend(extra_args)
+                # The track itself: yt-dlp takes URLs positionally, so it goes
+                # after every option. Without it yt-dlp exits with
+                # "You must provide at least one URL" and nothing downloads.
+                cli_args.append(f"https://www.youtube.com/watch?v={vid_id}")
+
+                # Stagger the first starts of a pass. Every thread asking
+                # YouTube for a stream in the same instant is what gets the
+                # requests throttled, and a throttled request is what used to
+                # come back as a song that "skipped".
+                slot = take_start_slot()
+                if slot > 0:
+                    time.sleep(min(0.4 * slot, 2.0))
+
+                downloaded_file = None
+                failure = None
+                with title_lock_for(title):
+                    for attempt in range(1, DOWNLOAD_ITEM_ATTEMPTS + 1):
+                        if getattr(self, 'cancel_download', False):
+                            break
+                        attempt_started = time.time()
+                        failure = None
+                        try:
+                            downloaded_file = run_yt_dlp_download(
+                                cli_args,
+                                progress_cb=lambda pct: self._dl_progress_percent(vid_id, pct),
+                                cancelled_cb=lambda: getattr(self, 'cancel_download', False),
+                            )
+                            # run_yt_dlp_download raises for anything that truly
+                            # failed, so getting here means the track is on
+                            # disk. Only its name is uncertain.
+                            if not downloaded_file or not os.path.isfile(downloaded_file):
+                                downloaded_file = find_downloaded_file(title, attempt_started)
+                            break
+                        except Exception as e:
+                            failure = str(e)
+                            downloaded_file = None
+                            print(f"Download attempt {attempt}/{DOWNLOAD_ITEM_ATTEMPTS} failed for {vid_id}: {failure}")
+                            if getattr(self, 'cancel_download', False):
+                                break
+                            if _is_permanent_download_error(failure):
+                                # The video itself is gone, so a later pass of
+                                # the queue would only fail it all over again.
+                                q['permanent_failure'] = True
+                                break
+                            if attempt < DOWNLOAD_ITEM_ATTEMPTS:
+                                time.sleep(min(2.0 * attempt, 8.0))
+
+                with self.active_downloads_lock:
+                    if vid_id in self.active_downloads:
+                        del self.active_downloads[vid_id]
+
+                # A clean yt-dlp exit means the track downloaded, even when no
+                # usable path came out of its output. Treating "no path" as a
+                # failure is what turned finished downloads into skipped songs.
+                if failure is None:
+                    if downloaded_file:
+                        _add_placeholder_tag(downloaded_file)
+                        with downloaded_lock:
+                            downloaded_filepaths.append(downloaded_file)
+                        produced_files[id(q)] = downloaded_file
                     q['status'] = "Finished"
                 else:
                     q['status'] = "Pending"
-                    
+
                 if getattr(self, 'cancel_download', False):
                     q['status'] = "Pending"
-                self.queue_status_changed_signal.emit(idx)
+                repaint(q)
 
                 finished_cnt = len([item_q for item_q in getattr(self, 'queue_items', []) if item_q.get('status') == "Finished"])
                 total_cnt = getattr(self, '_batch_total_count', len(getattr(self, 'queue_items', [])))
@@ -9415,25 +9623,27 @@ class MainApp(QMainWindow):
                             self.dl_progress_signal.emit(f"{prog_prefix}Downloading: {', '.join(vals)}")
                     else:
                         self.dl_progress_signal.emit(f"{prog_prefix}Processing...")
-                
+
             max_passes = 4
             for pass_num in range(1, max_passes + 1):
                 # Always check UP (from top / index 0) for undownloaded tracks before checking down
                 pending_items = sorted(
-                    [(idx, q) for idx, q in enumerate(self.queue_items) if q['status'] == "Pending"],
+                    [(idx, q) for idx, q in enumerate(self.queue_items)
+                     if q['status'] == "Pending" and not q.get('permanent_failure')],
                     key=lambda x: x[0]
                 )
                 if not pending_items or getattr(self, 'cancel_download', False):
                     break
-                
+
                 if pass_num > 1:
                     self.status_signal.emit(
                         f"Re-checking queue (Pass {pass_num}: retrying {len(pending_items)} pending downloads)...",
                         False, "#FF8C00"
                     )
-                    time.sleep(1.0)
-                
+                    time.sleep(min(1.5 * pass_num, 8.0))
+
                 max_workers = min(threads_count, len(pending_items))
+                reset_start_slots()
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     futures = []
                     for item in pending_items:
@@ -9441,51 +9651,75 @@ class MainApp(QMainWindow):
                             break
                         futures.append(executor.submit(download_single, item))
                     for fut in futures:
-                        fut.result()
-            
+                        try:
+                            fut.result()
+                        except Exception as e:
+                            # One track blowing up must not take the rest of the
+                            # queue down with it.
+                            print(f"Unexpected error while downloading: {e}")
+
             # --- Verification Pass with Placeholder Tag & Title Matching ---
             if not getattr(self, 'cancel_download', False):
-                valid_tagged_files = [f for f in downloaded_filepaths if os.path.exists(f) and os.path.getsize(f) > 1024]
-                queued_finished = [q for q in self.queue_items if q['status'] == "Finished"]
-                
-                if len(valid_tagged_files) < len(queued_finished):
-                    missing_items = []
-                    for idx, q in enumerate(self.queue_items):
-                        if q['status'] == "Finished":
-                            title = q['video'].get('title', '')
-                            found = any(title.lower() in os.path.basename(f).lower() for f in valid_tagged_files)
-                            if not found:
-                                q['status'] = "Pending"
-                                missing_items.append((idx, q))
-                                self.queue_status_changed_signal.emit(idx)
-                                
-                    if missing_items:
-                        missing_items.sort(key=lambda x: x[0])
-                        self.status_signal.emit(
-                            f"Verification: {len(missing_items)} files missing on disk. Redownloading missing tracks...",
-                            False, "#FF8C00"
-                        )
-                        with ThreadPoolExecutor(max_workers=min(threads_count, len(missing_items))) as executor:
-                            futures = [executor.submit(download_single, item) for item in missing_items]
-                            for fut in futures:
+                # Check every finished track against the file it actually
+                # produced. The old check compared a file count against a queue
+                # count and matched raw titles against sanitized filenames, so
+                # any title holding a ':' or a '/' looked missing and was
+                # downloaded all over again for no reason.
+                missing_items = []
+                for idx, q in enumerate(list(self.queue_items)):
+                    if q['status'] != "Finished":
+                        continue
+                    path = produced_files.get(id(q))
+                    if path and os.path.isfile(path) and os.path.getsize(path) > 1024:
+                        continue
+                    path = find_downloaded_file(q['video'].get('title', ''))
+                    if path:
+                        produced_files[id(q)] = path
+                        continue
+                    q['status'] = "Pending"
+                    missing_items.append((idx, q))
+                    repaint(q)
+
+                if missing_items:
+                    missing_items.sort(key=lambda x: x[0])
+                    self.status_signal.emit(
+                        f"Verification: {len(missing_items)} files missing on disk. Redownloading missing tracks...",
+                        False, "#FF8C00"
+                    )
+                    reset_start_slots()
+                    with ThreadPoolExecutor(max_workers=min(threads_count, len(missing_items))) as executor:
+                        futures = [executor.submit(download_single, item) for item in missing_items]
+                        for fut in futures:
+                            try:
                                 fut.result()
-                
+                            except Exception as e:
+                                print(f"Unexpected error while redownloading: {e}")
+
                 # Strip placeholder verification tag from all confirmed files
-                for f in downloaded_filepaths:
+                for f in list(dict.fromkeys(downloaded_filepaths + list(produced_files.values()))):
                     if os.path.exists(f):
                         _remove_placeholder_tag(f)
-            
-            self._last_downloaded_files = list(downloaded_filepaths)
+
+            self._last_downloaded_files = list(dict.fromkeys(
+                downloaded_filepaths + [p for p in produced_files.values() if p]
+            ))
 
             if getattr(self, 'cancel_download', False):
                 self.status_signal.emit("Download cancelled.", False, "#E31E24")
             else:
                 remaining = [q for q in self.queue_items if q['status'] == "Pending"]
                 if remaining:
-                    self.status_signal.emit(f"Batch completed ({len(remaining)} failed).", False, "#FF8C00")
+                    unavailable = len([q for q in remaining if q.get('permanent_failure')])
+                    if unavailable:
+                        self.status_signal.emit(
+                            f"Batch completed ({len(remaining)} failed, {unavailable} unavailable).",
+                            False, "#FF8C00"
+                        )
+                    else:
+                        self.status_signal.emit(f"Batch completed ({len(remaining)} failed).", False, "#FF8C00")
                 else:
                     self.status_signal.emit("Batch complete!", False, "#1abd33")
-            
+
         threading.Thread(target=bg_download, daemon=True).start()
         
     def _on_batch_complete(self):
