@@ -24,12 +24,12 @@ The GUI version is currently "complete" at v1.0, (and "improved" at v2.5) but fu
 **Upcoming features in GUI v3.0** (Features with an exclamation point (!) are currently added in beta releases)
 - Built-in support for renaming and metadata tagging downloaded files (!)
 - Improved local file navigation (!)
-- Import/Export logic for settings, music files, etc.
+- Import/Export logic for settings, music files, etc. (!)
 - Master playlist syncing for all devices on a local network (!)
 - Automatic update checking (!)
-- An icon that isn't a single-color circle
+- An icon that isn't a single-color circle (!)
 - Various QOL changes and bug fixes
-- MusicBee Plugin version - Will be released once the program has completely matured. This will be when all features have been added, and will be the Cython build wrapped in C#
+- MusicBee Plugin version (!)
 - Possibly winget or chocolatey package - We'll see, but it would be nice to be able to run a single winget command for everything. This will only happen once the program is for sure done.
 
 ### Support for other operating systems
