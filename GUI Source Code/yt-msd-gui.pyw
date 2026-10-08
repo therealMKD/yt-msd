@@ -2718,6 +2718,59 @@ def read_sync_tag_file(folder_path: Union[str, Path]) -> Optional[dict]:
                 print(f"Error reading sync tag from {tag_file}: {e}")
     return None
 
+# A TAG.yaml records last_synced as a local wall-clock string, while the chain
+# dicts in sync-chains.json keep it as an epoch number. Both forms have to be
+# comparable before a removable drive is written to, otherwise a client that has
+# not spoken to its host in a while can roll a drive that is still current back
+# to an older version of the chain.
+SYNC_TAG_TIME_FORMATS = ("%m-%d-%Y %H:%M:%S", "%m-%d-%Y %H:%M",
+                         "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M")
+# Two machines' clocks are never perfectly in step. A drive that only looks a
+# minute ahead is clock drift, not a newer version of the chain.
+SYNC_RETROGRADE_GRACE_SECONDS = 60
+
+
+def parse_sync_timestamp(value) -> Optional[float]:
+    """Normalize a last_synced value - epoch number or TAG.yaml date string - to epoch seconds."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        return ts if ts > 0 else None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:  # An epoch stored as text (older configs did this)
+        ts = float(text)
+        return ts if ts > 0 else None
+    except ValueError:
+        pass
+    for fmt in SYNC_TAG_TIME_FORMATS:
+        try:
+            return time.mktime(time.strptime(text, fmt))
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def format_sync_timestamp(ts: Optional[float]) -> str:
+    """The readable form of a parsed last_synced, for status lines and prompts."""
+    if not ts:
+        return "never"
+    try:
+        return time.strftime("%m-%d-%Y %H:%M:%S", time.localtime(ts))
+    except (ValueError, OSError, OverflowError):
+        return "an unknown time"
+
+
+def drive_last_synced_timestamp(folder_path: Union[str, Path]) -> Optional[float]:
+    """The last_synced recorded in the TAG.yaml sitting on a drive, if it has one."""
+    tag = read_sync_tag_file(folder_path)
+    if not tag:
+        return None
+    return parse_sync_timestamp(tag.get('last_synced'))
+
+
 def find_tagged_sync_folders_on_drive(drive_root: str) -> List[Tuple[Path, dict]]:
     """Scans drive root and one level of subdirectories for yt-msd TAG.yaml files.
     Playlists are always placed as a direct subfolder on the drive root."""
@@ -2996,7 +3049,8 @@ class SyncRemovableWorker:
     @staticmethod
     def sync_removable_chain(removable_chain: dict, config_manager: SyncConfigManager,
                              status_cb: Optional[Callable[[str], None]] = None,
-                             progress_cb: Optional[Callable[[int, int, str, int, int], None]] = None) -> Tuple[bool, str, int, int]:
+                             progress_cb: Optional[Callable[[int, int, str, int, int], None]] = None,
+                             confirm_cb: Optional[Callable[[str], bool]] = None) -> Tuple[bool, str, int, int]:
         sync_code = str(removable_chain.get('sync_code', ''))
         dest_path = Path(removable_chain.get('folder_path', ''))
         del_mode = removable_chain.get('deletion_mode', 'mirror')
@@ -3024,7 +3078,7 @@ class SyncRemovableWorker:
         try:
             return SyncRemovableWorker._sync_removable_chain_locked(
                 sync_code, dest_path, del_mode, chain_name, config_manager, status_cb, progress_cb,
-                matching_hc, matching_cc)
+                matching_hc, matching_cc, confirm_cb)
         finally:
             for lock in reversed(drive_locks):
                 lock.release()
@@ -3035,7 +3089,8 @@ class SyncRemovableWorker:
                                      status_cb: Optional[Callable[[str], None]],
                                      progress_cb: Optional[Callable[[int, int, str, int, int], None]],
                                      matching_hc: Optional[dict] = None,
-                                     matching_cc: Optional[dict] = None) -> Tuple[bool, str, int, int]:
+                                     matching_cc: Optional[dict] = None,
+                                     confirm_cb: Optional[Callable[[str], bool]] = None) -> Tuple[bool, str, int, int]:
         # Find matching hosted chain or client chain (the wrapper normally passes
         # these in already; the lookup is only a fallback for direct callers)
         if matching_hc is None and matching_cc is None:
@@ -3059,14 +3114,63 @@ class SyncRemovableWorker:
             return ok, msg, transferred, deleted
 
         elif matching_cc:
+            src_dir = Path(matching_cc.get('folder_path', ''))
+
+            # Retrograde failsafe. The drive carries its own last_synced in its
+            # TAG.yaml. If this PC's client copy has not been refreshed since that,
+            # writing it to the drive rolls the drive back to an older version of
+            # the chain - and in Mirror mode deletes tracks the drive still has.
+            # Such a client has to hear from its host first.
+            drive_ts = drive_last_synced_timestamp(dest_path)
+            client_ts = parse_sync_timestamp(matching_cc.get('last_synced'))
+            try:
+                drive_tracks = filter_audio_files(dest_path)
+            except Exception:
+                drive_tracks = []
+            # A drive with nothing on it has nothing to lose, and a client with no
+            # recorded sync is assumed stale rather than trusted.
+            is_retrograde = bool(drive_tracks) and drive_ts is not None and (
+                client_ts is None or client_ts < drive_ts - SYNC_RETROGRADE_GRACE_SECONDS)
+
             # 1. Sync client from host first over network
             if status_cb:
+                if is_retrograde:
+                    status_cb(f"[USB Sync: {chain_name}] This PC's copy is older than the drive's; "
+                              f"refreshing from host before writing...")
                 status_cb(f"[USB Sync: {chain_name}] Step 1/2: Updating client chain from host...")
             ok, msg, t, d = SyncClientWorker.sync_chain(matching_cc, status_cb=status_cb, progress_cb=progress_cb)
-            if not ok and status_cb:
-                status_cb(f"[USB Sync: {chain_name}] Host offline, syncing with local client cache...")
+            if ok:
+                # This copy genuinely did just come off the host, so say so. Without
+                # the stamp the drive would look newer than this PC after every
+                # successful USB sync, and the question would come back on the next
+                # plug-in.
+                matching_cc['last_synced'] = time.time()
+                try:
+                    config_manager.save()
+                except Exception:
+                    pass
+            if not ok:
+                if is_retrograde:
+                    # The host is out of reach, so the only copy this PC can offer
+                    # is older than what the drive already holds. Rolling a newer
+                    # drive back is the user's call, not the sync's.
+                    if status_cb:
+                        status_cb(f"[USB Sync: {chain_name}] Drive holds a newer version and the host is "
+                                  f"unreachable - asking before overwriting...")
+                    question = (
+                        f"Syncing '{chain_name}' would replace the copy on '{dest_path}' with an older one.\n\n"
+                        f"Drive last synced: {format_sync_timestamp(drive_ts)} "
+                        f"({len(drive_tracks)} track(s) on it)\n"
+                        f"This PC last synced: {format_sync_timestamp(client_ts)}\n\n"
+                        f"The host for Sync Code {sync_code} could not be reached:\n{msg}\n\n"
+                        "Sync an older version of the chain onto the drive anyway?"
+                    )
+                    if confirm_cb is None or not confirm_cb(question):
+                        return False, ("Sync skipped: the drive holds a newer version of this chain and the host "
+                                       "could not be reached, so this PC's older copy was not written to the drive."), 0, 0
+                if status_cb:
+                    status_cb(f"[USB Sync: {chain_name}] Host offline, syncing with local client cache...")
 
-            src_dir = Path(matching_cc.get('folder_path', ''))
             if status_cb:
                 status_cb(f"[USB Sync: {chain_name}] Step 2/2: Syncing local files to removable device...")
             ok2, msg2, transferred, deleted = SyncRemovableWorker.sync_local_folders(src_dir, dest_path, del_mode, status_cb, progress_cb)
@@ -3089,24 +3193,50 @@ class RemovableSyncThread(QThread):
     status_signal = Signal(str)
     progress_signal = Signal(int, int, str, int, int)
     finished_signal = Signal(bool, str, int, int)
+    confirm_signal = Signal(str, str)  # (chain id, question) - parked until answer_confirm()
 
     def __init__(self, removable_config: dict, config_manager: SyncConfigManager):
         super().__init__()
         self.removable_config = removable_config
         self.config_manager = config_manager
+        # Only MainApp turns this on, and only because it can put the question on
+        # screen. Left off, a sync that needs asking simply proceeds.
+        self.confirm_enabled = False
+        self._confirm_event = threading.Event()
+        self._confirm_answer = True
+
+    def answer_confirm(self, proceed: bool):
+        """The GUI thread's reply to a confirm_signal this thread emitted."""
+        self._confirm_answer = bool(proceed)
+        self._confirm_event.set()
 
     def run(self):
+        chain_id = str(self.removable_config.get('id', ''))
+
         def _status(txt):
             self.status_signal.emit(txt)
 
         def _progress(done, total, filename, idx, total_items):
             self.progress_signal.emit(done, total, filename, idx, total_items)
 
+        def _confirm(message: str) -> bool:
+            """Ask the user on the GUI thread and wait here for the answer."""
+            if not self.confirm_enabled:
+                return True
+            self._confirm_event.clear()
+            self._confirm_answer = True
+            self.confirm_signal.emit(chain_id, message)
+            while not self._confirm_event.wait(timeout=0.5):
+                if self.isInterruptionRequested():
+                    return False
+            return bool(self._confirm_answer)
+
         ok, msg, transferred, deleted = SyncRemovableWorker.sync_removable_chain(
             self.removable_config,
             self.config_manager,
             status_cb=_status,
-            progress_cb=_progress
+            progress_cb=_progress,
+            confirm_cb=_confirm
         )
         self.finished_signal.emit(ok, msg, transferred, deleted)
 
@@ -6623,6 +6753,11 @@ class MainApp(QMainWindow):
 
         thread = RemovableSyncThread(rc, self.sync_config_manager)
         self.sync_threads[cid] = thread
+        # The worker may stop short of overwriting a drive that holds a newer
+        # version of the chain. Asking about that belongs on the GUI thread, so
+        # the worker parks until this app answers it.
+        thread.confirm_enabled = True
+        thread.confirm_signal.connect(self._on_retrograde_sync_confirm)
 
         def _on_status(txt):
             status_text = f"Status: {txt}  |  Last Synced: Syncing..."
@@ -6642,7 +6777,15 @@ class MainApp(QMainWindow):
                 self.sync_manager_dialog._update_client_card_label(cid, "progress_lbl", prog_txt)
 
         def _on_finish(ok, msg, transferred, deleted):
-            rc['status'] = "Up to date" if ok else f"Sync Failed: {msg}"
+            # A skipped retrograde sync is a decision, not a fault, so it is
+            # reported as such instead of as a failed sync.
+            skipped = (not ok) and str(msg).startswith("Sync skipped")
+            if ok:
+                rc['status'] = "Up to date"
+            elif skipped:
+                rc['status'] = str(msg)
+            else:
+                rc['status'] = f"Sync Failed: {msg}"
             if ok:
                 rc['last_synced'] = time.time()
             self.sync_progress_state.pop(cid, None)
@@ -6650,6 +6793,8 @@ class MainApp(QMainWindow):
                 self.dl_progress_signal.emit("")
             if ok:
                 self.status_signal.emit(f"Removable media '{chain_name}' sync complete: {transferred} updated, {deleted} removed.", False, "#1abd33")
+            elif skipped:
+                self.status_signal.emit(f"Removable media '{chain_name}' was left as it is: {msg}", False, "#FF8C00")
             else:
                 self.status_signal.emit(f"Removable media '{chain_name}' sync failed: {msg}", False, "#E31E24")
             if self.sync_manager_dialog:
@@ -6662,6 +6807,31 @@ class MainApp(QMainWindow):
         thread.progress_signal.connect(_on_progress)
         thread.finished_signal.connect(_on_finish)
         thread.start()
+
+    def _on_retrograde_sync_confirm(self, chain_id: str, question: str):
+        """Main-thread slot for a removable sync that stopped short of rolling a
+        newer drive back to an older copy. The worker parks until this answers, so
+        the question is asked on the GUI thread and defaulting to No keeps the
+        drive exactly as it is."""
+        thread = self.sync_threads.get(chain_id)
+        if thread is None or not hasattr(thread, 'answer_confirm'):
+            return
+        parent = None
+        try:
+            if self.sync_manager_dialog is not None and self.sync_manager_dialog.isVisible():
+                parent = self.sync_manager_dialog
+        except RuntimeError:
+            parent = None
+        try:
+            answer = QMessageBox.question(parent, "Removable Drive Holds a Newer Version", question,
+                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            proceed = (answer == QMessageBox.Yes)
+        except Exception:
+            proceed = False
+        try:
+            thread.answer_confirm(proceed)
+        except RuntimeError:
+            pass
 
     def open_sync_manager(self, parent_dialog=None):
         """Opens or brings the Sync Chains Manager to the foreground directly with Main < Settings < Sync stacking."""
@@ -6788,7 +6958,9 @@ class MainApp(QMainWindow):
         choice = dlg.exec()
         if choice == QDialog.Accepted:
             self._launch_swap_helper(new_path, old_path, delete_old=not replaces_folder)
-            # closeEvent() saves config, hides the tray, and hard-exits the process (os._exit).
+            # closeEvent() saves the settings, hides the tray, and ends the event
+            # loop, which brings the process down a moment later - exactly what
+            # the swap helper started above is waiting for.
             self.close()
         elif replaces_folder:
             self.status_signal.emit(
@@ -7307,6 +7479,47 @@ class MainApp(QMainWindow):
         super().changeEvent(event)
 
     def closeEvent(self, event):
+        """Save settings, stop the background work, and end the Qt event loop.
+
+        The process itself is exited by the entry block at the bottom of this
+        file. Ending it here instead - os._exit() called from inside a Qt
+        virtual override - tears the process down while shiboken is still
+        unwinding the close event and while the sync, folder-watcher and
+        subprocess threads are mid-call. That faults in shiboken6.abi3.dll, and
+        the window and its Task Manager entry then stay where they are for the
+        seconds Windows Error Reporting takes to write the crash dump.
+        """
+        self.shutdown_for_exit()
+        event.accept()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
+    def shutdown_for_exit(self):
+        """One-shot shutdown, ordered so that nothing reaches this window again
+        once it is on its way out. Safe to call twice."""
+        if getattr(self, '_shutdown_done', False):
+            return
+        self._shutdown_done = True
+
+        # A background thread that is still working when this window goes away
+        # reaches for a signal on an object Qt has already deleted. The hard
+        # exit used to cut those threads off before they could say so; now the
+        # interpreter outlives them long enough to print a traceback for each.
+        # Only that one race is quieted - anything else still reports itself.
+        previous_thread_excepthook = threading.excepthook
+
+        def _thread_excepthook(args):
+            text = str(args.exc_value)
+            if 'has been deleted' in text or 'already deleted' in text:
+                return
+            try:
+                previous_thread_excepthook(args)
+            except Exception:
+                pass
+
+        threading.excepthook = _thread_excepthook
+
         try:
             self.save_config()
         except Exception:
@@ -7315,6 +7528,61 @@ class MainApp(QMainWindow):
         try:
             if hasattr(self, 'sync_config_manager') and self.sync_config_manager:
                 self.sync_config_manager.save()
+        except Exception:
+            pass
+
+        # Timers first: the 16 ms player tick is the likeliest thing to still
+        # reach the window after this point.
+        for timer_name in ('player_timer', 'wifi_monitor_timer', 'drive_monitor_timer',
+                           'local_rescan_timer', 'sync_timer', 'tray_click_timer'):
+            timer = getattr(self, timer_name, None)
+            if timer is not None:
+                try:
+                    timer.stop()
+                except Exception:
+                    pass
+
+        # Sync workers: ask them to stop and give each a moment, so they are not
+        # emitting signals into a window that is going away.
+        for thread in list(getattr(self, 'sync_threads', {}).values()):
+            try:
+                thread.requestInterruption()
+                thread.quit()
+                thread.wait(1000)
+            except Exception:
+                pass
+
+        # The LAN services: their threads call back into this window.
+        for service_name in ('udp_beacon', 'sync_host_server'):
+            service = getattr(self, service_name, None)
+            if service is not None:
+                try:
+                    service.stop()
+                except Exception:
+                    pass
+
+        # The folder watchers are stopped off the UI thread. stop_all() reaches
+        # watchdog's Observer.stop() with no timeout, which blocks until the
+        # emitter thread finishes - the reason refresh_sync_watchers() already
+        # runs it in a background thread. Measured here: 30+ seconds.
+        try:
+            if getattr(self, 'host_watcher', None) is not None:
+                threading.Thread(target=self.host_watcher.stop_all, daemon=True).start()
+        except Exception:
+            pass
+
+        try:
+            if getattr(self, 'vlc_player', None) is not None:
+                self.vlc_player.stop()
+        except Exception:
+            pass
+
+        # This window installed itself as an application-wide event filter (the
+        # Space key shortcut); nothing should reach it after this point.
+        try:
+            app = QApplication.instance()
+            if app is not None:
+                app.removeEventFilter(self)
         except Exception:
             pass
 
@@ -7329,9 +7597,6 @@ class MainApp(QMainWindow):
                 self.tray_icon.hide()
         except Exception:
             pass
-
-        event.accept()
-        os._exit(0)
 
     def reset_to_defaults(self):
         if os.path.exists(self.config_path):
@@ -10238,8 +10503,11 @@ if __name__ == "__main__":
         window = MainApp()
         window.show()
         ret = app.exec()
-        try:
-            window.close()
-        except Exception:
-            pass
-        os._exit(ret)
+        # closeEvent() has already saved the settings and stopped the background
+        # work; this only covers an exit that did not come through it. Then the
+        # interpreter finishes on its own terms. A hard os._exit() here faults
+        # in shiboken whenever a worker thread is still mid-call, and that is
+        # what kept the window on screen for seconds after the tray icon was
+        # already gone: Windows spends that long writing the crash dump.
+        window.shutdown_for_exit()
+        sys.exit(ret)
