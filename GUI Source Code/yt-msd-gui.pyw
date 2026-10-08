@@ -52,6 +52,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PySide6.QtCore import Qt, Signal, QTimer, Slot, QPoint, QRect, QMargins, QThread, QEvent, QObject, QByteArray
 from PySide6.QtGui import QIcon, QPixmap, QImage, QAction, QColor, QPalette, QPainter, QBrush, QFont, QDrag, QFontMetrics
 from PySide6.QtCore import QMimeData, QUrl
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 # ============================================================
 # APPLICATION ICON (title bar, taskbar, system tray)
@@ -109,9 +110,14 @@ SILENCE_PAD_DUR = 2.0
 CUSTOM_EQ_STRING = ""
 CUSTOM_NORM_CMD = ""  # Optional full ffmpeg -af override for normalization/trim
 
-# Internal version number — keep this in sync with the latest GitHub release tag.
-# (Matches the latest published release tag exactly: RELEASE-3.0)
-APP_VERSION = "RELEASE-3.0"
+# Internal version number - the numeric part of the latest GitHub release tag.
+# (RELEASE-3.0 is tagged as "RELEASE-3.0" and read here as "3.0":
+# _extract_version_number() reduces both sides to their numbers before comparing
+# them, so a tag is still recognised as this version or as a newer one. The same
+# numbers are what build_gui_exe.py puts in the installer and in the version
+# resource of the exe, so the app, the setup program and the file's own
+# Properties dialog all report one version.)
+APP_VERSION = "3.0"
 
 # GitHub repository whose releases page is polled for newer versions.
 UPDATE_REPO = "therealMKD/yt-msd"
@@ -7478,6 +7484,24 @@ class MainApp(QMainWindow):
                 self.hide()
         super().changeEvent(event)
 
+    def request_attention(self):
+        """Come forward because a second copy of yt-msd was started.
+
+        The second copy exits itself (see ask_running_instance_to_show); this is
+        the answer it asked for, and it is the only thing that happens.
+        """
+        try:
+            if not self.isVisible():
+                self.show()
+            if self.isMinimized():
+                self.showNormal()
+            self.raise_()
+            self.activateWindow()
+            self._on_status_update("yt-msd is already running - this is that window.",
+                                   False, "white")
+        except Exception:
+            pass
+
     def closeEvent(self, event):
         """Save settings, stop the background work, and end the Qt event loop.
 
@@ -7506,13 +7530,18 @@ class MainApp(QMainWindow):
         # reaches for a signal on an object Qt has already deleted. The hard
         # exit used to cut those threads off before they could say so; now the
         # interpreter outlives them long enough to print a traceback for each.
-        # Only that one race is quieted - anything else still reports itself.
+        # That one race is quieted below; nothing else is.
         previous_thread_excepthook = threading.excepthook
 
         def _thread_excepthook(args):
-            text = str(args.exc_value)
-            if 'has been deleted' in text or 'already deleted' in text:
-                return
+            # Only the one race Qt can lose here, and only as a RuntimeError:
+            # shiboken's "Internal C++ object ... already deleted" and Qt's own
+            # "Signal source has been deleted". Anything else a thread raises
+            # still reports itself, as it did before.
+            if args.exc_type is RuntimeError:
+                text = str(args.exc_value)
+                if 'has been deleted' in text or 'already deleted' in text:
+                    return
             try:
                 previous_thread_excepthook(args)
             except Exception:
@@ -7561,10 +7590,10 @@ class MainApp(QMainWindow):
                 except Exception:
                     pass
 
-        # The folder watchers are stopped off the UI thread. stop_all() reaches
-        # watchdog's Observer.stop() with no timeout, which blocks until the
-        # emitter thread finishes - the reason refresh_sync_watchers() already
-        # runs it in a background thread. Measured here: 30+ seconds.
+        # The folder watchers are stopped off the UI thread. Each observer is
+        # bounded - remove_chain() joins it with a 0.3 s timeout - but a chain
+        # whose handler is mid-callback still holds the stop up, and this window
+        # should not wait for that. Measured here: 30+ seconds.
         try:
             if getattr(self, 'host_watcher', None) is not None:
                 threading.Thread(target=self.host_watcher.stop_all, daemon=True).start()
@@ -10488,6 +10517,77 @@ class MainApp(QMainWindow):
                 self.thumbnails_loaded_signal.emit(vid_id, qpixmap)
         except: pass
 
+# ============================================================
+# ONE COPY AT A TIME
+# ============================================================
+# yt-msd keeps its settings in a gui_config.json beside its own exe and watches
+# the folders it is pointed at. Two copies of it means two processes writing the
+# same settings file - whichever closes last wins - and two sets of folder
+# watchers, LAN services and VLC instances on the same folders.
+#
+# So the first copy to start keeps a local server under this name. A second copy
+# finds it, asks it to come forward, and stops there; it never builds a MainApp,
+# so it never opens a second set of anything. A named local server is used rather
+# than a lock file because the running copy is the one that has to react, and it
+# is the only one that can bring its own window back.
+
+SINGLE_INSTANCE_NAME = "yt-msd-gui-single-instance"
+
+
+def ask_running_instance_to_show():
+    """True if another copy owns the name, having just been asked to come forward.
+
+    Nothing is created when this succeeds, which is the point: the second copy
+    has done all it needs to and the caller can exit.
+    """
+    client = QLocalSocket()
+    try:
+        client.connectToServer(SINGLE_INSTANCE_NAME)
+        if not client.waitForConnected(300):
+            return False
+        client.write(b"show")
+        client.flush()
+        client.waitForBytesWritten(300)
+        client.disconnectFromServer()
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            client.abort()
+        except Exception:
+            pass
+
+
+def take_single_instance_name():
+    """Claim the name for this copy, or None if it cannot be claimed.
+
+    A name left behind by a copy that was killed rather than closed is dropped
+    first, so a crash does not lock the program out of starting again.
+    """
+    try:
+        QLocalServer.removeServer(SINGLE_INSTANCE_NAME)
+        server = QLocalServer()
+        if not server.listen(SINGLE_INSTANCE_NAME):
+            return None
+        return server
+    except Exception:
+        return None
+
+
+def accept_instance_request(server, window):
+    """Read the second copy's request, close its end of it, and answer it."""
+    client = server.nextPendingConnection()
+    if client is None:
+        return
+    try:
+        client.waitForReadyRead(200)
+        client.deleteLater()
+    except Exception:
+        pass
+    window.request_attention()
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and ("--renamer" in sys.argv or "-r" in sys.argv):
         sys.argv = [a for a in sys.argv if a not in ("--renamer", "-r")]
@@ -10500,8 +10600,18 @@ if __name__ == "__main__":
         _window_icon = app_icon()
         if _window_icon is not None:
             app.setWindowIcon(_window_icon)
+        # One copy at a time. A second copy asks the first to come forward and
+        # exits before it can open a second set of watchers, LAN services or
+        # settings file. If the name cannot be claimed at all the copy carries on
+        # - a machine where this fails is not a reason to not open the program.
+        if ask_running_instance_to_show():
+            sys.exit(0)
+        instance_server = take_single_instance_name()
         window = MainApp()
         window.show()
+        if instance_server is not None:
+            instance_server.newConnection.connect(
+                lambda: accept_instance_request(instance_server, window))
         ret = app.exec()
         # closeEvent() has already saved the settings and stopped the background
         # work; this only covers an exit that did not come through it. Then the
