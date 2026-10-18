@@ -159,6 +159,6 @@ You put too many threads for downloading. Again, if your computer is using your 
 ### Downloads get really slow, or fail
 You are either getting rate limited by Youtube, or yt-dlp or ffmpeg isn't installed correctly.
 1. Change your download threads to 1, and see if the problem persists. If it doesn't, then you were using too many simultaneous threads and Youtube throttled your IP.
-2. If that doesn't work, see [Downloading Fails](#downloading-fails-(repeatedly-attempts-to-download))
+2. If that doesn't work, see [Downloading Fails](#downloading-fails-repeatedly-attempts-to-download)
 
 # Technical Information for Nerds
