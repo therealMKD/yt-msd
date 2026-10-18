@@ -69,8 +69,6 @@ Because of this, I would recommend against manually installing yt-dlp, and let t
 
 ## Musicbee Plugin
 Reference the [Plugin's Readme](https://github.com/therealMKD/yt-msd/tree/main/MusicBee%20Plugin#readme) 
- 
-
 
 # Youtube Search and Download Features
 
@@ -83,5 +81,40 @@ Reference the [Plugin's Readme](https://github.com/therealMKD/yt-msd/tree/main/M
 # Settings and Config
 
 # Troubleshooting
+[Python Version Specific Troubleshooting](#python-version-specific-troubleshooting)\
+[General Troubleshooting (Both python and exe versions)](#general-troubleshooting)
+
+## Python Version Specific Troubleshooting
+If the program won't start, pretty much the ONLY thing that could be wrong is a missing dependency. Follow this checklist:
+
+1. Make sure Python is installed. Open terminal, and run `py --version`. You should get an output like `Python 3.15.0`. If your Python version is LOWER than 3.14.8, you need to (update it)[#to-install-python].
+2. Make sure all required dependencies exist. Open terminal, and run `py -m pip list`. You will get an output listing all installed packages. That list should look like this, with equivalent, or higher version numbers:
+```
+Package            Version
+------------------ ----------
+ffmpeg             1.4
+mutagen            1.48.1
+pillow             13.0.0
+pip                26.2.1
+PySide6            6.12.0
+PySide6_Addons     6.12.0
+PySide6_Essentials 6.12.0
+PySide6_Pdf        6.12.0.140
+PySide6_WebEngine  6.12.0.140
+python-vlc         3.0.21203
+watchdog           6.0.0
+```
+If anything is missing, run `py -m pip install [missing dependency]`
+
+3. Make sure VLC and Ffmpeg are installed normally. Open terminal, and run `winget list ffmpeg`. You should see a result. Next, run `winget list vlc`. Again, you should see a result. If you see `No installed package found matching input criteria`, then you must install that package with `winget install`.
+4. If it STILL won't start, go to the directory where `yt-msd-gui.pyw` is located, and right click on blank space.\
+   Select "Open In Terminal", and run `py yt-msd-gui.pyw`. If you renamed the file, substitute the filename for your new one. When you run this command, look at the error that occurs.\
+   If the error is `No such file or directory`, you typed the name wrong. Double check it, or enclose it in quotes.\
+   If the error is `py is not a recognized as an internal or external command`, you don't have python [installed correctly](#to-install-python).\
+   If the error contains `ModuleNotFoundError` or `ImportError`, you have a missing dependency, and you didn't follow the previous steps. Start over.\
+   If the error does not match any of these cases, re-download the pyw file, and try again.\
+   If the errors persist, create an issue report here, and attach the exact error you get when trying to run the program.
+
+## General Troubleshooting
 
 # Technical Information for Nerds
