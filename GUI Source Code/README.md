@@ -85,7 +85,8 @@ Reference the [Plugin's Readme](https://github.com/therealMKD/yt-msd/tree/main/M
 [General Troubleshooting (Both python and exe versions)](#general-troubleshooting)
 
 > [!WARNING]
-Before doing ANY of these troubleshooting steps, check for a newer yt-msd version! If the problem is related to yt-msd itself, chances are that I've found and fixed it already!
+Before doing ANY of these troubleshooting steps, check for a newer yt-msd version! If the problem is related to yt-msd itself, chances are that I've found and fixed it already! Also, CLOSE yt-msd and reopen it! If you've had it running for a long time, it could start acting weird.
+
 
 ## Python Version Specific Troubleshooting
 If the program won't start, pretty much the ONLY thing that could be wrong is a missing dependency. Follow this checklist:
@@ -161,4 +162,11 @@ You are either getting rate limited by Youtube, or yt-dlp or ffmpeg isn't instal
 1. Change your download threads to 1, and see if the problem persists. If it doesn't, then you were using too many simultaneous threads and Youtube throttled your IP.
 2. If that doesn't work, see [Downloading Fails](#downloading-fails-repeatedly-attempts-to-download)
 
+### GUI Bugs
+Make sure your graphics drivers are updated. Restart yt-msd. If the issues persist, delete `gui-config.json` (WHILE YT-MSD IS CLOSED).
+
+### Youtube streams won't start immediately after startup
+This is an uncommon issue that sometimes happens if you try to play a youtube video while yt-msd is already fetching the stream during the startup sequence. I'm not able to reproduce it, it seems to happen randomly. Either wait a bit (30 seconds or so) while spam clicking the play button, or close yt-msd and restart it.\
+
 # Technical Information for Nerds
+
