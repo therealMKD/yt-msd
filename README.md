@@ -1,15 +1,15 @@
 # yt-msd
 # Easily download music from Youtube
 
-**DISCLAIMER:** This program is for educational purposes ONLY, and is not intended to be used for any form of piracy. This is intended to be a tool to allow you to have your music in an OFFLINE playlist, NOT as a way to distribute or sell music. I am NOT liable in any way for any illegal use of this program, and I DO NOT condone it. This program is for PERSONAL use ONLY. Don't do stupid stuff with it.
+> [!IMPORTANT]
+> **DISCLAIMER:** This program is for educational purposes ONLY, and is not intended to be used for any form of piracy. This is intended to be a tool to allow you to have your music in an OFFLINE playlist, NOT as a way to distribute or sell music. I am NOT liable in any way for any illegal use of this program, > and I DO NOT condone it. This program is for PERSONAL use ONLY. Don't do stupid stuff with it.
 
-***Another disclaimer:** This program was created with the help of AI, specifically Google Antigravity for earlier releases, and now Strata. If you have a problem with this, then don't use the program. I have done extensive bug testing on all release versions (beta versions could be buggy) to ensure that the program doesn't break or act wierdly, and works as it should. The reason I am using AI for this project is that my programming skills in Python are basic, but not advanced enough to build a program like this. This program is firstly intended to be a personal tool, the github release is simply because others might find it useful. Remember that.*
+
+> ***Another disclaimer:** This program was created with the help of AI, specifically Google Antigravity for earlier releases, and now Strata. If you have a problem with this, then don't use the program. I have done extensive bug testing on all release versions (beta versions could be buggy) to ensure that the  program doesn't break or act wierdly, and works as it should. The reason I am using AI for this project is that my programming skills in Python are basic, but not advanced enough to build a program like this. This program is firstly intended to be a personal tool, the github release is simply because others might find it useful. Remember that.*
 
 ## Why did I make this program?
 
-I don't want to deal with spotify's ads (Or pay for premium), and youtube playlists don't have working shuffle features, so I started downloading the mp3s of my playlist with yt-dlp. That was still annoying to do from the command line, so I created this. This program WILL function as a bare bones music player, but I would highly recommend using a dedicated program (I use MusicBee) that has more options. However, if you just want to have your music in a folder and listen to it, this will do it for you. 
-
-As development has continued, this program has shifted from just a downloader to a full music library manager, with eventual local network syncing. My end goal is to integrate this program with Musicbee, as a plugin, which will allow updating your library and playing your library with one program. (Yes, you can play your library with yt-msd standalone, but you can't do all the fancy stuff musicbee lets you do.) If your preferred method of music is to add songs to a youtube playlist, and then download them, this is the exact program you are looking for.
+I don't want to deal with spotify's ads (Or pay for premium), and youtube playlists don't have working shuffle features, so I started downloading the mp3s of my playlist with yt-dlp. That was still annoying to do from the command line, so I created this. This program WILL function as a bare bones music player, but I would highly recommend using a dedicated program (I use MusicBee) that has more options. (Note, there is a plugin for MusicBee that directly integrates yt-msd into it.) However, if you just want to have your music in a folder and listen to it, this will do it for you. 
 
 ### Table of Contents:
 
