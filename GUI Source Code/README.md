@@ -166,7 +166,7 @@ You are either getting rate limited by Youtube, or yt-dlp or ffmpeg isn't instal
 Make sure your graphics drivers are updated. Restart yt-msd. If the issues persist, delete `gui-config.json` (WHILE YT-MSD IS CLOSED).
 
 ### Youtube streams won't start immediately after startup
-This is an uncommon issue that sometimes happens if you try to play a youtube video while yt-msd is already fetching the stream during the startup sequence. I'm not able to reproduce it, it seems to happen randomly. Either wait a bit (30 seconds or so) while spam clicking the play button, or close yt-msd and restart it.\
+This is an uncommon issue that sometimes happens if you try to play a youtube video while yt-msd is already fetching the stream during the startup sequence. I'm not able to reproduce it, it seems to happen randomly. Either wait a bit (30 seconds or so) while spam clicking the play button, or close yt-msd and restart it.
 
 # Technical Information for Nerds
 
