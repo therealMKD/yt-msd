@@ -19,18 +19,70 @@ I don't want to deal with spotify's ads (Or pay for premium), and youtube playli
 
 # GUI Version Readme
 
-3.0 is out, I'll get a fully updated readme soon. The release has all the details required for installation, but it will take a while for me to write up all the usage information, since I refuse to use AI for my readmes (only the programming). Thank you for your patience!
+The GUI version is the main, and most advanced version of the program. It has two variants: the setup version (exe) and the python version (pyw). Both are IDENTICAL programs, the only difference is the way they are stored. For almost all cases, you will want to use the exe version, since the python version requires python and several other dependencies to be installed, while the setup version runs just like a normal windows program.
 
-### Support for other operating systems
+The exe version is also significantly faster to launch over the python version, because it does not have to deal with Python to start up the dependencies. To see the full readme for both gui versions, go to the [GUI Readme](https://github.com/therealMKD/yt-msd/tree/main/GUI%20Source%20Code#readme). If you just want to install the program, here's how to do it:
+
+## Exe version (Setup)
+
+Go to [the latest release](https://github.com/therealMKD/yt-msd/releases/latest) and download the file named `yt-msd-setup.exe`. Once it has finished downloading, double click to run it. If windows gives a warning, you can safely ignore it. For extra peace of mind, the release will have a virustotal scan of the setup file. You can verify that the file is unchanged by comparing the hashes.
+
+Progress through the installer, making whatever choices you prefer. **I would recommend against changing the install location, unless you absolutely have to.** If you do change it, the Musicbee plugin will require a manually-configured config file in order to work properly. If you don't use the Musicbee plugin, and don't plan on using it in the future, disregard this warning. **By default, the program is installed to `C:\Users\[your username]\%AppData%\Local\Programs\yt-msd\`.**
+
+Once the program is installed, you will be able to find it in the start menu, or through windows search, using `yt-msd` as the search term. Simply launch it like you would any other program. For first launch information, read the [First Startup Guide](#first-startup-guide).
+
+## Python version (pyw)
+
+Go to [the latest release](https://github.com/therealMKD/yt-msd/releases/latest), and download the file named `yt-msd-gui.pyw`. Before you can run it, you must install the following things on your computer:
+
+- **FIRST**, install python. You can get it [here](https://www.python.org/downloads/) or through winget by using `winget install python`. The program was made with version 3.14, but it will work on 3.15. I would recommend downloading 3.15.
+**If you use winget to install:**
+First, run `winget install python`. This will download and install the python install manager. Next, run `py install --configure`, and say yes to the prompt. Then restart your terminal before continuing. This creates a python scripts directory, and adds it to path. This lets you use `pip` as a command, without having to use `py -m pip` instead.
+
+- **NEXT** you must install ALL the following dependencies, with their respective commands:
+  - **ffmpeg** through `pip install ffmpeg` AND `winget install ffmpeg` - Both must be present
+  - **vlc** through `pip install python-vlc` AND `winget install vlc` - Both must be present (If you already have the vlc application, you do not need to install it with winget)
+  - **pillow** through `pip install pillow`
+  - **pyside6** through `pip install pyside6`
+  - **mutagen** through `pip install mutagen`
+  - **watchdog** through `pip install watchdog`
+
+If you get an error saying `pip is not a recognized command`, you can either fix it by troubleshooting your path, or just add `py -m` before the command. (For example `py -m pip install pillow`)
+
+After everything is installed, read the [First Startup Guide](#first-startup-guide) to set up the program for the first time.
+
+### Troubleshooting
+
+If the file won't start, you're probably missing a dependency. The easist way to figure this out is to navigate to the program's directory, right click on empty space, and select "Open in Terminal". Then run `py yt-msd-gui.pyw` or whatever your file is named. Read the error that occurs. If the error says `py is not a recognized command`, you don't have python installed. Uninstall, and reinstall python, using the installer from their website. 
+
+If the error is a traceback, google the error to figure out which dependency is missing. For example, if the error references `PIL.py`, then pillow isn't installed, and you need to install it via `pip install pillow`.
+
+For a few missing things, the program will launch, but error later. For these, you will get a dialogue from the program warning you. For example, if VLC doesn't exist, yt-msd will tell you to install it. If something isn't working, but the program still runs, it's a dependency problem. There is a full troubleshooting guide in the [GUI Readme](https://github.com/therealMKD/yt-msd/tree/main/GUI%20Source%20Code#readme).
+
+## First Startup Guide
+
+Regardless of whether you have the python or the exe version, the first startup of the program will trigger a few things:
+
+- First of all, you will get a windows dialogue asking if you want to allow yt-msd to access your network (create a firewall rule). This is necessary for sync to work. If you refuse the dialogue, it will reappear every time you reopen the program. Yes, it's annoying, but it's a failsafe in case the rule gets removed. If you don't want it through your firewall, you'll have to continue clicking no every startup.
+
+- Second, once the program has loaded completely, a check will be run to see if your system has yt-dlp installed **through winget**. If it is not found, yt-msd will automatically use winget to download it from `github.com/yt-dlp/yt-dlp/releases/latest`. If it is found, yt-msd will check the version installed on your system against the latest release on github, and update it with winget if you have an older version. Because winget is used in this process, if you have yt-dlp installed anywhere else, like through chocolatey, or pip, it will not be found, and the winget version will be used anyway.
+
+Once that process has completed, the program is ready. I would also recommend going to settings, and turning "Restore Last Session on Startup" on, so that your opened folders and searches persist between startups. I would also recommend enabling "Minimize to Taskbar" as well.
+
+**ALL versions will create a file named `gui-config.json` in the same directory. Unlike the CLI version, this file is NOT meant to be manually changed. If you delete it, all your settings will be reset, and it will be recreated next time you run the program.**
+
+Again, a complete guide on how to do EVERYTHING can be found [here](https://github.com/therealMKD/yt-msd/tree/main/GUI%20Source%20Code#readme).
+
+## Support for other operating systems (GUI version):
 I had previously planned for at least Linux support, but as the program has gotten further on in development, there are a lot of features that just won't work on Linux, and would require separate handling. I don't want to bloat up the main program, and having a dedicated Linux version isn't something I have time to support. Therefore, support for other operating systems does not exist, and if you run yt-msd on other operating systems, a great deal of features most likely will not work, due to dependency on windows. If you want to use yt-msd on other platforms, use the pyw version, but don't expect sync to work at all, and expect bugs.
 
 # CLI Version Readme
 
 There are 3 versions of the CLI: The python version, which requires python to be installed, as well as yt-dlp `pip install yt-dlp` and ffmpeg `pip install ffpmeg` AND `winget install ffmpeg`, the pex version, which only requires python and ffmpeg `winget install ffmpeg`, as well as the exe version. This will run as a standalone program, and everything you need will be bundled with it. This can also be added to the system's PATH, so that you can run yt-msd from anywhere by just initializing it with `yt-msd` in the terminal. All versions will generate a config.json file in their root directory. 
 
-**NOTE: As of 6/24/2026, the CLI version is depreciated. I will no longer be updating it to newer yt-dlp versions, or rebuilding the exe for updates. It is as-is now. I've made this decision because it is essentially a wrapper for yt-dlp, and there are plenty of other simple wrappers if you want an updated version. The GUI version is the unique one, and the one that I will continue updating and supporting. The last version of the CLI version can be found [here](https://github.com/therealMKD/yt-msd/releases/tag/CLI-1.2%2FGUI-1.0)**
+**NOTE: As of 6/24/2026, the CLI version is depreciated. I will no longer be updating it to newer yt-dlp versions, or rebuilding the exe for updates. It is as-is now. I've made this decision because it is essentially a wrapper for yt-dlp, and there are plenty of other simple wrappers if you want an updated version. The GUI version is the unique one, and the one that I will continue updating and supporting. The last version of the CLI version can be found [here](https://github.com/therealMKD/yt-msd/releases/tag/CLI-1.2%2FGUI-1.0)**.
 
-**If your system says that the exe is unsafe, ignore it! It is a false positive-you can safely click "run anyway"**
+**If your system says that the exe is unsafe, ignore it! It is a false positive- you can safely click "run anyway"**
 
 [VirusTotal Scan](https://www.virustotal.com/gui/file/d5e6979b279b04e55a5f4472091e91d6007f5aae9000561ea98b93b59e59e152)
 
@@ -62,7 +114,7 @@ There are 3 versions of the CLI: The python version, which requires python to be
 **Special Note for the EXE CLI version**:
 When you add the exe to PATH, it will work from anywhere AS LONG as it isn't moved. If you move the exe's location, you will have to run it manually by finding it and doubleclicking on it, and accepting the add to path prompt again. You can also just manually edit the PATH in windows settings. Note that running it and adding it to path twice will leave the old PATH variable there, so if you move it a bunch and re-add it, you will have a bunch of garbage PATH entries. If you don't want to add it to PATH, and you also don't want to tell it no every time you launch it, use the pex version instead.
 
-## Support for other operating systems:
+## Support for other operating systems (CLI Version):
 **MacOS**: Exe files don't run on MacOS, so you will have to use the pex version or the python version. I don't have a mac, so you'll need to figure out how to [install python yourself](https://letmegooglethat.com/?q=How+to+install+python+on+mac+os). If you are using the python version, you will also need to install pip and the required dependencies with `pip install yt-dlp` and `pip install ffmpeg`
 
 **Linux**: Linux also doesn't support exe files, so you must use the python or pex version. To install python on linux: Use `sudo apt install python3-pip` on debian-based linux, or `sudo dnf install python3-pip -y` on fedora. If you use Arch btw, figure it out.
