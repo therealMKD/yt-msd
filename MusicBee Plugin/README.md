@@ -4,7 +4,7 @@ The plugin itself doesn't actually do anything besides open yt-msd, and create a
 
 ## Install
 
-Download `mb_YtMsd.dll` from releases, then put it into `%APPDATA%\MusicBee\Plugins` OR go into the musicbee plugins menu (Preferences > Plugins > Add Plugin) and select the dll file. Either way, a copy of the dll will get placed in the plugins folder. Once the plugin is there, you will have to enable it (You might have to restart musicbee for it to show up) and then restart musicbee for the yt-msd option to show up in the tools menu.
+Download `mb_YtMsd.dll` from [releases](https://github.com/therealMKD/yt-msd/releases/latest), then put it into `%APPDATA%\MusicBee\Plugins` OR go into the musicbee plugins menu (Preferences > Plugins > Add Plugin) and select the dll file. Either way, a copy of the dll will get placed in the plugins folder. Once the plugin is there, you will have to enable it (You might have to restart musicbee for it to show up) and then restart musicbee for the yt-msd option to show up in the tools menu.
 
 With no `mb_YtMsd.ini` file, the program looks for yt-msd in the default installation directory: `C:\Users\[your username]\%AppData%\Local\yt-msd\`. It looks for a file named `yt-msd-gui.exe` and runs it. If your yt-msd location is different, you will have to download the ini file, and place that in the SAME directory as your plugin (Your MusicBee plugins folder). You will also have to edit it to point to the correct file, according to the [settings](#use).
 
