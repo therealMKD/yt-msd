@@ -73,6 +73,9 @@ Once that process has completed, the program is ready. I would also recommend go
 
 Again, a complete guide on how to do EVERYTHING can be found [here](https://github.com/therealMKD/yt-msd/tree/main/GUI%20Source%20Code#readme).
 
+## Musicbee plugin
+Installation instructions for the Musicbee plugin are in the [Plugin Readme](https://github.com/therealMKD/yt-msd/tree/main/MusicBee%20Plugin#readme)
+
 ## Support for other operating systems (GUI version):
 I had previously planned for at least Linux support, but as the program has gotten further on in development, there are a lot of features that just won't work on Linux, and would require separate handling. I don't want to bloat up the main program, and having a dedicated Linux version isn't something I have time to support. Therefore, support for other operating systems does not exist, and if you run yt-msd on other operating systems, a great deal of features most likely will not work, due to dependency on windows. If you want to use yt-msd on other platforms, use the pyw version, but don't expect sync to work at all, and expect bugs.
 
