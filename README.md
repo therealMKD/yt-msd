@@ -19,18 +19,7 @@ As development has continued, this program has shifted from just a downloader to
 
 # GUI Version Readme
 
-The GUI version is currently "complete" at v1.0, (and "improved" at v2.5) but further feature updates are still coming, and I'm not going to complete this until they are finished.
-
-**Upcoming features in GUI v3.0** (Features with an exclamation point (!) are currently added in beta releases)
-- Built-in support for renaming and metadata tagging downloaded files (!)
-- Improved local file navigation (!)
-- Import/Export logic for settings, music files, etc. (!)
-- Master playlist syncing for all devices on a local network (!)
-- Automatic update checking (!)
-- An icon that isn't a single-color circle (!)
-- Various QOL changes and bug fixes
-- MusicBee Plugin version (!)
-- Possibly winget or chocolatey package - We'll see, but it would be nice to be able to run a single winget command for everything. This will only happen once the program is for sure done.
+3.0 is out, I'll get a fully updated readme soon. The release has all the details required for installation, but it will take a while for me to write up all the usage information, since I refuse to use AI for my readmes (only the programming). Thank you for your patience!
 
 ### Support for other operating systems
 I had previously planned for at least Linux support, but as the program has gotten further on in development, there are a lot of features that just won't work on Linux, and would require separate handling. I don't want to bloat up the main program, and having a dedicated Linux version isn't something I have time to support. Therefore, support for other operating systems does not exist, and if you run yt-msd on other operating systems, a great deal of features most likely will not work, due to dependency on windows. If you want to use yt-msd on other platforms, use the pyw version, but don't expect sync to work at all, and expect bugs.
