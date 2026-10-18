@@ -27,7 +27,8 @@ The exe version is also significantly faster to launch over the python version, 
 
 Go to [the latest release](https://github.com/therealMKD/yt-msd/releases/latest) and download the file named `yt-msd-setup.exe`. Once it has finished downloading, double click to run it. If windows gives a warning, you can safely ignore it. For extra peace of mind, the release will have a virustotal scan of the setup file. You can verify that the file is unchanged by comparing the hashes.
 
-Progress through the installer, making whatever choices you prefer. **I would recommend against changing the install location, unless you absolutely have to.** If you do change it, the Musicbee plugin will require a manually-configured config file in order to work properly. If you don't use the Musicbee plugin, and don't plan on using it in the future, disregard this warning. **By default, the program is installed to `C:\Users\[your username]\%AppData%\Local\Programs\yt-msd\`.**
+Progress through the installer, making whatever choices you prefer. **I would recommend against changing the install location, unless you absolutely have to.** If you do change it, the Musicbee plugin will require a manually-configured config file in order to work properly. If you don't use the Musicbee plugin, and don't plan on using it in the future, disregard this warning.\
+**By default, the program is installed to `C:\Users\[your username]\%AppData%\Local\Programs\yt-msd\`.**
 
 Once the program is installed, you will be able to find it in the start menu, or through windows search, using `yt-msd` as the search term. Simply launch it like you would any other program. For first launch information, read the [First Startup Guide](#first-startup-guide).
 
