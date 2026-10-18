@@ -84,6 +84,9 @@ Reference the [Plugin's Readme](https://github.com/therealMKD/yt-msd/tree/main/M
 [Python Version Specific Troubleshooting](#python-version-specific-troubleshooting)\
 [General Troubleshooting (Both python and exe versions)](#general-troubleshooting)
 
+> [!WARNING]
+Before doing ANY of these troubleshooting steps, check for a newer yt-msd version! If the problem is related to yt-msd itself, chances are that I've found and fixed it already!
+
 ## Python Version Specific Troubleshooting
 If the program won't start, pretty much the ONLY thing that could be wrong is a missing dependency. Follow this checklist:
 
@@ -116,5 +119,46 @@ If anything is missing, run `py -m pip install [missing dependency]`
    If the errors persist, create an issue report here, and attach the exact error you get when trying to run the program.
 
 ## General Troubleshooting
+If the instructions listed don't fix the issue, create an issue report in this repository. **Please note that the only supported operating system is Windows 11. Linux, MacOS, and older Windows versions are NOT tested!**
+
+### Program won't start
+1. If it is the python version, refer to [python troubleshooting](#python-version-specific-troubleshooting).
+2. Uninstall and reinstall, getting the latest version from [releases](https://github.com/therealMKD/yt-msd/releases/latest).
+
+### Downloading fails (Repeatedly attempts to download)
+Either ffmpeg, or yt-dlp is not installed. 
+1. Verify that both yt-dlp and ffmpeg are installed. Open terminal, and run `winget list ffmpeg`, and `winget list yt-dlp`. Both commands should give results. If the result is `No installed package found matching input criteria`, then install the package with `winget install yt-dlp`, or `winget install ffmpeg`.\
+   Note that yt-msd is designed to update yt-dlp automatically. Google commonly updates youtube, and then breaks yt-dlp.
+2. If yt-dlp and ffmpeg BOTH exist, but downloads still don't work, Google probably broke yt-dlp again, and a new release hasn't been pushed yet. Your only option is to wait, since yt-msd is hard coded to look for `yt-dlp.yt-dlp`, so if you use `yt-dlp.yt-dlp.nightly` instead, yt-msd will ignore it. You can expect an update to happen within 24 hours or so. Additionally, make sure ffmpeg is updated, by running `winget upgrade ffmpeg`.
+
+### Youtube Search or playback fails
+Yt-dlp is outdated.
+1. Because yt-msd automatically updates yt-dlp, first go into settings, and click "Update with Winget" (In the lower right corner). If no updates are found,
+2. Wait for yt-dlp to update. Google periodically updates youtube and breaks yt-dlp, and it's usually 24 hours before a new release is pushed. Don't bother trying to use the nightly version, because yt-msd will only use `yt-dlp.yt-dlp` for stability reasons, and will completely ignore `yt-dlp.yt-dlp.nightly`.
+
+### Program freezes, or crashes (After successfully starting)
+1. If it's the python version, refer to [python troubleshooting](#python-version-specific-troubleshooting). 99% of problems on the python version are due to missing dependencies. Since the issue occurs after start, my recommendation is to follow step 4, opening the program in terminal. Do whatever it takes to crash or freeze the program, and look at the error that is generated.
+2. If it's the exe version, there is no console to show the errors. Uninstall, redownload, and reinstall. Make sure yt-dlp is updated (Follow instructions in [Youtube Search or playback fails](#youtube-search-or-playback-fails).
+
+### Renamer errors
+If you rename a file, and get a syntax error or similar (Not a `a file named [name] already exists` error), the original video title, or your new title, has an illegal character. Reminder: `?*<>":/\|` are illegal characters for filenames in windows. If the video title has an illegal character, yt-dlp changes it into a different UTF encoding, that looks the same, but doesn't cause a windows error.
+
+For example, the normal question mark, `U+003F` is illegal, but the fullwidth question mark, `U+FF1F` is not. If a youtube video has `U+003F` in the title, yt-dlp will replace it with `U+FF1F`. This can sometimes cause errors in the renamer. Most of the time, manually overriding the whole name will fix it, but in some rare cases, you will have to manually edit the file in file explorer.
+
+### Normalization Errors
+It's somewhat common to have errors while normalizing, I think it has something to do with filenames. You can ignore them, because the normalization still completes like it should. (Errors are only important if the end screen shows errors)
+
+If the end screen reports an error, it's probably the file itself. Try a different video, redownload the file, or use a different format. Note that over the past 6 months, I have run almost ten thousand files through the normalizer, and I have never seen a single error, so if you find one, make an issue report, because I have no idea how to troubleshoot an error I've never actually had.
+
+### Normalizing freezes the entire computer
+You put too many threads for normalization in settings. If the renamer is using your entire CPU, the rest of your computer can't use it, and your pc freezes. Always use 2 less threads than you have. (For example, my 13900K has 32 threads, I wouldn't want to use more than 30.)
+
+### Downloading freezes the entire computer
+You put too many threads for downloading. Again, if your computer is using your entire CPU to download, it can't use the CPU for other stuff, and your PC freezes.
+
+### Downloads get really slow, or fail
+You are either getting rate limited by Youtube, or yt-dlp or ffmpeg isn't installed correctly.
+1. Change your download threads to 1, and see if the problem persists. If it doesn't, then you were using too many simultaneous threads and Youtube throttled your IP.
+2. If that doesn't work, see [Downloading Fails](#downloading-fails-(repeatedly-attempts-to-download))
 
 # Technical Information for Nerds
