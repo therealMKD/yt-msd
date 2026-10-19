@@ -11,8 +11,7 @@ This is the main table of contents, these main sections also have their own tabl
 [Local File Features](#local-file-features)\
 [Yt-msd Sync Chains](#yt-msd-sync-chains)\
 [Settings and Config](#settings-and-config)\
-[Troubleshooting](#troubleshooting)\
-[Technical Information](#technical-information-for-nerds)
+[Troubleshooting](#troubleshooting)
 
 # Installation
 
@@ -73,6 +72,91 @@ Reference the [Plugin's Readme](https://github.com/therealMKD/yt-msd/tree/main/M
 # Youtube Search and Download Features
 
 # MP3 Renamer
+Once you've downloaded your music files, you probably don't want their filenames to stay the same as the video names. I recommend you use lyric videos for your music, for two reaons:\
+First, lyric videos will ONLY have music and no other sounds (A lot of music videos have extra sound), and second, they are more likely to be named correctly.
+
+What is correctly? Well, it's a file named "Artist - Title.mp3". Artist goes first, because then the files are grouped correctly regardless of whether you use metadata or not. However, it's not always possible to find a youtube video of a song that has the correct title, and often there will be extra stuff tacked on, like (Lyrics), or (Official Audio). Additionally, any music player worth it's salt will support reading ID3 tags, instead of falling back to a title. Having a tagged file is greatly preferred, but manually adding tags is even more tedious than manually renaming songs. 
+
+Therefore, instead of making you use a separate program to correctly name and tag files, I built an integrated renamer to quickly rename files to Artist - Title, and automatically tag them, as well as normalize them (make them all the same volume), and trim silence off.
+
+## Basic Use
+
+To use it, simply check the box underneath the format dropdown:
+
+<img width="205" height="24" alt="image" src="https://github.com/user-attachments/assets/b0ca816b-462b-4e11-a9bc-9bab1f22952f" />
+
+When the box is checked, the renamer window will appear once the entire download queue has been finished. 
+
+<img width="972" height="505" alt="image" src="https://github.com/user-attachments/assets/20e63b6b-a816-4fbc-ad24-d25f40019b78" />
+
+The renamer will open in the selected music download directory, which, as you can see, is shown in the renamer window. You can also see the amount of threads used for renaming (This can be changed in settings), and the amount of renamable files found.
+
+The program will automatically skip files that already have ID3 tags, so it is not necessary to put new files into a separate folder before renaming and normalizing them, since already processed files will be skipped.
+
+Ideally, you never have to manually rename any of the files. However, the success rate of the renaming algorithms is determined by the videos that you choose. Like I said earlier, if you choose lyric videos, renaming will be a much faster process. The algorithm attempts to recreate "Artist - Title" using the filename, as close as possible. Once it has the Artist - Title, it uses that to correctly fill the respective ID3 tags on the file. 
+
+There are two possible states that a file can be in, and two possible sets of options.
+
+First is the "No Artist" state. If the program cannot find a "-" or equivalent separator, it assumes that the artist is not in the title, and only the title is present.
+
+<img width="912" height="152" alt="image" src="https://github.com/user-attachments/assets/23aa95f1-83e0-478a-90fe-97464874c94a" />
+
+In this state, the program asks you to input the artist's name. 
+You can also type `n` to enter the full name (Artist - Title) if the algorithm messed up the title, 
+`s` to skip (Skipped files will be repeated at the very end), 
+`prev` to go back, if you fat fingered the previous title, 
+or `AUTO` to turn on auto mode (More about this later).
+
+The second state is the "Complete Title" state. This is when the algorithm CAN find both an artist and a title, and asks you to confirm if it is correct.
+
+<img width="957" height="152" alt="image" src="https://github.com/user-attachments/assets/87ae148c-df2c-45cf-8ca0-0f74baf7f554" />
+
+As you can see, the algorithm successfully stripped all excess off the title, and gave a clean Artist - Title. To continue from here, you can just press enter to accept. Additionally, you can:\
+Input `f` to flip the artist and title (Linkin Park does this a lot, with their videos being named "In the End - Linkin Park", for example)
+`s` to skip (Again, skipped songs will be repeated at the end)
+`prev` to go back one song, if you fat fingered it
+and `AUTO` to turn on auto mode.
+
+Once you've reached the end of the files to be renamed, you will be given the option to redo skipped songs: 
+
+<img width="584" height="47" alt="image" src="https://github.com/user-attachments/assets/f53583d7-6181-4769-baf4-0e582d54c845" />
+
+If a song errors, and renaming fails for some reason, that song will be considered skipped, and will also show up here. If you don't want to redo the skipped files, you can just enter `n` to this prompt.
+
+Once you've completed all the songs, and redone (or skipped) any skipped songs, you will be asked if you want to run normalization and silence trimming. Normalization changes the volume of all tracks to be the same. It does NOT edit any actual sound, it just applies a decibel correction across the entire track. This IS a lossy change, but the actual song is unchanged, it just changes volume. Silence trimming removes silence from both sides of the song.
+
+If you do not want any of this, you can turn it off in settings:
+
+<img width="763" height="157" alt="image" src="https://github.com/user-attachments/assets/c53d1dec-e040-462d-9f03-03e0bb42b124" />
+
+By default it is on ask, which will give you a `y/n` prompt in the renamer window. If you turn it off, it will go straight to the end screen after finishing all the renaming.
+
+## Auto Mode
+This is a feature intended to save time if your playlist is mostly made out of correctly formatted videos. It can be enabled at any time by typing `AUTO` in the rename box, or through settings:
+
+<img width="638" height="50" alt="image" src="https://github.com/user-attachments/assets/02cfa46c-ba3f-4de2-8f41-cc97f0d0c4a4" />
+
+Auto mode will ALWAYS ACCEPT tracks that match the `Artist - Title` format. It will ALWAYS SKIP tracks that do NOT have that format. (It will skip state 1, and accept state 2). 
+
+Just like with normal skipping, you will be able to manually go through any skipped tracks at the very end. Because the algorithm doesn't always get predictions right, only use this mode if your playlist has very clean titles.
+
+## Normalization 
+
+The entire right column of the settings menu lets you change the normalization and silence trimming. Here's exactly what it all does:
+
+<img width="383" height="356" alt="image" src="https://github.com/user-attachments/assets/86e28f5b-2b32-49fc-8799-fff498639aaa" />
+
+The renaming process is a two step sequence. First, the equalization string is run.\
+By default, this string is `equalizer=f=100:width_type=o:width=2:g=0`. This is a neutral equalizer, that would equalize everything evenly, if `gain` wasn't set to 0. Instead, by default, this string does nothing to the file.
+
+The reason it is there is to allow the user to easily add an eq filter if they wish, but by default, no equalization is done to the file. This is an ffmpeg string, so you can replace this with whatever EQ filter you would like.
+
+Second, the `loudnorm` command is used, to set the LUFS of the file to -16, and limits peaks to -1.5 dBTP to avoid clipping. Again, you can edit this string as you please. To make the output files louder, change `I=-16` to a larger number.
+
+Finally, trimming is applied after the loudnorm. This trim command is not exposed, but you can add silence padding on both ends of the file in the settings menu.
+
+If you want or need it, the full default ffmpeg argument for normalization is as follows:
+``
 
 # Local File Features
 
@@ -167,6 +251,3 @@ Make sure your graphics drivers are updated. Restart yt-msd. If the issues persi
 
 ### Youtube streams won't start immediately after startup
 This is an uncommon issue that sometimes happens if you try to play a youtube video while yt-msd is already fetching the stream during the startup sequence. I'm not able to reproduce it, it seems to happen randomly. Either wait a bit (30 seconds or so) while spam clicking the play button, or close yt-msd and restart it.
-
-# Technical Information for Nerds
-
