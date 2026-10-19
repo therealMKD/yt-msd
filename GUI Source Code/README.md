@@ -127,14 +127,14 @@ Once you've completed all the songs, and redone (or skipped) any skipped songs, 
 
 If you do not want any of this, you can turn it off in settings:
 
-<img width="763" height="157" alt="image" src="https://github.com/user-attachments/assets/c53d1dec-e040-462d-9f03-03e0bb42b124" />
+<img width="381" height="78" alt="image" src="https://github.com/user-attachments/assets/c53d1dec-e040-462d-9f03-03e0bb42b124" />
 
 By default it is on ask, which will give you a `y/n` prompt in the renamer window. If you turn it off, it will go straight to the end screen after finishing all the renaming.
 
 ## Auto Mode
 This is a feature intended to save time if your playlist is mostly made out of correctly formatted videos. It can be enabled at any time by typing `AUTO` in the rename box, or through settings:
 
-<img width="638" height="50" alt="image" src="https://github.com/user-attachments/assets/02cfa46c-ba3f-4de2-8f41-cc97f0d0c4a4" />
+<img width="319" height="25" alt="image" src="https://github.com/user-attachments/assets/02cfa46c-ba3f-4de2-8f41-cc97f0d0c4a4" />
 
 Auto mode will ALWAYS ACCEPT tracks that match the `Artist - Title` format. It will ALWAYS SKIP tracks that do NOT have that format. (It will skip state 1, and accept state 2). 
 
@@ -146,17 +146,19 @@ The entire right column of the settings menu lets you change the normalization a
 
 <img width="383" height="356" alt="image" src="https://github.com/user-attachments/assets/86e28f5b-2b32-49fc-8799-fff498639aaa" />
 
-The renaming process is a two step sequence. First, the equalization string is run.\
-By default, this string is `equalizer=f=100:width_type=o:width=2:g=0`. This is a neutral equalizer, that would equalize everything evenly, if `gain` wasn't set to 0. Instead, by default, this string does nothing to the file.
+Both of the custom equalization strings let you customize the 
+By default, this string is `equalizer=f=100:width_type=o:width=2:g=0`. This is a neutral equalizer, that would equalize everything evenly, if `gain` wasn't set to 0. By default, it is NOT appended to the command, unless you check the box for a custom string.
 
-The reason it is there is to allow the user to easily add an eq filter if they wish, but by default, no equalization is done to the file. This is an ffmpeg string, so you can replace this with whatever EQ filter you would like.
 
-Second, the `loudnorm` command is used, to set the LUFS of the file to -16, and limits peaks to -1.5 dBTP to avoid clipping. Again, you can edit this string as you please. To make the output files louder, change `I=-16` to a larger number.
 
-Finally, trimming is applied after the loudnorm. This trim command is not exposed, but you can add silence padding on both ends of the file in the settings menu.
+**NOTE: If you replace the loudnorm command, the entire `af` group gets replaced, including any custom EQ command. To use both a custom loudnorm AND EQ command, append the EQ command onto the END of the custom loudnorm command**
 
 If you want or need it, the full default ffmpeg argument for normalization is as follows:
-``
+```
+ffmpeg -nostdin -y -i "INPUT.mp3" -af "silenceremove=start_periods=1:start_duration=0.5:start_threshold=-60dB:start_silence=0.5:stop_silence=0.5,areverse,silenceremove=start_periods=1:start_duration=0.5:start_threshold=-60dB:start_silence=0.5:stop_silence=0.5,areverse,volume=-3.20dB" -codec:a libmp3lame -b:a 320k -map_metadata 0 "OUTPUT.mp3"
+```
+
+The loudnorm command is compressed into a single `volume` tag, which is why the final command does not have an `I` or `TP` value.
 
 # Local File Features
 
