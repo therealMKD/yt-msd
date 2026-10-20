@@ -2,6 +2,9 @@
 
 This is the full readme for the GUI version, with information on every single feature inside of yt-msd. For the CLI readme, go back to the main readme, at the bottom.
 
+>[!WARNING]
+>I'm currently working on the 3.1 update, because in the process of fleshing out this readme, I've come into some features that need to be changed, and some garbage features that are either no longer needed or no longer used. Until that update comes out, this readme remains partially finished, and in progress. I will completely update it once I'm satisfied with the program again.
+
 ## Table of Contents
 This is the main table of contents, these main sections also have their own tables of contents for subsections.
 
@@ -142,14 +145,15 @@ Just like with normal skipping, you will be able to manually go through any skip
 
 ## Normalization 
 
+>[!WARNING]
+All of this behavior is a mix of non-functional and crappily implemented stuff, mostly because it was made before I switched to Strata. The 3.1 update will completely rework the custom command sequences.
+
 The entire right column of the settings menu lets you change the normalization and silence trimming. Here's exactly what it all does:
 
 <img width="383" height="356" alt="image" src="https://github.com/user-attachments/assets/86e28f5b-2b32-49fc-8799-fff498639aaa" />
 
 Both of the custom equalization strings let you customize the 
 By default, this string is `equalizer=f=100:width_type=o:width=2:g=0`. This is a neutral equalizer, that would equalize everything evenly, if `gain` wasn't set to 0. By default, it is NOT appended to the command, unless you check the box for a custom string.
-
-
 
 **NOTE: If you replace the loudnorm command, the entire `af` group gets replaced, including any custom EQ command. To use both a custom loudnorm AND EQ command, append the EQ command onto the END of the custom loudnorm command**
 
