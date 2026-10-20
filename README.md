@@ -1,11 +1,15 @@
 # yt-msd
 # Easily download music from Youtube
 
+![Static Badge](https://img.shields.io/badge/3.1%20update%20in%20progress-Readme%20updating%20is%20paused-orange?style=for-the-badge)
+
 > [!IMPORTANT]
 **DISCLAIMER:** This program is for educational purposes ONLY, and is not intended to be used for any form of piracy. This is intended to be a tool to allow you to have your music in an OFFLINE playlist, NOT as a way to distribute or sell music. I am NOT liable in any way for any illegal use of this program,  and I DO NOT condone it. This program is for PERSONAL use ONLY. Don't do stupid stuff with it.
 
-
-> ***Another disclaimer:** This program was created with the help of AI, specifically Google Antigravity for earlier releases, and now Strata. If you have a problem with this, then don't use the program. I have done extensive bug testing on all release versions (beta versions could be buggy) to ensure that the  program doesn't break or act wierdly, and works as it should. The reason I am using AI for this project is that my programming skills in Python are basic, but not advanced enough to build a program like this. This program is firstly intended to be a personal tool, the github release is simply because others might find it useful. Remember that.*
+> [!WARNING]
+> This program was created with the help of AI, specifically Qwen3.8-Flash-Next (Strata). If you have a problem with this, don't use the program. Release versions have been extensively bug tested, and this is NOT an "AI slop" program. This is first and foremost a personal program, and I do not have the time to learn Python just to download my playlist from Youtube.
+> 
+> If you want to contribute to this project, you're welcome to use an AI model, HOWEVER, you **MUST** say that in the pull request, along with a detailed explanation of your change, to prove to me you understand it.
 
 ## Why did I make this program?
 
