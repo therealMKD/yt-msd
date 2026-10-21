@@ -127,6 +127,63 @@ APP_VERSION = "3.0"
 # GitHub repository whose releases page is polled for newer versions.
 UPDATE_REPO = "therealMKD/yt-msd"
 
+# Which file of a release this copy of yt-msd downloads depends on how it is being
+# run: the packaged exe is updated with its setup program, a copy started from the
+# source is updated with the new source file written over the one being run.
+INSTALLER_ASSET = "yt-msd-setup.exe"   # what the packaged exe looks for on a release
+SOURCE_ASSET = "yt-msd-gui.pyw"        # what a copy started from the source looks for
+
+# How a downloaded update gets applied, reported to UpdateReadyDialog and used by
+# _launch_swap_helper:
+UPDATE_MODE_INSTALLER = "installer"  # run the downloaded setup program; this file is left alone
+UPDATE_MODE_REPLACE = "replace"      # the download was written over the file being run
+UPDATE_MODE_SWAP = "swap"            # keep both files, delete this one, launch the new one
+
+
+def is_packaged_build():
+    """True when yt-msd is running as the packaged exe, False when it is running the source file."""
+    return bool(getattr(sys, 'frozen', False))
+
+
+def _release_asset_file(asset):
+    """(file name, download url) of one GitHub release asset, or ("", "") if it is unusable."""
+    if not isinstance(asset, dict):
+        return "", ""
+    name = (asset.get("name") or "").strip()
+    url = (asset.get("browser_download_url") or "").strip()
+    return name, url
+
+
+def select_release_asset(assets, wanted_name):
+    """Choose which file of a release this build should download.
+
+    A release page lists its files in whatever order the uploads happened to land
+    in, so the first asset is not necessarily the one worth downloading. The wanted
+    file is looked up by name instead: an exact match wins, then (for the setup
+    program) any .exe named like a setup program, then any asset that simply shares
+    the wanted extension. Returns (file name, download url), or ("", "") when the
+    release carries nothing this kind of yt-msd can install.
+    """
+    wanted_name = (wanted_name or "").strip().lower()
+    wanted_ext = os.path.splitext(wanted_name)[1]
+    setup_like = None
+    same_ext = None
+    for asset in assets or []:
+        name, url = _release_asset_file(asset)
+        if not name or not url:
+            continue
+        lowered = name.lower()
+        if lowered == wanted_name:
+            return name, url
+        if not lowered.endswith(wanted_ext):
+            continue
+        if same_ext is None:
+            same_ext = (name, url)
+        if wanted_ext == ".exe" and "setup" in lowered and setup_like is None:
+            setup_like = (name, url)
+    return setup_like or same_ext or ("", "")
+
+
 # The packaged GUI has no console of its own, so the renamer is run by starting
 # a second copy of the same exe with --renamer (see run_mp3_renamer). The
 # launcher build_gui_exe.py puts inside the exe answers that flag by allocating a
@@ -5816,10 +5873,16 @@ class TrayProgressPopup(QWidget):
 
 class UpdateAvailableDialog(QDialog):
     """Notifies the user that a newer yt-msd release is available and offers to download it."""
-    def __init__(self, parent_window, latest_tag, release_name, current_version):
+    def __init__(self, parent_window, latest_tag, release_name, current_version, asset_name=""):
         super().__init__(parent_window)
         self.parent_window = parent_window
         self.never_notify = False
+        # Whether this copy is the installed program or a copy started from the
+        # source decides which file of the release is offered, and what downloading
+        # it does to this folder.
+        self.packaged = is_packaged_build()
+        self.wanted_asset = INSTALLER_ASSET if self.packaged else SOURCE_ASSET
+        self.asset_name = (asset_name or "").strip()
         self.setWindowTitle("Update Available - yt-msd")
         self.setFixedWidth(470)
         self.setWindowFlags(self.windowFlags() | Qt.Tool)
@@ -5850,6 +5913,23 @@ class UpdateAvailableDialog(QDialog):
         self.never_cb.setToolTip("Stop checking for updates entirely")
         layout.addWidget(self.never_cb)
 
+        if self.asset_name:
+            what_lbl = QLabel(
+                f"Download: {self.asset_name}\n"
+                + ("This copy of yt-msd is the installed program, so the setup program is downloaded "
+                   "and the whole yt-msd folder is replaced once it has run."
+                   if self.packaged else
+                   "This copy of yt-msd is running from its source file, so the new source file is "
+                   "downloaded over the file you are running.")
+            )
+        elif self.packaged:
+            what_lbl = QLabel(f"This release has no {INSTALLER_ASSET} setup program to download.")
+        else:
+            what_lbl = QLabel(f"This release has no {SOURCE_ASSET} source file to download.")
+        what_lbl.setWordWrap(True)
+        what_lbl.setStyleSheet("color: #888; font-size: 11px;")
+        layout.addWidget(what_lbl)
+
         layout.addStretch()
 
         btn_h = QHBoxLayout()
@@ -5861,7 +5941,10 @@ class UpdateAvailableDialog(QDialog):
         btn_h.addWidget(ignore_btn)
 
         dl_btn = QPushButton("Download update")
-        dl_btn.setToolTip("Download the new version into the folder yt-msd is running from")
+        if self.packaged:
+            dl_btn.setToolTip("Download the setup program into the folder yt-msd is running from")
+        else:
+            dl_btn.setToolTip(f"Download the new {SOURCE_ASSET} over the file yt-msd is running from")
         dl_btn.clicked.connect(self._on_download)
         btn_h.addWidget(dl_btn)
         layout.addLayout(btn_h)
@@ -5876,8 +5959,8 @@ class UpdateAvailableDialog(QDialog):
 
 
 class UpdateReadyDialog(QDialog):
-    """Shown after a successful download; asks whether to auto-swap to the new version."""
-    def __init__(self, parent_window, new_path, old_path, tag, replaces_folder=False):
+    """Shown after a successful download; asks whether to close this version and move to the new one."""
+    def __init__(self, parent_window, new_path, old_path, tag, mode=UPDATE_MODE_SWAP):
         super().__init__(parent_window)
         self.parent_window = parent_window
         self.setWindowTitle("Launch Update? - yt-msd")
@@ -5892,8 +5975,9 @@ class UpdateReadyDialog(QDialog):
         title_lbl.setFont(QFont("Segoe UI Semibold", 11))
         layout.addWidget(title_lbl)
 
-        if replaces_folder:
-            # The download is an installer, not another copy of this program: it
+        self.mode = mode
+        if mode == UPDATE_MODE_INSTALLER:
+            # The download is a setup program, not another copy of this program: it
             # replaces the whole yt-msd folder, so this file is not the thing that
             # gets removed.
             desc = QLabel(
@@ -5902,16 +5986,30 @@ class UpdateReadyDialog(QDialog):
                 "the whole yt-msd folder, so this file is left where it is until the "
                 "installer has finished. Choosing Cancel leaves both untouched."
             )
+            ok_tip = "Close this version and run the setup program"
+            cancel_tip = "Keep both files; run the setup program yourself"
+        elif mode == UPDATE_MODE_REPLACE:
+            # The download was written over the file this program was started from,
+            # so the update is already on disk and only a restart is missing.
+            desc = QLabel(
+                f"The new version ({tag}) has been downloaded over the yt-msd file you are running:\n{new_path}\n\n"
+                "Would you like to close this version and launch that file? Choosing Cancel leaves "
+                "the updated file where it is and keeps this version running until you close it."
+            )
+            ok_tip = "Close this version and launch the updated file"
+            cancel_tip = "Keep this version running; restart it yourself later"
         else:
             desc = QLabel(
                 f"The new version ({tag}) has been downloaded to:\n{new_path}\n\n"
                 "Would you like to automatically close this version, delete the old file, and launch the new version? "
                 "Choosing Cancel keeps both files so you can swap them yourself."
             )
+            ok_tip = "Close this version, delete the old file, and launch the new version"
+            cancel_tip = "Keep both files; swap them manually"
         desc.setWordWrap(True)
         layout.addWidget(desc)
 
-        if not replaces_folder:
+        if mode == UPDATE_MODE_SWAP:
             old_lbl = QLabel(f"Old version file that would be removed: {old_path}")
             old_lbl.setWordWrap(True)
             old_lbl.setStyleSheet("color: #888; font-size: 11px;")
@@ -5923,12 +6021,12 @@ class UpdateReadyDialog(QDialog):
         btn_h.addStretch()
 
         cancel_btn = QPushButton("Cancel")
-        cancel_btn.setToolTip("Keep both files; swap them manually")
+        cancel_btn.setToolTip(cancel_tip)
         cancel_btn.clicked.connect(self.reject)
         btn_h.addWidget(cancel_btn)
 
         ok_btn = QPushButton("OK")
-        ok_btn.setToolTip("Close this version, delete the old file, and launch the new version")
+        ok_btn.setToolTip(ok_tip)
         ok_btn.clicked.connect(self.accept)
         btn_h.addWidget(ok_btn)
         layout.addLayout(btn_h)
@@ -6186,7 +6284,7 @@ class MainApp(QMainWindow):
     local_list_refresh_signal = Signal()  # ask for a non-blocking local folder rescan
     _local_items_signal = Signal(object)  # (folder_path, scanned items) from the folder scan thread
     update_available_signal = Signal(str, str, str, str)  # tag, release_name, download_url, asset_name
-    update_downloaded_signal = Signal(str, str)  # new_file_path, tag (emitted from the download bg thread)
+    update_downloaded_signal = Signal(str, str, str)  # new_file_path, tag, how it is applied (emitted from the download bg thread)
     missing_deps_signal = Signal(str)  # html fragment of missing dependencies (emitted from the VLC init thread)
     import_finished_signal = Signal(object)  # prepared export package, read on the import thread
     import_failed_signal = Signal(str)  # import problem, reported from the import thread
@@ -6968,8 +7066,11 @@ class MainApp(QMainWindow):
                 tag = (data.get("tag_name") or "").strip()
                 release_name = (data.get("name") or tag).strip()
                 assets = data.get("assets") or []
-                download_url = (assets[0].get("browser_download_url") or "") if assets else ""
-                asset_name = (assets[0].get("name") or "") if assets else ""
+                # Which file is wanted depends on what kind of yt-msd this is, and it
+                # is looked up by name: a release page lists its files in the order
+                # they were uploaded, so the setup program is not always the first one.
+                wanted_asset = INSTALLER_ASSET if is_packaged_build() else SOURCE_ASSET
+                asset_name, download_url = select_release_asset(assets, wanted_asset)
                 if not tag:
                     return
                 if tag == getattr(self, '_downloaded_update_tag', None):
@@ -6985,21 +7086,45 @@ class MainApp(QMainWindow):
 
     def _show_update_dialog(self, tag, release_name, download_url, asset_name):
         """Show the update dialog on the GUI thread and act on the user's choice."""
-        dlg = UpdateAvailableDialog(self, tag, release_name, APP_VERSION)
+        dlg = UpdateAvailableDialog(self, tag, release_name, APP_VERSION, asset_name)
         choice = dlg.exec()
         if dlg.never_notify:
             self.disable_update_checks = True
             self.save_config()
-        if choice == QDialog.Accepted:
-            filename = asset_name or f"yt-msd-{tag}.pyw"
-            self._download_update(download_url, filename, tag)
+        if choice != QDialog.Accepted:
+            return
+        if not download_url or not asset_name:
+            wanted = INSTALLER_ASSET if is_packaged_build() else SOURCE_ASSET
+            self.status_signal.emit(
+                f"Release {tag} has no {wanted} file this copy of yt-msd can download.",
+                False, "#E31E24"
+            )
+            return
+        self._download_update(download_url, asset_name, tag)
 
     def _download_update(self, url, filename, tag):
-        """Download the newest release asset into the folder yt-msd is currently running from."""
+        """Download the release file this kind of yt-msd needs, into the folder it runs from."""
         if not url:
             self.status_signal.emit("Update has no downloadable file to fetch.", False, "#E31E24")
             return
-        dest_path = os.path.join(self.config_dir, filename)
+        running_path = self._current_executable_path()
+        running_name = os.path.basename(running_path).lower()
+        if is_packaged_build():
+            # The installed program is updated by its setup program, which replaces the
+            # whole yt-msd folder around this exe. Only a download carrying this exe's
+            # own name is a file-for-file replacement of the running file.
+            base_dir = self.config_dir
+            if os.path.basename(filename).lower() == running_name:
+                mode = UPDATE_MODE_SWAP
+            else:
+                mode = UPDATE_MODE_INSTALLER
+        else:
+            # A copy started from the source is updated by writing the new source file
+            # over the very file that is being run, whatever the release page calls it.
+            base_dir = os.path.dirname(running_path)
+            filename = os.path.basename(running_path)
+            mode = UPDATE_MODE_REPLACE
+        dest_path = os.path.join(base_dir, filename)
         self.status_signal.emit(f"Downloading update {tag}...", False, "#3B8ED0")
 
         def _bg():
@@ -7007,11 +7132,13 @@ class MainApp(QMainWindow):
                 req = urllib.request.Request(url, headers={"User-Agent": "yt-msd-updater"})
                 with urllib.request.urlopen(req, timeout=120) as resp:
                     payload = resp.read()
+                # The whole file is in memory before anything is written, so a failed
+                # download never leaves a half-written file where yt-msd runs from.
                 with open(dest_path, "wb") as out:
                     out.write(payload)
                 self._downloaded_update_tag = tag
                 self.status_signal.emit(f"Update {tag} downloaded to: {dest_path}", False, "#1abd33")
-                self.update_downloaded_signal.emit(dest_path, tag)
+                self.update_downloaded_signal.emit(dest_path, tag, mode)
             except Exception as e:
                 self.status_signal.emit(f"Update download failed: {e}", False, "#E31E24")
 
@@ -7019,29 +7146,36 @@ class MainApp(QMainWindow):
 
     def _current_executable_path(self):
         """Absolute path of the file this instance is currently running from."""
-        if getattr(sys, 'frozen', False):
+        if is_packaged_build():
             return os.path.abspath(sys.executable)
         return os.path.abspath(__file__)
 
-    def _prompt_swap_dialog(self, new_path, tag):
-        """After a successful download, offer to auto-close, delete the old file, and launch the new version."""
+    def _prompt_swap_dialog(self, new_path, tag, mode=UPDATE_MODE_SWAP):
+        """After a successful download, offer to close this version and move on to the new one."""
         old_path = self._current_executable_path()
-        # A drop-in update arrives under this program's own name and is swapped file
-        # for file. Anything else - the installer a folder build ships - replaces the
-        # whole yt-msd folder, so this file is not the one that gets deleted.
-        replaces_folder = (os.path.basename(new_path).lower()
-                           != os.path.basename(old_path).lower())
-        dlg = UpdateReadyDialog(self, new_path, old_path, tag, replaces_folder)
+        if mode == UPDATE_MODE_REPLACE:
+            # The new source file was written over the file this program was started
+            # from, so it already sits exactly where the old one was.
+            new_path = old_path
+        dlg = UpdateReadyDialog(self, new_path, old_path, tag, mode)
         choice = dlg.exec()
         if choice == QDialog.Accepted:
-            self._launch_swap_helper(new_path, old_path, delete_old=not replaces_folder)
+            # Only a drop-in update deletes the file this program was started from: an
+            # installer overwrites the whole folder itself, and a replaced source file
+            # is already in place.
+            self._launch_swap_helper(new_path, old_path, delete_old=(mode == UPDATE_MODE_SWAP))
             # closeEvent() saves the settings, hides the tray, and ends the event
             # loop, which brings the process down a moment later - exactly what
             # the swap helper started above is waiting for.
             self.close()
-        elif replaces_folder:
+        elif mode == UPDATE_MODE_INSTALLER:
             self.status_signal.emit(
                 f"Update ready. Run {new_path} when you want to update yt-msd; this version is left as it is.",
+                False, "#FF8C00"
+            )
+        elif mode == UPDATE_MODE_REPLACE:
+            self.status_signal.emit(
+                f"Update ready. {new_path} is already the new version; restart yt-msd to run it.",
                 False, "#FF8C00"
             )
         else:
@@ -7054,7 +7188,7 @@ class MainApp(QMainWindow):
         """Write a temporary helper script that waits for this process to exit, deletes the old file,
         launches the new version, then deletes itself."""
         pid = os.getpid()
-        if getattr(sys, 'frozen', False):
+        if is_packaged_build():
             launch_cmd = f'"{new_path}"'
         else:
             interp = os.path.abspath(sys.executable)
@@ -7066,8 +7200,10 @@ class MainApp(QMainWindow):
             launch_cmd = f'"{interp}" "{new_path}"'
 
         swap_path = os.path.join(tempfile.gettempdir(), f"ytmsd_swap_{pid}.bat")
-        # An installer replaces the whole folder, so the running copy is left alone
-        # and the installer overwrites it. A drop-in update is swapped file for file.
+        # UPDATE_MODE_INSTALLER leaves this file alone and lets the setup program
+        # overwrite the whole yt-msd folder. UPDATE_MODE_REPLACE has already written the
+        # new source file over this one, so there is nothing to delete. UPDATE_MODE_SWAP
+        # is a drop-in update: the file this program was started from goes first.
         drop_old = (
             'if not "%OLD%"=="%NEW%" (\r\n'
             '  if exist "%OLD%" del /F /Q "%OLD%"\r\n'
