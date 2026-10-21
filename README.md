@@ -46,7 +46,10 @@ Go to [the latest release](https://github.com/therealMKD/yt-msd/releases/latest)
 **If you use winget to install:**
 First, run `winget install python`. This will download and install the python install manager. Next, run `py install --configure`, and say yes to the prompt. Then restart your terminal before continuing. This creates a python scripts directory, and adds it to path. This lets you use `pip` as a command, without having to use `py -m pip` instead.
 
-- **NEXT** you must install ALL the following dependencies, with their respective commands:
+- **NEXT** you must install ALL the following dependencies, with their respective commands, or with this command:
+  - ```
+    python -m pip install ffmpeg python-vlc pillow pyside6 mutagen watchdog
+    ```
   - **ffmpeg** through `pip install ffmpeg` AND `winget install ffmpeg` - Both must be present
   - **vlc** through `pip install python-vlc` AND `winget install vlc` - Both must be present (If you already have the vlc application, you do not need to install it with winget)
   - **pillow** through `pip install pillow`
