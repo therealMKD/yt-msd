@@ -780,6 +780,32 @@ YTDLP_UPDATE_CHECK_INTERVAL = 7 * 24 * 60 * 60  # seconds between "is yt-dlp cur
 YTDLP_INSTALL_TIMEOUT = 1200  # winget installs can be slow
 YTDLP_EXTRACT_TIMEOUT = 300  # search / stream-info extraction
 
+# Playback reads ahead of the player. A stream URL takes a second or two to resolve
+# with yt-dlp, and that time used to land between two tracks - the player sat on an
+# empty media while the successor's URL was fetched, which looked like a skip or a
+# laggy start. So the successor is resolved while the current track still has this
+# many seconds left, on its own thread, and the resolved URL is held ready.
+# PREFETCH_URL_MAX_AGE is the guard: a YouTube stream URL that has been sitting
+# longer than that has expired and is resolved again.
+PREFETCH_SECONDS_BEFORE_END = 30
+PREFETCH_URL_MAX_AGE = 15 * 60  # seconds a prefetched stream URL is still trusted
+PREFETCH_CACHE_LIMIT = 4        # resolved stream URLs held at most
+
+# "Stop after current", cycled one state per click: off -> once -> always -> off.
+STOP_AFTER_OFF = 0     # playback advances to the next track when one ends, as it always did
+STOP_AFTER_ONCE = 1    # stop when the current track ends, then the state returns to off
+STOP_AFTER_ALWAYS = 2  # stop after every track until the button is clicked again
+STOP_AFTER_STATE_NAMES = {STOP_AFTER_OFF: "off", STOP_AFTER_ONCE: "once", STOP_AFTER_ALWAYS: "always"}
+STOP_AFTER_LABELS = {STOP_AFTER_OFF: "Off", STOP_AFTER_ONCE: "Once", STOP_AFTER_ALWAYS: "Always"}
+STOP_AFTER_TOOLTIPS = {
+    STOP_AFTER_OFF: "Stop After Current: Off - playback advances to the next track.\n"
+                    "Click once: stop after this track.",
+    STOP_AFTER_ONCE: "Stop After Current: Once - this track is the last one, then the button returns to Off.\n"
+                     "Click again: keep stopping after every track.",
+    STOP_AFTER_ALWAYS: "Stop After Current: Always - every track stops when it ends.\n"
+                       "Click once: turn it off.",
+}
+
 _ytdlp_exe_cache = None
 _ytdlp_exe_cache_lock = threading.Lock()
 
@@ -920,6 +946,41 @@ def run_yt_dlp_json(args, timeout=YTDLP_EXTRACT_TIMEOUT):
         tail = [line for line in (result.stderr or "").splitlines() if line.strip()]
         raise RuntimeError(tail[-1] if tail else f"yt-dlp exited with code {result.returncode}")
     return json.loads(result.stdout or "")
+
+
+def stream_cli_args():
+    """The yt-dlp arguments that turn one video id into a playable stream URL.
+
+    Shared by the play path and by the prefetch thread so the two never resolve a
+    track differently - the prefetched URL is the URL the player would have found.
+    """
+    cli_args = [
+        "-J",
+        "--format", "bestaudio/best",
+        "--extractor-args", "youtube:player_client=android",
+        "--no-playlist",
+    ]
+    if getattr(sys, 'frozen', False):
+        cli_args.extend(["--ffmpeg-location", getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))])
+    return cli_args
+
+
+def resolve_stream_url(vid_id):
+    """(stream url, user agent) for a video id, or raises when there is no stream."""
+    info = run_yt_dlp_json(stream_cli_args() + [f"https://www.youtube.com/watch?v={vid_id}"])
+    url = info.get('url') if info else None
+    if not url and info and 'formats' in info:
+        for f in reversed(info['formats']):
+            if f.get('url') and (f.get('acodec') != 'none' or f.get('vcodec') == 'none'):
+                url = f['url']
+                break
+        if not url and info['formats']:
+            url = info['formats'][-1].get('url')
+    if not url:
+        raise RuntimeError("No playable audio stream URL found")
+    headers = info.get('http_headers', {}) if info else {}
+    user_agent = headers.get('User-Agent', 'com.google.android.youtube/19.29.37 (Linux; U; Android 11)')
+    return url, user_agent
 
 
 # The lines yt-dlp prints when it names the file it ended up with. Which of
@@ -6372,6 +6433,17 @@ class MainApp(QMainWindow):
         self.is_shuffled = False
         self.shuffle_history = []
         self.shuffle_order = []
+        # "Stop after current": off / once / always, cycled by the player-bar button
+        # and the tray entry (see the prefetch and stop-after block near play_result).
+        self.stop_after_current = STOP_AFTER_OFF
+        # Streams resolved seconds ahead of time: video id -> (url, user agent, epoch).
+        # Written only by the prefetch thread, read once by the play path; the lock is
+        # what keeps those two from tripping over the same dictionary.
+        self._prefetched_streams = {}
+        self._prefetch_lock = threading.Lock()
+        self._prefetch_busy = set()     # video ids currently being resolved
+        self._prefetch_decision = None  # (video id, next index, next video) decided ahead
+        self._prefetch_trigger_key = None  # the track the decision was made for
         self.is_muted = False
         self.active_downloads = {}
         self.active_downloads_lock = threading.Lock()
@@ -7625,6 +7697,16 @@ class MainApp(QMainWindow):
         next_action = self.tray_menu.addAction("Next Track")
         next_action.triggered.connect(self.play_next)
 
+        # Stop After Current - the same control as the player-bar button: one entry,
+        # three states, one click each (off -> once -> always -> off). The menu is
+        # rebuilt every time it opens, so the label and the tick always match.
+        stop_mode = getattr(self, 'stop_after_current', STOP_AFTER_OFF)
+        stop_act = self.tray_menu.addAction(f"Stop After Current ({STOP_AFTER_LABELS[stop_mode]})")
+        stop_act.setCheckable(True)
+        stop_act.setChecked(stop_mode != STOP_AFTER_OFF)
+        stop_act.setToolTip(STOP_AFTER_TOOLTIPS[stop_mode])
+        stop_act.triggered.connect(lambda checked=False: self.cycle_stop_after_current())
+
         self.tray_menu.addSeparator()
 
         # Volume Controls Submenu
@@ -8347,7 +8429,7 @@ class MainApp(QMainWindow):
 
         self.apply_theme()
         if 'show_thumbnails' in cfg and getattr(self, 'search_results', None):
-            self._on_search_results(self.search_results, False)
+            self._on_search_results(self.search_results, False, reset_view=False)
         # The settings dialog reads these values when it is built, so the cached
         # one is dropped: reopening it shows the imported settings.
         settings_dialog = getattr(self, 'settings_dialog', None)
@@ -8612,6 +8694,15 @@ class MainApp(QMainWindow):
         self.shuffle_btn.setToolTip("Shuffle Playback (Toggle)")
         self.shuffle_btn.clicked.connect(self.toggle_shuffle)
         c.addWidget(self.shuffle_btn)
+
+        # Stop After Current: one button, three states (off -> once -> always).
+        self.stop_after_btn = QPushButton("\uE76A")
+        self.stop_after_btn.setObjectName("stopAfterBtn")
+        self.stop_after_btn.setFixedSize(36, 36)
+        self.stop_after_btn.setProperty("stop_after_state", STOP_AFTER_STATE_NAMES[self.stop_after_current])
+        self.stop_after_btn.setToolTip(STOP_AFTER_TOOLTIPS[self.stop_after_current])
+        self.stop_after_btn.clicked.connect(self.cycle_stop_after_current)
+        c.addWidget(self.stop_after_btn)
         c.addStretch(1)
         
         self.time_label = QLabel("0:00 / 0:00")
@@ -8633,7 +8724,7 @@ class MainApp(QMainWindow):
         if self.save_place and hasattr(self, 'session_data'):
             sd = self.session_data
             if sd.get('search_results'):
-                self._on_search_results(sd['search_results'], False)
+                self._on_search_results(sd['search_results'], False, reset_view=False)
                 self.playback_index = sd.get('playback_index', -1)
             
             # Restore playback state if item exists
@@ -9055,6 +9146,29 @@ class MainApp(QMainWindow):
             QPushButton#playerPlayBtn:hover {{
                 background-color: {btn_hover};
             }}
+            QPushButton#stopAfterBtn {{
+                background-color: transparent;
+                color: {secondary_fg};
+                font-family: 'Segoe MDL2 Assets';
+                font-size: 20px;
+                font-weight: normal;
+                border-radius: 6px;
+                padding: 0px;
+            }}
+            QPushButton#stopAfterBtn:hover {{
+                background-color: {btn_hover};
+                color: {fg};
+            }}
+            QPushButton#stopAfterBtn[stop_after_state="once"] {{
+                background-color: {accent};
+                color: {accent_fg};
+                font-weight: bold;
+            }}
+            QPushButton#stopAfterBtn[stop_after_state="always"] {{
+                background-color: #E31E24;
+                color: white;
+                font-weight: bold;
+            }}
             {tooltip_css}
         """.format(
             bg=bg, fg=fg, frame_bg=frame_bg, input_bg=input_bg, input_border=input_border,
@@ -9073,6 +9187,7 @@ class MainApp(QMainWindow):
         # dialogs through this stylesheet, so no app-level call is required.
         self.setStyleSheet(full_css)
         self.update_shuffle_btn_style()
+        self._update_stop_after_ui()
 
     # --- Local Folder Logic ---
     def set_local_explorer_address(self, path: str = "", add_to_recent: bool = False):
@@ -9568,7 +9683,8 @@ class MainApp(QMainWindow):
         self.show_thumbnails = state == Qt.Checked.value
         self.save_config()
         if self.search_results:
-            self._on_search_results(self.search_results, False)
+            # Same list, taller rows: keep the reader where they were reading.
+            self._on_search_results(self.search_results, False, reset_view=False)
 
     def open_settings_dialog(self):
         if not hasattr(self, 'settings_dialog') or self.settings_dialog is None:
@@ -9594,6 +9710,8 @@ class MainApp(QMainWindow):
     def perform_search(self, is_playlist=False):
         query = self.search_entry.text()
         if not query: return
+        # A new search is read from its first row, not from wherever the last one was left
+        self._reset_results_scroll()
         self._on_status_update("Searching...", False, "#3B8ED0")
         self.search_btn.setEnabled(False)
         
@@ -9653,7 +9771,7 @@ class MainApp(QMainWindow):
                 
         threading.Thread(target=bg_search, daemon=True).start()
 
-    def _on_search_results(self, res, is_playlist):
+    def _on_search_results(self, res, is_playlist, reset_view=True):
         self.search_btn.setEnabled(True)
         self.search_results = res
         self._thumbnail_labels = getattr(self, '_thumbnail_labels', {})
@@ -9671,9 +9789,25 @@ class MainApp(QMainWindow):
             placeholder.setProperty("has_ui", False)
             self.results_vbox.addWidget(placeholder)
             
+        # reset_view is True when these are results from a search that was just run, and
+        # False when the same list is only being redrawn (thumbnail toggle, settings
+        # import, session restore). A new search is read from its first row, and the
+        # successor decided for the list being replaced is no longer part of the playlist
+        # playback is stepping through; a redraw of the same list is neither.
+        if reset_view:
+            self.invalidate_next_track_prefetch()
+            self._reset_results_scroll()
         self._on_status_update(f"Found {len(res)} results.", False, "white")
         QTimer.singleShot(0, self.lazy_load_visible_results)
+        # Lazy loading re-expands rows as they are built; land at the top again after it.
+        if reset_view:
+            QTimer.singleShot(0, self._reset_results_scroll)
         self.update_queue_all_checkbox_state()
+
+    def _reset_results_scroll(self):
+        """Scroll the results pane back to its top."""
+        if getattr(self, 'results_area', None):
+            self.results_area.verticalScrollBar().setValue(0)
 
     def _on_search_failed(self):
         self.search_btn.setEnabled(True)
@@ -10518,6 +10652,194 @@ class MainApp(QMainWindow):
             self.dl_progress_signal.emit("")
             self._on_batch_complete()
 
+    # ------------------------------------------------------------------
+    # Next-track prefetch (section 8 of the AI Readme)
+    # ------------------------------------------------------------------
+    # Once the current track has PREFETCH_SECONDS_BEFORE_END seconds left, the track
+    # that comes after it is resolved with yt-dlp on its own thread and its stream
+    # URL is held ready. The GUI thread only decides which track that is; everything
+    # slow happens in the prefetch thread, so the track playing now keeps playing
+    # untouched. play_result() then finds the URL already there.
+
+    def _playback_source_items(self):
+        """(the list playback is stepping through, is it the local pane)."""
+        if getattr(self, 'current_video_id', None) == "local":
+            items = [x for x in getattr(self, 'current_local_items', []) if x.get('is_dir') is False]
+            return items, True
+        return (self.search_results or []), False
+
+    def _next_playback_preview(self):
+        """(index, video) for the track that would play next, changing nothing.
+
+        This mirrors play_next()'s rules - local or searched, shuffled or in order -
+        but mutates no state. With shuffle on, the random pick is made here and
+        remembered in _prefetch_decision, because the prefetch has to fetch the same
+        track the player will actually advance to. None means nothing follows.
+        """
+        items, is_local = self._playback_source_items()
+        if not items:
+            return None
+        current_idx = getattr(self, 'local_playback_index', -1) if is_local else self.playback_index
+        if getattr(self, 'is_shuffled', False):
+            history = list(getattr(self, 'shuffle_history', []))
+            unplayed = [i for i in range(len(items)) if i not in history]
+            if not unplayed:
+                unplayed = [i for i in range(len(items)) if i != current_idx]
+            if not unplayed:
+                return None
+            next_idx = random.choice(unplayed)
+        else:
+            next_idx = current_idx + 1
+            if not (0 <= next_idx < len(items)):
+                return None
+        video = items[next_idx]
+        if not isinstance(video, dict):
+            return None
+        return next_idx, video
+
+    def _prefetch_decision_for(self, vid_id):
+        """(next index, next video) decided seconds ago for this track, or None if stale."""
+        decision = getattr(self, '_prefetch_decision', None)
+        if decision and vid_id and decision[0] == vid_id:
+            return decision[1], decision[2]
+        return None
+
+    def _take_prefetched_stream(self, vid_id):
+        """The stream URL resolved ahead of time for this track, consumed once."""
+        with self._prefetch_lock:
+            entry = self._prefetched_streams.pop(vid_id, None)
+        if not entry:
+            return None
+        url, user_agent, resolved_at = entry
+        # A wall-clock stamp would be wrong whenever Windows corrects the clock, so the
+        # age is measured with the monotonic clock - the same clock the stamp was taken
+        # from in _prefetch_stream_worker().
+        if time.monotonic() - resolved_at > PREFETCH_URL_MAX_AGE:
+            return None
+        return url, user_agent
+
+    def _maybe_prefetch_next_track(self):
+        """Called from the player timer once the current track is nearing its end.
+
+        Everything done here is cheap: one preview, one remembered decision, and the
+        start of a thread. The yt-dlp call itself never runs on the GUI thread.
+        """
+        if not getattr(self, 'search_results', None):
+            return
+        # Local files need no resolving, and a track that will not be followed
+        # automatically needs nothing ready.
+        if getattr(self, 'current_video_id', None) in (None, "", "local"):
+            return
+        if getattr(self, 'stop_after_current', STOP_AFTER_OFF):
+            return
+        current_id = self.current_video_id
+        # One decision per track: the player timer fires every 16 ms and must not
+        # re-decide (or re-fetch) the same track sixty times a second.
+        if getattr(self, '_prefetch_trigger_key', None) == current_id:
+            return
+        preview = self._next_playback_preview()
+        self._prefetch_trigger_key = current_id
+        if not preview:
+            self._prefetch_decision = None
+            return
+        next_idx, video = preview
+        self._prefetch_decision = (current_id, next_idx, video)
+        next_id = video.get('id')
+        if not next_id:
+            return
+        with self._prefetch_lock:
+            if next_id in self._prefetch_busy or next_id in self._prefetched_streams:
+                return
+            self._prefetch_busy.add(next_id)
+        threading.Thread(target=self._prefetch_stream_worker, args=(next_id,), daemon=True).start()
+
+    def _prefetch_stream_worker(self, vid_id):
+        """Resolve one stream URL off the GUI thread. Failures stay silent: the normal
+        play path resolves that track again when it is actually started."""
+        try:
+            url, user_agent = resolve_stream_url(vid_id)
+            resolved = (url, user_agent, time.monotonic())
+        except Exception:
+            resolved = None
+        finally:
+            with self._prefetch_lock:
+                self._prefetch_busy.discard(vid_id)
+        if not resolved:
+            return
+        with self._prefetch_lock:
+            self._prefetched_streams[vid_id] = resolved
+            while len(self._prefetched_streams) > PREFETCH_CACHE_LIMIT:
+                oldest = min(self._prefetched_streams, key=lambda k: self._prefetched_streams[k][2])
+                self._prefetched_streams.pop(oldest, None)
+
+    def invalidate_next_track_prefetch(self):
+        """Forget a decided successor and any URL already resolved for it, so an
+        outdated successor cannot be played as though it came from the new list."""
+        self._prefetch_decision = None
+        self._prefetch_trigger_key = None
+        with self._prefetch_lock:
+            self._prefetched_streams.clear()
+
+    # ------------------------------------------------------------------
+    # "Stop after current" - three states, one click each
+    # ------------------------------------------------------------------
+    # Off    : a track ending advances to the next one, exactly as it always did.
+    # Once   : the current track is the last one; when it ends the state resets to Off
+    #          and the track stays stopped where it is.
+    # Always : every track stops when it ends and stays stopped, until clicked again.
+    # One click walks the cycle Off -> Once -> Always -> Off, from the player-bar
+    # button or from the tray menu. A manual "Next Track" always advances regardless.
+
+    def cycle_stop_after_current(self):
+        """Move to the next state in the off -> once -> always -> off cycle."""
+        current = getattr(self, 'stop_after_current', STOP_AFTER_OFF)
+        self.set_stop_after_current((int(current) + 1) % 3)
+
+    def set_stop_after_current(self, state):
+        try:
+            state = int(state)
+        except (TypeError, ValueError):
+            state = STOP_AFTER_OFF
+        if state not in (STOP_AFTER_OFF, STOP_AFTER_ONCE, STOP_AFTER_ALWAYS):
+            state = STOP_AFTER_OFF
+        self.stop_after_current = state
+        self._update_stop_after_ui()
+        if state == STOP_AFTER_OFF:
+            self._on_status_update("Stop after current: off - playback will advance to the next track.", False, "white")
+        elif state == STOP_AFTER_ONCE:
+            self._on_status_update("Stop after current: once - this track is the last one.", False, "#FF8C00")
+        else:
+            self._on_status_update("Stop after current: always - every track stops when it ends.", False, "#E31E24")
+
+    def _update_stop_after_ui(self):
+        """Reflect the state in the player-bar button. The tray menu is rebuilt every
+        time it opens (_build_tray_menu), so it needs no live update."""
+        btn = getattr(self, 'stop_after_btn', None)
+        if btn is None:
+            return
+        state = getattr(self, 'stop_after_current', STOP_AFTER_OFF)
+        btn.setProperty("stop_after_state", STOP_AFTER_STATE_NAMES[state])
+        btn.setToolTip(STOP_AFTER_TOOLTIPS[state])
+        btn.style().unpolish(btn)
+        btn.style().polish(btn)
+
+    def _finish_stop_after_current(self):
+        """A track ended while "stop after current" was armed: hold here instead of
+        advancing, and spend the one-shot state back to off."""
+        self.is_playing = False
+        if getattr(self, 'play_btn', None):
+            self.play_btn.setText("\uE768")
+        # The successor readied seconds ago is not wanted now; its resolved URL stays
+        # in the cache in case the user presses Next themselves. The trigger key goes
+        # too, so a track the user starts again by hand reads ahead once more.
+        self._prefetch_decision = None
+        self._prefetch_trigger_key = None
+        if getattr(self, 'stop_after_current', STOP_AFTER_OFF) == STOP_AFTER_ONCE:
+            self.set_stop_after_current(STOP_AFTER_OFF)
+            self._on_status_update("Stopped after the current track.", False, "gray")
+        else:
+            self._on_status_update("Stopped after the current track - Stop after current is still on.", False, "gray")
+
     def play_result(self, video, paused_at_start=False, from_nav=False):
         # If VLC is still initializing in background, defer and retry
         if not getattr(self, '_vlc_ready', False):
@@ -10548,29 +10870,13 @@ class MainApp(QMainWindow):
                 
         def bg_fetch():
             try:
-                cli_args = [
-                    "-J",
-                    "--format", "bestaudio/best",
-                    "--extractor-args", "youtube:player_client=android",
-                    "--no-playlist",
-                ]
-                if getattr(sys, 'frozen', False):
-                    cli_args.extend(["--ffmpeg-location", getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))])
-                info = run_yt_dlp_json(cli_args + [f"https://www.youtube.com/watch?v={vid_id}"])
-                url = info.get('url') if info else None
-                if not url and info and 'formats' in info:
-                    for f in reversed(info['formats']):
-                        if f.get('url') and (f.get('acodec') != 'none' or f.get('vcodec') == 'none'):
-                            url = f['url']
-                            break
-                    if not url and info['formats']:
-                        url = info['formats'][-1].get('url')
-
-                if not url:
-                    raise Exception("No playable audio stream URL found")
-
-                headers = info.get('http_headers', {}) if info else {}
-                user_agent = headers.get('User-Agent', 'com.google.android.youtube/19.29.37 (Linux; U; Android 11)')
+                # Resolved seconds ago by the prefetch thread? Use that and skip yt-dlp
+                # entirely - this is what removes the gap at a changeover.
+                prefetched = self._take_prefetched_stream(vid_id)
+                if prefetched:
+                    url, user_agent = prefetched
+                else:
+                    url, user_agent = resolve_stream_url(vid_id)
 
                 # If another stream request started while fetching, ignore this one
                 if getattr(self, '_pending_fetch_id', None) != vid_id:
@@ -10736,6 +11042,21 @@ class MainApp(QMainWindow):
             return
             
         if not self.search_results: return
+
+        # A successor decided seconds ago (see _maybe_prefetch_next_track) is honoured
+        # first, so the stream that was already resolved is the stream that plays.
+        decided = self._prefetch_decision_for(getattr(self, 'current_video_id', ''))
+        if decided is not None:
+            self._prefetch_decision = None
+            next_idx, next_video = decided
+            if (next_video is not None and 0 <= next_idx < len(self.search_results)
+                    and self.search_results[next_idx].get('id') == next_video.get('id')):
+                if getattr(self, 'is_shuffled', False):
+                    self.shuffle_history.append(next_idx)
+                self.playback_index = next_idx
+                self.play_result(next_video, from_nav=True)
+                return
+
         if getattr(self, 'is_shuffled', False):
             if not hasattr(self, 'shuffle_history'):
                 self.shuffle_history = []
@@ -10794,7 +11115,11 @@ class MainApp(QMainWindow):
                 if getattr(self, '_has_played_current', False) and not getattr(self, '_ended_trigger', False) and getattr(self, 'is_playing', False):
                     self._ended_trigger = True
                     self._has_played_current = False
-                    self.play_next()
+                    # "Stop after current" armed: hold on this track instead of advancing.
+                    if getattr(self, 'stop_after_current', STOP_AFTER_OFF):
+                        self._finish_stop_after_current()
+                    else:
+                        self.play_next()
                 
             pos = self.vlc_player.get_position() * 10000
             ms = self.vlc_player.get_time()
@@ -10808,6 +11133,12 @@ class MainApp(QMainWindow):
                     self.progress_slider.blockSignals(True)
                     self.progress_slider.setValue(int(pos))
                     self.progress_slider.blockSignals(False)
+
+            # Nearing the end? Have the next track's stream resolved already, on its own
+            # thread, so the changeover does not stall on yt-dlp.
+            if state == vlc.State.Playing and total_ms and total_ms > 0:
+                if (total_ms - ms) <= PREFETCH_SECONDS_BEFORE_END * 1000:
+                    self._maybe_prefetch_next_track()
 
         # Update hover tooltip continuously
         if hasattr(self, 'tray_icon') and self.tray_icon:
