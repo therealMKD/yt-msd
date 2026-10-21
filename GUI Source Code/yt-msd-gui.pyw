@@ -2313,7 +2313,14 @@ class HostFolderWatcher:
     def __init__(self, on_change_callback: Callable[[str], None]):
         self.on_change_callback = on_change_callback
         self.watched_chains: Dict[str, dict] = {}
-        self.lock = threading.Lock()
+        # RLock, not Lock: add_or_update_chain() takes this lock and then calls remove_chain(),
+        # which takes it again on the same thread. A plain threading.Lock deadlocks that thread
+        # where it stands, holding the lock for good - so the first hosted chain ever created
+        # silently killed the watcher (no folder change was ever noticed, so clients were never
+        # notified), and every later refresh_sync_watchers() call leaked another stuck thread
+        # because stop_all(), remove_chain() and add_or_update_chain() all queue on a lock that
+        # nobody will ever release again.
+        self.lock = threading.RLock()
 
     def add_or_update_chain(self, chain_id: str, folder_path: str, sync_code: str, delay_mins: int = 5):
         with self.lock:
@@ -2841,6 +2848,11 @@ def make_removable_chain_id(sync_code: str, folder_path: str) -> str:
 # SyncConfigManager.save) never interleave partial reads/writes and clobber each other.
 _CONFIG_WRITE_LOCK = threading.Lock()
 
+# The sync settings a fresh install gets. Named here rather than written inline so that
+# MainApp.reset_to_defaults() can hand back exactly these defaults instead of guessing at
+# a copy of the literal.
+DEFAULT_SYNC_SETTINGS = {"auto_sync_interval_mins": 30, "firewall_prompted": False}
+
 
 class SyncConfigManager:
     """Manages persistence of sync configuration within the unified gui_config.json."""
@@ -2848,7 +2860,7 @@ class SyncConfigManager:
         self.config_dir = config_dir
         self.config_file = os.path.join(config_dir, "gui_config.json")
         self.legacy_file = os.path.join(config_dir, "sync_config.json")
-        self.settings: dict = {"auto_sync_interval_mins": 30, "firewall_prompted": False}
+        self.settings: dict = dict(DEFAULT_SYNC_SETTINGS)
         self.hosted_chains: List[dict] = []
         self.client_chains: List[dict] = []
         self.load()
@@ -5668,7 +5680,16 @@ class SettingsDialog(QDialog):
         self.parent.open_sync_manager(parent_dialog=self)
 
     def _reset_defaults(self):
-        if QMessageBox.question(self, "Confirm Reset", "This will wipe your config and recent data. Continue?") == QMessageBox.Yes:
+        # Wording that matches what reset_to_defaults() actually clears: every stored setting and
+        # history entry, plus the hosted and client chains. A drive that has been initialised keeps
+        # its own TAG.yaml marker on the device, so its card reappears while it is plugged in - but
+        # with the hosted/client chains gone there is nothing left for it to sync against. Music
+        # files themselves are never touched, on this machine or on a drive.
+        warning = ("This wipes everything yt-msd remembers: every setting, your download and local "
+                   "folder history, your playlist history, and every hosted and client sync chain. "
+                   "An initialised drive keeps its marker on the device, so its card comes back "
+                   "while it is plugged in. Your music files are not touched. Continue?")
+        if QMessageBox.question(self, "Confirm Reset", warning) == QMessageBox.Yes:
             self.parent.reset_to_defaults()
             self.accept()
 
@@ -7720,6 +7741,57 @@ class MainApp(QMainWindow):
         self.download_threads = 3
         self.normalization_threads = max(1, os.cpu_count() // 2)
         self.local_rescan_interval = 60
+        # Everything else gui_config.json stores. The file is deleted at the top of this method, but
+        # save_config() at the bottom writes a fresh one out of whatever these attributes and widgets
+        # hold, so anything not cleared here was straight back in the file the reset had just removed.
+        # These are the parts a user would call "my recent data": the download folders and the
+        # destination the top bar shows, the local folders and the folder open in the tree pane, the
+        # playlist history, the format and bitrate the two top-bar combos are set to, the metadata tick
+        # on the local pane, and the window geometry kept for MusicBee launches. session_data needs
+        # nothing: save_config() rebuilds it from the live window on every save, and load_config() only
+        # reads it back when "save place" is on, which this reset turns off. ytdlp_last_update_check is
+        # cleared as well so the next launch behaves like a first run and looks for a newer yt-dlp
+        # instead of trusting a timestamp left over from before the reset.
+        default_dl = os.path.join(os.path.expanduser("~"), "Downloads")
+        self.format_var = "mp3"
+        self.bitrate_var = "192"
+        self.recent_folders = [default_dl]
+        self.download_path = default_dl
+        self.local_folders = []
+        self.local_current_path = ""
+        self.recent_playlists = []
+        self.show_local_metadata = False
+        self.host_window_geometry = ""
+        self.ytdlp_last_update_check = 0.0
+        # ...and the widgets that display those values, because save_config() reads the format, the
+        # bitrate and the download folder straight off them. Left where they were, they would put the
+        # old values back into the new file on the next save. Signals are blocked so no handler runs
+        # against a value that has already been changed underneath it.
+        if hasattr(self, 'format_combo'):
+            self.format_combo.blockSignals(True)
+            self.format_combo.setCurrentText(self.format_var)
+            self.format_combo.blockSignals(False)
+        if hasattr(self, 'bitrate_combo'):
+            self.bitrate_combo.blockSignals(True)
+            self.bitrate_combo.setCurrentText(self.bitrate_var)
+            self.bitrate_combo.blockSignals(False)
+        if hasattr(self, 'path_combo'):
+            self.path_combo.blockSignals(True)
+            self.path_combo.clear()
+            self.path_combo.addItems([str(folder) for folder in self.recent_folders])
+            self.path_combo.setCurrentText(self.download_path)
+            self.path_combo.blockSignals(False)
+        if hasattr(self, 'local_meta_cb'):
+            self.local_meta_cb.blockSignals(True)
+            self.local_meta_cb.setChecked(False)
+            self.local_meta_cb.blockSignals(False)
+        if hasattr(self, 'local_path_combo'):
+            # Rebuilds the address bar from the now-empty recent list without firing
+            # load_local_folder, which would try to scan a folder this reset has just forgotten.
+            self.set_local_explorer_address("")
+        # local_current_path is empty, so the scan returns None and the pane is cleared instead of
+        # continuing to list the files of a folder that is no longer set anywhere.
+        self.refresh_local_list()
         if hasattr(self, 'local_rescan_timer'):
             self._update_local_rescan_timer()
         if hasattr(self, 'run_renamer_cb'):
@@ -7730,8 +7802,18 @@ class MainApp(QMainWindow):
         
         # Apply changes
         self.apply_theme()
-        if hasattr(self, 'splitter'):
-            self.splitter.setSizes(self.splitter_sizes)
+        # The old form of this read self.splitter, which MainApp never creates: the two real
+        # splitters are main_splitter (local pane | everything else) and content_splitter
+        # (results | queue), and save_config() stores three sizes by reading both of them. The
+        # hasattr() was therefore always false, so the panel widths survived the reset and were
+        # written straight back into the new file. Same split the startup code applies.
+        if hasattr(self, 'main_splitter') and hasattr(self, 'content_splitter'):
+            self.main_splitter.setSizes([self.splitter_sizes[0], self.splitter_sizes[1] + self.splitter_sizes[2]])
+            self.content_splitter.setSizes([self.splitter_sizes[1], self.splitter_sizes[2]])
+            # Clear what each splitter kept as the user's own arrangement, or the next double-click
+            # on a handle restores the pre-reset widths instead of the default pair.
+            for splitter in (self.main_splitter, self.content_splitter):
+                splitter._last_custom_sizes = []
         if hasattr(self, 'vol_slider'):
             self.vol_slider.setValue(100)
         # The Settings dialog is cached on MainApp and reused, and it reads the MainApp attributes
@@ -7747,8 +7829,61 @@ class MainApp(QMainWindow):
             except Exception:
                 pass
             self.settings_dialog = None
+        # Sync chains and sync settings live in the same file this method deletes, but
+        # SyncConfigManager holds live copies of all three - hosted_chains, client_chains and
+        # settings - and the Sync dialog, the export dialog and the removable-drive path all read
+        # that manager rather than the file. Clearing only the file therefore left every chain in
+        # memory, and the next save() - on close, or from any chain operation - wrote them back into
+        # a brand-new file, so no chain was ever actually removed. That write-back is worth keeping
+        # for the case where the file is deleted by hand while the app is running: the manager still
+        # re-creates it on exit. It must not survive an explicit reset, so the manager is emptied
+        # here too.
+        # A mirror sync works on the drive it is copying to for its whole run. Stopping the chains
+        # first while one is mid-flight would leave it adding and deleting files against a chain
+        # definition that no longer exists, so the threads are asked to stop before the chains go.
+        for thread in list(getattr(self, 'sync_threads', {}).values()):
+            try:
+                thread.requestInterruption()
+                thread.quit()
+                thread.wait(1000)
+            except Exception:
+                pass
+        sync_threads = getattr(self, 'sync_threads', None)
+        if sync_threads is not None:
+            sync_threads.clear()  # in place again: SyncManagerDialog aliases this same dict
+        # The per-chain "Syncing... / [3/40] (7%)" lines the cards show are keyed by chain id.
+        # Left behind they describe chains this reset has just removed, and a card for a new chain
+        # with the same sync code would inherit the old progress text.
+        progress_state = getattr(self, 'sync_progress_state', None)
+        if progress_state is not None:
+            progress_state.clear()
+        sync_manager = getattr(self, 'sync_config_manager', None)
+        if sync_manager is not None:
+            # Emptied in place. The open Sync dialog keeps references to these very objects, so
+            # rebinding them to new lists would leave that window showing chains that are gone.
+            sync_manager.hosted_chains.clear()
+            sync_manager.client_chains.clear()
+            sync_manager.settings.clear()
+            sync_manager.settings.update(DEFAULT_SYNC_SETTINGS)
+        watcher = getattr(self, 'host_watcher', None)
+        if watcher is not None:
+            try:
+                watcher.stop_all()
+            except Exception:
+                pass
+        if hasattr(self, 'sync_timer'):
+            # Re-arms the client auto-sync timer on the default interval. With no client chains the
+            # callback returns immediately, but it should not keep running on an interval the user
+            # picked before the reset.
+            self._update_sync_timer()
+        sync_dialog = getattr(self, 'sync_manager_dialog', None)
+        if sync_dialog is not None:
+            try:
+                sync_dialog.refresh_cards(force=True)
+            except Exception:
+                pass
         self.save_config()
-        self._on_status_update("Settings reset to defaults.", False, "#3B8ED0")
+        self._on_status_update("Settings, recent data and sync chains reset to defaults.", False, "#3B8ED0")
 
     # ── EXPORT / IMPORT PACKAGES ──────────────────────────────────────────────
     def open_export_dialog(self):
