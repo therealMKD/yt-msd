@@ -107,8 +107,13 @@ LOUDNESS_RANGE = "11"
 BITRATE = "320k"
 MAX_WORKERS = max(1, _available_threads // 2)
 SILENCE_PAD_DUR = 2.0
-CUSTOM_EQ_STRING = ""
-CUSTOM_NORM_CMD = ""  # Optional full ffmpeg -af override for normalization/trim
+SILENCE_TRIM = True  # Trim leading/trailing silence; independent of the loudnorm override
+# Built-in silence trimming values. Used verbatim for both the front pass and the
+# reversed back pass - a loudnorm override never changes them.
+SILENCE_THRESHOLD = "-60dB"
+SILENCE_DURATION = "0.5"
+SILENCE_KEEP = "0.5"
+CUSTOM_NORM_CMD = ""  # Optional override of ONLY the loudnorm part of the ffmpeg -af chain
 
 # Internal version number - the numeric part of the latest GitHub release tag.
 # (RELEASE-3.0 is tagged as "RELEASE-3.0" and read here as "3.0":
@@ -1093,6 +1098,41 @@ def _get_audio_duration(filepath):
         pass
     return None
 
+def _silence_trim_filters():
+    """
+    The built-in silence-trim filters, exactly as they have always been built:
+    one pass for the front of the track, then the same filter over a reversed
+    stream so the trailing silence is trimmed too, then reversed back.
+    """
+    single = (
+        f"silenceremove=start_periods=1:start_duration={SILENCE_DURATION}:"
+        f"start_threshold={SILENCE_THRESHOLD}:start_silence={SILENCE_KEEP}:stop_silence={SILENCE_KEEP}"
+    )
+    return f"{single},areverse,{single},areverse"
+
+
+def build_af_chain(loudnorm_filter=None, include_silence_trim=None, include_pad=True):
+    """
+    Assemble the ffmpeg -af chain from its three independent parts:
+
+      1. silence trim    - _silence_trim_filters(), gated by the SILENCE_TRIM setting
+      2. loudnorm        - the built-in whole-track gain, or the loudnorm/EQ override
+      3. end-of-file pad - apad, gated by SILENCE_PAD_DUR
+
+    A loudnorm override only replaces part 2. Silence trimming is never overridden
+    by it, and turning silence trimming off never touches the loudnorm part.
+    """
+    trim_on = SILENCE_TRIM if include_silence_trim is None else include_silence_trim
+    parts = []
+    if trim_on:
+        parts.append(_silence_trim_filters())
+    if loudnorm_filter:
+        parts.append(loudnorm_filter)
+    if include_pad and SILENCE_PAD_DUR > 0:
+        parts.append(f"apad=pad_dur={SILENCE_PAD_DUR}")
+    return ",".join(parts)
+
+
 def normalize_file(index, total, filepath, custom_norm_cmd=None):
     suffix = filepath.suffix.lower()
     artist, title = read_metadata_tags(filepath)
@@ -1112,10 +1152,15 @@ def normalize_file(index, total, filepath, custom_norm_cmd=None):
     final_gain = min(gain, max_gain)
     
     limit_str = " (Peak Limited)" if final_gain < gain else ""
+    _effective_norm_cmd = (custom_norm_cmd or CUSTOM_NORM_CMD or "").strip()
+    gain_line = (
+        f"  └─ Loudnorm/EQ override: {_effective_norm_cmd}" if _effective_norm_cmd
+        else f"  └─ Applying Whole-Track Gain: {final_gain:+.2f} dB{limit_str} (Target: {target_lufs} LUFS)"
+    )
     _safe_print(
         f"[{index}/{total}] {Colors.CYAN}Processing:{Colors.END} {filepath.name}...\n"
         f"  ├─ Measured: {input_i:+.2f} LUFS | True Peak: {input_tp:+.2f} dB\n"
-        f"  └─ Applying Whole-Track Gain: {final_gain:+.2f} dB{limit_str} (Target: {target_lufs} LUFS)"
+        f"{gain_line}"
     )
     
     try:
@@ -1124,25 +1169,11 @@ def normalize_file(index, total, filepath, custom_norm_cmd=None):
     except Exception as e:
         return False, filepath.name, f"Failed to create temp file: {e}"
         
-    SILENCE_THRESHOLD = "-60dB"
-    SILENCE_DURATION = "0.5"
-    SILENCE_KEEP = "0.5"
-    af_chain = (
-        f"silenceremove=start_periods=1:start_duration={SILENCE_DURATION}:start_threshold={SILENCE_THRESHOLD}:start_silence={SILENCE_KEEP}:stop_silence={SILENCE_KEEP},"
-        f"areverse,"
-        f"silenceremove=start_periods=1:start_duration={SILENCE_DURATION}:start_threshold={SILENCE_THRESHOLD}:start_silence={SILENCE_KEEP}:stop_silence={SILENCE_KEEP},"
-        f"areverse,"
-        f"volume={final_gain:.2f}dB"
-    )
-    if SILENCE_PAD_DUR > 0:
-        af_chain += f",apad=pad_dur={SILENCE_PAD_DUR}"
-    if CUSTOM_EQ_STRING:
-        af_chain += f",{CUSTOM_EQ_STRING}"
-
-    # Allow full af_chain override from custom norm command
-    _effective_norm_cmd = custom_norm_cmd or CUSTOM_NORM_CMD
-    if _effective_norm_cmd:
-        af_chain = _effective_norm_cmd
+    # The three parts of the chain are independent: silence trimming, the loudnorm
+    # filter and the end-of-file pad. A loudnorm override replaces ONLY the loudnorm
+    # filter and can never replace the silence trimming command.
+    loudnorm_filter = _effective_norm_cmd or f"volume={final_gain:.2f}dB"
+    af_chain = build_af_chain(loudnorm_filter)
 
     command = ["ffmpeg", "-nostdin", "-y", "-i", str(filepath), "-af", af_chain]
     
@@ -1188,9 +1219,9 @@ def normalize_file(index, total, filepath, custom_norm_cmd=None):
     except Exception as e:
         return False, filepath.name, f"Failed to replace original file with temp: {e}"
     
-    # Report silence removal stats
+    # Report silence removal stats (only meaningful when the trim filters ran)
     new_duration = _get_audio_duration(filepath)
-    if orig_duration is not None and new_duration is not None:
+    if SILENCE_TRIM and orig_duration is not None and new_duration is not None:
         total_removed = orig_duration - new_duration
         pad_added = SILENCE_PAD_DUR if SILENCE_PAD_DUR > 0 else 0.0
         net_removed = total_removed + pad_added  # silence removed before pad was added
@@ -1233,7 +1264,8 @@ def run_loudness_normalization(folder_path, skip_files=None):
         return 0, 0
         
     print(f"{Colors.GREEN}Starting static volume adjustment on {len(files)} files with {MAX_WORKERS} worker threads...{Colors.END}")
-    print(f"{Colors.DIM}Settings: Target Loudness={TARGET_LUFS} LUFS | Max Peak={TRUE_PEAK} dB | Output Bitrate={BITRATE}{Colors.END}\n")
+    print(f"{Colors.DIM}Settings: Target Loudness={TARGET_LUFS} LUFS | Max Peak={TRUE_PEAK} dB | Output Bitrate={BITRATE}{Colors.END}")
+    print(f"{Colors.DIM}Silence trim: {'ON' if SILENCE_TRIM else 'OFF'} | End pad: {SILENCE_PAD_DUR}s | Loudnorm: {CUSTOM_NORM_CMD or 'built-in whole-track gain'}{Colors.END}\n")
     
     completed = 0
     failed = 0
@@ -1257,7 +1289,7 @@ def run_loudness_normalization(folder_path, skip_files=None):
     print(f"  {Colors.GREEN}Success: {completed}{Colors.END} | {Colors.RED}Failed: {failed}{Colors.END}\n")
     return completed, failed
 
-def trim_silence_file(index, total, filepath, custom_norm_cmd=None):
+def trim_silence_file(index, total, filepath):
     _safe_print(f"[{index}/{total}] {Colors.CYAN}Trimming silence:{Colors.END} {filepath.name}...")
     suffix = filepath.suffix.lower()
     artist, title = read_metadata_tags(filepath)
@@ -1268,18 +1300,8 @@ def trim_silence_file(index, total, filepath, custom_norm_cmd=None):
     except Exception as e:
         return False, filepath.name, f"Failed to create temp file: {e}"
     
-    SILENCE_THRESHOLD = "-60dB"
-    SILENCE_DURATION = "0.5"
-    SILENCE_KEEP = "0.5"
-    af_chain = (
-        f"silenceremove=start_periods=1:start_duration={SILENCE_DURATION}:start_threshold={SILENCE_THRESHOLD}:start_silence={SILENCE_KEEP}:stop_silence={SILENCE_KEEP},"
-        f"areverse,"
-        f"silenceremove=start_periods=1:start_duration={SILENCE_DURATION}:start_threshold={SILENCE_THRESHOLD}:start_silence={SILENCE_KEEP}:stop_silence={SILENCE_KEEP},"
-        f"areverse"
-    )
-    _effective_norm_cmd = custom_norm_cmd or CUSTOM_NORM_CMD
-    if _effective_norm_cmd:
-        af_chain = _effective_norm_cmd
+    # Silence trimming only. The loudnorm/EQ override is never applied to this pass.
+    af_chain = build_af_chain(include_pad=False)
     command = ["ffmpeg", "-nostdin", "-y", "-i", str(filepath), "-af", af_chain]
     
     if suffix == ".mp3":
@@ -1332,6 +1354,11 @@ def run_silence_trim(folder_path, skip_files=None):
     print(f"{Colors.CYAN}{Colors.BOLD}=== SILENCE TRIM PASS ==============={Colors.END}")
     print(f"{Colors.CYAN}{Colors.BOLD}====================================={Colors.END}\n")
     
+    if not SILENCE_TRIM:
+        print(f"{Colors.YELLOW}[!] Silence trimming is disabled in settings.{Colors.END}")
+        print(f"{Colors.DIM}    Skipping silence trim pass.{Colors.END}\n")
+        return 0, 0
+
     if not check_ffmpeg_available():
         print(f"{Colors.YELLOW}[!] FFmpeg was not found in your system's PATH.{Colors.END}")
         print(f"{Colors.DIM}    Skipping silence trim pass.{Colors.END}\n")
@@ -1352,7 +1379,7 @@ def run_silence_trim(folder_path, skip_files=None):
         return 0, 0
 
     print(f"{Colors.GREEN}Trimming silence on {len(files)} files with {MAX_WORKERS} worker threads...{Colors.END}")
-    print(f"{Colors.DIM}Threshold: -50 dB | Min silence duration: 0.5s{Colors.END}\n")
+    print(f"{Colors.DIM}Threshold: {SILENCE_THRESHOLD} | Min silence duration: {SILENCE_DURATION}s | Silence kept: {SILENCE_KEEP}s{Colors.END}\n")
     
     completed = 0
     failed = 0
@@ -1400,17 +1427,16 @@ def run_integrated_renamer_cli():
                         help="Seconds of silence to append at end of each normalized file")
     parser.add_argument('--norm-threads', type=int, default=None,
                         help="Worker threads for normalization pass")
-    parser.add_argument('--eq', default=None,
-                        help="Extra ffmpeg -af filter string appended after the main chain")
+    parser.add_argument('--silence-trim', choices=['on', 'off'], default='on',
+                        help="Silence trimming: on=trim front and back (default), off=leave silence alone")
     parser.add_argument('--custom-norm-cmd', default=None,
-                        help="Replace the entire ffmpeg -af filter chain for normalization and silence trim")
+                        help="Replace ONLY the loudnorm part of the ffmpeg -af chain (silence trim unaffected)")
     args, _ = parser.parse_known_args()
 
-    global SILENCE_PAD_DUR, CUSTOM_EQ_STRING, MAX_WORKERS, CUSTOM_NORM_CMD
+    global SILENCE_PAD_DUR, SILENCE_TRIM, MAX_WORKERS, CUSTOM_NORM_CMD
     if args.silence_pad is not None:
         SILENCE_PAD_DUR = args.silence_pad
-    if args.eq:
-        CUSTOM_EQ_STRING = args.eq
+    SILENCE_TRIM = (args.silence_trim == 'on')
     if args.custom_norm_cmd:
         CUSTOM_NORM_CMD = args.custom_norm_cmd
     if args.norm_threads is not None and args.norm_threads > 0:
@@ -4682,8 +4708,7 @@ def default_export_config() -> dict:
         'normalization_mode': 'ask',
         'auto_rename': False,
         'silence_pad_dur': 2.0,
-        'use_custom_eq': False,
-        'custom_eq_string': '',
+        'silence_trim': True,
         'use_custom_norm_cmd': False,
         'custom_norm_cmd': '',
         'download_threads': 3,
@@ -5283,36 +5308,41 @@ class SettingsDialog(QDialog):
         norm_threads_h.addStretch()
         right_layout.addLayout(norm_threads_h)
 
-        # Custom EQ string
-        right_layout.addWidget(QLabel("CUSTOM FFMPEG EQ FILTER (ADVANCED)", font=QFont("Segoe UI Semibold", 10)))
-        eq_h = QHBoxLayout()
-        self.eq_cb = QCheckBox()
-        self.eq_cb.setChecked(parent.use_custom_eq)
-        self.eq_cb.toggled.connect(self._toggle_eq)
-        eq_h.addWidget(self.eq_cb)
-        initial_eq = parent.custom_eq_string if parent.custom_eq_string else "equalizer=f=100:width_type=o:width=2:g=0"
-        self.eq_edit = QLineEdit(initial_eq)
-        self.eq_edit.setPlaceholderText("e.g. equalizer=f=100:width_type=o:width=2:g=-10")
-        self.eq_edit.setEnabled(parent.use_custom_eq)
-        self.eq_edit.textChanged.connect(self._update_eq)
-        eq_h.addWidget(self.eq_edit, 1)
-        eq_h.addWidget(self._make_info_btn("Appended to the ffmpeg filter chain during normalization."))
-        right_layout.addLayout(eq_h)
+        # Silence trimming on/off. This is its own part of the filter chain and is
+        # completely independent of the loudnorm/EQ override below.
+        self.silence_trim_cb = QCheckBox("Trim silence from the start and end of the file")
+        self.silence_trim_cb.setToolTip(
+            f"Removes leading and trailing silence during normalization.\n"
+            f"Built-in filter (unchanged): silenceremove=start_periods=1:\n"
+            f"start_duration={SILENCE_DURATION}:start_threshold={SILENCE_THRESHOLD}:\n"
+            f"start_silence={SILENCE_KEEP}:stop_silence={SILENCE_KEEP}, applied forwards and reversed.\n"
+            f"Turning this off does NOT change the loudnorm/EQ override,\n"
+            f"and using a loudnorm/EQ override does NOT change this filter.")
+        self.silence_trim_cb.setChecked(parent.silence_trim)
+        self.silence_trim_cb.toggled.connect(self._toggle_silence_trim)
+        right_layout.addWidget(self.silence_trim_cb)
 
-        # Custom normalization command override (replaces built-in filter chain)
-        right_layout.addWidget(QLabel("CUSTOM NORM/TRIM COMMAND OVERRIDE (ADVANCED)", font=QFont("Segoe UI Semibold", 10)))
+        # Custom loudnorm/EQ override (replaces only the loudnorm filter, never the silence trim)
+        right_layout.addWidget(QLabel("LOUDNORM/EQ OVERRIDE (ADVANCED)", font=QFont("Segoe UI Semibold", 10)))
         norm_cmd_h = QHBoxLayout()
         self.norm_cmd_cb = QCheckBox()
+        self.norm_cmd_cb.setToolTip("Replace the built-in whole-track gain with your own loudnorm/EQ filter")
         self.norm_cmd_cb.setChecked(parent.use_custom_norm_cmd)
         self.norm_cmd_cb.toggled.connect(self._toggle_norm_cmd)
         norm_cmd_h.addWidget(self.norm_cmd_cb)
-        initial_norm = parent.custom_norm_cmd if parent.custom_norm_cmd else f"loudnorm=I={TARGET_LUFS}:TP={TRUE_PEAK}:LRA=11"
+        _default_loudnorm = f"loudnorm=I={TARGET_LUFS}:TP={TRUE_PEAK}:LRA={LOUDNESS_RANGE}"
+        initial_norm = parent.custom_norm_cmd if parent.custom_norm_cmd else _default_loudnorm
         self.norm_cmd_edit = QLineEdit(initial_norm)
-        self.norm_cmd_edit.setPlaceholderText("e.g. loudnorm=I=-16:TP=-1.5:LRA=11")
+        self.norm_cmd_edit.setPlaceholderText(_default_loudnorm)
         self.norm_cmd_edit.setEnabled(parent.use_custom_norm_cmd)
         self.norm_cmd_edit.textChanged.connect(self._update_norm_cmd)
         norm_cmd_h.addWidget(self.norm_cmd_edit, 1)
-        norm_cmd_h.addWidget(self._make_info_btn("Replaces the entire -af filter chain for normalization AND silence trim."))
+        norm_cmd_h.addWidget(self._make_info_btn(
+            f"Replaces ONLY the loudnorm part of the ffmpeg filter chain.\n"
+            f"The silence trim and the end-of-file pad are still applied around it.\n"
+            f"Exact loudnorm values used by default: I={TARGET_LUFS} LUFS | TP={TRUE_PEAK} dB | LRA={LOUDNESS_RANGE}.\n"
+            f"Want EQ too? Append it after the loudnorm part in this same box, e.g.\n"
+            f"{_default_loudnorm},equalizer=f=100:width_type=o:width=2:g=-3"))
         right_layout.addLayout(norm_cmd_h)
 
         # Run a custom file after a download batch finishes
@@ -5510,16 +5540,11 @@ class SettingsDialog(QDialog):
             val = float(text)
             if val >= 0:
                 self.parent.silence_pad_dur = val
+                global SILENCE_PAD_DUR
+                SILENCE_PAD_DUR = val
                 self.parent.save_config()
         except ValueError:
             pass
-
-    def _toggle_eq(self, state):
-        self.parent.use_custom_eq = state
-        self.eq_edit.setEnabled(state)
-        if state and not self.eq_edit.text().strip():
-            self.eq_edit.setText("equalizer=f=100:width_type=o:width=2:g=0")
-        self.parent.save_config()
 
     def _update_dl_threads(self, text):
         try:
@@ -5541,15 +5566,17 @@ class SettingsDialog(QDialog):
         self.parent.normalization_threads = val
         self.parent.save_config()
 
-    def _update_eq(self, text):
-        self.parent.custom_eq_string = text
+    def _toggle_silence_trim(self, state):
+        self.parent.silence_trim = state
+        global SILENCE_TRIM
+        SILENCE_TRIM = state
         self.parent.save_config()
 
     def _toggle_norm_cmd(self, state):
         self.parent.use_custom_norm_cmd = state
         self.norm_cmd_edit.setEnabled(state)
         if state and not self.norm_cmd_edit.text().strip():
-            self.norm_cmd_edit.setText(f"loudnorm=I={TARGET_LUFS}:TP={TRUE_PEAK}:LRA=11")
+            self.norm_cmd_edit.setText(f"loudnorm=I={TARGET_LUFS}:TP={TRUE_PEAK}:LRA={LOUDNESS_RANGE}")
         global CUSTOM_NORM_CMD
         CUSTOM_NORM_CMD = self.parent.custom_norm_cmd if state else ""
         self.parent.save_config()
@@ -6178,8 +6205,7 @@ class MainApp(QMainWindow):
         self.normalization_mode = "ask"  # "on" | "off" | "ask"
         self.auto_rename = False
         self.silence_pad_dur = 2.0
-        self.use_custom_eq = False
-        self.custom_eq_string = ""
+        self.silence_trim = True
         self.use_custom_norm_cmd = False
         self.custom_norm_cmd = ""
         self.download_threads = 3
@@ -6238,8 +6264,10 @@ class MainApp(QMainWindow):
         self.config_path = os.path.join(self.config_dir, "gui_config.json")
         self.load_config()
 
-        # Apply CUSTOM_NORM_CMD global from loaded config immediately
-        global CUSTOM_NORM_CMD
+        # Apply the normalization globals from the loaded config immediately
+        global SILENCE_TRIM, SILENCE_PAD_DUR, CUSTOM_NORM_CMD
+        SILENCE_TRIM = bool(self.silence_trim)
+        SILENCE_PAD_DUR = float(self.silence_pad_dur)
         if self.use_custom_norm_cmd and self.custom_norm_cmd.strip():
             CUSTOM_NORM_CMD = self.custom_norm_cmd.strip()
 
@@ -7244,8 +7272,7 @@ class MainApp(QMainWindow):
                     self.normalization_mode = c.get('normalization_mode', 'ask')
                     self.auto_rename = c.get('auto_rename', False)
                     self.silence_pad_dur = c.get('silence_pad_dur', 2.0)
-                    self.use_custom_eq = c.get('use_custom_eq', False)
-                    self.custom_eq_string = c.get('custom_eq_string', '')
+                    self.silence_trim = bool(c.get('silence_trim', True))
                     self.use_custom_norm_cmd = c.get('use_custom_norm_cmd', False)
                     self.custom_norm_cmd = c.get('custom_norm_cmd', '')
                     self.download_threads = c.get('download_threads', 3)
@@ -7300,8 +7327,7 @@ class MainApp(QMainWindow):
             'normalization_mode': self.normalization_mode,
             'auto_rename': self.auto_rename,
             'silence_pad_dur': self.silence_pad_dur,
-            'use_custom_eq': self.use_custom_eq,
-            'custom_eq_string': self.custom_eq_string,
+            'silence_trim': self.silence_trim,
             'use_custom_norm_cmd': self.use_custom_norm_cmd,
             'custom_norm_cmd': self.custom_norm_cmd,
             'download_threads': self.download_threads,
@@ -7650,8 +7676,7 @@ class MainApp(QMainWindow):
         self.normalization_mode = "ask"
         self.auto_rename = False
         self.silence_pad_dur = 2.0
-        self.use_custom_eq = False
-        self.custom_eq_string = ""
+        self.silence_trim = True
         self.use_custom_norm_cmd = False
         self.custom_norm_cmd = ""
         self.download_threads = 3
@@ -7967,15 +7992,15 @@ class MainApp(QMainWindow):
                 self.silence_pad_dur = float(cfg.get('silence_pad_dur'))
             except (TypeError, ValueError):
                 self.silence_pad_dur = 2.0
-        if 'use_custom_eq' in cfg:
-            self.use_custom_eq = bool(cfg.get('use_custom_eq'))
-        if 'custom_eq_string' in cfg:
-            self.custom_eq_string = str(cfg.get('custom_eq_string') or "")
+        if 'silence_trim' in cfg:
+            self.silence_trim = bool(cfg.get('silence_trim'))
         if 'use_custom_norm_cmd' in cfg:
             self.use_custom_norm_cmd = bool(cfg.get('use_custom_norm_cmd'))
         if 'custom_norm_cmd' in cfg:
             self.custom_norm_cmd = str(cfg.get('custom_norm_cmd') or "")
-        global CUSTOM_NORM_CMD
+        global SILENCE_TRIM, SILENCE_PAD_DUR, CUSTOM_NORM_CMD
+        SILENCE_TRIM = bool(self.silence_trim)
+        SILENCE_PAD_DUR = float(self.silence_pad_dur)
         CUSTOM_NORM_CMD = self.custom_norm_cmd.strip() if (self.use_custom_norm_cmd and self.custom_norm_cmd.strip()) else ""
         if 'download_threads' in cfg:
             try:
@@ -10045,8 +10070,7 @@ class MainApp(QMainWindow):
             args.append('--auto')
         args.append(f'--silence-pad={str(self.silence_pad_dur)}')
         args.append(f'--norm-threads={self.normalization_threads}')
-        if self.use_custom_eq and self.custom_eq_string.strip():
-            args.append(f'--eq={self.custom_eq_string.strip()}')
+        args.append(f'--silence-trim={"on" if self.silence_trim else "off"}')
         if self.use_custom_norm_cmd and self.custom_norm_cmd.strip():
             args.append(f'--custom-norm-cmd={self.custom_norm_cmd.strip()}')
 
