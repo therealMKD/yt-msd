@@ -501,7 +501,7 @@ def _remove_placeholder_tag(filepath):
 
 
 def clean_and_tag_files(folder_path, start_auto=False):
-    extensions = {".mp3", ".m4a"}
+    extensions = TAGGABLE_EXTENSIONS
     files = sorted([f for f in folder_path.iterdir() if f.is_file() and f.suffix.lower() in extensions])
     
     if not files:
@@ -1367,7 +1367,7 @@ def run_loudness_normalization(folder_path, skip_files=None):
         print(f"{Colors.DIM}    Skipping volume adjustment pass.{Colors.END}\n")
         return 0, 0
         
-    extensions = {".mp3", ".m4a"}
+    extensions = TAGGABLE_EXTENSIONS
     files = sorted([f for f in folder_path.iterdir() if f.is_file() and f.suffix.lower() in extensions])
 
     # Filter out files that were already tagged before the renaming pass started
@@ -1482,7 +1482,7 @@ def run_silence_trim(folder_path, skip_files=None):
         print(f"{Colors.DIM}    Skipping silence trim pass.{Colors.END}\n")
         return 0, 0
     
-    extensions = {".mp3", ".m4a"}
+    extensions = TAGGABLE_EXTENSIONS
     files = sorted([f for f in folder_path.iterdir() if f.is_file() and f.suffix.lower() in extensions])
 
     # Filter out files that were already tagged before the renaming pass started
@@ -1572,7 +1572,7 @@ def run_integrated_renamer_cli():
         folder = _select_renamer_folder()
 
     # Snapshot which files already have both artist+title tags BEFORE renaming writes new tags
-    _ext = {".mp3", ".m4a"}
+    _ext = TAGGABLE_EXTENSIONS
     _pre_tagged = frozenset(
         f for f in folder.iterdir()
         if f.is_file() and f.suffix.lower() in _ext
@@ -1637,6 +1637,34 @@ THEME_COLORS = {
     "White": ("#FFFFFF", "#E5E5E5")
 }
 
+# The formats the Format dropdown offers, and therefore the formats a download can
+# be saved as. The rule for this list is strict: a format is only allowed if the
+# tagger can write artist/title into it and read them back, because the player gets
+# everything it displays out of those two tags. Three formats used to be on this
+# list and are off it on purpose, each verified against mutagen:
+#   .aac  - a raw ADTS bitstream with no tag container of any kind.
+#   .wav  - RIFF/PCM. mutagen opens it but gives it no tag API at all, so the
+#           tagger has nowhere to put an artist or a title.
+#   .flac - taggable, but only through Vorbis comments, which is a different tag
+#           system from the ID3/MP4 path this tagger uses.
+# All three are still in AUDIO_EXTENSIONS below, so a file someone already downloaded
+# in one of them stays visible and playable - it can just no longer be produced. The
+# two that are left are the two the whole pipeline actually supports: MP3 (ID3v2) and
+# M4A (MP4 atoms). M4A is the same AAC codec, so no codec was ever lost, only the
+# containers that could not carry a tag.
+DOWNLOAD_FORMATS = ("mp3", "m4a")
+DEFAULT_DOWNLOAD_FORMAT = "mp3"
+
+# The same list as file suffixes, for the passes that walk a folder. Derived from
+# DOWNLOAD_FORMATS so that a format cannot be offered in the dropdown without also
+# being handled by the rename/tag/normalize/silence-trim passes, which is how aac,
+# flac and wav ended up downloadable-but-never-taggable in the first place.
+TAGGABLE_EXTENSIONS = {f".{fmt}" for fmt in DOWNLOAD_FORMATS}
+
+# Audio extensions the local file browser and the sync scan accept. This is wider
+# than DOWNLOAD_FORMATS on purpose: it also covers files that are already sitting in
+# someone's library, including .aac files downloaded by older versions of the app,
+# which should stay visible and playable even though they can no longer be produced.
 AUDIO_EXTENSIONS = {'.mp3', '.flac', '.wav', '.m4a', '.ogg', '.opus', '.aac', '.wma', '.mka', '.aiff', '.alac', '.ape', '.wv'}
 
 def get_system_accent_color():
@@ -7496,7 +7524,16 @@ class MainApp(QMainWindow):
             if os.path.exists(self.config_path):
                 with open(self.config_path, 'r') as f:
                     c = json.load(f)
-                    self.format_var = c.get('format', 'mp3')
+                    self.format_var = c.get('format', DEFAULT_DOWNLOAD_FORMAT)
+                    # A format that is no longer offered must not survive in a config
+                    # written by an older version. aac, flac and wav were all dropped
+                    # because the tagger cannot write artist/title into any of them, and
+                    # setCurrentText with a value the combo does not contain leaves the
+                    # combo showing the default while format_var still holds the dead
+                    # name - the next download would then go out with an --audio-format
+                    # the app no longer supports. Fall back to the default instead.
+                    if self.format_var not in DOWNLOAD_FORMATS:
+                        self.format_var = DEFAULT_DOWNLOAD_FORMAT
                     self.bitrate_var = c.get('bitrate', '192')
                     self.recent_folders = c.get('folders', [default_dl])
                     self.download_path = self.recent_folders[0] if self.recent_folders else default_dl
@@ -8317,7 +8354,13 @@ class MainApp(QMainWindow):
         Returns True when the package changed the local folder, so the caller
         knows the local file list has to be rescanned."""
         if 'format' in cfg and hasattr(self, 'format_combo'):
-            self.format_combo.setCurrentText(str(cfg.get('format')))
+            _imported_format = str(cfg.get('format')).strip().lower()
+            # Same rule as load_config(): an imported package that still names a
+            # format this build no longer offers would otherwise put the combo into a
+            # no-current-item state, and the next download would go out with a blank
+            # --audio-format. Unknown formats are ignored and the current pick stands.
+            if _imported_format in DOWNLOAD_FORMATS:
+                self.format_combo.setCurrentText(_imported_format)
         if 'bitrate' in cfg and hasattr(self, 'bitrate_combo'):
             self.bitrate_combo.setCurrentText(str(cfg.get('bitrate')))
         if 'mode' in cfg:
@@ -8558,7 +8601,7 @@ class MainApp(QMainWindow):
         set_r = QHBoxLayout()
         set_r.addWidget(QLabel("Format:"))
         self.format_combo = QComboBox()
-        self.format_combo.addItems(["mp3", "m4a", "flac", "wav", "aac"])
+        self.format_combo.addItems(list(DOWNLOAD_FORMATS))
         self.format_combo.setCurrentText(self.format_var)
         self.format_combo.currentTextChanged.connect(self.save_config)
         set_r.addWidget(self.format_combo)
