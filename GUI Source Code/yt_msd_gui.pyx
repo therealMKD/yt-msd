@@ -22,7 +22,7 @@
 # ---- END OF CYTHON HEADER - the unchanged yt-msd-gui.pyw source follows ----
 # Open Source Software under the Apache License, Version 2.0
 # PySide6 version of yt-msd
-# Programmed with Antigravity, if you don't like it, don't use it.
+# Programmed with Strata, with Qwen 3.8-Flash-Next (IQ3_XXS), in VScode with Cline. Ff you don't like that, don't use it.
 
 import os
 import re
@@ -8718,7 +8718,13 @@ class MainApp(QMainWindow):
         c.addWidget(self.shuffle_btn)
 
         # Stop After Current: one button, three states (off -> once -> always).
-        self.stop_after_btn = QPushButton("\uE76A")
+        # U+25A0 BLACK SQUARE rather than a Segoe MDL2 Assets private-use codepoint:
+        # the previous caption (U+E76A "Replay") is not in this machine's MDL2 font, so
+        # Qt fell back to the .notdef glyph and the button drew an empty box. U+25A0 is a
+        # normal text glyph that Segoe MDL2 Assets (the family the #stopAfterBtn rule
+        # asks for), Segoe UI and the fallback fonts all have, so it paints as a filled
+        # square whichever font the rule resolves to.
+        self.stop_after_btn = QPushButton("\u25A0")
         self.stop_after_btn.setObjectName("stopAfterBtn")
         self.stop_after_btn.setFixedSize(36, 36)
         self.stop_after_btn.setProperty("stop_after_state", STOP_AFTER_STATE_NAMES[self.stop_after_current])
