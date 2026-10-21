@@ -6486,6 +6486,11 @@ class MainApp(QMainWindow):
         # "Stop after current": off / once / always, cycled by the player-bar button
         # and the tray entry (see the prefetch and stop-after block near play_result).
         self.stop_after_current = STOP_AFTER_OFF
+        # Which track an automatic "once" belongs to. A new search arms one for the
+        # stream that is playing (see _arm_stop_after_for_new_search), and this id is
+        # what lets that arming be forgotten again when a different track starts.
+        # None means the armed state, if there is one, is the user's own.
+        self._search_stop_after_track = None
         # Streams resolved seconds ahead of time: video id -> (url, user agent, epoch).
         # Written only by the prefetch thread, read once by the play path; the lock is
         # what keeps those two from tripping over the same dictionary.
@@ -9500,6 +9505,9 @@ class MainApp(QMainWindow):
             url = item['path'].replace("\\", "/")
             if not url.startswith("file:///"): url = "file:///" + url
             self.current_video_id = "local"
+            # A file from the local pane is not the track a search armed its one-shot
+            # for, and it steps through the folder list, which a search does not touch.
+            self._release_search_stop_after("local")
             self.current_local_file_path = item['path']
             
             audio_files = [x for x in getattr(self, 'current_local_items', []) if x.get('is_dir') is False]
@@ -9865,10 +9873,18 @@ class MainApp(QMainWindow):
         # import, session restore). A new search is read from its first row, and the
         # successor decided for the list being replaced is no longer part of the playlist
         # playback is stepping through; a redraw of the same list is neither.
+        # A search replaces the list playback is stepping through, so the track that
+        # is playing when it lands is armed with a one-shot stop instead of being
+        # followed by whatever row happens to sit at its index in the new list.
+        search_armed_stop_after = False
         if reset_view:
             self.invalidate_next_track_prefetch()
             self._reset_results_scroll()
-        self._on_status_update(f"Found {len(res)} results.", False, "white")
+            search_armed_stop_after = self._arm_stop_after_for_new_search()
+        if search_armed_stop_after:
+            self._on_status_update(f"Found {len(res)} results - Stop after current is Once now, so the track already playing stays the last one of the search it came from.", False, "#FF8C00")
+        else:
+            self._on_status_update(f"Found {len(res)} results.", False, "white")
         QTimer.singleShot(0, self.lazy_load_visible_results)
         # Lazy loading re-expands rows as they are built; land at the top again after it.
         if reset_view:
@@ -10864,6 +10880,9 @@ class MainApp(QMainWindow):
     def cycle_stop_after_current(self):
         """Move to the next state in the off -> once -> always -> off cycle."""
         current = getattr(self, 'stop_after_current', STOP_AFTER_OFF)
+        # A click is the user taking the state in hand, so an arming a search left
+        # behind is no longer what he wants and goes with it.
+        self._search_stop_after_track = None
         self.set_stop_after_current((int(current) + 1) % 3)
 
     def set_stop_after_current(self, state):
@@ -10905,11 +10924,77 @@ class MainApp(QMainWindow):
         # too, so a track the user starts again by hand reads ahead once more.
         self._prefetch_decision = None
         self._prefetch_trigger_key = None
+        # Whichever way the arming was set - the button or a new search - it has now
+        # been spent on the track that just finished.
+        self._search_stop_after_track = None
         if getattr(self, 'stop_after_current', STOP_AFTER_OFF) == STOP_AFTER_ONCE:
             self.set_stop_after_current(STOP_AFTER_OFF)
             self._on_status_update("Stopped after the current track.", False, "gray")
         else:
             self._on_status_update("Stopped after the current track - Stop after current is still on.", False, "gray")
+
+    def _stream_track_in_progress(self):
+        """The video id of the stream the player is committed to, or None when there
+        is no stream for a new search to interrupt.
+
+        "Committed" covers a stream playing, paused, or still being resolved by
+        yt-dlp: a paused track resumes and then advances exactly like one that was
+        playing, and a track being fetched starts on its own the moment yt-dlp
+        answers. Local files are left out on purpose - a search replaces
+        search_results, which is the list a searched track steps through, and it
+        leaves the folder list a local file steps through untouched.
+        """
+        if getattr(self, '_is_loading_stream', False):
+            return getattr(self, '_pending_fetch_id', None) or None
+        vid_id = getattr(self, 'current_video_id', None)
+        if not vid_id or vid_id == "local":
+            return None
+        player = getattr(self, 'vlc_player', None)
+        if player is None:
+            return None
+        if player.get_state() not in (vlc.State.Playing, vlc.State.Paused):
+            return None
+        return vid_id
+
+    def _arm_stop_after_for_new_search(self):
+        """Arm "stop after current: once" for the track playing when a new search lands.
+
+        play_next() steps through search_results by index, and a new search replaces
+        search_results underneath the track that is already playing. That track is
+        still a track of the previous list, but its index now counts into the new
+        one, so when it finished the listener was dropped into the middle of the
+        search they had just run - which looked like the player moving on to some
+        video at random. The one-shot state makes the track already playing the last
+        one of the list it came from, and leaves the new search to be started by
+        hand. Returns True only when it armed: a state the user chose by clicking is
+        never overwritten, and a search with no stream in progress arms nothing.
+        """
+        if getattr(self, 'stop_after_current', STOP_AFTER_OFF) != STOP_AFTER_OFF:
+            return False
+        vid_id = self._stream_track_in_progress()
+        if not vid_id:
+            return False
+        self._search_stop_after_track = vid_id
+        self.set_stop_after_current(STOP_AFTER_ONCE)
+        return True
+
+    def _release_search_stop_after(self, new_vid_id=None):
+        """Forget a "once" that a search armed, as opposed to one the user clicked.
+
+        Such an arming belongs to one track only. Once a different track starts - a
+        row clicked in the new list, a manual Next or Previous, a file from the local
+        pane - it has nothing left to protect, and leaving it armed would have
+        stopped the track the user just chose after it finished. The same track
+        started again keeps its arming, because it still came from the old list.
+        """
+        armed_for = getattr(self, '_search_stop_after_track', None)
+        if not armed_for:
+            return
+        if new_vid_id and new_vid_id == armed_for:
+            return
+        self._search_stop_after_track = None
+        if getattr(self, 'stop_after_current', STOP_AFTER_OFF) == STOP_AFTER_ONCE:
+            self.set_stop_after_current(STOP_AFTER_OFF)
 
     def play_result(self, video, paused_at_start=False, from_nav=False):
         # If VLC is still initializing in background, defer and retry
@@ -10924,6 +11009,10 @@ class MainApp(QMainWindow):
         
         # Track pending fetch ID and loading state
         vid_id = video.get('id', '')
+        # The one-shot a search armed belongs to the track that was playing when that
+        # search ran. The track the user has just picked is not it, so the arming is
+        # dropped here instead of stopping this track after it ends.
+        self._release_search_stop_after(vid_id)
         self._pending_fetch_id = vid_id
         self._is_loading_stream = True
         self._has_played_current = False
