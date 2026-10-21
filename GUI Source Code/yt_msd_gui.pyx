@@ -2904,6 +2904,18 @@ class SyncConfigManager:
             except Exception:
                 pass
 
+        # bind_client_wifi() used to write the Wi-Fi binding as 'bound_wifi_ssid' while every
+        # reader - the chain card label, the auto-sync gate, the LAN-notification path and the
+        # removable-drive path - asks for 'wifi_ssid'. A chain that was bound to a network in an
+        # earlier build therefore reads back as unbound, and the sync quietly reverts to running on
+        # any network. Fold the stray key back onto the name the readers use so an existing binding
+        # survives the upgrade instead of silently disappearing.
+        for chain in self.client_chains:
+            stray_ssid = chain.pop('bound_wifi_ssid', None)
+            if stray_ssid is not None and not str(chain.get('wifi_ssid') or '').strip():
+                chain['wifi_ssid'] = str(stray_ssid).strip()
+                migrated = True
+
         if migrated:
             self.save()
 
@@ -2989,7 +3001,11 @@ class SyncConfigManager:
     def bind_client_wifi(self, chain_id: str, ssid: str):
         for c in self.client_chains:
             if c.get('id') == chain_id:
-                c['bound_wifi_ssid'] = ssid.strip()
+                # Must be written under exactly 'wifi_ssid'. add_client_chain() stores it under
+                # that name and every reader asks for it by that name, so writing it anywhere else
+                # made "Bind Wi-Fi" / "Unbind Wi-Fi" on a live chain look like a no-op: the card
+                # kept its old label and the auto-sync gate kept the SSID the chain was created with.
+                c['wifi_ssid'] = ssid.strip()
                 break
         self.save()
 
@@ -4189,7 +4205,13 @@ class SyncManagerDialog(QDialog):
                 ("12 Hours", 12 * 3600),
                 ("24 Hours", 24 * 3600),
                 ("1 Week", 7 * 86400),
-                ("Forever (Until Re-enabled)", 0)
+                # -1 and not 0. pause_client_chain() turns any other duration into
+                # "now + duration_seconds", so 0 asked for a pause that had already expired by the
+                # time the card was rebuilt: the chain carried on syncing and the card flipped
+                # straight back to "Pause Sync". -1 is the sentinel both pause_client_chain() and
+                # is_client_chain_paused() already treat as "paused until the user resumes it",
+                # which is what this menu entry promises.
+                ("Forever (Until Re-enabled)", -1)
             ]
             for label, secs in durations:
                 act = pause_menu.addAction(label)
@@ -7701,6 +7723,22 @@ class MainApp(QMainWindow):
         self.silence_trim = True
         self.use_custom_norm_cmd = False
         self.custom_norm_cmd = ""
+        self.disable_update_checks = False
+        self.disable_ytdlp_updates = False
+        # These two opt-outs live on MainApp only, never in the settings list save_config() writes
+        # from scratch, so without this they survived a "factory reset": save_config() writes
+        # whatever the attributes hold and load_config() reads it back on the next launch, so the
+        # user stayed opted out of app-update and yt-dlp-update prompts through a reset that claimed
+        # to put everything back to default.
+        global SILENCE_TRIM, SILENCE_PAD_DUR, CUSTOM_NORM_CMD
+        SILENCE_TRIM = True
+        SILENCE_PAD_DUR = self.silence_pad_dur
+        CUSTOM_NORM_CMD = ""
+        # The renamer half is a second copy of this program launched in a console, and it reads the
+        # module globals above rather than the MainApp attributes. Resetting only the attributes left
+        # every renamer this window launched running with the pre-reset trim / pad / override until
+        # the app was restarted. load_config() and _apply_imported_config() push the globals for the
+        # same reason; a reset has to do it too.
         self.download_threads = 3
         self.normalization_threads = max(1, os.cpu_count() // 2)
         self.local_rescan_interval = 60
@@ -7718,6 +7756,19 @@ class MainApp(QMainWindow):
             self.splitter.setSizes(self.splitter_sizes)
         if hasattr(self, 'vol_slider'):
             self.vol_slider.setValue(100)
+        # The Settings dialog is cached on MainApp and reused, and it reads the MainApp attributes
+        # only when it is first built. Resetting without dropping it left the very dialog the user
+        # just clicked "reset" in showing the old tick marks and the old pad value - and the next
+        # toggle would have written those stale values straight back. _apply_imported_config()
+        # throws the cached dialog away for the same reason; do the same here. The caller closes
+        # this dialog right after the reset, so closing it from here is safe.
+        settings_dialog = getattr(self, 'settings_dialog', None)
+        if settings_dialog is not None:
+            try:
+                settings_dialog.close()
+            except Exception:
+                pass
+            self.settings_dialog = None
         self.save_config()
         self._on_status_update("Settings reset to defaults.", False, "#3B8ED0")
 
