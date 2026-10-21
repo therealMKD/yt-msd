@@ -44,7 +44,7 @@ Go to [the latest release](https://github.com/therealMKD/yt-msd/releases/latest)
 - **FIRST**, install python. You can get it [here](https://www.python.org/downloads/) or through winget by using `winget install python`. The program was made with version 3.15, it may or may not work on older versions.
 
 **If you use winget to install:**
-First, run `winget install python`. This will download and install the python install manager. Next, run `py install --configure`, and say yes to the prompt. Then restart your terminal before continuing. This creates a python scripts directory, and adds it to path. This lets you use `pip` as a command, without having to use `py -m pip` instead.
+First, run `winget install python`. This will download and install the python install manager. Run `py` and verify that Python is installed properly (It should open IDLE, after listing the Python version)
 
 - **NEXT** you must install ALL the following dependencies, with these two commands:
   - ```
@@ -53,8 +53,6 @@ First, run `winget install python`. This will download and install the python in
   - ```
     winget install yt-dlp.ffmpeg VideoLAN.VLC
     ```
-
-If you get an error saying `pip is not a recognized command`, you can either fix it by troubleshooting your path, or just add `py -m` before the command. (For example `py -m pip install pillow`)
 
 After everything is installed, read the [First Startup Guide](#first-startup-guide) to set up the program for the first time.
 
