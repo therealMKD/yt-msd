@@ -22,7 +22,7 @@
 # Not done here (later steps): compile the .c with MSVC into a .pyd extension (setuptools) or
 # into an .exe (cl.exe), then package it. MSVC and the Windows SDK are auto-detected by
 # setuptools from a plain PowerShell prompt - see requirements-build.txt for the verified
-# toolchain (Cython 3.3.0, MSVC 14.44 / 14.50, Python 3.14).
+# toolchain (Cython 3.3.0, MSVC 14.44 / 14.50, Python 3.15).
 #
 # Verified on this machine while setting this up:
 #   - the 9900-line source transpiles with no errors and no warnings;

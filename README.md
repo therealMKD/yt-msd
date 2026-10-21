@@ -41,7 +41,8 @@ Once the program is installed, you will be able to find it in the start menu, or
 
 Go to [the latest release](https://github.com/therealMKD/yt-msd/releases/latest), and download the file named `yt-msd-gui.pyw`. Before you can run it, you must install the following things on your computer:
 
-- **FIRST**, install python. You can get it [here](https://www.python.org/downloads/) or through winget by using `winget install python`. The program was made with version 3.14, but it will work on 3.15. I would recommend downloading 3.15.
+- **FIRST**, install python. You can get it [here](https://www.python.org/downloads/) or through winget by using `winget install python`. The program was made with version 3.15, it may or may not work on older versions.
+
 **If you use winget to install:**
 First, run `winget install python`. This will download and install the python install manager. Next, run `py install --configure`, and say yes to the prompt. Then restart your terminal before continuing. This creates a python scripts directory, and adds it to path. This lets you use `pip` as a command, without having to use `py -m pip` instead.
 

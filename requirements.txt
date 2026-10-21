@@ -1,5 +1,5 @@
 # yt-msd runtime dependencies (GUI Source Code/yt-msd-gui.pyw)
-# Pinned to the versions verified working on the release machine (Python 3.14, Windows x64).
+# Pinned to the versions verified working on the release machine (Python 3.15, Windows x64).
 # Install with:  python -m pip install -r requirements.txt
 #
 # Notes:
@@ -16,8 +16,8 @@
 #     newer yt-dlp exists. A yt-dlp.exe placed next to the program or anywhere on PATH
 #     works too.
 
-PySide6==6.11.2
+PySide6==6.12.0
 mutagen==1.48.1
-pillow==12.3.0
+pillow==13.0.0
 watchdog==6.0.0
 python-vlc==3.0.21203

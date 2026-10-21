@@ -43,3 +43,8 @@ build_dir_cython/
 *.pyd
 GUI Source Code/*.c
 CLI Source Code/*.c
+
+# Personal AI reference notes - notes written FOR the AI assistant, never shipped with the repo.
+# Deliberately untracked: it is not documentation for users and must never be committed.
+AI Readme.md
+GUI Source Code/AI Readme.md

@@ -98,7 +98,7 @@ def find_pyd():
     """The compiled extension, whatever suffix setuptools gave it.
 
     setuptools names it after the running interpreter, e.g.
-    yt_msd_gui.cp314-win_amd64.pyd. That is the name Python and PyInstaller
+    yt_msd_gui.cp315-win_amd64.pyd. That is the name Python and PyInstaller
     look for, so it is left as it is.
     """
     found = glob.glob(os.path.join(BUILD_DIR, "%s*.pyd" % MODULE_NAME))
