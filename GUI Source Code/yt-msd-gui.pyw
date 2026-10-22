@@ -802,7 +802,11 @@ PREFETCH_CACHE_LIMIT = 4        # resolved stream URLs held at most
 # stream the listener never asked to stop is re-resolved by itself, keeping its position, up
 # to STREAM_REFETCH_LIMIT times per track. STREAM_URL_MAX_AGE is the backstop: a loaded URL
 # that old is re-resolved the moment the user scrubs or presses Play, unless the player is
-# measurably advancing on it - a stream that is working is left alone however old its URL is.
+# measurably advancing on it - a stream that is working is left alone however old its URL is,
+# and so is a stream that was only ever loaded and left sitting, which is the track the session
+# restore preloads at start up. Age alone reloads a stream that has actually been heard and has
+# then gone idle; reloading anything else is a restart rather than a recovery, and the two are
+# told apart by _stream_listened.
 # STREAM_END_SLACK_MS is how far short of its own reported length a media may "end" before
 # that ending is read as a stream that gave up rather than a track that finished.
 STREAM_STALL_SECONDS = 8
@@ -1741,6 +1745,33 @@ MUTAGEN_TAGGABLE_EXTENSIONS = {'.mp3', '.m4a', '.alac', '.flac', '.ogg', '.opus'
 # entries nobody is looking at any more are dropped once the cache reaches its cap.
 _LOCAL_META_CACHE_CAP = 6000
 _local_meta_cache = {}
+
+# The rows of a folder are filled in chunks, and every chunk hands the event loop back a
+# chance to lay the new rows out and paint them. The first chunk is deliberately about
+# what fits in the pane, because those are the rows the user switched folders to look at:
+# a folder of thirty files is filled by that chunk alone, and a folder of a thousand is
+# on screen and readable while the rest of it is still arriving.
+LOCAL_RENDER_FIRST_CHUNK_ROWS = 32
+
+# How tall a row is assumed to be until the pane has measured its own, which is what
+# decides how many rows a screenful is.
+LOCAL_RENDER_ROW_HEIGHT_GUESS = 24.0
+
+# After the first chunk the size is worked out from what a row actually costs this machine -
+# building it, laying it out and painting it - so that a chunk is as big as it can be and still
+# keep the GUI thread away for no more than about a frame. A fast machine fills a thousand files
+# in a few larger chunks, a slow one in many smaller ones, and neither stops answering the user.
+LOCAL_RENDER_CHUNK_MIN_ROWS = 32
+LOCAL_RENDER_CHUNK_MAX_ROWS = 1024
+LOCAL_RENDER_CHUNK_BUDGET_S = 0.020
+
+# The pane is handed the height the finished folder is going to occupy as soon as its listing is
+# known, and it keeps that height until the fill is done. A row that has already been drawn is
+# therefore never moved while the rest of the folder is being built: the folder appears at the
+# size it is going to be, its scrollbar is right from the first frame, and every chunk after the
+# first lands in room that is already reserved instead of stretching the list under the user and
+# forcing everything already on screen to be laid out and painted over again. Chunked filling
+# without it is what makes a big folder look like it is inflating rather than arriving.
 
 
 def _format_audio_duration(seconds):
@@ -6544,7 +6575,7 @@ class MainApp(QMainWindow):
     host_activity_signal = Signal(str, str, str)
     _probe_results_signal = Signal(dict)  # cached drive/chain state from the drive probe thread
     local_list_refresh_signal = Signal()  # ask for a non-blocking local folder rescan
-    _local_items_signal = Signal(object)  # (folder_path, scanned items) from the folder scan thread
+    _local_listing_signal = Signal(object)  # (render_id, folder_path, items) from the folder scan thread
     update_available_signal = Signal(str, str, str, str)  # tag, release_name, download_url, asset_name
     update_downloaded_signal = Signal(str, str, str)  # new_file_path, tag, how it is applied (emitted from the download bg thread)
     missing_deps_signal = Signal(str)  # html fragment of missing dependencies (emitted from the VLC init thread)
@@ -6578,6 +6609,31 @@ class MainApp(QMainWindow):
         self.local_rows = []
         self.local_row_by_path = {}
         self.local_btns = []
+        # Every folder switch gets its own id. Rows produced by a scan of a folder that
+        # has already been replaced are dropped by it instead of landing on the folder
+        # that is on screen now.
+        self._local_render_id = 0
+        # The listing of the folder currently filling the pane, less the rows that have
+        # already been drawn, plus what the last chunk cost the GUI thread. A fill that is
+        # still running is abandoned by the next folder switch.
+        self._local_render_pending = None
+        self._local_render_pending_id = 0
+        self._local_render_pending_path = None
+        self._local_render_step = 0
+        self._local_render_chunk_end = None
+        self._local_render_chunk_cost = 0.0
+        self._local_render_chunk_rows = 0
+        self._local_render_row_cost = 0.0
+        self._local_render_row_height = LOCAL_RENDER_ROW_HEIGHT_GUESS
+        # How many rows the folder on screen is going to have, and the height already handed to
+        # the pane for them. See _reserve_local_extent.
+        self._local_render_total_rows = 0
+        self._local_render_extent_height = 0
+        # Chunk N+1 is queued on a zero timer, which Qt runs after it has already laid out
+        # and polished chunk N - the reason a folder fills in instead of arriving at once.
+        self._local_render_timer = QTimer()
+        self._local_render_timer.setSingleShot(True)
+        self._local_render_timer.timeout.connect(self._fill_local_chunk)
         self.local_selection_anchor = None
         self.current_local_file_path = ""
         self.splitter_sizes = [300, 800, 300]
@@ -6659,13 +6715,19 @@ class MainApp(QMainWindow):
         # block (see the block before "Stop after current") starts by asking whether this is set.
         # The rest is the watchdog for it: the last position libVLC reported and the moment it
         # last moved, whether the stream has been noticed dead, whether it is being re-resolved
-        # right now, how many times this track has already reloaded itself, and a position the
-        # user asked for that has to wait until the fresh media answers.
+        # right now, how many times this track has already reloaded itself, whether anybody has
+        # ever heard this media advancing, and a position the user asked for that has to wait
+        # until the fresh media answers.
         self._loaded_stream = None
         self._loaded_stream_at = None
         self._stream_seen_ms = -1
         self._stream_moved_at = None
         self._stream_dead = False
+        # Only a stream that has been heard advancing can count as having gone idle, which is the
+        # only case where the age of its URL is on its own a reason to re-resolve it. A track the
+        # session restore preloads at start up starts here as False and stays that way until
+        # somebody plays it. See _stream_needs_renew.
+        self._stream_listened = False
         self._stream_refetching = False
         self._stream_refetch_attempts = 0
         self._stream_renew_started_at = None
@@ -6734,7 +6796,7 @@ class MainApp(QMainWindow):
         self.host_activity_signal.connect(self._on_host_activity)
         self._probe_results_signal.connect(self._apply_probe_results)
         self.local_list_refresh_signal.connect(self._refresh_local_list_async)
-        self._local_items_signal.connect(self._apply_local_items)
+        self._local_listing_signal.connect(self._on_local_listing)
         self.update_available_signal.connect(self._show_update_dialog)
         self.update_downloaded_signal.connect(self._prompt_swap_dialog)
         self.missing_deps_signal.connect(self._show_missing_dependencies)
@@ -6787,9 +6849,14 @@ class MainApp(QMainWindow):
             sd = self.session_data
             if sd.get('current_video_id') == "local" and sd.get('local_current_path'):
                 idx = sd.get('local_playback_index', -1)
-                audio_files = [x for x in getattr(self, 'current_local_items', []) if x.get('is_dir') is False]
-                if 0 <= idx < len(audio_files):
-                    QTimer.singleShot(100, lambda: self._on_local_click(audio_files[idx], paused_at_start=True))
+                # The folder opened above has only just started streaming its rows, so
+                # the track to resume on is remembered here and looked up by
+                # _finish_local_render, which runs when that list is actually complete.
+                # The folder it belongs to is remembered with it, because a folder that
+                # cannot be opened - or one the user switches away from before the rows
+                # land - must not have a track of another folder resumed in it.
+                self._pending_local_restore_index = idx
+                self._pending_local_restore_path = sd.get('local_current_path')
 
         # --- Local Network Sync Chains Subsystem ---
         self.sync_config_manager = SyncConfigManager(self.config_dir)
@@ -9479,28 +9546,236 @@ class MainApp(QMainWindow):
         self.refresh_local_list()
 
     def refresh_local_list(self):
-        self._build_local_rows(self._scan_local_items(self.local_current_path))
+        """Re-render the open folder. The switch itself is instant and the rows then fill
+        in a screenful at a time - see _start_local_render - so a folder holding hundreds
+        of files no longer delays the screen change the user asked for."""
+        self._start_local_render(self.local_current_path)
 
     def _refresh_local_list_async(self):
-        """Rescan the open folder on a worker thread. Used for every refresh that
-        was not caused by the user directly (a sync finishing, the hourly
-        auto-rescan), so a slow drive never holds the UI hostage."""
-        path = self.local_current_path
+        """Rescan the open folder for every refresh that was not caused by the user
+        directly (a sync finishing, the hourly auto-rescan). _start_local_render already
+        does its scanning off the GUI thread, so this is the same path under the name the
+        callers that must not block use."""
+        self._start_local_render(self.local_current_path)
 
-        def _bg():
+    def _start_local_render(self, path):
+        """Show `path` now, and let its rows come in afterwards.
+
+        The rows of the folder being replaced are torn down and the scan starts on a
+        worker thread before this returns, so nothing about the screen change is waiting
+        on the folder: the view is cleared to the new folder in the time it takes to drop
+        the old rows, and the first rows land as soon as the listing is known. The
+        listing itself is the cheap part - scandir hands over the name, size and timestamp
+        of every entry as it walks the folder, so 500 files list in a few milliseconds -
+        and it is sorted before the first batch because the batch order is the order the
+        rows appear in, and File Explorer order is what the user expects to land on.
+
+        Each render has its own id. The scan thread checks it before handing the listing
+        over and the GUI thread checks it again before every chunk of rows it builds, so
+        the rows of a folder that has already been left behind - or of a drive pulled out
+        mid-listing - cannot arrive on the folder that is on screen instead."""
+        self._local_render_id = getattr(self, '_local_render_id', 0) + 1
+        render_id = self._local_render_id
+        # A fill still under way belongs to the folder being replaced.
+        self._local_render_timer.stop()
+        self._local_render_pending = None
+        # The metadata reads of the folder being replaced are cancelled here rather than
+        # per chunk, because the chunks of one folder have to keep reading under the same
+        # pass. See _fetch_local_metadata_bg.
+        self._local_meta_pass = getattr(self, '_local_meta_pass', 0) + 1
+        self._reset_local_rows()
+
+        def _list_and_feed():
             items = self._scan_local_items(path)
-            try:
-                self._local_items_signal.emit((path, items))
-            except RuntimeError:
-                pass
+            if render_id != getattr(self, '_local_render_id', 0):
+                return  # a newer folder is on screen now; this listing is stale
+            # The whole listing crosses to the GUI thread in one go, because how big a
+            # chunk of rows should be depends on what building and painting them costs on
+            # this machine, and only the GUI thread can know that. A folder that cannot be
+            # listed comes back as None and is reported as an empty render, so the pane
+            # stays clear for it instead of keeping rows from a drive that is gone.
+            self._emit_local_listing(render_id, path, items)
 
-        threading.Thread(target=_bg, daemon=True).start()
+        threading.Thread(target=_list_and_feed, daemon=True).start()
 
-    def _apply_local_items(self, payload):
-        path, items = payload
+    def _emit_local_listing(self, render_id, path, items):
+        """Hand the finished listing to the GUI thread, which does the chunking. Returning
+        False means the signal is gone - the window is being torn down."""
+        try:
+            self._local_listing_signal.emit((render_id, path, items))
+            return True
+        except RuntimeError:
+            return False
+
+    def _on_local_listing(self, payload):
+        """The GUI-thread half of a render: the new folder is on screen and its listing is
+        known, so the pane starts filling with it - one screenful of rows first, everything
+        after that behind it. A listing whose render id is not the current one belongs to a
+        folder the user has already moved on from and is dropped."""
+        render_id, path, items = payload
+        if render_id != getattr(self, '_local_render_id', 0):
+            return  # this listing was listed for a folder that has since been replaced
         if path != self.local_current_path:
-            return  # the folder changed while the scan was running
-        self._build_local_rows(items)
+            return  # and so was this one
+        if not items:
+            # A folder with nothing in it has no chunks to fill, but the render still has to
+            # be closed out: the selection, and any track left paused when the window was
+            # closed, are settled against a list that is now known to be empty.
+            self._local_render_pending = None
+            self._finish_local_render()
+            return
+        self._local_render_pending = items
+        self._local_render_pending_id = render_id
+        self._local_render_pending_path = path
+        self._local_render_total_rows = len(items)
+        self._local_render_step = self._local_screenful_rows()
+        self._local_render_chunk_end = None
+        self._local_render_chunk_cost = 0.0
+        self._local_render_chunk_rows = 0
+        self._local_render_row_cost = 0.0
+        self._fill_local_chunk()
+
+    def _local_screenful_rows(self):
+        """How many rows the pane can show at once, which is the size of the first chunk:
+        the rows the user switched folders to look at are the rows built first, and a folder
+        smaller than a screen is built in one go, exactly as fast as it always was."""
+        pane = getattr(self, 'local_list', None)
+        height = pane.viewport().height() if pane is not None else 0
+        fits = int(height // max(1.0, self._local_render_row_height)) if height > 0 else 0
+        return max(fits, LOCAL_RENDER_FIRST_CHUNK_ROWS)
+
+    def _fill_local_chunk(self):
+        """Create the rows of the next chunk and hand control back. The event loop lays
+        those rows out and polishes them before the zero timer runs this again, which is
+        what makes a big folder fill in on screen instead of arriving all at once.
+
+        The gap between one chunk ending and the next starting is what that chunk cost, its
+        painting included, so it is divided by the rows that chunk produced to get what a row
+        costs on this machine, and the next chunk is made as big as that cost allows within
+        the budget. A folder of rows that are expensive - long titles, tags that have to be
+        read - fills in smaller chunks than a folder of cheap ones, and both stay answerable."""
+        pending = getattr(self, '_local_render_pending', None)
+        if not pending:
+            self._local_render_pending = None
+            return
+        if (self._local_render_pending_id != getattr(self, '_local_render_id', 0)
+                or self._local_render_pending_path != self.local_current_path):
+            self._local_render_pending = None
+            return  # the user moved on while this folder was still filling in
+
+        now = time.perf_counter()
+        if self._local_render_chunk_end is not None:
+            spent = (now - self._local_render_chunk_end) + self._local_render_chunk_cost
+            cost_per_row = spent / max(1, self._local_render_chunk_rows)
+            previous = self._local_render_row_cost
+            # Smoothed, so one chunk that happened to land on a slow stretch - a folder
+            # whose tags still have to be read, a window being dragged - does not decide
+            # the size of every chunk after it.
+            self._local_render_row_cost = (previous * 0.4 + cost_per_row * 0.6) \
+                if previous > 0.0 else cost_per_row
+            budget = max(0.001, LOCAL_RENDER_CHUNK_BUDGET_S)
+            self._local_render_step = int(min(LOCAL_RENDER_CHUNK_MAX_ROWS,
+                                              max(LOCAL_RENDER_CHUNK_MIN_ROWS,
+                                                  budget / max(self._local_render_row_cost,
+                                                              1e-6))))
+
+        step = max(1, self._local_render_step)
+        self._local_render_pending = pending[step:] or None
+        rows_before = len(self.local_rows)
+        try:
+            self._append_local_rows(pending[:step])
+        except RuntimeError:
+            self._local_render_pending = None
+            return  # the pane is being taken down around us
+        self._local_render_chunk_cost = time.perf_counter() - now
+        self._local_render_chunk_end = time.perf_counter()
+        rows_added = len(self.local_rows) - rows_before
+        self._local_render_chunk_rows = rows_added
+        if rows_added:
+            self._measure_local_row_pitch(rows_before)
+            # The listing has always said how many rows there are going to be, and the fill knows
+            # what a row of this folder costs the list, so the height of the finished folder is
+            # known here - before any of these rows have been painted - and the pane is given it.
+            # Everything the fill does after this point happens inside a pane that is already the
+            # size it is going to end up.
+            self._reserve_local_extent()
+        if self._local_render_pending:
+            self._local_render_timer.start(0)
+        else:
+            self._finish_local_render()
+
+    def _measure_local_row_pitch(self, rows_before):
+        """What one row of this folder costs the list, read off the rows already on screen.
+
+        The height the pane's content reports lags a fill like this one: a row container has only
+        just been created, so it has nothing to report about its own height until the event loop
+        has polished it and laid it out. Measuring a row from that number is measuring the rows of
+        the chunk before last, and an estimate built from it is a little different at every chunk -
+        which makes the pane a slightly different size at every chunk, the thing the reservation
+        below exists to prevent. The rows the previous chunk built have been laid out by now, and
+        where the first and last of them ended up says exactly what a row costs: the row itself and
+        the spacing the list puts between rows.
+        """
+        if rows_before < 2:
+            return  # nothing has been laid out yet, so the guess stands
+        first_row = self.local_rows[0][0]
+        settled_row = self.local_rows[rows_before - 1][0]
+        span = settled_row.y() - first_row.y()
+        if span <= 0:
+            return  # and this chunk got its turn before those rows were laid out
+        self._local_render_row_height = span / (rows_before - 1)
+
+    def _reserve_local_extent(self):
+        """Hand the pane the height the finished folder is going to take up.
+
+        The listing has said how many rows the folder has since before the first row existed, and
+        the fill knows what a row of this folder costs the list, so the height the finished folder
+        is going to occupy is worked out here - before any of its rows have been painted - and the
+        content widget is given it as its own minimum. From here on the fill happens inside a pane
+        that is already the size it is going to end up: the rows already drawn do not move, the
+        scrollbar spans the whole folder before its last row exists, and each chunk after the first
+        is built into room that is already there instead of making the folder taller under the user
+        a batch at a time. That is the cheaper shape as well - a content widget whose own height
+        has changed makes Qt lay out every row it already has again, and doing that twenty-odd
+        times is most of what a streamed fill costs.
+
+        The estimate is reworked at every chunk and only worth acting on when it has moved by more
+        than a row, so the pane is sized once, early, and left alone.
+        """
+        pane = getattr(self, 'local_list', None)
+        content = getattr(self, 'local_content', None)
+        total = getattr(self, '_local_render_total_rows', 0)
+        if pane is None or content is None or total <= 0:
+            return
+        row_pitch = max(1.0, self._local_render_row_height)
+        # The space the list leaves above its first row and below its last. The rows carry the
+        # top one in their own position on screen; the bottom one is the same margin.
+        top_margin = 0
+        if self.local_rows:
+            top_margin = max(0, self.local_rows[0][0].y())
+        height = int(total * row_pitch + 2 * top_margin + 0.5)
+        height = max(height, pane.viewport().height())
+        applied = getattr(self, '_local_render_extent_height', 0)
+        if applied and abs(height - applied) <= row_pitch:
+            return  # the pane already has room for the whole folder
+        self._local_render_extent_height = height
+        content.setMinimumHeight(height)
+
+    def _release_local_extent(self):
+        """Take back the height reserved for a folder that is no longer filling in.
+
+        Two moments want it. At the end of a fill the rows themselves are the better answer for
+        how tall the pane's content is than the estimate the fill was working to, and dropping
+        the estimate is what keeps a folder whose rows came out a little shorter than expected
+        from leaving a strip of blank pane under it. And when a folder is being replaced, the
+        reserved height belongs to a listing that is going away; the incoming folder reserves its
+        own as soon as its first chunk has landed.
+        """
+        self._local_render_total_rows = 0
+        self._local_render_extent_height = 0
+        content = getattr(self, 'local_content', None)
+        if content is not None:
+            content.setMinimumHeight(0)
 
     def _scan_local_items(self, folder_path: str):
         """All filesystem work for the local file list. Returns None when the
@@ -9547,23 +9822,44 @@ class MainApp(QMainWindow):
         return items
 
     def _build_local_rows(self, items):
+        """Render a list that is already fully known in one pass. Folder switches use
+        _start_local_render, which streams the rows in batch by batch; this is kept for
+        callers that have the whole listing in hand."""
+        self._reset_local_rows()
+        self._append_local_rows(items or [])
+        self._finish_local_render()
+
+    def _reset_local_rows(self):
+        """Tear down the rows of the folder being replaced. What was selected survives,
+        so a refresh of the folder already on screen - a sync landing new files - does not
+        quietly drop the user's selection. The row the shift-ranges were anchored to does
+        not survive, and the count beside the metadata checkbox waits until the new rows
+        exist rather than reporting the selection of rows that are no longer there."""
         while self.local_vbox.count():
             item = self.local_vbox.takeAt(0)
             if item.widget(): item.widget().deleteLater()
-            
+
         self.local_rows = []
         self.local_row_by_path = {}
         self.local_btns = []
+        self.current_local_items = []
         self.local_selection_anchor = None
-        if items is None:
-            self.current_local_items = []
-            self.local_selected_paths = set()
-            self._update_local_selection_ui()
-            return
-        
-        self.current_local_items = items
-        
-        for idx, item in enumerate(items):
+        self._update_local_selection_ui()
+        # The height handed to the pane for the rows of the folder being replaced goes with
+        # them; the incoming folder reserves its own once its first chunk has landed.
+        self._release_local_extent()
+
+    def _append_local_rows(self, items):
+        """Create the widgets for one batch of rows. Numbering continues from the rows
+        already on screen, so selection ranges and the right-click menu keep working
+        while a folder is still being filled in. The metadata reads for this batch start
+        here rather than at the end of the folder, so a duration appears on a row the
+        user can already see."""
+        base_index = len(self.local_rows)
+        prev_btns = len(self.local_btns)
+
+        for offset, item in enumerate(items):
+            idx = base_index + offset
             raw_title = item.get('meta_name', item['name']) if getattr(self, 'show_local_metadata', False) else item['name']
             escaped_title = raw_title.replace('&', '&&')
 
@@ -9620,22 +9916,46 @@ class MainApp(QMainWindow):
             if not item['is_dir']:
                 self.local_btns.append((btn, dur_lbl, item))
 
-        # Drop any selection that no longer points at something in this folder.
+        self.current_local_items.extend(items)
+        # A selection that survived a refresh of the folder has to pick up the rows built
+        # after it. When nothing is selected there is nothing to pick up: a fresh row
+        # carries no 'selected' property at all and the stylesheet only styles
+        # selected="true", so skipping this pass is what keeps a 500-file folder from
+        # re-polishing every row it has already drawn, batch after batch.
+        if getattr(self, 'local_selected_paths', ()):
+            self._apply_local_selection_styles()
+        self._fetch_local_metadata_bg(self.local_btns[prev_btns:])
+
+    def _finish_local_render(self):
+        """The last batch of this render has landed. Only now is it known whether a
+        selection that survived the refresh still points at something in the folder, and
+        a local track the session was closed on can be resumed against a list that is
+        finally complete."""
+        self._release_local_extent()
         previous_selection = set(getattr(self, 'local_selected_paths', ()))
         self.local_selected_paths = {p for p in previous_selection if p in self.local_row_by_path}
         self._apply_local_selection_styles()
         self._update_local_selection_ui()
 
-        if self.local_btns:
-            self._fetch_local_metadata_bg()
+        resume_index = getattr(self, '_pending_local_restore_index', None)
+        if resume_index is None:
+            return
+        resume_path = getattr(self, '_pending_local_restore_path', None)
+        if resume_path is not None and os.path.abspath(resume_path) != self.local_current_path:
+            return  # this folder is not the one that track was left on
+        self._pending_local_restore_index = None
+        audio_files = [x for x in self.current_local_items if not x.get('is_dir')]
+        if 0 <= resume_index < len(audio_files):
+            QTimer.singleShot(100, lambda: self._on_local_click(audio_files[resume_index], paused_at_start=True))
             
-    def _fetch_local_metadata_bg(self):
-        """Fill in the durations and the artist/title of the rows of the folder on
-        screen. mutagen reads them inside this process; ffprobe is only reached for
-        the files mutagen cannot open or cannot tag. A row whose values were already
-        answered from the cache while the folder was scanned is not touched at all,
-        and each row that does need reading is written back on its own instead of the
-        whole list being rebuilt around it."""
+    def _fetch_local_metadata_bg(self, rows=None):
+        """Fill in the durations and the artist/title of the rows handed to it - the
+        batch of rows that just landed, or every row of the folder when called without
+        any. mutagen reads them inside this process; ffprobe is only reached for the
+        files mutagen cannot open or cannot tag. A row whose values were already answered
+        from the cache while the folder was scanned is not touched at all, and each row
+        that does need reading is written back on its own instead of the whole list being
+        rebuilt around it."""
         from PySide6.QtCore import QObject, Signal
 
         class MetaWorker(QObject):
@@ -9645,19 +9965,38 @@ class MainApp(QMainWindow):
             self._meta_worker = MetaWorker()
             self._meta_worker.meta_done.connect(self._apply_local_row_meta)
 
-        # Every rebuild supersedes the one before it. Without this, the rows of a
-        # folder you have already left carry on being read in the background, and that
-        # backlog is a large part of what made the next folder slow to fill in.
-        self._local_meta_pass = getattr(self, '_local_meta_pass', 0) + 1
-        this_pass = self._local_meta_pass
+        # The pass belongs to the render, not to this call. Every batch of the folder on
+        # screen reads under the same pass, so a batch landing a second into a 500-file
+        # folder cannot cancel the reads of the batches before it. Switching folders bumps
+        # the pass in _start_local_render, and that is what stops the reads of the folder
+        # that has been replaced - a backlog that was a large part of what made the next
+        # folder slow to fill in.
+        this_pass = getattr(self, '_local_meta_pass', 0)
 
-        pending = [(btn, d_lbl, item) for (btn, d_lbl, item) in self.local_btns
+        source = self.local_btns if rows is None else rows
+        pending = [(btn, d_lbl, item) for (btn, d_lbl, item) in source
                    if 'duration_str' not in item]
         if not pending:
             return
 
         want_tags = getattr(self, 'show_local_metadata', False)
         workers = max(1, min(4, os.cpu_count() or 1))
+
+        # One reader pool per render rather than one per batch: the batches of a streamed
+        # folder arrive every few milliseconds, and each with its own pool of readers would
+        # pile threads onto the disk the folder is being read from.
+        pool = getattr(self, '_meta_pool', None)
+        if pool is None or getattr(self, '_meta_pool_pass', None) != this_pass:
+            old_pool = pool
+            pool = ThreadPoolExecutor(max_workers=workers)
+            self._meta_pool = pool
+            self._meta_pool_pass = this_pass
+            if old_pool is not None:
+                try:
+                    # Reads queued for the folder that has just been replaced are pointless.
+                    old_pool.shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    pass
 
         def read_row(btn, d_lbl, item):
             if self._local_meta_pass != this_pass:
@@ -9708,16 +10047,14 @@ class MainApp(QMainWindow):
                 return  # superseded while the read was running: there is no row to write onto
             self._meta_worker.meta_done.emit(btn, d_lbl, item)
 
-        def bg_task():
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = [pool.submit(read_row, btn, d_lbl, item) for (btn, d_lbl, item) in pending]
-                for future in futures:
-                    try:
-                        future.result()
-                    except Exception:
-                        pass
-
-        threading.Thread(target=bg_task, daemon=True).start()
+        # The rows are queued on the render's own pool. submit() is what starts the reader
+        # threads and it costs microseconds, so the GUI thread is back at the event loop
+        # building the next batch of rows while these reads run.
+        for btn, d_lbl, item in pending:
+            try:
+                pool.submit(read_row, btn, d_lbl, item)
+            except Exception:
+                break  # this pool was already closed by a newer render
 
     def _apply_local_row_meta(self, btn, d_lbl, item):
         """Write the values a background read produced onto that one row: the name
@@ -11150,6 +11487,12 @@ class MainApp(QMainWindow):
         self._stream_moved_at = None
         self._stream_dead = False
         self._stream_refetch_attempts = 0
+        # Whether anybody has heard this particular media advancing. A refresh of a stream that
+        # gave out mid-listen is the same listening carried onto new media, so it carries over;
+        # anything else - including the track the session restore preloads paused at start up -
+        # has not been listened to at all yet, and is not a stream that can have gone idle.
+        # _stream_needs_renew uses this to keep age from reloading a track nobody has played.
+        self._stream_listened = bool(keep_pending_seek and getattr(self, '_stream_listened', False))
         if not keep_pending_seek:
             self._pending_stream_seek_frac = None
             self._pending_stream_seek_ms = None
@@ -11186,16 +11529,28 @@ class MainApp(QMainWindow):
         """Whether the stream on the player should be re-resolved before it is asked for anything.
 
         Two answers are yes: it was noticed dead - a position that stopped moving, or
-        vlc.State.Error - and its URL is older than STREAM_URL_MAX_AGE while the player is not
-        currently advancing on it, which is the track left paused, or left running into a link
-        that has since died, for longer than a YouTube URL lasts. Never for a local file, and
-        never while a fetch or a refresh is already under way.
+        vlc.State.Error - and it is a stream the listener has actually been hearing whose URL has
+        outlived STREAM_URL_MAX_AGE while the player is not advancing on it, which is the track
+        left running into a link that has since died, or left idle on the player for longer than
+        a YouTube URL lasts. Never for a local file, and never while a fetch or a refresh is
+        already under way.
+
+        The age of the URL only means something for a stream that has been listened to and has
+        then stopped. A track preloaded at start up by the session restore, or one paused within
+        the life of its URL, is media nobody is currently hearing: its URL grows old on the
+        player without anything going wrong, and re-resolving it there lands the listener back at
+        the top of the track, which reads as the track restarting itself. What that track needs is
+        the URL it already has being tried, and the watchdog noticing within a few seconds whether
+        it still answers - the same rule that already leaves a working stream alone however old
+        its URL is.
         """
         if not getattr(self, '_loaded_stream', None) or self._stream_is_switching():
             return False
         if getattr(self, '_stream_dead', False):
             return True
-        return self._loaded_stream_age() > STREAM_URL_MAX_AGE and not self._stream_is_moving()
+        if self._loaded_stream_age() <= STREAM_URL_MAX_AGE or self._stream_is_moving():
+            return False
+        return bool(getattr(self, '_stream_listened', False))
 
     def _mark_stream_dead(self):
         """Say once, in the status line, that the loaded stream has stopped delivering audio."""
@@ -11237,6 +11592,11 @@ class MainApp(QMainWindow):
         if ms is not None and ms != getattr(self, '_stream_seen_ms', -1):
             self._stream_seen_ms = ms
             self._stream_moved_at = time.monotonic()
+            if getattr(self, 'is_playing', False) and int(ms or 0) > 0:
+                # Somebody is hearing this media: from here on it is a stream that can go idle on
+                # the listener's hands, which is the only kind the age of its URL is a reason to
+                # reload. A media that has merely been loaded and left paused never gets here.
+                self._stream_listened = True
             if getattr(self, '_stream_dead', False):
                 self._stream_dead = False
                 self._stream_refetch_attempts = 0
@@ -11318,6 +11678,12 @@ class MainApp(QMainWindow):
             hold_ms = max(int(player.get_time() or 0), 0)
         except Exception:
             hold_ms = 0
+        if hold_ms == 0:
+            # A stream that has given up stops reporting a position altogether, and taking that at
+            # its word lands the listener back at the top of the track - which is what makes a
+            # reload read as the track starting over. The last position this media did report is
+            # where the listener actually was, so that is the position held for the fresh media.
+            hold_ms = max(int(getattr(self, '_stream_seen_ms', -1) or 0), 0)
         # Where to land: a scrub the user just asked for beats whatever the dead media thinks
         # its own position is, and only one of the two is ever left pending.
         if hold_ms > 0 and getattr(self, '_pending_stream_seek_frac', None) is None:

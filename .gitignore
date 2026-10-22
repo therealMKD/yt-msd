@@ -13,6 +13,7 @@ build_dir/
 build_dir_gui/
 ffmpeg_extracted/
 dist/
+.test_harness/
 
 # Python artifacts
 __pycache__/
@@ -32,10 +33,6 @@ GUI Source Code/yt-msd-gui/
 ffmpeg.zip
 
 # Test Files
-mp3renamer5000legacy.py
-GUI Source Code/mp3renamer5000.py
-GUI Source Code/mp3renamer5000_restored.py
-
 *.json
 
 # Cython build artifacts (generated C sources, compiled extensions, cythonize staging dir)
