@@ -34,7 +34,16 @@ import subprocess
 import zipfile
 import shutil
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+# ThreadPoolExecutor is not defined in concurrent.futures - Python 3.15 hands it over with
+# a "lazy from" (concurrent/futures/__init__.py: lazy from .thread import ThreadPoolExecutor),
+# and that deferred binding is an object of its own called lazy_import, which is not callable.
+# Running this file as a script never notices: Python resolves the binding the moment the name
+# is used. The compiled build does notice, because it stores whatever the name held at import
+# time, and in the installed exe that is the unresolved binding - which is the
+# "TypeError: 'lazy_import' object is not callable" that fired on every local-library metadata
+# pass. Importing from the module that really defines the class skips the lazy re-export.
+from concurrent.futures.thread import ThreadPoolExecutor
+from concurrent.futures import as_completed  # a plain re-export, already resolved at import
 try:
     import winreg
 except ImportError:
@@ -11121,7 +11130,7 @@ class MainApp(QMainWindow):
 
         def _run_batch():
             import time
-            from concurrent.futures import ThreadPoolExecutor
+            from concurrent.futures.thread import ThreadPoolExecutor  # see the note at the top
 
             with self.active_downloads_lock:
                 self.active_downloads.clear()
