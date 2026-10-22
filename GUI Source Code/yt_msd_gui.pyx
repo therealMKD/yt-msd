@@ -393,6 +393,20 @@ def clean_youtube_title(filename):
     MASK = "\x00APOS\x00"
     title = re.sub(r"([a-zA-Z0-9])'([a-zA-Z0-9])", rf"\1{MASK}\2", title)
 
+    # 2b. Quoted-title pattern with no explicit artist separator.
+    #     When no " - " was detected anywhere but there is a balanced single-quote pair
+    #     (opening quote preceded by whitespace), treat it as "<artist> '<title>' <junk>":
+    #     everything before the quotes becomes the artist, the quoted text becomes the title,
+    #     the quotes are dropped and everything after the closing quote is stripped.
+    #     Common for Kpop uploads, e.g. "A2O Lite 'NEON' Official Video" -> "A2O Lite - NEON".
+    if " - " not in title:
+        m = re.match(r"^(.*?)\s+'([^']+)'.*$", title)
+        if m:
+            quoted_artist = m.group(1).strip()
+            quoted_title  = m.group(2).strip()
+            if quoted_artist and quoted_title:
+                title = f"{quoted_artist} - {quoted_title}"
+
     # 3. Remove balanced single-quote pairs ('x')
     old = None
     while old != title:
@@ -748,6 +762,15 @@ def clean_and_tag_files(folder_path, start_auto=False):
                     idx += 1
                     continue
             
+            # If this file was recorded as skipped earlier in the pass (e.g. its rename
+            # failed because of an illegal character in a manually entered name) but is
+            # now being handled successfully - typically because the user went back to it
+            # with 'prev' and gave it a valid name - drop it from the skipped list so it
+            # is not presented again in the end-of-pass review of skipped files.
+            while file in skipped_files:
+                skipped_files.remove(file)
+                skipped_count -= 1
+
             artist, title = None, None
             if " - " in final_name:
                 parts = final_name.split(" - ", 1)
