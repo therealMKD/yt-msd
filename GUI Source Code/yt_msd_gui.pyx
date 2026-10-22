@@ -813,6 +813,26 @@ PREFETCH_SECONDS_BEFORE_END = 30
 PREFETCH_URL_MAX_AGE = 15 * 60  # seconds a prefetched stream URL is still trusted
 PREFETCH_CACHE_LIMIT = 4        # resolved stream URLs held at most
 
+# Keeping one track playing. A YouTube stream URL is a signed link with a lifetime rather
+# than a file: partway through a long track - or after a track has been paused for an hour -
+# it stops answering, and libVLC reports that as nothing useful. The media on the player
+# either falls to vlc.State.Error or goes on claiming Playing with a position that has
+# stopped moving, and in both cases scrubbing does nothing and Play does nothing, so the only
+# way back was to pick the track again. STREAM_STALL_SECONDS is how long a reported position
+# may stand still while the player claims Playing before the stream counts as dead; a dead
+# stream the listener never asked to stop is re-resolved by itself, keeping its position, up
+# to STREAM_REFETCH_LIMIT times per track. STREAM_URL_MAX_AGE is the backstop: a loaded URL
+# that old is re-resolved the moment the user scrubs or presses Play, unless the player is
+# measurably advancing on it - a stream that is working is left alone however old its URL is.
+# STREAM_END_SLACK_MS is how far short of its own reported length a media may "end" before
+# that ending is read as a stream that gave up rather than a track that finished.
+STREAM_STALL_SECONDS = 8
+STREAM_URL_MAX_AGE = 30 * 60      # seconds the URL on the player may be before a scrub or Play re-resolves it
+STREAM_REFETCH_LIMIT = 3          # self-healing re-resolutions per track before the player says so and waits
+STREAM_RENEW_COOLDOWN = 10        # seconds between two re-resolutions of the same track
+STREAM_END_SLACK_MS = 15000       # a stream that ended this far short of its length did not finish
+STREAM_SEEK_RESTORE_TIMEOUT = 12  # seconds a scrub or a restored position stays queued for fresh media
+
 # "Stop after current", cycled one state per click: off -> once -> always -> off.
 STOP_AFTER_OFF = 0     # playback advances to the next track when one ends, as it always did
 STOP_AFTER_ONCE = 1    # stop when the current track ends, then the state returns to off
@@ -6402,6 +6422,7 @@ class MainApp(QMainWindow):
     ytdlp_missing_signal = Signal(str)  # yt-dlp absent or not installable (from a bg thread)
     ytdlp_update_signal = Signal(str, str)  # installed yt-dlp version, newest yt-dlp version
     ytdlp_version_signal = Signal(str)  # yt-dlp version found by a bg thread, shown on the GUI thread
+    stream_refreshed_signal = Signal(bool, str)  # (re-resolved ok, track title) from the stream-refresh thread
 
     def __init__(self):
         super().__init__()
@@ -6499,6 +6520,27 @@ class MainApp(QMainWindow):
         self._prefetch_busy = set()     # video ids currently being resolved
         self._prefetch_decision = None  # (video id, next index, next video) decided ahead
         self._prefetch_trigger_key = None  # the track the decision was made for
+        # The stream the player is actually loaded with: (video id, url, user agent, how old
+        # that URL already was when it was resolved). This is what a dead stream is re-resolved
+        # from, and it is None while a local file is playing or nothing has been played - a
+        # file on disk is not a link with an expiry, so every question in the stream-liveness
+        # block (see the block before "Stop after current") starts by asking whether this is set.
+        # The rest is the watchdog for it: the last position libVLC reported and the moment it
+        # last moved, whether the stream has been noticed dead, whether it is being re-resolved
+        # right now, how many times this track has already reloaded itself, and a position the
+        # user asked for that has to wait until the fresh media answers.
+        self._loaded_stream = None
+        self._loaded_stream_at = None
+        self._stream_seen_ms = -1
+        self._stream_moved_at = None
+        self._stream_dead = False
+        self._stream_refetching = False
+        self._stream_refetch_attempts = 0
+        self._stream_renew_started_at = None
+        self._pending_stream_seek_frac = None
+        self._pending_stream_seek_ms = None
+        self._pending_stream_pause = False
+        self._pending_stream_seek_at = None
         self.is_muted = False
         self.active_downloads = {}
         self.active_downloads_lock = threading.Lock()
@@ -6551,6 +6593,7 @@ class MainApp(QMainWindow):
         self.search_results_signal.connect(self._on_search_results)
         self.search_failed_signal.connect(self._on_search_failed)
         self.playback_started_signal.connect(self._on_playback_started)
+        self.stream_refreshed_signal.connect(self._on_stream_refreshed)
         self.queue_update_signal.connect(self._refresh_queue_display)
         self.queue_status_changed_signal.connect(self._on_queue_status_changed)
         self.thumbnails_loaded_signal.connect(self._on_thumbnail_loaded)
@@ -9532,6 +9575,9 @@ class MainApp(QMainWindow):
                 QTimer.singleShot(250, delay_pause)
             else:
                 self.vlc_player.play()
+            # A file on disk is not a signed link with a lifetime, so there is nothing here that
+            # can expire: the stream watchdog is told to watch nothing on this track.
+            self._note_loaded_stream(None)
             self.playback_started_signal.emit(display_name, "local", paused_at_start)
 
     # --- Local file editor: selection, delete, rename ---
@@ -9882,7 +9928,7 @@ class MainApp(QMainWindow):
             self._reset_results_scroll()
             search_armed_stop_after = self._arm_stop_after_for_new_search()
         if search_armed_stop_after:
-            self._on_status_update(f"Found {len(res)} results - Stop after current is Once now, so the track already playing stays the last one of the search it came from.", False, "#FF8C00")
+            self._on_status_update(f"Found {len(res)} results - Stop after current", False, "#FF8C00")
         else:
             self._on_status_update(f"Found {len(res)} results.", False, "white")
         QTimer.singleShot(0, self.lazy_load_visible_results)
@@ -10792,18 +10838,23 @@ class MainApp(QMainWindow):
         return None
 
     def _take_prefetched_stream(self, vid_id):
-        """The stream URL resolved ahead of time for this track, consumed once."""
+        """The stream URL resolved ahead of time for this track, consumed once, as
+        (url, user agent, how old the URL already was in seconds). The age comes along because
+        reading a URL ahead spends that much of its life before the player ever sees it, and
+        the stream-liveness watchdog counts a loaded stream from when its URL was resolved.
+        """
         with self._prefetch_lock:
             entry = self._prefetched_streams.pop(vid_id, None)
         if not entry:
             return None
         url, user_agent, resolved_at = entry
+        age = time.monotonic() - resolved_at
         # A wall-clock stamp would be wrong whenever Windows corrects the clock, so the
         # age is measured with the monotonic clock - the same clock the stamp was taken
         # from in _prefetch_stream_worker().
-        if time.monotonic() - resolved_at > PREFETCH_URL_MAX_AGE:
+        if age > PREFETCH_URL_MAX_AGE:
             return None
-        return url, user_agent
+        return url, user_agent, age
 
     def _maybe_prefetch_next_track(self):
         """Called from the player timer once the current track is nearing its end.
@@ -10866,6 +10917,293 @@ class MainApp(QMainWindow):
         self._prefetch_trigger_key = None
         with self._prefetch_lock:
             self._prefetched_streams.clear()
+
+    # ------------------------------------------------------------------
+    # Keeping one track playing - a stream URL that stops answering
+    # ------------------------------------------------------------------
+    # The constants above STREAM_STALL_SECONDS explain why this exists. The rule the whole
+    # block follows: only the media is replaced, never the track. Everything the listener is
+    # relying on - the highlighted row, playback_index, shuffle_history, the stop-after state,
+    # the decided successor - stays exactly where it is, and only the URL libVLC is reading is
+    # swapped for a freshly resolved one of the same video.
+
+    def _note_loaded_stream(self, vid_id, url=None, user_agent=None, url_age=0.0,
+                            keep_pending_seek=False):
+        """Record what the player has just been handed, and start the watchdog over.
+
+        Called by the two paths that put media on the player: play_result()'s fetch thread,
+        with the URL it resolved and how old that URL already was (one read ahead of the play
+        by the prefetch thread is that much of the URL's life already spent), and
+        _on_local_click(), with no id at all - which is how a file says "there is nothing here
+        that can expire". keep_pending_seek is the refresh path's exception: a re-resolve has
+        already decided where the listener should end up, and that has to survive the reset.
+        """
+        self._loaded_stream = (vid_id, url, user_agent, url_age) if vid_id and vid_id != "local" else None
+        self._loaded_stream_at = time.monotonic() if self._loaded_stream else None
+        self._stream_seen_ms = -1
+        # None rather than "now": the stall clock for a fresh media starts the first time the
+        # player actually reports Playing, so a stream that takes a while to open is not
+        # judged for taking a while to open.
+        self._stream_moved_at = None
+        self._stream_dead = False
+        self._stream_refetch_attempts = 0
+        if not keep_pending_seek:
+            self._pending_stream_seek_frac = None
+            self._pending_stream_seek_ms = None
+            self._pending_stream_pause = False
+            self._pending_stream_seek_at = None
+            self._stream_renew_started_at = None  # a different track starts with a clean allowance
+
+    def _loaded_stream_age(self):
+        """How long ago the URL the media on the player was built from was resolved."""
+        stream = getattr(self, '_loaded_stream', None)
+        started = getattr(self, '_loaded_stream_at', None)
+        if not stream or started is None:
+            return 0.0
+        return (time.monotonic() - started) + float(stream[3] or 0.0)
+
+    def _stream_is_moving(self):
+        """Whether libVLC reported a position that was moving, recently.
+
+        A stream that is measurably advancing is a stream that is working, whatever its age:
+        a URL forty minutes old carrying a long mix is not swapped out from under somebody who
+        is listening to it without a single problem.
+        """
+        moved_at = getattr(self, '_stream_moved_at', None)
+        return moved_at is not None and (time.monotonic() - moved_at) <= STREAM_STALL_SECONDS
+
+    def _stream_is_switching(self):
+        """True while the player is already being handed something else: a track still being
+        fetched, or a dead stream already being re-resolved. Nothing in this block acts during
+        either, because the media still on the player belongs to the previous track and acting
+        on it would hijack a fetch the user started."""
+        return bool(getattr(self, '_is_loading_stream', False) or getattr(self, '_stream_refetching', False))
+
+    def _stream_needs_renew(self):
+        """Whether the stream on the player should be re-resolved before it is asked for anything.
+
+        Two answers are yes: it was noticed dead - a position that stopped moving, or
+        vlc.State.Error - and its URL is older than STREAM_URL_MAX_AGE while the player is not
+        currently advancing on it, which is the track left paused, or left running into a link
+        that has since died, for longer than a YouTube URL lasts. Never for a local file, and
+        never while a fetch or a refresh is already under way.
+        """
+        if not getattr(self, '_loaded_stream', None) or self._stream_is_switching():
+            return False
+        if getattr(self, '_stream_dead', False):
+            return True
+        return self._loaded_stream_age() > STREAM_URL_MAX_AGE and not self._stream_is_moving()
+
+    def _mark_stream_dead(self):
+        """Say once, in the status line, that the loaded stream has stopped delivering audio."""
+        if getattr(self, '_stream_dead', False):
+            return
+        self._stream_dead = True
+        title = (getattr(self, 'current_playing_title', '') or 'this track')
+        if getattr(self, '_stream_refetch_attempts', 0) < STREAM_REFETCH_LIMIT:
+            self._on_status_update(f"Stream stopped responding - reloading it: {title}", False, "#FF8C00")
+        elif not getattr(self, 'is_playing', False):
+            self._on_status_update(f"Stream stopped responding - Play will reload it: {title}", False, "#FF8C00")
+        else:
+            self._on_status_update(
+                f"Stream stopped responding and would not reload - pick the track to start it again: {title}",
+                False, "#E31E24")
+
+    def _watch_stream_liveness(self, state, ms):
+        """Run the loaded stream through the watchdog, once per player-timer tick.
+
+        libVLC never reports "this URL died". A stream that stops answering either falls to
+        vlc.State.Error or goes on claiming Playing with a position that has stopped moving,
+        and those are the two things this can see. A position that moves is remembered, and if
+        the stream had been marked dead it clears that and its allowance of self-healing
+        attempts - a stream that dropped for a moment is not punished for it. A position that
+        does not move while the app wants the track playing is a dead stream: a pause is a
+        still position by request, so it is not a stall. A dead stream the listener never asked
+        to stop is reloaded on its own.
+        """
+        if not getattr(self, '_loaded_stream', None) or self._stream_is_switching():
+            return
+        if state == vlc.State.Error:
+            self._mark_stream_dead()
+            self._recover_stream_if_possible()
+            return
+        if state != vlc.State.Playing:
+            return
+        if getattr(self, '_stream_moved_at', None) is None:
+            self._stream_moved_at = time.monotonic()  # first tick this media has been worth watching
+        if ms is not None and ms != getattr(self, '_stream_seen_ms', -1):
+            self._stream_seen_ms = ms
+            self._stream_moved_at = time.monotonic()
+            if getattr(self, '_stream_dead', False):
+                self._stream_dead = False
+                self._stream_refetch_attempts = 0
+            return
+        if not getattr(self, 'is_playing', False) or getattr(self, '_stream_dead', False):
+            return
+        if (time.monotonic() - self._stream_moved_at) > STREAM_STALL_SECONDS:
+            self._mark_stream_dead()
+            self._recover_stream_if_possible()
+
+    def _recover_stream_if_possible(self):
+        """Reload a dead stream by itself, and only while the listener never asked it to stop.
+
+        STREAM_REFETCH_LIMIT is what keeps a genuinely unplayable track - one yt-dlp can no
+        longer resolve at all - from turning into a fetch that retries itself forever.
+        """
+        if not getattr(self, 'is_playing', False):
+            return False
+        if getattr(self, '_stream_refetch_attempts', 0) >= STREAM_REFETCH_LIMIT:
+            return False
+        return self._renew_loaded_stream()
+
+    def _stream_ended_short(self, total_ms, ms):
+        """Whether the media that just reported vlc.State.Ended was a stream that gave up
+        before its own length, rather than a track that finished.
+
+        An expired URL ends the media exactly the way the end of a track does, and the only
+        thing telling them apart is where the position stopped: a real ending stops a second or
+        two short of the reported length, a dead stream stops well short of it. A length the
+        media never reported is treated as a finished track, because there is nothing it could
+        be short of, and a local file is the whole file - it is never short.
+        """
+        if not getattr(self, '_loaded_stream', None):
+            return False
+        if not total_ms or total_ms <= 0:
+            return False
+        return (int(total_ms) - int(ms)) > STREAM_END_SLACK_MS
+
+    def _renew_loaded_stream(self, force=False):
+        """Resolve the track already on the player all over again, and hand libVLC fresh media
+        for it.
+
+        This is not the track started again. The position it stopped at - or the row the user
+        scrubbed to, or the point a Play press was meant to resume from - is held until the new
+        media answers and then applied by the player timer (see _apply_pending_stream_seek), so
+        it reads as one long buffer rather than as the song starting over. Nothing else moves:
+        playback_index, the row in the list, shuffle_history, the stop-after state and the
+        next-track read-ahead are all left exactly as they were, and _pending_fetch_id is the
+        same guard play_result() uses, so a track the user picks during the refresh wins the
+        player. _ended_trigger is held up for the duration so the dying media cannot spend
+        itself as an "ended" track and move the playlist on mid-swap.
+
+        The yt-dlp call runs on its own thread exactly as play_result()'s bg_fetch does, and it
+        is that thread - not the GUI thread - that calls set_media and play: the thread that
+        fetches a stream is the one that owns handing it to the player, which is the exception
+        the play path already makes to the rule that a background thread stays out of VLC (that
+        rule is about the *prefetch* thread, which must not touch the player at all). Everything
+        that touches a Qt widget goes through stream_refreshed_signal instead. Returns True when
+        a refresh is running or has just been started. force is for the listener asking for it
+        directly - a Play press - which is rate limited by a thumb rather than by a dragged seek
+        bar, and so does not have to wait out the cooldown.
+        """
+        stream = getattr(self, '_loaded_stream', None)
+        if not stream or not getattr(self, 'vlc_instance', None) or not getattr(self, 'vlc_player', None):
+            return False
+        if getattr(self, '_stream_refetching', False):
+            return True  # one refresh in flight per dead stream; a second scrub only adds a position
+        vid_id = stream[0]
+        if getattr(self, '_stream_refetch_attempts', 0) >= STREAM_REFETCH_LIMIT:
+            return False  # _mark_stream_dead has already said so in the status line
+        last_try = getattr(self, '_stream_renew_started_at', None)
+        if not force and last_try is not None and (time.monotonic() - last_try) < STREAM_RENEW_COOLDOWN:
+            # One yt-dlp call per track per cooldown, and no more. A dead stream is worth
+            # reloading, but a seek bar being dragged across it is a hundred sliderMoved
+            # signals, and each one would otherwise start its own fetch.
+            return False
+        player = self.vlc_player
+        try:
+            hold_ms = max(int(player.get_time() or 0), 0)
+        except Exception:
+            hold_ms = 0
+        # Where to land: a scrub the user just asked for beats whatever the dead media thinks
+        # its own position is, and only one of the two is ever left pending.
+        if hold_ms > 0 and getattr(self, '_pending_stream_seek_frac', None) is None:
+            self._pending_stream_seek_ms = hold_ms
+        self._pending_stream_pause = not bool(getattr(self, 'is_playing', False))
+        self._pending_stream_seek_at = time.monotonic()
+        self._stream_renew_started_at = time.monotonic()
+        self._stream_refetch_attempts += 1
+        self._stream_refetching = True
+        self._pending_fetch_id = vid_id
+        self._is_loading_stream = True
+        self._ended_trigger = True
+        title = (getattr(self, 'current_playing_title', '') or vid_id)
+        self._on_status_update(f"Re-fetching stream: {title}...", False, "#3B8ED0")
+
+        def bg_renew():
+            try:
+                url, user_agent = resolve_stream_url(vid_id)
+            except Exception as e:
+                print(f"Stream refresh error: {e}")
+                self._stream_refetching = False
+                if getattr(self, '_pending_fetch_id', None) == vid_id:
+                    self._is_loading_stream = False
+                self.stream_refreshed_signal.emit(False, title)
+                return
+            if getattr(self, '_pending_fetch_id', None) != vid_id:
+                return  # another track was started during the refresh; that one owns the player now
+            media = self.vlc_instance.media_new(url)
+            media.add_option(f':http-user-agent={user_agent}')
+            self.vlc_player.set_media(media)
+            self.vlc_player.play()
+            self._note_loaded_stream(vid_id, url, user_agent, 0.0, keep_pending_seek=True)
+            self._stream_refetching = False
+            self._is_loading_stream = False
+            self.stream_refreshed_signal.emit(True, title)
+        threading.Thread(target=bg_renew, daemon=True).start()
+        return True
+
+    def _apply_pending_stream_seek(self):
+        """Put the listener where they were - or where they asked to be - on freshly resolved media.
+
+        Neither a restored position nor a scrubbed-to one can be set on a media that has not
+        opened yet: libVLC says nothing about a stream it has not read, and that is the other
+        half of why a dead stream looked unresponsive. Both wait here until the player reports
+        Playing, then are applied once. A scrub is held as a fraction of the track for the same
+        reason - a media that is not open again reports no length to turn it into milliseconds.
+        A request nothing accepted within STREAM_SEEK_RESTORE_TIMEOUT seconds is dropped rather
+        than left to pounce on the track minutes later.
+        """
+        player = getattr(self, 'vlc_player', None)
+        if player is None:
+            return
+        asked_frac = getattr(self, '_pending_stream_seek_frac', None)
+        asked_ms = getattr(self, '_pending_stream_seek_ms', None)
+        asked_pause = bool(getattr(self, '_pending_stream_pause', False))
+        if asked_frac is None and asked_ms is None and not asked_pause:
+            return
+        started_at = getattr(self, '_pending_stream_seek_at', None)
+        if started_at is not None and (time.monotonic() - started_at) > STREAM_SEEK_RESTORE_TIMEOUT:
+            self._pending_stream_seek_frac = None
+            self._pending_stream_seek_ms = None
+            self._pending_stream_pause = False
+            return
+        if asked_frac is not None:
+            if player.set_position(asked_frac) not in (0, None):
+                return
+            self._pending_stream_seek_frac = None
+        elif asked_ms is not None:
+            if player.set_time(int(asked_ms)) not in (0, None):
+                return
+            self._pending_stream_seek_ms = None
+        if asked_pause:
+            player.set_pause(1)
+            self._pending_stream_pause = False
+
+    def _on_stream_refreshed(self, ok, title):
+        """The GUI-thread half of a stream refresh, reported from the thread that ran it."""
+        if ok:
+            if getattr(self, 'is_playing', False):
+                if getattr(self, 'play_btn', None):
+                    self.play_btn.setText("\uE769")
+                self._on_status_update(f"Playing: {title}", True, "gray")
+            else:
+                if getattr(self, 'play_btn', None):
+                    self.play_btn.setText("\uE768")
+                self._on_status_update(f"Ready: {title}", True, "gray")
+        else:
+            self._on_status_update(f"Could not re-fetch the stream for {title} - pick the track to try again.",
+                                   False, "#E31E24")
 
     # ------------------------------------------------------------------
     # "Stop after current" - three states, one click each
@@ -11034,9 +11372,10 @@ class MainApp(QMainWindow):
                 # entirely - this is what removes the gap at a changeover.
                 prefetched = self._take_prefetched_stream(vid_id)
                 if prefetched:
-                    url, user_agent = prefetched
+                    url, user_agent, url_age = prefetched
                 else:
                     url, user_agent = resolve_stream_url(vid_id)
+                    url_age = 0.0
 
                 # If another stream request started while fetching, ignore this one
                 if getattr(self, '_pending_fetch_id', None) != vid_id:
@@ -11056,6 +11395,11 @@ class MainApp(QMainWindow):
                 else:
                     self.vlc_player.play()
                 self._is_loading_stream = False
+                # Remember what the player is now loaded with, so that a stream which stops
+                # answering later can be re-resolved without this track being picked out of the
+                # list again - and so that a track left paused past the life of its URL can be
+                # picked up where it stopped.
+                self._note_loaded_stream(vid_id, url, user_agent, url_age)
                 self.playback_started_signal.emit(video.get('title', 'Unknown'), vid_id, paused_at_start)
             except Exception as e:
                 print(f"Stream error: {e}")
@@ -11116,6 +11460,31 @@ class MainApp(QMainWindow):
 
     def toggle_playback(self):
         if not self.vlc_player: return
+        if self._stream_needs_renew():
+            # Pressing play on a stream that has stopped answering is the listener asking for the
+            # music, not for the media that happens to be loaded: a dead media answers neither a
+            # play nor a seek, which is exactly what made this look like a play button that does
+            # nothing. Re-resolve this same track and pick up where it stopped - a play the user
+            # asked for gets the whole allowance back, is not held by the seek cooldown, and
+            # leaves the app wanting the track playing even if the cooldown still has this one
+            # waiting, because the next press of the button goes through.
+            self.is_playing = True
+            if getattr(self, 'play_btn', None):
+                self.play_btn.setText("\uE769")
+            self._stream_refetch_attempts = 0
+            self._renew_loaded_stream(force=True)
+            return
+        if getattr(self, '_loaded_stream', None) and getattr(self, '_stream_refetching', False):
+            # Play pressed while the re-resolution the previous press started is still running:
+            # the fresh media is already on its way, so all this means is "play it when it lands"
+            # - the queued position stops asking for a pause, and the dying media is not paused
+            # and unpaused behind a fetch that is about to replace it.
+            self.is_playing = True
+            if getattr(self, 'play_btn', None):
+                self.play_btn.setText("\uE769")
+            self._pending_stream_pause = False
+            self._pending_stream_seek_at = time.monotonic()
+            return
         if self.vlc_player.is_playing():
             self.vlc_player.pause()
             self.play_btn.setText("\uE768")
@@ -11238,8 +11607,26 @@ class MainApp(QMainWindow):
             self.play_result(self.search_results[self.playback_index], from_nav=True)
 
     def on_seek(self, val):
-        if self.vlc_player:
-            self.vlc_player.set_position(float(val)/10000.0)
+        if not self.vlc_player:
+            return
+        frac = float(val) / 10000.0
+        if self._stream_needs_renew() or getattr(self, '_stream_refetching', False):
+            # Scrubbing a stream that has stopped answering does nothing at all, and that is how
+            # the whole problem hid: the slider moved and libVLC ignored it. Keep the position
+            # they asked for - as a fraction, because a media that is not open again reports no
+            # length to convert it - and re-resolve this same track; _apply_pending_stream_seek
+            # puts them there once the fresh media answers. A drag that keeps moving only ever
+            # queues the last position asked for, because one refresh is enough for one dead
+            # stream and STREAM_RENEW_COOLDOWN keeps a dragged bar from becoming a fetch storm.
+            self._pending_stream_seek_frac = frac
+            self._pending_stream_seek_ms = None
+            if self._renew_loaded_stream():
+                return
+            # Nothing worth re-resolving - the cooldown is still running, or this track has used
+            # up its attempts. That is no reason to ignore the scrub itself, so ask the media the
+            # ordinary way and let the listener drag the bar as they always could.
+            self._pending_stream_seek_frac = None
+        self.vlc_player.set_position(frac)
 
     def on_volume_changed(self, val):
         self.volume_val = val
@@ -11267,23 +11654,44 @@ class MainApp(QMainWindow):
 
         if self.vlc_player and self.current_video_id:
             state = self.vlc_player.get_state()
-            if state == vlc.State.Playing:
-                self._has_played_current = True
-                self._ended_trigger = False
-            elif state == vlc.State.Ended:
-                # ONLY trigger auto-advance if this track actually played and hasn't triggered ended yet
-                if getattr(self, '_has_played_current', False) and not getattr(self, '_ended_trigger', False) and getattr(self, 'is_playing', False):
-                    self._ended_trigger = True
-                    self._has_played_current = False
-                    # "Stop after current" armed: hold on this track instead of advancing.
-                    if getattr(self, 'stop_after_current', STOP_AFTER_OFF):
-                        self._finish_stop_after_current()
-                    else:
-                        self.play_next()
-                
             pos = self.vlc_player.get_position() * 10000
             ms = self.vlc_player.get_time()
             total_ms = self.vlc_player.get_length()
+            # This timer is also what notices that a stream has stopped answering, because
+            # libVLC never reports it itself - see the stream-liveness block above "Stop after
+            # current". The position it reports is the only evidence there is.
+            self._watch_stream_liveness(state, ms)
+            if state == vlc.State.Playing:
+                self._has_played_current = True
+                if not getattr(self, '_stream_refetching', False):
+                    # A refresh in flight means this Playing still belongs to the dying media: its
+                    # ending is being held by _renew_loaded_stream, and a position queued for the
+                    # fresh media must not be spent on the media that is about to be replaced. The
+                    # fresh media reporting Playing both clears the held ending and lands the
+                    # position, which is what makes the whole thing read as one continuous buffer.
+                    self._ended_trigger = False
+                    self._apply_pending_stream_seek()
+            elif state == vlc.State.Ended:
+                # ONLY trigger auto-advance if this track actually played and hasn't triggered ended yet
+                if getattr(self, '_has_played_current', False) and not getattr(self, '_ended_trigger', False) and getattr(self, 'is_playing', False):
+                    if self._stream_ended_short(total_ms, ms) and self._recover_stream_if_possible():
+                        # A stream whose URL gave out mid-track reports the same Ending as a track
+                        # that finished, so this one is held rather than advanced: the track the
+                        # listener was hearing is the one worth saving. The fresh media reporting
+                        # Playing puts both of these flags back on its own. A reload that has
+                        # already used up its attempts gets here as False, and the track is taken
+                        # as finished by the rules below.
+                        self._ended_trigger = True
+                        self._has_played_current = False
+                    else:
+                        self._ended_trigger = True
+                        self._has_played_current = False
+                        # "Stop after current" armed: hold on this track instead of advancing.
+                        if getattr(self, 'stop_after_current', STOP_AFTER_OFF):
+                            self._finish_stop_after_current()
+                        else:
+                            self.play_next()
+                
             if total_ms > 0:
                 cur_str = f"{int(ms/60000)}:{int((ms%60000)/1000):02d}"
                 tot_str = f"{int(total_ms/60000)}:{int((total_ms%60000)/1000):02d}"
