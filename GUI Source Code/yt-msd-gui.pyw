@@ -359,13 +359,13 @@ def clean_youtube_title(filename):
     title = re.sub(r'#\S+', '', title)
 
     # Quote handling:
-    # 1. Remove balanced double-quote pairs ("x") - outermost first
-    old = None
-    while old != title:
-        old = title
-        title = re.sub(r'"([^"]*)"', r'\1', title)
-    title = re.sub(r'(?<![a-zA-Z0-9])"(?![a-zA-Z0-9])', '', title)
-    title = title.replace('"', '')
+    # 1. Double quotes are never part of a contraction, so every double-quote character is
+    #    removed outright: ASCII " plus the unicode variants - curly U+201C/U+201D, low
+    #    double U+201E, reversed-9 high U+201F, guillemets U+00AB/U+00BB and the double
+    #    prime U+2033. No pairing and no adjacency rules are applied. This is what stops Bad
+    #    Lip Reading style titles (which wrap words in quotes) from leaving floating double
+    #    quotes behind in the filename.
+    title = re.sub(r'["\u201c\u201d\u201e\u201f\u00ab\u00bb\u2033]', '', title)
 
     # 2. Mask interior word contractions (e.g. Don't, won't, it's, rock'n'roll)
     MASK = "\x00APOS\x00"
