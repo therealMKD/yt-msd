@@ -117,13 +117,13 @@ SILENCE_KEEP = "0.5"
 CUSTOM_NORM_CMD = ""  # Optional override of ONLY the loudnorm part of the ffmpeg -af chain
 
 # Internal version number - the numeric part of the latest GitHub release tag.
-# (RELEASE-3.0 is tagged as "RELEASE-3.0" and read here as "3.0":
+# (RELEASE-3.1 is tagged as "RELEASE-3.1" and read here as "3.1":
 # _extract_version_number() reduces both sides to their numbers before comparing
 # them, so a tag is still recognised as this version or as a newer one. The same
 # numbers are what build_gui_exe.py puts in the installer and in the version
 # resource of the exe, so the app, the setup program and the file's own
 # Properties dialog all report one version.)
-APP_VERSION = "3.0"
+APP_VERSION = "3.1"
 
 # GitHub repository whose releases page is polled for newer versions.
 UPDATE_REPO = "therealMKD/yt-msd"
