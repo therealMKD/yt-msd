@@ -748,6 +748,13 @@ Filename: "{app}\\@EXE_NAME@.exe"; Description: "Start yt-msd"; Flags: nowait po
 // point at which the older files can be cleared out first. (Comments here have to
 // be "//": in this section the file is read as Pascal, where a semicolon ends a
 // statement instead of starting a comment.)
+//
+// The message box here has to be SuppressibleMsgBox and not MsgBox. Inno does not
+// suppress a plain MsgBox that [Code] displays, even with /VERYSILENT
+// /SUPPRESSMSGBOXES: the setup then waits for someone to click OK, which is exactly
+// what a silent run (winget, a login script, "winget install") cannot do.
+// SuppressibleMsgBox shows the same text in an interactive run and answers itself
+// when the install is silent.
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   OldInternal: string;
@@ -755,7 +762,7 @@ begin
   OldInternal := ExpandConstant('{app}\\_internal');
   if DirExists(OldInternal) then begin
     if not DelTree(OldInternal, True, True, True) then
-      MsgBox('Could not remove the older yt-msd files in ' + OldInternal + '. Close yt-msd if it is running, then run this setup again.', mbError, MB_OK);
+      SuppressibleMsgBox('Could not remove the older yt-msd files in ' + OldInternal + '. Close yt-msd if it is running, then run this setup again.', mbError, MB_OK, IDOK);
   end;
   Result := '';
 end;
