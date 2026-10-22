@@ -55,6 +55,7 @@ import random
 import socket
 import struct
 import hashlib
+import traceback
 from typing import Dict, List, Optional, Tuple, Callable, Union
 from PIL import Image
 
@@ -72,7 +73,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QSystemTrayIcon, QMenu, QFrame, QGridLayout,
                                QSizePolicy, QStyle, QToolTip, QStyleOption, QSpinBox, QProgressBar, QInputDialog)
 from PySide6.QtCore import Qt, Signal, QTimer, Slot, QPoint, QRect, QMargins, QThread, QEvent, QObject, QByteArray
-from PySide6.QtGui import QIcon, QPixmap, QImage, QAction, QColor, QPalette, QPainter, QBrush, QFont, QDrag, QFontMetrics
+from PySide6.QtGui import QIcon, QPixmap, QImage, QAction, QColor, QPalette, QPainter, QPainterPath, QBrush, QFont, QDrag, QFontMetrics
 from PySide6.QtCore import QMimeData, QUrl
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
@@ -824,7 +825,11 @@ PREFETCH_CACHE_LIMIT = 4        # resolved stream URLs held at most
 # stream the listener never asked to stop is re-resolved by itself, keeping its position, up
 # to STREAM_REFETCH_LIMIT times per track. STREAM_URL_MAX_AGE is the backstop: a loaded URL
 # that old is re-resolved the moment the user scrubs or presses Play, unless the player is
-# measurably advancing on it - a stream that is working is left alone however old its URL is.
+# measurably advancing on it - a stream that is working is left alone however old its URL is,
+# and so is a stream that was only ever loaded and left sitting, which is the track the session
+# restore preloads at start up. Age alone reloads a stream that has actually been heard and has
+# then gone idle; reloading anything else is a restart rather than a recovery, and the two are
+# told apart by _stream_listened.
 # STREAM_END_SLACK_MS is how far short of its own reported length a media may "end" before
 # that ending is read as a stream that gave up rather than a track that finished.
 STREAM_STALL_SECONDS = 8
@@ -1764,6 +1769,33 @@ MUTAGEN_TAGGABLE_EXTENSIONS = {'.mp3', '.m4a', '.alac', '.flac', '.ogg', '.opus'
 _LOCAL_META_CACHE_CAP = 6000
 _local_meta_cache = {}
 
+# The rows of a folder are filled in chunks, and every chunk hands the event loop back a
+# chance to lay the new rows out and paint them. The first chunk is deliberately about
+# what fits in the pane, because those are the rows the user switched folders to look at:
+# a folder of thirty files is filled by that chunk alone, and a folder of a thousand is
+# on screen and readable while the rest of it is still arriving.
+LOCAL_RENDER_FIRST_CHUNK_ROWS = 32
+
+# How tall a row is assumed to be until the pane has measured its own, which is what
+# decides how many rows a screenful is.
+LOCAL_RENDER_ROW_HEIGHT_GUESS = 24.0
+
+# After the first chunk the size is worked out from what a row actually costs this machine -
+# building it, laying it out and painting it - so that a chunk is as big as it can be and still
+# keep the GUI thread away for no more than about a frame. A fast machine fills a thousand files
+# in a few larger chunks, a slow one in many smaller ones, and neither stops answering the user.
+LOCAL_RENDER_CHUNK_MIN_ROWS = 32
+LOCAL_RENDER_CHUNK_MAX_ROWS = 1024
+LOCAL_RENDER_CHUNK_BUDGET_S = 0.020
+
+# The pane is handed the height the finished folder is going to occupy as soon as its listing is
+# known, and it keeps that height until the fill is done. A row that has already been drawn is
+# therefore never moved while the rest of the folder is being built: the folder appears at the
+# size it is going to be, its scrollbar is right from the first frame, and every chunk after the
+# first lands in room that is already reserved instead of stretching the list under the user and
+# forcing everything already on screen to be laid out and painted over again. Chunked filling
+# without it is what makes a big folder look like it is inflating rather than arriving.
+
 
 def _format_audio_duration(seconds):
     """The duration text a local row shows: H:MM:SS at an hour or more, M:SS under it."""
@@ -2067,17 +2099,93 @@ class DraggableQueueWidget(QWidget):
         self._drag_source_widget = None
 
 
+# The box a result thumbnail sits in, and the colour that box wears when the track
+# it belongs to is the one the player is holding. See _refresh_playback_highlights.
+# The tile is the outside of the box and it does not move: how much of the box shows
+# around the picture is set by growing the picture until it covers the tile down to
+# THUMB_BOX_INSET on every side (cover_thumbnail). Growing the picture is the only way
+# to thin the band, because the band IS the leftover - scaling to fit inside the tile
+# kept the aspect ratio and spent the leftover on the box, which is why it read as far
+# thicker than the inset it was built with: a 16:9 thumbnail fitted into this 1.8:1 tile
+# showed 6 px of colour down each side and 3 top and bottom, and a legacy 4:3 thumbnail
+# showed 16 at the sides.
+# The other thing that eats the box is the app stylesheet: QLabel is a QFrame, and the
+# stylesheet pads every QFrame by 5 px ("QFrame { ... padding: 5px; }"). A padded label
+# draws a frame of its own around the picture - it even scales the picture down into the
+# padded rect - so 5 px of frame shows whatever the inset is, and an inset change is
+# invisible. So the tile behind wears the colour, and the label is the size of the picture
+# and carries no padding of its own.
+THUMB_TILE_W = 90
+THUMB_TILE_H = 50
+# Two pixels, not one: at one pixel the frame vanished into the anti-aliasing on a light
+# theme and the play state was impossible to read. The tile never changes size, so a wider
+# inset just means the picture is cut back further.
+THUMB_BOX_INSET = 2
+THUMB_BOX_W = THUMB_TILE_W - 2 * THUMB_BOX_INSET
+THUMB_BOX_H = THUMB_TILE_H - 2 * THUMB_BOX_INSET
+# The curve of the box's corners, and the curve the picture inside it is cut to so the
+# two follow the same circle instead of a square-cornered picture inside a round frame.
+# The box is always the inset wider than the picture at every point of that circle, which
+# is what keeps the frame an even thickness into the corners as well as down the sides.
+THUMB_BOX_RADIUS = 4
+THUMB_IMG_RADIUS = THUMB_BOX_RADIUS - THUMB_BOX_INSET
+
+THUMB_BOX_PLAIN = "#2b2b2b"     # the box of every row that is not the loaded track
+THUMB_BOX_PLAYING = "#1abd33"   # the box of the track the player is running
+THUMB_BOX_PAUSED = "#FF8C00"    # the box of the loaded track, held where it stopped
+
+# What a row is told about the player - "playing" or "paused", the same tokens the local
+# rows carry as their play_state property - and the colour the thumbnail box wears for it.
+THUMB_BOX_COLORS = {"playing": THUMB_BOX_PLAYING, "paused": THUMB_BOX_PAUSED}
+
+
+def cover_thumbnail(pixmap, width=THUMB_BOX_W, height=THUMB_BOX_H, radius=THUMB_IMG_RADIUS):
+    """Scale a thumbnail until it covers width x height, cut back to that size keeping the
+    middle, and round its corners to sit inside the box's own curve. Covering rather than
+    fitting is what makes the box the same thickness on all four sides: the box colour is
+    what is left over after the picture is placed, and a fitted 16:9 picture leaves its
+    spare width as a wide band of colour down each side."""
+    if pixmap.isNull():
+        return pixmap
+    scaled = pixmap.scaled(width, height, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+    w, h = min(width, scaled.width()), min(height, scaled.height())
+    cropped = scaled.copy((scaled.width() - w) // 2, (scaled.height() - h) // 2, w, h)
+    if radius <= 0:
+        return cropped
+    masked = QPixmap(w, h)
+    masked.fill(Qt.transparent)
+    painter = QPainter(masked)
+    painter.setRenderHint(QPainter.Antialiasing)
+    corners = QPainterPath()
+    corners.addRoundedRect(0, 0, w, h, radius, radius)
+    painter.setClipPath(corners)
+    painter.drawPixmap(0, 0, cropped)
+    painter.end()
+    return masked
+
+
 class ThumbnailWidget(QWidget):
 
     def __init__(self, video, parent_app, parent=None):
         super().__init__(parent)
-        self.setFixedSize(90, 50)
+        self.setFixedSize(THUMB_TILE_W, THUMB_TILE_H)
         self.video = video
         self.parent_app = parent_app
         
+        self.box_color = THUMB_BOX_PLAIN
+        # Without this attribute the tile's background is painted from the palette, which is a
+        # flat rectangle and ignores the rounded corners the stylesheet asks for - the picture
+        # inside would be cut round inside a box with square ones.
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self._box_style(f"background-color: {THUMB_BOX_PLAIN}; border-radius: {THUMB_BOX_RADIUS}px;")
+
         self.thumb_label = QLabel(self)
-        self.thumb_label.setFixedSize(90, 50)
-        self.thumb_label.setStyleSheet("background-color: #2b2b2b;")
+        self.thumb_label.setFixedSize(THUMB_BOX_W, THUMB_BOX_H)
+        self.thumb_label.move(THUMB_BOX_INSET, THUMB_BOX_INSET)
+        # Its own stylesheet is what keeps the picture the size it was made: without it the
+        # app's QFrame padding takes 5 px off every side and the label scales the picture
+        # down to fit, which is a frame nobody asked for.
+        self.thumb_label.setStyleSheet("background: transparent; border: none; padding: 0px;")
         self.thumb_label.setAlignment(Qt.AlignCenter)
         
         accent = get_accent_color(parent_app.accent_color_name)
@@ -2099,6 +2207,24 @@ class ThumbnailWidget(QWidget):
     def leaveEvent(self, event):
         self.play_btn.hide()
         super().leaveEvent(event)
+
+    def _box_style(self, style):
+        """Put the colour of the box on the tile rather than on the label. The label is a
+        QFrame, and the app stylesheet pads every QFrame by 5 px, so a coloured label paints
+        a 5 px frame of its own around the picture however thin the inset is. The tile is a
+        plain QWidget, which that rule does not pad, and so it shows the inset exactly as
+        written."""
+        self.setStyleSheet(style)
+
+    def set_highlight(self, play_state):
+        """Wear the colour of what the player is doing with this track: green while it
+        runs, orange while it is held where it stopped, and the plain grey the row started
+        with for everything else - including a row whose state is not known any more."""
+        color = THUMB_BOX_COLORS.get(play_state, THUMB_BOX_PLAIN)
+        if self.box_color == color:
+            return
+        self.box_color = color
+        self._box_style(f"background-color: {color}; border-radius: {THUMB_BOX_RADIUS}px;")
 
 # ============================================================
 # LOCAL NETWORK PLAYLIST & AUDIO FILE SYNC ("SYNC CHAINS")
@@ -5066,7 +5192,6 @@ def default_export_config() -> dict:
         'volume': 100,
         'local_folders': [],
         'local_current_path': '',
-        'show_thumbnails': False,
         'show_local_metadata': False,
         'minimize_to_tray': False,
         'recent_playlists': [],
@@ -6566,7 +6691,7 @@ class MainApp(QMainWindow):
     host_activity_signal = Signal(str, str, str)
     _probe_results_signal = Signal(dict)  # cached drive/chain state from the drive probe thread
     local_list_refresh_signal = Signal()  # ask for a non-blocking local folder rescan
-    _local_items_signal = Signal(object)  # (folder_path, scanned items) from the folder scan thread
+    _local_listing_signal = Signal(object)  # (render_id, folder_path, items) from the folder scan thread
     update_available_signal = Signal(str, str, str, str)  # tag, release_name, download_url, asset_name
     update_downloaded_signal = Signal(str, str, str)  # new_file_path, tag, how it is applied (emitted from the download bg thread)
     missing_deps_signal = Signal(str)  # html fragment of missing dependencies (emitted from the VLC init thread)
@@ -6600,6 +6725,31 @@ class MainApp(QMainWindow):
         self.local_rows = []
         self.local_row_by_path = {}
         self.local_btns = []
+        # Every folder switch gets its own id. Rows produced by a scan of a folder that
+        # has already been replaced are dropped by it instead of landing on the folder
+        # that is on screen now.
+        self._local_render_id = 0
+        # The listing of the folder currently filling the pane, less the rows that have
+        # already been drawn, plus what the last chunk cost the GUI thread. A fill that is
+        # still running is abandoned by the next folder switch.
+        self._local_render_pending = None
+        self._local_render_pending_id = 0
+        self._local_render_pending_path = None
+        self._local_render_step = 0
+        self._local_render_chunk_end = None
+        self._local_render_chunk_cost = 0.0
+        self._local_render_chunk_rows = 0
+        self._local_render_row_cost = 0.0
+        self._local_render_row_height = LOCAL_RENDER_ROW_HEIGHT_GUESS
+        # How many rows the folder on screen is going to have, and the height already handed to
+        # the pane for them. See _reserve_local_extent.
+        self._local_render_total_rows = 0
+        self._local_render_extent_height = 0
+        # Chunk N+1 is queued on a zero timer, which Qt runs after it has already laid out
+        # and polished chunk N - the reason a folder fills in instead of arriving at once.
+        self._local_render_timer = QTimer()
+        self._local_render_timer.setSingleShot(True)
+        self._local_render_timer.timeout.connect(self._fill_local_chunk)
         self.local_selection_anchor = None
         self.current_local_file_path = ""
         self.splitter_sizes = [300, 800, 300]
@@ -6619,7 +6769,6 @@ class MainApp(QMainWindow):
         self.volume_val = 100
         self.use_custom_args = False
         self.custom_args = ""
-        self.show_thumbnails = False
         self.minimize_to_tray = False
         self.save_place = False
         self.last_session = {}
@@ -6655,6 +6804,9 @@ class MainApp(QMainWindow):
         self.current_video_id = None
         self.current_playing_title = ""
         self.playback_index = -1
+        # The row currently carrying the playing/paused colour: (pane, key, state), or None.
+        # Compared against on every player tick so the colour moves only when it has to.
+        self._playback_box = None
         self.is_shuffled = False
         self.shuffle_history = []
         self.shuffle_order = []
@@ -6681,13 +6833,19 @@ class MainApp(QMainWindow):
         # block (see the block before "Stop after current") starts by asking whether this is set.
         # The rest is the watchdog for it: the last position libVLC reported and the moment it
         # last moved, whether the stream has been noticed dead, whether it is being re-resolved
-        # right now, how many times this track has already reloaded itself, and a position the
-        # user asked for that has to wait until the fresh media answers.
+        # right now, how many times this track has already reloaded itself, whether anybody has
+        # ever heard this media advancing, and a position the user asked for that has to wait
+        # until the fresh media answers.
         self._loaded_stream = None
         self._loaded_stream_at = None
         self._stream_seen_ms = -1
         self._stream_moved_at = None
         self._stream_dead = False
+        # Only a stream that has been heard advancing can count as having gone idle, which is the
+        # only case where the age of its URL is on its own a reason to re-resolve it. A track the
+        # session restore preloads at start up starts here as False and stays that way until
+        # somebody plays it. See _stream_needs_renew.
+        self._stream_listened = False
         self._stream_refetching = False
         self._stream_refetch_attempts = 0
         self._stream_renew_started_at = None
@@ -6756,7 +6914,7 @@ class MainApp(QMainWindow):
         self.host_activity_signal.connect(self._on_host_activity)
         self._probe_results_signal.connect(self._apply_probe_results)
         self.local_list_refresh_signal.connect(self._refresh_local_list_async)
-        self._local_items_signal.connect(self._apply_local_items)
+        self._local_listing_signal.connect(self._on_local_listing)
         self.update_available_signal.connect(self._show_update_dialog)
         self.update_downloaded_signal.connect(self._prompt_swap_dialog)
         self.missing_deps_signal.connect(self._show_missing_dependencies)
@@ -6809,9 +6967,14 @@ class MainApp(QMainWindow):
             sd = self.session_data
             if sd.get('current_video_id') == "local" and sd.get('local_current_path'):
                 idx = sd.get('local_playback_index', -1)
-                audio_files = [x for x in getattr(self, 'current_local_items', []) if x.get('is_dir') is False]
-                if 0 <= idx < len(audio_files):
-                    QTimer.singleShot(100, lambda: self._on_local_click(audio_files[idx], paused_at_start=True))
+                # The folder opened above has only just started streaming its rows, so
+                # the track to resume on is remembered here and looked up by
+                # _finish_local_render, which runs when that list is actually complete.
+                # The folder it belongs to is remembered with it, because a folder that
+                # cannot be opened - or one the user switches away from before the rows
+                # land - must not have a track of another folder resumed in it.
+                self._pending_local_restore_index = idx
+                self._pending_local_restore_path = sd.get('local_current_path')
 
         # --- Local Network Sync Chains Subsystem ---
         self.sync_config_manager = SyncConfigManager(self.config_dir)
@@ -7766,7 +7929,6 @@ class MainApp(QMainWindow):
                     self.volume_val = c.get('volume', 100)
                     self.local_folders = c.get('local_folders', [])
                     self.local_current_path = c.get('local_current_path', "")
-                    self.show_thumbnails = c.get('show_thumbnails', False)
                     self.show_local_metadata = c.get('show_local_metadata', False)
                     self.minimize_to_tray = c.get('minimize_to_tray', False)
                     self.recent_playlists = c.get('recent_playlists', [])
@@ -7823,7 +7985,6 @@ class MainApp(QMainWindow):
             'local_folders': self.local_folders,
             'local_current_path': self.local_current_path,
             'volume': self.volume_val,
-            'show_thumbnails': self.show_thumbnails,
             'show_local_metadata': getattr(self, 'show_local_metadata', False),
             'minimize_to_tray': self.minimize_to_tray,
             'use_custom_args': self.use_custom_args,
@@ -8074,6 +8235,11 @@ class MainApp(QMainWindow):
             return
         self._shutdown_done = True
 
+        # A dialog raised on the way out would hold the process open until someone
+        # dismissed it, so from here a failure is written to yt-msd-crash.log and not
+        # shown. silence_crash_dialogs() stops only the dialogs.
+        silence_crash_dialogs()
+
         # A background thread that is still working when this window goes away
         # reaches for a signal on an object Qt has already deleted. The hard
         # exit used to cut those threads off before they could say so; now the
@@ -8188,7 +8354,6 @@ class MainApp(QMainWindow):
         self.use_custom_args = False
         self.custom_args = ""
         self.last_search = ""
-        self.show_thumbnails = False
         self.minimize_to_tray = False
         self.run_renamer = False
         self.renamer_path = ""
@@ -8611,8 +8776,6 @@ class MainApp(QMainWindow):
             # list has to be pushed into it here or it stays stale until relaunch.
             self.set_local_explorer_address(self.local_current_path,
                                            add_to_recent=os.path.isdir(self.local_current_path or ""))
-        if 'show_thumbnails' in cfg:
-            self.show_thumbnails = bool(cfg.get('show_thumbnails'))
         if 'show_local_metadata' in cfg:
             self.show_local_metadata = bool(cfg.get('show_local_metadata'))
         if 'minimize_to_tray' in cfg:
@@ -8695,8 +8858,6 @@ class MainApp(QMainWindow):
             self.disable_ytdlp_updates = bool(cfg.get('disable_ytdlp_updates'))
 
         self.apply_theme()
-        if 'show_thumbnails' in cfg and getattr(self, 'search_results', None):
-            self._on_search_results(self.search_results, False, reset_view=False)
         # The settings dialog reads these values when it is built, so the cached
         # one is dropped: reopening it shows the imported settings.
         settings_dialog = getattr(self, 'settings_dialog', None)
@@ -9101,11 +9262,6 @@ class MainApp(QMainWindow):
         self.header_divider.setStyleSheet("color: #888888; font-weight: bold;")
         h.addWidget(self.header_divider)
         
-        self.show_thumb_cb = QCheckBox("Show Thumbnails")
-        self.show_thumb_cb.setChecked(self.show_thumbnails)
-        self.show_thumb_cb.stateChanged.connect(self.toggle_thumbnails)
-        h.addWidget(self.show_thumb_cb)
-        
         self.open_yt_btn = QPushButton("")
         self.open_yt_btn.setObjectName("topIconBtn")
         self.open_yt_btn.setToolTip("Open search / playlist on YouTube")
@@ -9338,6 +9494,26 @@ class MainApp(QMainWindow):
             QWidget#localRow[selected="true"] {{
                 background-color: {accent};
             }}
+            /* The row that is the track the player is holding wears the colour of that
+               state - green while it runs, orange while it is held - and it is written
+               after the selection rule so that a row which is both selected and playing
+               says the thing the listener is looking at the folder list to find out. */
+            QWidget#localRow[play_state="playing"] {{
+                background-color: {THUMB_BOX_PLAYING};
+            }}
+            QWidget#localRow[play_state="paused"] {{
+                background-color: {THUMB_BOX_PAUSED};
+            }}
+            /* A green and an orange row both carry saturated colour behind the text, so
+               the text on them is fixed rather than left to the theme's own foreground,
+               which is chosen to sit on the dark panes and not on these. */
+            QWidget#localRow[play_state="playing"] QPushButton#transparentBtn,
+            QWidget#localRow[play_state="paused"] QPushButton#transparentBtn,
+            QWidget#localRow[play_state="playing"] QLabel#durationLabel,
+            QWidget#localRow[play_state="paused"] QLabel#durationLabel {{
+                color: #1a1a1a;
+                font-weight: bold;
+            }}
             QPushButton#transparentBtn[selected="true"] {{
                 background-color: transparent;
                 color: {accent_fg};
@@ -9454,6 +9630,10 @@ class MainApp(QMainWindow):
             queue_item_bg=queue_item_bg, queue_item_bg_finished=queue_item_bg_finished,
             btn_hover=btn_hover, checkmark_path=checkmark_path, downarrow_path=downarrow_path,
             main_btn_border=main_btn_border, secondary_fg=secondary_fg,
+            # The colours a row wears when it is the track the player is holding, shared with
+            # the thumbnail box of a search row so both panes say the same thing in the same
+            # green and the same orange.
+            THUMB_BOX_PLAYING=THUMB_BOX_PLAYING, THUMB_BOX_PAUSED=THUMB_BOX_PAUSED,
             tooltip_css=tooltip_css
         )
         # Apply the theme at the widget level (as in 2.3). A single
@@ -9501,28 +9681,236 @@ class MainApp(QMainWindow):
         self.refresh_local_list()
 
     def refresh_local_list(self):
-        self._build_local_rows(self._scan_local_items(self.local_current_path))
+        """Re-render the open folder. The switch itself is instant and the rows then fill
+        in a screenful at a time - see _start_local_render - so a folder holding hundreds
+        of files no longer delays the screen change the user asked for."""
+        self._start_local_render(self.local_current_path)
 
     def _refresh_local_list_async(self):
-        """Rescan the open folder on a worker thread. Used for every refresh that
-        was not caused by the user directly (a sync finishing, the hourly
-        auto-rescan), so a slow drive never holds the UI hostage."""
-        path = self.local_current_path
+        """Rescan the open folder for every refresh that was not caused by the user
+        directly (a sync finishing, the hourly auto-rescan). _start_local_render already
+        does its scanning off the GUI thread, so this is the same path under the name the
+        callers that must not block use."""
+        self._start_local_render(self.local_current_path)
 
-        def _bg():
+    def _start_local_render(self, path):
+        """Show `path` now, and let its rows come in afterwards.
+
+        The rows of the folder being replaced are torn down and the scan starts on a
+        worker thread before this returns, so nothing about the screen change is waiting
+        on the folder: the view is cleared to the new folder in the time it takes to drop
+        the old rows, and the first rows land as soon as the listing is known. The
+        listing itself is the cheap part - scandir hands over the name, size and timestamp
+        of every entry as it walks the folder, so 500 files list in a few milliseconds -
+        and it is sorted before the first batch because the batch order is the order the
+        rows appear in, and File Explorer order is what the user expects to land on.
+
+        Each render has its own id. The scan thread checks it before handing the listing
+        over and the GUI thread checks it again before every chunk of rows it builds, so
+        the rows of a folder that has already been left behind - or of a drive pulled out
+        mid-listing - cannot arrive on the folder that is on screen instead."""
+        self._local_render_id = getattr(self, '_local_render_id', 0) + 1
+        render_id = self._local_render_id
+        # A fill still under way belongs to the folder being replaced.
+        self._local_render_timer.stop()
+        self._local_render_pending = None
+        # The metadata reads of the folder being replaced are cancelled here rather than
+        # per chunk, because the chunks of one folder have to keep reading under the same
+        # pass. See _fetch_local_metadata_bg.
+        self._local_meta_pass = getattr(self, '_local_meta_pass', 0) + 1
+        self._reset_local_rows()
+
+        def _list_and_feed():
             items = self._scan_local_items(path)
-            try:
-                self._local_items_signal.emit((path, items))
-            except RuntimeError:
-                pass
+            if render_id != getattr(self, '_local_render_id', 0):
+                return  # a newer folder is on screen now; this listing is stale
+            # The whole listing crosses to the GUI thread in one go, because how big a
+            # chunk of rows should be depends on what building and painting them costs on
+            # this machine, and only the GUI thread can know that. A folder that cannot be
+            # listed comes back as None and is reported as an empty render, so the pane
+            # stays clear for it instead of keeping rows from a drive that is gone.
+            self._emit_local_listing(render_id, path, items)
 
-        threading.Thread(target=_bg, daemon=True).start()
+        threading.Thread(target=_list_and_feed, daemon=True).start()
 
-    def _apply_local_items(self, payload):
-        path, items = payload
+    def _emit_local_listing(self, render_id, path, items):
+        """Hand the finished listing to the GUI thread, which does the chunking. Returning
+        False means the signal is gone - the window is being torn down."""
+        try:
+            self._local_listing_signal.emit((render_id, path, items))
+            return True
+        except RuntimeError:
+            return False
+
+    def _on_local_listing(self, payload):
+        """The GUI-thread half of a render: the new folder is on screen and its listing is
+        known, so the pane starts filling with it - one screenful of rows first, everything
+        after that behind it. A listing whose render id is not the current one belongs to a
+        folder the user has already moved on from and is dropped."""
+        render_id, path, items = payload
+        if render_id != getattr(self, '_local_render_id', 0):
+            return  # this listing was listed for a folder that has since been replaced
         if path != self.local_current_path:
-            return  # the folder changed while the scan was running
-        self._build_local_rows(items)
+            return  # and so was this one
+        if not items:
+            # A folder with nothing in it has no chunks to fill, but the render still has to
+            # be closed out: the selection, and any track left paused when the window was
+            # closed, are settled against a list that is now known to be empty.
+            self._local_render_pending = None
+            self._finish_local_render()
+            return
+        self._local_render_pending = items
+        self._local_render_pending_id = render_id
+        self._local_render_pending_path = path
+        self._local_render_total_rows = len(items)
+        self._local_render_step = self._local_screenful_rows()
+        self._local_render_chunk_end = None
+        self._local_render_chunk_cost = 0.0
+        self._local_render_chunk_rows = 0
+        self._local_render_row_cost = 0.0
+        self._fill_local_chunk()
+
+    def _local_screenful_rows(self):
+        """How many rows the pane can show at once, which is the size of the first chunk:
+        the rows the user switched folders to look at are the rows built first, and a folder
+        smaller than a screen is built in one go, exactly as fast as it always was."""
+        pane = getattr(self, 'local_list', None)
+        height = pane.viewport().height() if pane is not None else 0
+        fits = int(height // max(1.0, self._local_render_row_height)) if height > 0 else 0
+        return max(fits, LOCAL_RENDER_FIRST_CHUNK_ROWS)
+
+    def _fill_local_chunk(self):
+        """Create the rows of the next chunk and hand control back. The event loop lays
+        those rows out and polishes them before the zero timer runs this again, which is
+        what makes a big folder fill in on screen instead of arriving all at once.
+
+        The gap between one chunk ending and the next starting is what that chunk cost, its
+        painting included, so it is divided by the rows that chunk produced to get what a row
+        costs on this machine, and the next chunk is made as big as that cost allows within
+        the budget. A folder of rows that are expensive - long titles, tags that have to be
+        read - fills in smaller chunks than a folder of cheap ones, and both stay answerable."""
+        pending = getattr(self, '_local_render_pending', None)
+        if not pending:
+            self._local_render_pending = None
+            return
+        if (self._local_render_pending_id != getattr(self, '_local_render_id', 0)
+                or self._local_render_pending_path != self.local_current_path):
+            self._local_render_pending = None
+            return  # the user moved on while this folder was still filling in
+
+        now = time.perf_counter()
+        if self._local_render_chunk_end is not None:
+            spent = (now - self._local_render_chunk_end) + self._local_render_chunk_cost
+            cost_per_row = spent / max(1, self._local_render_chunk_rows)
+            previous = self._local_render_row_cost
+            # Smoothed, so one chunk that happened to land on a slow stretch - a folder
+            # whose tags still have to be read, a window being dragged - does not decide
+            # the size of every chunk after it.
+            self._local_render_row_cost = (previous * 0.4 + cost_per_row * 0.6) \
+                if previous > 0.0 else cost_per_row
+            budget = max(0.001, LOCAL_RENDER_CHUNK_BUDGET_S)
+            self._local_render_step = int(min(LOCAL_RENDER_CHUNK_MAX_ROWS,
+                                              max(LOCAL_RENDER_CHUNK_MIN_ROWS,
+                                                  budget / max(self._local_render_row_cost,
+                                                              1e-6))))
+
+        step = max(1, self._local_render_step)
+        self._local_render_pending = pending[step:] or None
+        rows_before = len(self.local_rows)
+        try:
+            self._append_local_rows(pending[:step])
+        except RuntimeError:
+            self._local_render_pending = None
+            return  # the pane is being taken down around us
+        self._local_render_chunk_cost = time.perf_counter() - now
+        self._local_render_chunk_end = time.perf_counter()
+        rows_added = len(self.local_rows) - rows_before
+        self._local_render_chunk_rows = rows_added
+        if rows_added:
+            self._measure_local_row_pitch(rows_before)
+            # The listing has always said how many rows there are going to be, and the fill knows
+            # what a row of this folder costs the list, so the height of the finished folder is
+            # known here - before any of these rows have been painted - and the pane is given it.
+            # Everything the fill does after this point happens inside a pane that is already the
+            # size it is going to end up.
+            self._reserve_local_extent()
+        if self._local_render_pending:
+            self._local_render_timer.start(0)
+        else:
+            self._finish_local_render()
+
+    def _measure_local_row_pitch(self, rows_before):
+        """What one row of this folder costs the list, read off the rows already on screen.
+
+        The height the pane's content reports lags a fill like this one: a row container has only
+        just been created, so it has nothing to report about its own height until the event loop
+        has polished it and laid it out. Measuring a row from that number is measuring the rows of
+        the chunk before last, and an estimate built from it is a little different at every chunk -
+        which makes the pane a slightly different size at every chunk, the thing the reservation
+        below exists to prevent. The rows the previous chunk built have been laid out by now, and
+        where the first and last of them ended up says exactly what a row costs: the row itself and
+        the spacing the list puts between rows.
+        """
+        if rows_before < 2:
+            return  # nothing has been laid out yet, so the guess stands
+        first_row = self.local_rows[0][0]
+        settled_row = self.local_rows[rows_before - 1][0]
+        span = settled_row.y() - first_row.y()
+        if span <= 0:
+            return  # and this chunk got its turn before those rows were laid out
+        self._local_render_row_height = span / (rows_before - 1)
+
+    def _reserve_local_extent(self):
+        """Hand the pane the height the finished folder is going to take up.
+
+        The listing has said how many rows the folder has since before the first row existed, and
+        the fill knows what a row of this folder costs the list, so the height the finished folder
+        is going to occupy is worked out here - before any of its rows have been painted - and the
+        content widget is given it as its own minimum. From here on the fill happens inside a pane
+        that is already the size it is going to end up: the rows already drawn do not move, the
+        scrollbar spans the whole folder before its last row exists, and each chunk after the first
+        is built into room that is already there instead of making the folder taller under the user
+        a batch at a time. That is the cheaper shape as well - a content widget whose own height
+        has changed makes Qt lay out every row it already has again, and doing that twenty-odd
+        times is most of what a streamed fill costs.
+
+        The estimate is reworked at every chunk and only worth acting on when it has moved by more
+        than a row, so the pane is sized once, early, and left alone.
+        """
+        pane = getattr(self, 'local_list', None)
+        content = getattr(self, 'local_content', None)
+        total = getattr(self, '_local_render_total_rows', 0)
+        if pane is None or content is None or total <= 0:
+            return
+        row_pitch = max(1.0, self._local_render_row_height)
+        # The space the list leaves above its first row and below its last. The rows carry the
+        # top one in their own position on screen; the bottom one is the same margin.
+        top_margin = 0
+        if self.local_rows:
+            top_margin = max(0, self.local_rows[0][0].y())
+        height = int(total * row_pitch + 2 * top_margin + 0.5)
+        height = max(height, pane.viewport().height())
+        applied = getattr(self, '_local_render_extent_height', 0)
+        if applied and abs(height - applied) <= row_pitch:
+            return  # the pane already has room for the whole folder
+        self._local_render_extent_height = height
+        content.setMinimumHeight(height)
+
+    def _release_local_extent(self):
+        """Take back the height reserved for a folder that is no longer filling in.
+
+        Two moments want it. At the end of a fill the rows themselves are the better answer for
+        how tall the pane's content is than the estimate the fill was working to, and dropping
+        the estimate is what keeps a folder whose rows came out a little shorter than expected
+        from leaving a strip of blank pane under it. And when a folder is being replaced, the
+        reserved height belongs to a listing that is going away; the incoming folder reserves its
+        own as soon as its first chunk has landed.
+        """
+        self._local_render_total_rows = 0
+        self._local_render_extent_height = 0
+        content = getattr(self, 'local_content', None)
+        if content is not None:
+            content.setMinimumHeight(0)
 
     def _scan_local_items(self, folder_path: str):
         """All filesystem work for the local file list. Returns None when the
@@ -9569,23 +9957,46 @@ class MainApp(QMainWindow):
         return items
 
     def _build_local_rows(self, items):
+        """Render a list that is already fully known in one pass. Folder switches use
+        _start_local_render, which streams the rows in batch by batch; this is kept for
+        callers that have the whole listing in hand."""
+        self._reset_local_rows()
+        self._append_local_rows(items or [])
+        self._finish_local_render()
+
+    def _reset_local_rows(self):
+        """Tear down the rows of the folder being replaced. What was selected survives,
+        so a refresh of the folder already on screen - a sync landing new files - does not
+        quietly drop the user's selection. The row the shift-ranges were anchored to does
+        not survive, and the count beside the metadata checkbox waits until the new rows
+        exist rather than reporting the selection of rows that are no longer there."""
         while self.local_vbox.count():
             item = self.local_vbox.takeAt(0)
             if item.widget(): item.widget().deleteLater()
-            
+
         self.local_rows = []
         self.local_row_by_path = {}
         self.local_btns = []
+        # These rows are gone, and with them the row this app was colouring.
+        self._forget_playback_box()
+        self.current_local_items = []
         self.local_selection_anchor = None
-        if items is None:
-            self.current_local_items = []
-            self.local_selected_paths = set()
-            self._update_local_selection_ui()
-            return
-        
-        self.current_local_items = items
-        
-        for idx, item in enumerate(items):
+        self._update_local_selection_ui()
+        # The height handed to the pane for the rows of the folder being replaced goes with
+        # them; the incoming folder reserves its own once its first chunk has landed.
+        self._release_local_extent()
+
+    def _append_local_rows(self, items):
+        """Create the widgets for one batch of rows. Numbering continues from the rows
+        already on screen, so selection ranges and the right-click menu keep working
+        while a folder is still being filled in. The metadata reads for this batch start
+        here rather than at the end of the folder, so a duration appears on a row the
+        user can already see."""
+        base_index = len(self.local_rows)
+        prev_btns = len(self.local_btns)
+
+        for offset, item in enumerate(items):
+            idx = base_index + offset
             raw_title = item.get('meta_name', item['name']) if getattr(self, 'show_local_metadata', False) else item['name']
             escaped_title = raw_title.replace('&', '&&')
 
@@ -9642,22 +10053,50 @@ class MainApp(QMainWindow):
             if not item['is_dir']:
                 self.local_btns.append((btn, dur_lbl, item))
 
-        # Drop any selection that no longer points at something in this folder.
+        self.current_local_items.extend(items)
+        # A selection that survived a refresh of the folder has to pick up the rows built
+        # after it. When nothing is selected there is nothing to pick up: a fresh row
+        # carries no 'selected' property at all and the stylesheet only styles
+        # selected="true", so skipping this pass is what keeps a 500-file folder from
+        # re-polishing every row it has already drawn, batch after batch.
+        if getattr(self, 'local_selected_paths', ()):
+            self._apply_local_selection_styles()
+        # The play state is not part of the selection, so it is put onto the new rows on its
+        # own: a folder refreshed under a playing file rebuilds the row for that file, and
+        # that row has to come back carrying the colour it had before it was replaced.
+        self._reapply_playback_box_after_rebuild()
+        self._fetch_local_metadata_bg(self.local_btns[prev_btns:])
+
+    def _finish_local_render(self):
+        """The last batch of this render has landed. Only now is it known whether a
+        selection that survived the refresh still points at something in the folder, and
+        a local track the session was closed on can be resumed against a list that is
+        finally complete."""
+        self._release_local_extent()
         previous_selection = set(getattr(self, 'local_selected_paths', ()))
         self.local_selected_paths = {p for p in previous_selection if p in self.local_row_by_path}
         self._apply_local_selection_styles()
         self._update_local_selection_ui()
 
-        if self.local_btns:
-            self._fetch_local_metadata_bg()
+        resume_index = getattr(self, '_pending_local_restore_index', None)
+        if resume_index is None:
+            return
+        resume_path = getattr(self, '_pending_local_restore_path', None)
+        if resume_path is not None and os.path.abspath(resume_path) != self.local_current_path:
+            return  # this folder is not the one that track was left on
+        self._pending_local_restore_index = None
+        audio_files = [x for x in self.current_local_items if not x.get('is_dir')]
+        if 0 <= resume_index < len(audio_files):
+            QTimer.singleShot(100, lambda: self._on_local_click(audio_files[resume_index], paused_at_start=True))
             
-    def _fetch_local_metadata_bg(self):
-        """Fill in the durations and the artist/title of the rows of the folder on
-        screen. mutagen reads them inside this process; ffprobe is only reached for
-        the files mutagen cannot open or cannot tag. A row whose values were already
-        answered from the cache while the folder was scanned is not touched at all,
-        and each row that does need reading is written back on its own instead of the
-        whole list being rebuilt around it."""
+    def _fetch_local_metadata_bg(self, rows=None):
+        """Fill in the durations and the artist/title of the rows handed to it - the
+        batch of rows that just landed, or every row of the folder when called without
+        any. mutagen reads them inside this process; ffprobe is only reached for the
+        files mutagen cannot open or cannot tag. A row whose values were already answered
+        from the cache while the folder was scanned is not touched at all, and each row
+        that does need reading is written back on its own instead of the whole list being
+        rebuilt around it."""
         from PySide6.QtCore import QObject, Signal
 
         class MetaWorker(QObject):
@@ -9667,19 +10106,38 @@ class MainApp(QMainWindow):
             self._meta_worker = MetaWorker()
             self._meta_worker.meta_done.connect(self._apply_local_row_meta)
 
-        # Every rebuild supersedes the one before it. Without this, the rows of a
-        # folder you have already left carry on being read in the background, and that
-        # backlog is a large part of what made the next folder slow to fill in.
-        self._local_meta_pass = getattr(self, '_local_meta_pass', 0) + 1
-        this_pass = self._local_meta_pass
+        # The pass belongs to the render, not to this call. Every batch of the folder on
+        # screen reads under the same pass, so a batch landing a second into a 500-file
+        # folder cannot cancel the reads of the batches before it. Switching folders bumps
+        # the pass in _start_local_render, and that is what stops the reads of the folder
+        # that has been replaced - a backlog that was a large part of what made the next
+        # folder slow to fill in.
+        this_pass = getattr(self, '_local_meta_pass', 0)
 
-        pending = [(btn, d_lbl, item) for (btn, d_lbl, item) in self.local_btns
+        source = self.local_btns if rows is None else rows
+        pending = [(btn, d_lbl, item) for (btn, d_lbl, item) in source
                    if 'duration_str' not in item]
         if not pending:
             return
 
         want_tags = getattr(self, 'show_local_metadata', False)
         workers = max(1, min(4, os.cpu_count() or 1))
+
+        # One reader pool per render rather than one per batch: the batches of a streamed
+        # folder arrive every few milliseconds, and each with its own pool of readers would
+        # pile threads onto the disk the folder is being read from.
+        pool = getattr(self, '_meta_pool', None)
+        if pool is None or getattr(self, '_meta_pool_pass', None) != this_pass:
+            old_pool = pool
+            pool = ThreadPoolExecutor(max_workers=workers)
+            self._meta_pool = pool
+            self._meta_pool_pass = this_pass
+            if old_pool is not None:
+                try:
+                    # Reads queued for the folder that has just been replaced are pointless.
+                    old_pool.shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    pass
 
         def read_row(btn, d_lbl, item):
             if self._local_meta_pass != this_pass:
@@ -9730,16 +10188,14 @@ class MainApp(QMainWindow):
                 return  # superseded while the read was running: there is no row to write onto
             self._meta_worker.meta_done.emit(btn, d_lbl, item)
 
-        def bg_task():
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = [pool.submit(read_row, btn, d_lbl, item) for (btn, d_lbl, item) in pending]
-                for future in futures:
-                    try:
-                        future.result()
-                    except Exception:
-                        pass
-
-        threading.Thread(target=bg_task, daemon=True).start()
+        # The rows are queued on the render's own pool. submit() is what starts the reader
+        # threads and it costs microseconds, so the GUI thread is back at the event loop
+        # building the next batch of rows while these reads run.
+        for btn, d_lbl, item in pending:
+            try:
+                pool.submit(read_row, btn, d_lbl, item)
+            except Exception:
+                break  # this pool was already closed by a newer render
 
     def _apply_local_row_meta(self, btn, d_lbl, item):
         """Write the values a background read produced onto that one row: the name
@@ -9869,6 +10325,132 @@ class MainApp(QMainWindow):
                 return True
             w = w.parent()
         return False
+
+    # ------------------------------------------------------------------
+    # Which row the player is holding, in colour
+    # ------------------------------------------------------------------
+    # A search row already has a grey box around its thumbnail and a local row already
+    # takes a background when it is selected, so the play state is not a new widget to
+    # draw - it is one more thing those existing surfaces can say.
+    #
+    # The colour comes from what libVLC reports rather than from is_playing, because
+    # is_playing is what the listener last asked for and not what the media is doing: a
+    # stream whose URL has given out is neither playing nor held, and the box should say
+    # that about it too. Opening and Buffering are left uncoloured for the same reason -
+    # a track still on its way is not a track the player has got hold of yet.
+    def _playback_box_state(self):
+        """The play-state token for the state the player is in, or None when it holds
+        nothing it could be playing."""
+        if not self.vlc_player:
+            return None
+        try:
+            state = self.vlc_player.get_state()
+        except Exception:
+            return None
+        if state == vlc.State.Playing:
+            return "playing"
+        if state == vlc.State.Paused:
+            return "paused"
+        return None
+
+    def _playback_box_key(self):
+        """(where, which, state) for the row that carries the play state right now, or
+        None when no row should. 'where' picks the pane and 'which' is the video id of a
+        search row or the path of a local one - the same keys those panes already index
+        their rows by."""
+        state = self._playback_box_state()
+        if state is None:
+            return None
+        vid_id = self.current_video_id
+        if vid_id == "local":
+            path = getattr(self, 'current_local_file_path', '')
+            if not path:
+                return None
+            return ("local", path, state)
+        if not vid_id:
+            return None
+        return ("search", vid_id, state)
+
+    def _refresh_playback_highlights(self):
+        """Move the coloured row to whichever track the player is holding, when that has
+        changed since the last look.
+
+        This runs from the player's own tick, which is already asking libVLC for the state,
+        so a play, a pause, a resume, an automatic advance, prev/next, a local file and a
+        stream that had to be re-resolved all land here without anything else having to
+        remember to say so. A tick where nothing changed - which is nearly every tick -
+        stops at this comparison, so a pane full of rows is not repolished sixty times a
+        second while a track runs."""
+        key = self._playback_box_key()
+        previous = getattr(self, '_playback_box', None)
+        if key == previous:
+            return
+        if previous is not None and key is not None and previous[:2] == key[:2]:
+            # The same row changing colour - play into pause and back again - only has to
+            # be repainted once, rather than cleared and painted again.
+            self._apply_playback_box(key)
+        else:
+            if previous is not None:
+                self._apply_playback_box((previous[0], previous[1], None))
+            self._apply_playback_box(key)
+        self._playback_box = key
+
+    def _apply_playback_box(self, key):
+        """Write a play state onto the row that key names. A state of None puts that row
+        back to the plain look it has when it is not the loaded track."""
+        if key is None:
+            return
+        where, target, state = key
+        if where == "local":
+            self._set_local_row_play_state(target, state)
+        elif where == "search":
+            self._set_search_row_box(target, state)
+
+    def _forget_playback_box(self):
+        """The row this app coloured is no longer there to uncolour. Dropping the record of
+        it is what lets the next highlight reach the row that exists now instead of being
+        skipped as already done - a new search and a rebuilt folder each replace every row
+        the pane had, and a row that is rebuilt starts plain."""
+        self._playback_box = None
+
+    def _set_search_row_box(self, vid_id, state):
+        label = getattr(self, '_thumbnail_labels', {}).get(vid_id)
+        if label is None:
+            return  # this row is scrolled out of view, so it has no thumbnail box to colour
+        tile = label.parentWidget()
+        if tile is None or not hasattr(tile, 'set_highlight'):
+            return
+        try:
+            tile.set_highlight(state)
+        except RuntimeError:
+            pass  # the row was torn down between the lookup and the colouring
+
+    def _set_local_row_play_state(self, path, state):
+        index = getattr(self, 'local_row_by_path', {}).get(path)
+        if index is None or index >= len(self.local_rows):
+            return  # this file is not a row of the folder currently on screen
+        row_w = self.local_rows[index][0]
+        # An empty token matches no rule of the stylesheet, which is how the row gets its
+        # plain background back. Local rows are coloured through the stylesheet rather than
+        # per row so that filling a folder does not parse a style string for every file in it.
+        token = state or ""
+        try:
+            if row_w.property('play_state') == token:
+                return
+            row_w.setProperty('play_state', token)
+            row_w.style().unpolish(row_w)
+            row_w.style().polish(row_w)
+            row_w.update()
+        except RuntimeError:
+            pass  # a newer rebuild has already torn this row down
+
+    def _reapply_playback_box_after_rebuild(self):
+        """Put the play state back onto the rows that have just been created, when the track
+        they contain is the one the player is holding."""
+        box = getattr(self, '_playback_box', None)
+        if box is None:
+            return
+        self._apply_playback_box(box)
 
     def _apply_local_selection_styles(self):
         selected_paths = getattr(self, 'local_selected_paths', set())
@@ -10029,13 +10611,6 @@ class MainApp(QMainWindow):
             msg += f" Skipped {len(skipped)}: " + ", ".join(s['message'] for s in skipped[:3])
         self._on_status_update(msg, False, "#1abd33" if not skipped else "#E31E24")
 
-    def toggle_thumbnails(self, state):
-        self.show_thumbnails = state == Qt.Checked.value
-        self.save_config()
-        if self.search_results:
-            # Same list, taller rows: keep the reader where they were reading.
-            self._on_search_results(self.search_results, False, reset_view=False)
-
     def open_settings_dialog(self):
         if not hasattr(self, 'settings_dialog') or self.settings_dialog is None:
             self.settings_dialog = SettingsDialog(self)
@@ -10126,12 +10701,15 @@ class MainApp(QMainWindow):
         self.search_results = res
         self._thumbnail_labels = getattr(self, '_thumbnail_labels', {})
         self._thumbnail_labels.clear()
+        # Every row these results had is about to be deleted, so the row this app was
+        # colouring goes with them and cannot be coloured back to plain later.
+        self._forget_playback_box()
         
         while self.results_vbox.count():
             item = self.results_vbox.takeAt(0)
             if item.widget(): item.widget().deleteLater()
             
-        height = 54 if self.show_thumbnails else 34
+        height = 54
         for video in res:
             placeholder = QWidget()
             placeholder.setFixedHeight(height)
@@ -10140,7 +10718,7 @@ class MainApp(QMainWindow):
             self.results_vbox.addWidget(placeholder)
             
         # reset_view is True when these are results from a search that was just run, and
-        # False when the same list is only being redrawn (thumbnail toggle, settings
+        # False when the same list is only being redrawn (settings
         # import, session restore). A new search is read from its first row, and the
         # successor decided for the list being replaced is no longer part of the playlist
         # playback is stepping through; a redraw of the same list is neither.
@@ -10234,19 +10812,15 @@ class MainApp(QMainWindow):
         l = QHBoxLayout(placeholder)
         l.setContentsMargins(2,2,2,2)
         
-        if self.show_thumbnails:
-            tw = ThumbnailWidget(video, self)
-            l.addWidget(tw)
-            self._thumbnail_labels[video['id']] = tw.thumb_label
-            threading.Thread(target=self._fetch_thumbnail, args=(video,), daemon=True).start()
-        else:
-            pbtn = QPushButton("\uE768")
-            pbtn.setToolTip("Play this track")
-            pbtn.setFixedWidth(40)
-            pbtn.setObjectName("iconBtn")
-            pbtn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 16px;")
-            pbtn.clicked.connect(lambda checked=False, v=video: self.play_result(v))
-            l.addWidget(pbtn)
+        tw = ThumbnailWidget(video, self)
+        l.addWidget(tw)
+        self._thumbnail_labels[video['id']] = tw.thumb_label
+        # A row that has just been built starts with the plain box, so the state it is in -
+        # this row is the track that is running, held, or neither - has to be put on it now.
+        box = getattr(self, '_playback_box', None)
+        if box is not None and box[0] == "search" and box[1] == video.get('id', ''):
+            tw.set_highlight(box[2])
+        threading.Thread(target=self._fetch_thumbnail, args=(video,), daemon=True).start()
             
         title = video.get('title', 'Unknown')
         cb = QCheckBox(f"{title.replace('&', '&&')}")
@@ -11172,6 +11746,12 @@ class MainApp(QMainWindow):
         self._stream_moved_at = None
         self._stream_dead = False
         self._stream_refetch_attempts = 0
+        # Whether anybody has heard this particular media advancing. A refresh of a stream that
+        # gave out mid-listen is the same listening carried onto new media, so it carries over;
+        # anything else - including the track the session restore preloads paused at start up -
+        # has not been listened to at all yet, and is not a stream that can have gone idle.
+        # _stream_needs_renew uses this to keep age from reloading a track nobody has played.
+        self._stream_listened = bool(keep_pending_seek and getattr(self, '_stream_listened', False))
         if not keep_pending_seek:
             self._pending_stream_seek_frac = None
             self._pending_stream_seek_ms = None
@@ -11208,16 +11788,28 @@ class MainApp(QMainWindow):
         """Whether the stream on the player should be re-resolved before it is asked for anything.
 
         Two answers are yes: it was noticed dead - a position that stopped moving, or
-        vlc.State.Error - and its URL is older than STREAM_URL_MAX_AGE while the player is not
-        currently advancing on it, which is the track left paused, or left running into a link
-        that has since died, for longer than a YouTube URL lasts. Never for a local file, and
-        never while a fetch or a refresh is already under way.
+        vlc.State.Error - and it is a stream the listener has actually been hearing whose URL has
+        outlived STREAM_URL_MAX_AGE while the player is not advancing on it, which is the track
+        left running into a link that has since died, or left idle on the player for longer than
+        a YouTube URL lasts. Never for a local file, and never while a fetch or a refresh is
+        already under way.
+
+        The age of the URL only means something for a stream that has been listened to and has
+        then stopped. A track preloaded at start up by the session restore, or one paused within
+        the life of its URL, is media nobody is currently hearing: its URL grows old on the
+        player without anything going wrong, and re-resolving it there lands the listener back at
+        the top of the track, which reads as the track restarting itself. What that track needs is
+        the URL it already has being tried, and the watchdog noticing within a few seconds whether
+        it still answers - the same rule that already leaves a working stream alone however old
+        its URL is.
         """
         if not getattr(self, '_loaded_stream', None) or self._stream_is_switching():
             return False
         if getattr(self, '_stream_dead', False):
             return True
-        return self._loaded_stream_age() > STREAM_URL_MAX_AGE and not self._stream_is_moving()
+        if self._loaded_stream_age() <= STREAM_URL_MAX_AGE or self._stream_is_moving():
+            return False
+        return bool(getattr(self, '_stream_listened', False))
 
     def _mark_stream_dead(self):
         """Say once, in the status line, that the loaded stream has stopped delivering audio."""
@@ -11259,6 +11851,11 @@ class MainApp(QMainWindow):
         if ms is not None and ms != getattr(self, '_stream_seen_ms', -1):
             self._stream_seen_ms = ms
             self._stream_moved_at = time.monotonic()
+            if getattr(self, 'is_playing', False) and int(ms or 0) > 0:
+                # Somebody is hearing this media: from here on it is a stream that can go idle on
+                # the listener's hands, which is the only kind the age of its URL is a reason to
+                # reload. A media that has merely been loaded and left paused never gets here.
+                self._stream_listened = True
             if getattr(self, '_stream_dead', False):
                 self._stream_dead = False
                 self._stream_refetch_attempts = 0
@@ -11340,6 +11937,12 @@ class MainApp(QMainWindow):
             hold_ms = max(int(player.get_time() or 0), 0)
         except Exception:
             hold_ms = 0
+        if hold_ms == 0:
+            # A stream that has given up stops reporting a position altogether, and taking that at
+            # its word lands the listener back at the top of the track - which is what makes a
+            # reload read as the track starting over. The last position this media did report is
+            # where the listener actually was, so that is the position held for the fresh media.
+            hold_ms = max(int(getattr(self, '_stream_seen_ms', -1) or 0), 0)
         # Where to land: a scrub the user just asked for beats whatever the dead media thinks
         # its own position is, and only one of the two is ever left pending.
         if hold_ms > 0 and getattr(self, '_pending_stream_seek_frac', None) is None:
@@ -11874,6 +12477,10 @@ class MainApp(QMainWindow):
             self.vol_slider.style().polish(self.vol_slider)
 
     def update_player_ui(self):
+        # The tick that already asks libVLC what the media is doing is the one place in
+        # this app that knows the play state, so it is the one place that colours the row
+        # of the track that state belongs to.
+        self._refresh_playback_highlights()
         title = getattr(self, 'current_playing_title', '').strip()
         time_txt = ""
 
@@ -11963,8 +12570,9 @@ class MainApp(QMainWindow):
     def _on_thumbnail_loaded(self, vid_id, pixmap):
         if hasattr(self, '_thumbnail_labels') and vid_id in self._thumbnail_labels:
             if not pixmap.isNull():
-                scaled_pixmap = pixmap.scaled(90, 50, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                self._thumbnail_labels[vid_id].setPixmap(scaled_pixmap)
+                # Covering the box and cutting back to it, so the box is the same width on
+                # all four sides of the picture whatever shape the thumbnail arrived in.
+                self._thumbnail_labels[vid_id].setPixmap(cover_thumbnail(pixmap))
 
     def _fetch_thumbnail(self, v):
         vid_id = v.get('id')
@@ -12057,14 +12665,292 @@ def accept_instance_request(server, window):
         pass
     window.request_attention()
 
+# ============================================================
+# CRASH REPORTING - where an unhandled error goes
+#
+# The installed program is a windowed exe: no console, no terminal behind it, and a
+# windowed PyInstaller build gives print() nowhere to go. An error that no part of
+# the program caught has had nowhere to say itself out loud - the window simply
+# stopped doing whatever it was doing, and the only way to read the reason was to
+# run the .pyw from a terminal with "py yt-msd-gui.pyw".
+#
+# So an unhandled error is written to yt-msd-crash.log in the folder the program
+# sits in (or in %LOCALAPPDATA%\yt-msd when that folder cannot be written to) and,
+# while the window is still there, shown in a dialog that names the failure and
+# points at the log. This lives in the source rather than in the build, so the .pyw
+# and the compiled exe behave the same; install_crash_reporting() is called by the
+# entry block below, before any of the program's own work starts.
+# ============================================================
+
+CRASH_LOG_NAME = "yt-msd-crash.log"
+CRASH_LOG_MAX = 256 * 1024          # past this, the older half of the log is dropped
+MAX_CRASH_DIALOGS_PER_MINUTE = 3    # a fault that repeats is logged, not repeated
+
+_crash_state = {"writing_log": False, "in_dialog": False,
+                "dialogs_allowed": True, "dialog_times": []}
+_crash_reporter = None  # the QObject that carries a background error to the GUI thread
+
+
+def traceback_text(exc_type, exc_value, exc_traceback):
+    """The traceback as text, or a plain description when it will not format."""
+    try:
+        return "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+    except Exception:
+        return "Error could not be formatted: %r: %r" % (exc_type, exc_value)
+
+
+def crash_log_folders():
+    r"""The folders the crash log may live in, best first.
+
+    First is the folder the program itself sits in, which is where gui_config.json
+    already is; the installer puts that under %LOCALAPPDATA%, so it is writable
+    without an administrator. %LOCALAPPDATA%\yt-msd is the fallback for a copy run
+    from somewhere it may not be allowed to write to - C:\Program Files, a read-only
+    share, a USB drive that was pulled out mid-run.
+    """
+    folders = []
+    if getattr(sys, "frozen", False):
+        folders.append(os.path.dirname(os.path.abspath(sys.executable)))
+        folders.append(getattr(sys, "_MEIPASS", ""))
+    else:
+        try:
+            folders.append(os.path.dirname(os.path.abspath(__file__)))
+        except NameError:  # a module that was never given a file at all
+            pass
+    local = os.environ.get("LOCALAPPDATA") or ""
+    if local:
+        folders.append(os.path.join(local, "yt-msd"))
+    unique = []
+    for folder in folders:
+        if folder and folder not in unique:
+            unique.append(folder)
+    return unique
+
+
+def trim_crash_log(path):
+    """Drop the older half of the log once it passes CRASH_LOG_MAX, so a program
+    that fails most days does not end up with a file no one can open."""
+    try:
+        if os.path.getsize(path) <= CRASH_LOG_MAX:
+            return
+        keep = CRASH_LOG_MAX // 2
+        with open(path, "rb") as handle:
+            handle.seek(-keep, os.SEEK_END)
+            tail = handle.read()
+        note = b"[the oldest entries were dropped to keep this file small]\n"
+        with open(path, "wb") as handle:
+            handle.write(note + tail)
+    except OSError:
+        pass  # the log is the last thing a failing program can still do
+
+
+def crash_log_entry(what, detail):
+    """One entry: when, which program, which build, how it was started, and the
+    traceback itself. Enough to read an error without the machine it happened on."""
+    build = "installed program" if getattr(sys, "frozen", False) else "python source"
+    lines = [
+        "=" * 72,
+        "%s | yt-msd %s | %s | %s" % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                                      APP_VERSION, build, what),
+        "Python %s on %s" % (sys.version.split()[0], sys.platform),
+        "Started as: %s" % " ".join(sys.argv),
+        detail.rstrip(),
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def write_crash_log(what, detail):
+    """Append one crash to yt-msd-crash.log, in the first folder that will take it.
+    Returns the path written, or None when no folder would.
+
+    Nothing here is allowed to fail loudly: this runs when the program is already
+    failing, and a second fault while reporting the first would hide it.
+    """
+    entry = crash_log_entry(what, detail)
+    for folder in crash_log_folders():
+        try:
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, CRASH_LOG_NAME)
+            trim_crash_log(path)
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(entry)
+            return path
+        except OSError:
+            continue
+    return None
+
+
+class CrashReporter(QObject):
+    """The bridge a background thread uses to reach the GUI thread.
+
+    A widget may only be created in the thread that runs the event loop, so a thread
+    that fails cannot raise a dialog itself. It emits this signal instead, and Qt
+    delivers it in the thread this object was created in - the GUI thread.
+    """
+    report_requested = Signal(str, str, str)
+
+    def __init__(self):
+        super().__init__()
+        self.report_requested.connect(self._show)
+
+    def _show(self, what, detail, path):
+        show_crash_dialog(what, detail, path or None)
+
+
+def crash_dialog_allowed():
+    """At most MAX_CRASH_DIALOGS_PER_MINUTE dialogs a minute. A fault inside a
+    repaint or a one-second timer would otherwise raise a new dialog on every tick
+    of it, and the log keeps every one of them."""
+    now = time.time()
+    recent = [shown for shown in _crash_state["dialog_times"] if now - shown < 60.0]
+    if len(recent) >= MAX_CRASH_DIALOGS_PER_MINUTE:
+        _crash_state["dialog_times"] = recent
+        return False
+    recent.append(now)
+    _crash_state["dialog_times"] = recent
+    return True
+
+
+def open_crash_log(path):
+    """Open the log in whatever edits .log files. Only the button on the dialog
+    calls this, and nothing depends on it working."""
+    try:
+        os.startfile(path)
+        return True
+    except OSError:
+        return False
+
+
+def show_crash_dialog(what, detail, path):
+    """The dialog: what stopped, the traceback behind "Show Details", and where the
+    same text was written. Returns True when a dialog was raised."""
+    if not _crash_state["dialogs_allowed"] or _crash_state["in_dialog"]:
+        return False
+    if QApplication.instance() is None or not crash_dialog_allowed():
+        return False
+    _crash_state["in_dialog"] = True
+    try:
+        box = QMessageBox()  # no parent: a crash may have taken the window with it
+        box.setIcon(QMessageBox.Critical)
+        box.setWindowTitle("yt-msd ran into an error")
+        box.setText("yt-msd hit an error it could not handle: %s\n\n"
+                    "Whatever was running when it happened stopped. The full error is "
+                    "behind \"Show Details\", and in the log file." % what)
+        if path:
+            box.setInformativeText("Written to: %s" % path)
+        else:
+            box.setInformativeText("The error could not be written to a log file - "
+                                   "use \"Show Details\" to read it or copy it.")
+        box.setDetailedText(detail)
+        if path:
+            open_button = box.addButton("Open the log file", QMessageBox.ActionRole)
+            open_button.clicked.connect(lambda checked=False, log=path: open_crash_log(log))
+        box.setStandardButtons(QMessageBox.Ok)
+        box.exec()
+        return True
+    except Exception:
+        return False
+    finally:
+        _crash_state["in_dialog"] = False
+
+
+def report_crash(what, detail, want_dialog=True):
+    """Write the failure down, then say so: a dialog while the window is up, the
+    traceback on stderr when it is not - the renamer console, a "--console" run of
+    the exe, or a failure so early there is no window yet."""
+    path = None
+    if not _crash_state["writing_log"]:
+        _crash_state["writing_log"] = True
+        try:
+            path = write_crash_log(what, detail)
+        except Exception:
+            path = None
+        finally:
+            _crash_state["writing_log"] = False
+
+    if want_dialog and _crash_reporter is not None and QApplication.instance() is not None:
+        try:
+            _crash_reporter.report_requested.emit(what, detail, path or "")
+            return path
+        except RuntimeError:  # the GUI thread that owned the reporter is gone
+            pass
+
+    stream = getattr(sys, "stderr", None)
+    if stream is not None:
+        try:
+            stream.write("%s\n%s\n" % (what, detail))
+            stream.flush()
+        except Exception:
+            pass
+    return path
+
+
+def handle_unhandled_error(exc_type, exc_value, exc_traceback):
+    """sys.excepthook - anything that escapes the program's own try/except blocks."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    report_crash("Unhandled error", traceback_text(exc_type, exc_value, exc_traceback))
+
+
+def handle_thread_error(args):
+    """threading.excepthook - a background job that died on its own. The window
+    carries on; the job that was running in that thread does not."""
+    name = getattr(args.thread, "name", "") or "unnamed"
+    report_crash("Background thread error (%s)" % name,
+                 traceback_text(args.exc_type, args.exc_value, args.exc_traceback))
+
+
+def handle_unraisable_error(args):
+    """sys.unraisablehook - an error Python could not hand to anyone: inside a __del__,
+    inside a garbage-collection pass, inside the clean-up done at exit. Those are
+    written down and left alone, because they are rarely the reason something stopped.
+    """
+    try:
+        detail = "%s\n%s" % (getattr(args, "err_msg", "Unraisable exception"),
+                             traceback_text(getattr(args, "exc_type", None),
+                                           getattr(args, "exc_value", None),
+                                           getattr(args, "exc_traceback", None)))
+    except Exception:
+        detail = repr(args)
+    report_crash("Unraisable error", detail, want_dialog=False)
+
+
+def install_crash_reporting():
+    """Point every route an unhandled error can take at the log and the dialog.
+    Called once from the entry block, before the window or the renamer starts."""
+    global _crash_reporter
+    sys.excepthook = handle_unhandled_error
+    threading.excepthook = handle_thread_error
+    if hasattr(sys, "unraisablehook"):
+        sys.unraisablehook = handle_unraisable_error
+    if _crash_reporter is None and QApplication.instance() is not None:
+        _crash_reporter = CrashReporter()
+    return _crash_reporter
+
+
+def silence_crash_dialogs():
+    """Stop raising dialogs, which is what the window does on its way out: a dialog
+    raised during shutdown would hold the process open until someone dismissed it.
+    The logging side keeps working."""
+    _crash_state["dialogs_allowed"] = False
+
 
 if __name__ == "__main__":
+    # "--console" means "this copy needs somewhere to print errors". For the installed
+    # exe the launcher answers that by giving the copy a console (see attach_console
+    # in the launcher); for the .pyw the terminal is already there. Either way the
+    # flag is dropped here, so Qt is not handed an option that is ours, not Qt's.
+    sys.argv = [a for a in sys.argv if a != "--console"]
     if len(sys.argv) > 1 and ("--renamer" in sys.argv or "-r" in sys.argv):
         sys.argv = [a for a in sys.argv if a not in ("--renamer", "-r")]
+        install_crash_reporting()
         run_integrated_renamer_cli()
     else:
         QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
         app = QApplication(sys.argv)
+        install_crash_reporting()
         # Title bar + taskbar icon for every window of the app (Qt uses the
         # application icon for any window that does not set its own).
         _window_icon = app_icon()

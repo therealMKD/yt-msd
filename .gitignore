@@ -2,6 +2,12 @@
 config.json
 gui_config.json
 
+# Crash reports written by the program when something goes unhandled (the CRASH
+# REPORTING section of the .pyw). The log is written beside the program, so running
+# the .pyw from source leaves one in "GUI Source Code"; the installed program leaves
+# its own beside the exe under %LOCALAPPDATA%\Programs\yt-msd.
+yt-msd-crash.log
+
 # Ignore test directories / generic folders created
 Test Songs/
 CLI Version/

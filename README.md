@@ -64,6 +64,8 @@ If the error is a traceback, google the error to figure out which dependency is 
 
 For a few missing things, the program will launch, but error later. For these, you will get a dialogue from the program warning you. For example, if VLC doesn't exist, yt-msd will tell you to install it. If something isn't working, but the program still runs, it's a dependency problem. There is a full troubleshooting guide in the [GUI Readme](https://github.com/therealMKD/yt-msd/tree/main/GUI%20Source%20Code#readme).
 
+Once the program is running, a failure it cannot handle reports itself the same way in both versions: a dialog names the error, and the full error text is written to `yt-msd-crash.log` in the folder the program sits in (`C:\Users\[your username]\AppData\Local\Programs\yt-msd` for the setup version, `GUI Source Code` for the python version). The setup version has no console of its own, so it can also be started with `yt-msd-gui.exe --console`, which opens the window with a terminal behind it and prints errors there like `py yt-msd-gui.pyw` does.
+
 ## First Startup Guide
 
 Regardless of whether you have the python or the exe version, the first startup of the program will trigger a few things:
