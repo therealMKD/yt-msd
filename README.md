@@ -1,8 +1,6 @@
 # yt-msd
 # Easily download music from Youtube
 
-![Static Badge](https://img.shields.io/badge/3.1%20update%20in%20progress-Readme%20updating%20is%20paused-orange?style=for-the-badge)
-
 > [!IMPORTANT]
 **DISCLAIMER:** This program is for educational purposes ONLY, and is not intended to be used for any form of piracy. This is intended to be a tool to allow you to have your music in an OFFLINE playlist, NOT as a way to distribute or sell music. I am NOT liable in any way for any illegal use of this program,  and I DO NOT condone it. This program is for PERSONAL use ONLY. Don't do stupid stuff with it.
 
