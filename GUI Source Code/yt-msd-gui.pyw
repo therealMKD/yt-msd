@@ -50,7 +50,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QSystemTrayIcon, QMenu, QFrame, QGridLayout,
                                QSizePolicy, QStyle, QToolTip, QStyleOption, QSpinBox, QProgressBar, QInputDialog)
 from PySide6.QtCore import Qt, Signal, QTimer, Slot, QPoint, QRect, QMargins, QThread, QEvent, QObject, QByteArray
-from PySide6.QtGui import QIcon, QPixmap, QImage, QAction, QColor, QPalette, QPainter, QBrush, QFont, QDrag, QFontMetrics
+from PySide6.QtGui import QIcon, QPixmap, QImage, QAction, QColor, QPalette, QPainter, QPainterPath, QBrush, QFont, QDrag, QFontMetrics
 from PySide6.QtCore import QMimeData, QUrl
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
@@ -2076,17 +2076,93 @@ class DraggableQueueWidget(QWidget):
         self._drag_source_widget = None
 
 
+# The box a result thumbnail sits in, and the colour that box wears when the track
+# it belongs to is the one the player is holding. See _refresh_playback_highlights.
+# The tile is the outside of the box and it does not move: how much of the box shows
+# around the picture is set by growing the picture until it covers the tile down to
+# THUMB_BOX_INSET on every side (cover_thumbnail). Growing the picture is the only way
+# to thin the band, because the band IS the leftover - scaling to fit inside the tile
+# kept the aspect ratio and spent the leftover on the box, which is why it read as far
+# thicker than the inset it was built with: a 16:9 thumbnail fitted into this 1.8:1 tile
+# showed 6 px of colour down each side and 3 top and bottom, and a legacy 4:3 thumbnail
+# showed 16 at the sides.
+# The other thing that eats the box is the app stylesheet: QLabel is a QFrame, and the
+# stylesheet pads every QFrame by 5 px ("QFrame { ... padding: 5px; }"). A padded label
+# draws a frame of its own around the picture - it even scales the picture down into the
+# padded rect - so 5 px of frame shows whatever the inset is, and an inset change is
+# invisible. So the tile behind wears the colour, and the label is the size of the picture
+# and carries no padding of its own.
+THUMB_TILE_W = 90
+THUMB_TILE_H = 50
+# Two pixels, not one: at one pixel the frame vanished into the anti-aliasing on a light
+# theme and the play state was impossible to read. The tile never changes size, so a wider
+# inset just means the picture is cut back further.
+THUMB_BOX_INSET = 2
+THUMB_BOX_W = THUMB_TILE_W - 2 * THUMB_BOX_INSET
+THUMB_BOX_H = THUMB_TILE_H - 2 * THUMB_BOX_INSET
+# The curve of the box's corners, and the curve the picture inside it is cut to so the
+# two follow the same circle instead of a square-cornered picture inside a round frame.
+# The box is always the inset wider than the picture at every point of that circle, which
+# is what keeps the frame an even thickness into the corners as well as down the sides.
+THUMB_BOX_RADIUS = 4
+THUMB_IMG_RADIUS = THUMB_BOX_RADIUS - THUMB_BOX_INSET
+
+THUMB_BOX_PLAIN = "#2b2b2b"     # the box of every row that is not the loaded track
+THUMB_BOX_PLAYING = "#1abd33"   # the box of the track the player is running
+THUMB_BOX_PAUSED = "#FF8C00"    # the box of the loaded track, held where it stopped
+
+# What a row is told about the player - "playing" or "paused", the same tokens the local
+# rows carry as their play_state property - and the colour the thumbnail box wears for it.
+THUMB_BOX_COLORS = {"playing": THUMB_BOX_PLAYING, "paused": THUMB_BOX_PAUSED}
+
+
+def cover_thumbnail(pixmap, width=THUMB_BOX_W, height=THUMB_BOX_H, radius=THUMB_IMG_RADIUS):
+    """Scale a thumbnail until it covers width x height, cut back to that size keeping the
+    middle, and round its corners to sit inside the box's own curve. Covering rather than
+    fitting is what makes the box the same thickness on all four sides: the box colour is
+    what is left over after the picture is placed, and a fitted 16:9 picture leaves its
+    spare width as a wide band of colour down each side."""
+    if pixmap.isNull():
+        return pixmap
+    scaled = pixmap.scaled(width, height, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+    w, h = min(width, scaled.width()), min(height, scaled.height())
+    cropped = scaled.copy((scaled.width() - w) // 2, (scaled.height() - h) // 2, w, h)
+    if radius <= 0:
+        return cropped
+    masked = QPixmap(w, h)
+    masked.fill(Qt.transparent)
+    painter = QPainter(masked)
+    painter.setRenderHint(QPainter.Antialiasing)
+    corners = QPainterPath()
+    corners.addRoundedRect(0, 0, w, h, radius, radius)
+    painter.setClipPath(corners)
+    painter.drawPixmap(0, 0, cropped)
+    painter.end()
+    return masked
+
+
 class ThumbnailWidget(QWidget):
 
     def __init__(self, video, parent_app, parent=None):
         super().__init__(parent)
-        self.setFixedSize(90, 50)
+        self.setFixedSize(THUMB_TILE_W, THUMB_TILE_H)
         self.video = video
         self.parent_app = parent_app
         
+        self.box_color = THUMB_BOX_PLAIN
+        # Without this attribute the tile's background is painted from the palette, which is a
+        # flat rectangle and ignores the rounded corners the stylesheet asks for - the picture
+        # inside would be cut round inside a box with square ones.
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self._box_style(f"background-color: {THUMB_BOX_PLAIN}; border-radius: {THUMB_BOX_RADIUS}px;")
+
         self.thumb_label = QLabel(self)
-        self.thumb_label.setFixedSize(90, 50)
-        self.thumb_label.setStyleSheet("background-color: #2b2b2b;")
+        self.thumb_label.setFixedSize(THUMB_BOX_W, THUMB_BOX_H)
+        self.thumb_label.move(THUMB_BOX_INSET, THUMB_BOX_INSET)
+        # Its own stylesheet is what keeps the picture the size it was made: without it the
+        # app's QFrame padding takes 5 px off every side and the label scales the picture
+        # down to fit, which is a frame nobody asked for.
+        self.thumb_label.setStyleSheet("background: transparent; border: none; padding: 0px;")
         self.thumb_label.setAlignment(Qt.AlignCenter)
         
         accent = get_accent_color(parent_app.accent_color_name)
@@ -2108,6 +2184,24 @@ class ThumbnailWidget(QWidget):
     def leaveEvent(self, event):
         self.play_btn.hide()
         super().leaveEvent(event)
+
+    def _box_style(self, style):
+        """Put the colour of the box on the tile rather than on the label. The label is a
+        QFrame, and the app stylesheet pads every QFrame by 5 px, so a coloured label paints
+        a 5 px frame of its own around the picture however thin the inset is. The tile is a
+        plain QWidget, which that rule does not pad, and so it shows the inset exactly as
+        written."""
+        self.setStyleSheet(style)
+
+    def set_highlight(self, play_state):
+        """Wear the colour of what the player is doing with this track: green while it
+        runs, orange while it is held where it stopped, and the plain grey the row started
+        with for everything else - including a row whose state is not known any more."""
+        color = THUMB_BOX_COLORS.get(play_state, THUMB_BOX_PLAIN)
+        if self.box_color == color:
+            return
+        self.box_color = color
+        self._box_style(f"background-color: {color}; border-radius: {THUMB_BOX_RADIUS}px;")
 
 # ============================================================
 # LOCAL NETWORK PLAYLIST & AUDIO FILE SYNC ("SYNC CHAINS")
@@ -5075,7 +5169,6 @@ def default_export_config() -> dict:
         'volume': 100,
         'local_folders': [],
         'local_current_path': '',
-        'show_thumbnails': False,
         'show_local_metadata': False,
         'minimize_to_tray': False,
         'recent_playlists': [],
@@ -6653,7 +6746,6 @@ class MainApp(QMainWindow):
         self.volume_val = 100
         self.use_custom_args = False
         self.custom_args = ""
-        self.show_thumbnails = False
         self.minimize_to_tray = False
         self.save_place = False
         self.last_session = {}
@@ -6689,6 +6781,9 @@ class MainApp(QMainWindow):
         self.current_video_id = None
         self.current_playing_title = ""
         self.playback_index = -1
+        # The row currently carrying the playing/paused colour: (pane, key, state), or None.
+        # Compared against on every player tick so the colour moves only when it has to.
+        self._playback_box = None
         self.is_shuffled = False
         self.shuffle_history = []
         self.shuffle_order = []
@@ -7811,7 +7906,6 @@ class MainApp(QMainWindow):
                     self.volume_val = c.get('volume', 100)
                     self.local_folders = c.get('local_folders', [])
                     self.local_current_path = c.get('local_current_path', "")
-                    self.show_thumbnails = c.get('show_thumbnails', False)
                     self.show_local_metadata = c.get('show_local_metadata', False)
                     self.minimize_to_tray = c.get('minimize_to_tray', False)
                     self.recent_playlists = c.get('recent_playlists', [])
@@ -7868,7 +7962,6 @@ class MainApp(QMainWindow):
             'local_folders': self.local_folders,
             'local_current_path': self.local_current_path,
             'volume': self.volume_val,
-            'show_thumbnails': self.show_thumbnails,
             'show_local_metadata': getattr(self, 'show_local_metadata', False),
             'minimize_to_tray': self.minimize_to_tray,
             'use_custom_args': self.use_custom_args,
@@ -8233,7 +8326,6 @@ class MainApp(QMainWindow):
         self.use_custom_args = False
         self.custom_args = ""
         self.last_search = ""
-        self.show_thumbnails = False
         self.minimize_to_tray = False
         self.run_renamer = False
         self.renamer_path = ""
@@ -8656,8 +8748,6 @@ class MainApp(QMainWindow):
             # list has to be pushed into it here or it stays stale until relaunch.
             self.set_local_explorer_address(self.local_current_path,
                                            add_to_recent=os.path.isdir(self.local_current_path or ""))
-        if 'show_thumbnails' in cfg:
-            self.show_thumbnails = bool(cfg.get('show_thumbnails'))
         if 'show_local_metadata' in cfg:
             self.show_local_metadata = bool(cfg.get('show_local_metadata'))
         if 'minimize_to_tray' in cfg:
@@ -8740,8 +8830,6 @@ class MainApp(QMainWindow):
             self.disable_ytdlp_updates = bool(cfg.get('disable_ytdlp_updates'))
 
         self.apply_theme()
-        if 'show_thumbnails' in cfg and getattr(self, 'search_results', None):
-            self._on_search_results(self.search_results, False, reset_view=False)
         # The settings dialog reads these values when it is built, so the cached
         # one is dropped: reopening it shows the imported settings.
         settings_dialog = getattr(self, 'settings_dialog', None)
@@ -9146,11 +9234,6 @@ class MainApp(QMainWindow):
         self.header_divider.setStyleSheet("color: #888888; font-weight: bold;")
         h.addWidget(self.header_divider)
         
-        self.show_thumb_cb = QCheckBox("Show Thumbnails")
-        self.show_thumb_cb.setChecked(self.show_thumbnails)
-        self.show_thumb_cb.stateChanged.connect(self.toggle_thumbnails)
-        h.addWidget(self.show_thumb_cb)
-        
         self.open_yt_btn = QPushButton("")
         self.open_yt_btn.setObjectName("topIconBtn")
         self.open_yt_btn.setToolTip("Open search / playlist on YouTube")
@@ -9383,6 +9466,26 @@ class MainApp(QMainWindow):
             QWidget#localRow[selected="true"] {{
                 background-color: {accent};
             }}
+            /* The row that is the track the player is holding wears the colour of that
+               state - green while it runs, orange while it is held - and it is written
+               after the selection rule so that a row which is both selected and playing
+               says the thing the listener is looking at the folder list to find out. */
+            QWidget#localRow[play_state="playing"] {{
+                background-color: {THUMB_BOX_PLAYING};
+            }}
+            QWidget#localRow[play_state="paused"] {{
+                background-color: {THUMB_BOX_PAUSED};
+            }}
+            /* A green and an orange row both carry saturated colour behind the text, so
+               the text on them is fixed rather than left to the theme's own foreground,
+               which is chosen to sit on the dark panes and not on these. */
+            QWidget#localRow[play_state="playing"] QPushButton#transparentBtn,
+            QWidget#localRow[play_state="paused"] QPushButton#transparentBtn,
+            QWidget#localRow[play_state="playing"] QLabel#durationLabel,
+            QWidget#localRow[play_state="paused"] QLabel#durationLabel {{
+                color: #1a1a1a;
+                font-weight: bold;
+            }}
             QPushButton#transparentBtn[selected="true"] {{
                 background-color: transparent;
                 color: {accent_fg};
@@ -9499,6 +9602,10 @@ class MainApp(QMainWindow):
             queue_item_bg=queue_item_bg, queue_item_bg_finished=queue_item_bg_finished,
             btn_hover=btn_hover, checkmark_path=checkmark_path, downarrow_path=downarrow_path,
             main_btn_border=main_btn_border, secondary_fg=secondary_fg,
+            # The colours a row wears when it is the track the player is holding, shared with
+            # the thumbnail box of a search row so both panes say the same thing in the same
+            # green and the same orange.
+            THUMB_BOX_PLAYING=THUMB_BOX_PLAYING, THUMB_BOX_PAUSED=THUMB_BOX_PAUSED,
             tooltip_css=tooltip_css
         )
         # Apply the theme at the widget level (as in 2.3). A single
@@ -9842,6 +9949,8 @@ class MainApp(QMainWindow):
         self.local_rows = []
         self.local_row_by_path = {}
         self.local_btns = []
+        # These rows are gone, and with them the row this app was colouring.
+        self._forget_playback_box()
         self.current_local_items = []
         self.local_selection_anchor = None
         self._update_local_selection_ui()
@@ -9924,6 +10033,10 @@ class MainApp(QMainWindow):
         # re-polishing every row it has already drawn, batch after batch.
         if getattr(self, 'local_selected_paths', ()):
             self._apply_local_selection_styles()
+        # The play state is not part of the selection, so it is put onto the new rows on its
+        # own: a folder refreshed under a playing file rebuilds the row for that file, and
+        # that row has to come back carrying the colour it had before it was replaced.
+        self._reapply_playback_box_after_rebuild()
         self._fetch_local_metadata_bg(self.local_btns[prev_btns:])
 
     def _finish_local_render(self):
@@ -10185,6 +10298,132 @@ class MainApp(QMainWindow):
             w = w.parent()
         return False
 
+    # ------------------------------------------------------------------
+    # Which row the player is holding, in colour
+    # ------------------------------------------------------------------
+    # A search row already has a grey box around its thumbnail and a local row already
+    # takes a background when it is selected, so the play state is not a new widget to
+    # draw - it is one more thing those existing surfaces can say.
+    #
+    # The colour comes from what libVLC reports rather than from is_playing, because
+    # is_playing is what the listener last asked for and not what the media is doing: a
+    # stream whose URL has given out is neither playing nor held, and the box should say
+    # that about it too. Opening and Buffering are left uncoloured for the same reason -
+    # a track still on its way is not a track the player has got hold of yet.
+    def _playback_box_state(self):
+        """The play-state token for the state the player is in, or None when it holds
+        nothing it could be playing."""
+        if not self.vlc_player:
+            return None
+        try:
+            state = self.vlc_player.get_state()
+        except Exception:
+            return None
+        if state == vlc.State.Playing:
+            return "playing"
+        if state == vlc.State.Paused:
+            return "paused"
+        return None
+
+    def _playback_box_key(self):
+        """(where, which, state) for the row that carries the play state right now, or
+        None when no row should. 'where' picks the pane and 'which' is the video id of a
+        search row or the path of a local one - the same keys those panes already index
+        their rows by."""
+        state = self._playback_box_state()
+        if state is None:
+            return None
+        vid_id = self.current_video_id
+        if vid_id == "local":
+            path = getattr(self, 'current_local_file_path', '')
+            if not path:
+                return None
+            return ("local", path, state)
+        if not vid_id:
+            return None
+        return ("search", vid_id, state)
+
+    def _refresh_playback_highlights(self):
+        """Move the coloured row to whichever track the player is holding, when that has
+        changed since the last look.
+
+        This runs from the player's own tick, which is already asking libVLC for the state,
+        so a play, a pause, a resume, an automatic advance, prev/next, a local file and a
+        stream that had to be re-resolved all land here without anything else having to
+        remember to say so. A tick where nothing changed - which is nearly every tick -
+        stops at this comparison, so a pane full of rows is not repolished sixty times a
+        second while a track runs."""
+        key = self._playback_box_key()
+        previous = getattr(self, '_playback_box', None)
+        if key == previous:
+            return
+        if previous is not None and key is not None and previous[:2] == key[:2]:
+            # The same row changing colour - play into pause and back again - only has to
+            # be repainted once, rather than cleared and painted again.
+            self._apply_playback_box(key)
+        else:
+            if previous is not None:
+                self._apply_playback_box((previous[0], previous[1], None))
+            self._apply_playback_box(key)
+        self._playback_box = key
+
+    def _apply_playback_box(self, key):
+        """Write a play state onto the row that key names. A state of None puts that row
+        back to the plain look it has when it is not the loaded track."""
+        if key is None:
+            return
+        where, target, state = key
+        if where == "local":
+            self._set_local_row_play_state(target, state)
+        elif where == "search":
+            self._set_search_row_box(target, state)
+
+    def _forget_playback_box(self):
+        """The row this app coloured is no longer there to uncolour. Dropping the record of
+        it is what lets the next highlight reach the row that exists now instead of being
+        skipped as already done - a new search and a rebuilt folder each replace every row
+        the pane had, and a row that is rebuilt starts plain."""
+        self._playback_box = None
+
+    def _set_search_row_box(self, vid_id, state):
+        label = getattr(self, '_thumbnail_labels', {}).get(vid_id)
+        if label is None:
+            return  # this row is scrolled out of view, so it has no thumbnail box to colour
+        tile = label.parentWidget()
+        if tile is None or not hasattr(tile, 'set_highlight'):
+            return
+        try:
+            tile.set_highlight(state)
+        except RuntimeError:
+            pass  # the row was torn down between the lookup and the colouring
+
+    def _set_local_row_play_state(self, path, state):
+        index = getattr(self, 'local_row_by_path', {}).get(path)
+        if index is None or index >= len(self.local_rows):
+            return  # this file is not a row of the folder currently on screen
+        row_w = self.local_rows[index][0]
+        # An empty token matches no rule of the stylesheet, which is how the row gets its
+        # plain background back. Local rows are coloured through the stylesheet rather than
+        # per row so that filling a folder does not parse a style string for every file in it.
+        token = state or ""
+        try:
+            if row_w.property('play_state') == token:
+                return
+            row_w.setProperty('play_state', token)
+            row_w.style().unpolish(row_w)
+            row_w.style().polish(row_w)
+            row_w.update()
+        except RuntimeError:
+            pass  # a newer rebuild has already torn this row down
+
+    def _reapply_playback_box_after_rebuild(self):
+        """Put the play state back onto the rows that have just been created, when the track
+        they contain is the one the player is holding."""
+        box = getattr(self, '_playback_box', None)
+        if box is None:
+            return
+        self._apply_playback_box(box)
+
     def _apply_local_selection_styles(self):
         selected_paths = getattr(self, 'local_selected_paths', set())
         for row_w, btn, dur_lbl, row_item, _ in getattr(self, 'local_rows', []):
@@ -10344,13 +10583,6 @@ class MainApp(QMainWindow):
             msg += f" Skipped {len(skipped)}: " + ", ".join(s['message'] for s in skipped[:3])
         self._on_status_update(msg, False, "#1abd33" if not skipped else "#E31E24")
 
-    def toggle_thumbnails(self, state):
-        self.show_thumbnails = state == Qt.Checked.value
-        self.save_config()
-        if self.search_results:
-            # Same list, taller rows: keep the reader where they were reading.
-            self._on_search_results(self.search_results, False, reset_view=False)
-
     def open_settings_dialog(self):
         if not hasattr(self, 'settings_dialog') or self.settings_dialog is None:
             self.settings_dialog = SettingsDialog(self)
@@ -10441,12 +10673,15 @@ class MainApp(QMainWindow):
         self.search_results = res
         self._thumbnail_labels = getattr(self, '_thumbnail_labels', {})
         self._thumbnail_labels.clear()
+        # Every row these results had is about to be deleted, so the row this app was
+        # colouring goes with them and cannot be coloured back to plain later.
+        self._forget_playback_box()
         
         while self.results_vbox.count():
             item = self.results_vbox.takeAt(0)
             if item.widget(): item.widget().deleteLater()
             
-        height = 54 if self.show_thumbnails else 34
+        height = 54
         for video in res:
             placeholder = QWidget()
             placeholder.setFixedHeight(height)
@@ -10455,7 +10690,7 @@ class MainApp(QMainWindow):
             self.results_vbox.addWidget(placeholder)
             
         # reset_view is True when these are results from a search that was just run, and
-        # False when the same list is only being redrawn (thumbnail toggle, settings
+        # False when the same list is only being redrawn (settings
         # import, session restore). A new search is read from its first row, and the
         # successor decided for the list being replaced is no longer part of the playlist
         # playback is stepping through; a redraw of the same list is neither.
@@ -10549,19 +10784,15 @@ class MainApp(QMainWindow):
         l = QHBoxLayout(placeholder)
         l.setContentsMargins(2,2,2,2)
         
-        if self.show_thumbnails:
-            tw = ThumbnailWidget(video, self)
-            l.addWidget(tw)
-            self._thumbnail_labels[video['id']] = tw.thumb_label
-            threading.Thread(target=self._fetch_thumbnail, args=(video,), daemon=True).start()
-        else:
-            pbtn = QPushButton("\uE768")
-            pbtn.setToolTip("Play this track")
-            pbtn.setFixedWidth(40)
-            pbtn.setObjectName("iconBtn")
-            pbtn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 16px;")
-            pbtn.clicked.connect(lambda checked=False, v=video: self.play_result(v))
-            l.addWidget(pbtn)
+        tw = ThumbnailWidget(video, self)
+        l.addWidget(tw)
+        self._thumbnail_labels[video['id']] = tw.thumb_label
+        # A row that has just been built starts with the plain box, so the state it is in -
+        # this row is the track that is running, held, or neither - has to be put on it now.
+        box = getattr(self, '_playback_box', None)
+        if box is not None and box[0] == "search" and box[1] == video.get('id', ''):
+            tw.set_highlight(box[2])
+        threading.Thread(target=self._fetch_thumbnail, args=(video,), daemon=True).start()
             
         title = video.get('title', 'Unknown')
         cb = QCheckBox(f"{title.replace('&', '&&')}")
@@ -12218,6 +12449,10 @@ class MainApp(QMainWindow):
             self.vol_slider.style().polish(self.vol_slider)
 
     def update_player_ui(self):
+        # The tick that already asks libVLC what the media is doing is the one place in
+        # this app that knows the play state, so it is the one place that colours the row
+        # of the track that state belongs to.
+        self._refresh_playback_highlights()
         title = getattr(self, 'current_playing_title', '').strip()
         time_txt = ""
 
@@ -12307,8 +12542,9 @@ class MainApp(QMainWindow):
     def _on_thumbnail_loaded(self, vid_id, pixmap):
         if hasattr(self, '_thumbnail_labels') and vid_id in self._thumbnail_labels:
             if not pixmap.isNull():
-                scaled_pixmap = pixmap.scaled(90, 50, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                self._thumbnail_labels[vid_id].setPixmap(scaled_pixmap)
+                # Covering the box and cutting back to it, so the box is the same width on
+                # all four sides of the picture whatever shape the thumbnail arrived in.
+                self._thumbnail_labels[vid_id].setPixmap(cover_thumbnail(pixmap))
 
     def _fetch_thumbnail(self, v):
         vid_id = v.get('id')
