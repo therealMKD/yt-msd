@@ -75,6 +75,12 @@ Reference the [Plugin's Readme](https://github.com/therealMKD/yt-msd/tree/main/M
 # Youtube Search and Download Features
 
 # MP3 Renamer
+
+[Basic Use](#basic-use)\
+[Auto Mode](#auto-mode)\
+[Normalization](#normalization)\
+[How the renamer works](#how-the-renamer-works)
+
 Once you've downloaded your music files, you probably don't want their filenames to stay the same as the video names. I recommend you use lyric videos for your music, for two reaons:\
 First, lyric videos will ONLY have music and no other sounds (A lot of music videos have extra sound), and second, they are more likely to be named correctly.
 
@@ -145,24 +151,23 @@ Just like with normal skipping, you will be able to manually go through any skip
 
 ## Normalization 
 
->[!WARNING]
-All of this behavior is a mix of non-functional and crappily implemented stuff, mostly because it was made before I switched to Strata. The 3.1 update will completely rework the custom command sequences.
-
 The entire right column of the settings menu lets you change the normalization and silence trimming. Here's exactly what it all does:
 
-<img width="383" height="356" alt="image" src="https://github.com/user-attachments/assets/86e28f5b-2b32-49fc-8799-fff498639aaa" />
+<img width="892" height="696" alt="image" src="https://github.com/user-attachments/assets/ca42ab88-5497-4adf-b461-7a2078ca0a0e" />
 
-Both of the custom equalization strings let you customize the 
-By default, this string is `equalizer=f=100:width_type=o:width=2:g=0`. This is a neutral equalizer, that would equalize everything evenly, if `gain` wasn't set to 0. By default, it is NOT appended to the command, unless you check the box for a custom string.
+At the very top, you can change how normalization works in the renamer. By default this is set to "Ask", which will give you a `y/n` query at the end of renaming. You can force this on, or off with this setting, so you never get asked.
 
-**NOTE: If you replace the loudnorm command, the entire `af` group gets replaced, including any custom EQ command. To use both a custom loudnorm AND EQ command, append the EQ command onto the END of the custom loudnorm command**
+The checkbox below will automatically turn on [Auto](#auto-mode) mode, without you having to manually activate it with `AUTO` in the renamer window.
 
-If you want or need it, the full default ffmpeg argument for normalization is as follows:
-```
-ffmpeg -nostdin -y -i "INPUT.mp3" -af "silenceremove=start_periods=1:start_duration=0.5:start_threshold=-60dB:start_silence=0.5:stop_silence=0.5,areverse,silenceremove=start_periods=1:start_duration=0.5:start_threshold=-60dB:start_silence=0.5:stop_silence=0.5,areverse,volume=-3.20dB" -codec:a libmp3lame -b:a 320k -map_metadata 0 "OUTPUT.mp3"
-```
+The checkbox at the bottom of this section turns silence trimming on or off. This detects silence and automatically removes it. You can also increase the number in the silence padding box to add silence back onto the files, after the original silence has been removed. If you don't have a music player that can add silence in-between files, I would recommend setting this to `0.5`. 
 
-The loudnorm command is compressed into a single `volume` tag, which is why the final command does not have an `I` or `TP` value.
+The normalization thread box determines how many threads normalization and silence trimming will use, or how many files can be handled simultaneously. I would recommend setting this to a maximum of 2 less than the amount of virtual cores your CPU has.
+
+The loudnorm/EQ override box allows you to add or change the loudnorm and equalization commands. You will be unable to edit this box until you have turned it on. This allows you to manually override the loudnorm command, and add an equalizer pass, or any other ffmpeg commands you want. This will be placed OUTSIDE of the silence trimming argument, so editing this will not remove silence trimming (unless you un-check the box of course)
+
+## How the renamer works
+
+
 
 # Local File Features
 
