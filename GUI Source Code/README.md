@@ -3,7 +3,7 @@
 This is the full readme for the GUI version, with information on every single feature inside of yt-msd. For the CLI readme, go back to the main readme, at the bottom.
 
 >[!WARNING]
->I'm currently working on the 3.1 update, because in the process of fleshing out this readme, I've come into some features that need to be changed, and some garbage features that are either no longer needed or no longer used. Until that update comes out, this readme remains partially finished, and in progress. I will completely update it once I'm satisfied with the program again.
+>I'm currently in the process of a few minor updates, along with other stuff. Because of that, this readme is not complete, and some information may be subject to change. This warning will be removed once the readme is finished.
 
 ## Table of Contents
 This is the main table of contents, these main sections also have their own tables of contents for subsections.
