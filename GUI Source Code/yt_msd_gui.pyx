@@ -881,6 +881,19 @@ STREAM_RENEW_COOLDOWN = 10        # seconds between two re-resolutions of the sa
 STREAM_END_SLACK_MS = 15000       # a stream that ended this far short of its length did not finish
 STREAM_SEEK_RESTORE_TIMEOUT = 12  # seconds a scrub or a restored position stays queued for fresh media
 
+# The captions the play button carries, and the one place they are set (_update_play_button).
+# Play and Pause are the codes that button has always used; Replay is the state the button
+# takes when the media on the player has run to its end and nothing was started after it - a
+# media libVLC can no longer seek, scrub or resume, so the only thing a press can mean is
+# "this track again, from the top". U+E72C rather than the published MDL2 chart's own "Replay"
+# (U+E76A) for the same reason the stop-after button avoids a private-use codepoint (see the
+# comment where that button is built): U+E76A has no glyph in this machine's copy of the font
+# and Qt would draw an empty box. U+E72C was drawn at the size the button uses and looked at
+# to confirm it reads as "start this again".
+PLAY_GLYPH = "\uE768"
+PAUSE_GLYPH = "\uE769"
+REPLAY_GLYPH = "\uE72C"
+
 # "Stop after current", cycled one state per click: off -> once -> always -> off.
 STOP_AFTER_OFF = 0     # playback advances to the next track when one ends, as it always did
 STOP_AFTER_ONCE = 1    # stop when the current track ends, then the state returns to off
@@ -6919,6 +6932,21 @@ class MainApp(QMainWindow):
         self._pending_stream_seek_ms = None
         self._pending_stream_pause = False
         self._pending_stream_seek_at = None
+        # A track that ran to its end and was left on the player rather than advanced. libVLC is
+        # done with that media: it answers neither a scrub nor a resume any more, which is why
+        # dragging the bar back after a track finished did nothing at all. While this is set the
+        # play button is a replay button and a scrub is a replay to the place the bar was put,
+        # both through _replay_finished_track. Armed by _hold_finished_track, and cleared by
+        # _note_loaded_stream - that is, by any new media reaching the player.
+        self._finished_track = False
+        # The "stop after current" state the hold happened under, remembered so that replaying
+        # the track a "once" was spent on re-arms it: hearing that track again should not end
+        # with the player moving on to a track nobody picked. See _replay_finished_track.
+        self._finished_track_armed_under = STOP_AFTER_OFF
+        # True between a replay asking for fresh media and that media arriving. It is what tells a
+        # failed re-fetch apart from a failed self-heal: only the first has been promised the track
+        # from its top, so only the first puts the replay button back. See _on_stream_refreshed.
+        self._replay_in_flight = False
         self.is_muted = False
         self.active_downloads = {}
         self.active_downloads_lock = threading.Lock()
@@ -8200,9 +8228,14 @@ class MainApp(QMainWindow):
         self.tray_header_action.setEnabled(False)
         self.tray_menu.addSeparator()
 
-        # Play / Pause Action
+        # Play / Pause Action. A track left finished on the player is neither playing nor paused,
+        # and the only press that does anything with it starts it again - which is what this entry
+        # says, and what the button on the player bar shows (see _update_play_button).
         is_playing = getattr(self, 'is_playing', False)
-        play_label = "Pause" if is_playing else "Play"
+        if getattr(self, '_finished_track', False):
+            play_label = "Replay Track"
+        else:
+            play_label = "Pause" if is_playing else "Play"
         play_action = self.tray_menu.addAction(play_label)
         play_action.triggered.connect(self.toggle_playback)
 
@@ -11848,6 +11881,13 @@ class MainApp(QMainWindow):
         that can expire". keep_pending_seek is the refresh path's exception: a re-resolve has
         already decided where the listener should end up, and that has to survive the reset.
         """
+        # Whatever the media before this one left behind - a finished track held for replay,
+        # including the "stop after current" state that hold was made under, and a replay still
+        # waiting for its media - ends with media arriving. The arming is kept rather than cleared,
+        # so holding the new track again is still able to say what it was armed under. See
+        # _hold_finished_track.
+        self._finished_track = False
+        self._replay_in_flight = False
         self._loaded_stream = (vid_id, url, user_agent, url_age) if vid_id and vid_id != "local" else None
         self._loaded_stream_at = time.monotonic() if self._loaded_stream else None
         self._stream_seen_ms = -1
@@ -12199,17 +12239,22 @@ class MainApp(QMainWindow):
     def _on_stream_refreshed(self, ok, title):
         """The GUI-thread half of a stream refresh, reported from the thread that ran it."""
         if ok:
+            self._update_play_button()
             if getattr(self, 'is_playing', False):
-                if getattr(self, 'play_btn', None):
-                    self.play_btn.setText("\uE769")
                 self._on_status_update(f"Playing: {title}", True, "gray")
             else:
-                if getattr(self, 'play_btn', None):
-                    self.play_btn.setText("\uE768")
                 self._on_status_update(f"Ready: {title}", True, "gray")
         else:
             self._on_status_update(f"Could not re-fetch the stream for {title} - pick the track to try again.",
                                    False, "#E31E24")
+            if getattr(self, '_replay_in_flight', False):
+                # A replay started this re-fetch, and the media it was meant to replace is still
+                # the finished one. Nothing about that media changed, so the press that failed
+                # leaves the button as the one thing it can still do with it: ask again, from the
+                # beginning. A failed self-heal of a stream that gave out part-way through is not
+                # that, and is left as it has always been left - the next Play press goes through
+                # _stream_needs_renew() and picks the track up where it stopped.
+                self._hold_finished_track()
 
     # ------------------------------------------------------------------
     # "Stop after current" - three states, one click each
@@ -12270,8 +12315,7 @@ class MainApp(QMainWindow):
         """A track ended while "stop after current" was armed: hold here instead of
         advancing, and spend the one-shot state back to off."""
         self.is_playing = False
-        if getattr(self, 'play_btn', None):
-            self.play_btn.setText("\uE768")
+        self._update_play_button()
         # The successor readied seconds ago is not wanted now; its resolved URL stays
         # in the cache in case the user presses Next themselves. The trigger key goes
         # too, so a track the user starts again by hand reads ahead once more.
@@ -12285,6 +12329,137 @@ class MainApp(QMainWindow):
             self._on_status_update("Stopped after the current track.", False, "gray")
         else:
             self._on_status_update("Stopped after the current track - Stop after current is still on.", False, "gray")
+
+    def _update_play_button(self):
+        """Redraw the player-bar button to say what pressing it would do right now: start a
+        stopped track, pause a playing one, or start a finished one again from the beginning.
+
+        Every path that changes what that button means goes through here rather than setting a
+        caption itself, because the three states share one 44-pixel button. A replay caption that
+        is only a different picture is the same as no caption at all, so the tooltip travels with
+        the glyph.
+        """
+        btn = getattr(self, 'play_btn', None)
+        if btn is None:
+            return  # the state is right; the player bar has simply not been built yet
+        if getattr(self, '_finished_track', False):
+            btn.setText(REPLAY_GLYPH)
+            btn.setToolTip("Replay - play this track again from the beginning")
+            return
+        btn.setText(PAUSE_GLYPH if getattr(self, 'is_playing', False) else PLAY_GLYPH)
+        btn.setToolTip("Play / Pause")
+
+    def _player_media_is_finished(self):
+        """Whether a press of the play button can only mean "this track all over again".
+
+        The armed hold is the app's own verdict on a track it chose to keep. The vlc.State.Ended half
+        catches the same media in a state no hold was armed for - a track that reached its end while
+        the listener had it stopped, so the auto-advance gate skipped it and nothing ever offered the
+        ending as anything - instead of leaving them pressing against a media libVLC has finished
+        with. Nothing answers while a fetch or a refresh is already under way: that media belongs to
+        a track the user started, and a replay would take the player out from under it.
+        """
+        if self._stream_is_switching():
+            return False
+        if getattr(self, '_finished_track', False):
+            return True
+        player = getattr(self, 'vlc_player', None)
+        if player is None:
+            return False
+        try:
+            if player.get_state() != vlc.State.Ended:
+                return False
+            ms = player.get_time()
+            total_ms = player.get_length()
+        except Exception:
+            return False
+        # An Ended that is really a stream whose URL gave out part-way through is not a finished
+        # track, and the promise attached to it is the other one: pick up where it stopped. That
+        # is what _stream_needs_renew() answers for a track whose automatic reloads ran out, and a
+        # replay here would answer it from 0:00 instead - the listener's place thrown away because
+        # the media happened to report the same state a real ending does.
+        if self._stream_ended_short(total_ms, ms):
+            return False
+        return True
+
+    def _hold_finished_track(self, armed_under=None):
+        """Leave a finished track sitting on the player, with the way back to it on the button.
+
+        The media is over and libVLC is done with it - it answers no seek, no pause and no
+        resume - so the only press that does anything is the one that starts the track again. The
+        listener keeps a track they can hear again from the player bar instead of one they have
+        to pick back out of the list. Nothing about the track itself moves: the row,
+        playback_index, shuffle_history and the stop-after state all stay where they were, so a
+        replay is the same track and a Next is still the track after it.
+
+        armed_under is the "stop after current" state this hold was made under, remembered so a
+        replay of this same track can put that state back (see _replay_finished_track). Left out,
+        the hold keeps whatever mode the previous hold recorded.
+        """
+        if armed_under is not None:
+            self._finished_track_armed_under = int(armed_under)
+        self._finished_track = True
+        self._replay_in_flight = False  # nothing is mid-flight any more; the hold is the verdict
+        self.is_playing = False  # nothing is playing, and the button must not pretend otherwise
+        # The successor readied seconds ago is not wanted by a hold, and a track the user starts
+        # again from here reads its own successor ahead once the hold is lifted.
+        self._prefetch_decision = None
+        self._prefetch_trigger_key = None
+        self._update_play_button()
+
+    def _replay_finished_track(self, at_frac=None):
+        """Hear the finished track all over again - from the top, or from wherever the scrubber
+        was put. Returns True when the replay is under way.
+
+        For a stream this is a re-fetch rather than a rewind, and for one reason: the media on the
+        player has finished, and the signed URL it was built from was played out with it. The
+        video id, the row, playback_index and shuffle_history are untouched, so the fresh media is
+        the same track, and the position asked for rides along as a pending seek for
+        _apply_pending_stream_seek to land on the first tick that reports Playing. The top of the
+        track counts as a position asked for: left to itself, _renew_loaded_stream holds the
+        position the finished media last reported, and on a track that finished that is its own end
+        - the fresh media would open where the old one stopped and finish again at once.
+
+        The allowance of self-healing re-resolutions is handed back in full, exactly as a Play
+        press on a dead stream hands it back: this is the listener asking for the music, and a
+        track that spent its reloads on the way here has not been asked for since.
+        """
+        player = getattr(self, 'vlc_player', None)
+        if player is None or self._stream_is_switching():
+            return False
+        armed_under = int(getattr(self, '_finished_track_armed_under', STOP_AFTER_OFF))
+        self._finished_track = False
+        self.is_playing = True
+        self._stream_dead = False
+        self._stream_refetch_attempts = 0
+        # A "once" spent on the track that finished was spent on this very track, and a replay is
+        # that track heard again. Letting the replayed one advance would drop the listener onto a
+        # track they never picked - the thing "stop after current" exists to prevent - so the state
+        # is put back, and the button says so. An "always" is still armed as it was, and a hold no
+        # state caused has nothing to put back.
+        if armed_under == STOP_AFTER_ONCE and getattr(self, 'stop_after_current', STOP_AFTER_OFF) == STOP_AFTER_OFF:
+            self.set_stop_after_current(STOP_AFTER_ONCE)
+        self._update_play_button()  # a pause button again: the replay is what is playing now
+        frac = 0.0 if at_frac is None else max(0.0, min(1.0, float(at_frac)))
+        if getattr(self, '_loaded_stream', None):
+            self._pending_stream_seek_frac = frac
+            self._pending_stream_seek_ms = None
+            self._pending_stream_pause = False
+            self._pending_stream_seek_at = time.monotonic()
+            self._replay_in_flight = True
+            if self._renew_loaded_stream(force=True):
+                return True
+            # Nothing left to re-resolve, or a refresh this press joined on the way to: the
+            # position asked for still stands, and it is the media itself that gets restarted.
+            self._replay_in_flight = False
+        self._pending_stream_seek_frac = frac if frac > 0.0 else None
+        self._pending_stream_seek_ms = None
+        self._pending_stream_seek_at = time.monotonic() if frac > 0.0 else None
+        self._pending_stream_pause = False
+        player.play()
+        title = (getattr(self, 'current_playing_title', '') or 'this track')
+        self._on_status_update(f"Replaying: {title}", True, "gray")
+        return True
 
     def _stream_track_in_progress(self):
         """The video id of the stream the player is committed to, or None when there
@@ -12428,11 +12603,11 @@ class MainApp(QMainWindow):
         self.current_video_id = vid_id
         if paused_at_start:
             self.is_playing = False
-            self.play_btn.setText("\uE768")
+            self._update_play_button()
             self._on_status_update(f"Ready: {title}", True, "gray")
         else:
             self.is_playing = True
-            self.play_btn.setText("\uE769")
+            self._update_play_button()
             self._on_status_update(f"Playing: {title}", True, "gray")
 
     def eventFilter(self, obj, event):
@@ -12475,6 +12650,14 @@ class MainApp(QMainWindow):
 
     def toggle_playback(self):
         if not self.vlc_player: return
+        if self._player_media_is_finished():
+            # The media on the player has finished and nothing was started after it, so this press
+            # is not a resume - there is nothing left to resume. It is a replay: the same track
+            # started again from the top, which is what the button now says it does. For a stream
+            # "started again" means on freshly resolved media, because the URL the finished one was
+            # built from has been played out (see _replay_finished_track).
+            if self._replay_finished_track():
+                return
         if self._stream_needs_renew():
             # Pressing play on a stream that has stopped answering is the listener asking for the
             # music, not for the media that happens to be loaded: a dead media answers neither a
@@ -12484,8 +12667,7 @@ class MainApp(QMainWindow):
             # leaves the app wanting the track playing even if the cooldown still has this one
             # waiting, because the next press of the button goes through.
             self.is_playing = True
-            if getattr(self, 'play_btn', None):
-                self.play_btn.setText("\uE769")
+            self._update_play_button()
             self._stream_refetch_attempts = 0
             self._renew_loaded_stream(force=True)
             return
@@ -12495,8 +12677,7 @@ class MainApp(QMainWindow):
             # - the queued position stops asking for a pause, and the dying media is not paused
             # and unpaused behind a fetch that is about to replace it.
             self.is_playing = True
-            if getattr(self, 'play_btn', None):
-                self.play_btn.setText("\uE769")
+            self._update_play_button()
             self._pending_stream_pause = False
             self._pending_stream_seek_at = time.monotonic()
             return
@@ -12508,12 +12689,12 @@ class MainApp(QMainWindow):
             self._stream_moved_at = None
             self._stream_resuming = True
             self.vlc_player.pause()
-            self.play_btn.setText("\uE768")
             self.is_playing = False
+            self._update_play_button()
         else:
             self.vlc_player.play()
-            self.play_btn.setText("\uE769")
             self.is_playing = True
+            self._update_play_button()
 
     def toggle_shuffle(self):
         self.is_shuffled = not self.is_shuffled
@@ -12631,6 +12812,14 @@ class MainApp(QMainWindow):
         if not self.vlc_player:
             return
         frac = float(val) / 10000.0
+        if self._player_media_is_finished():
+            # The media on the player has run to its end, and a media libVLC is done with answers
+            # no seek at all: the bar moved and nothing else did, which is how dragging back after
+            # a track finished used to do nothing whatsoever. What the bar is asking for here is
+            # the track again from where it was put, so the scrub goes down as a replay and the
+            # position rides along to whatever media answers it.
+            if self._replay_finished_track(at_frac=frac):
+                return
         if self._stream_needs_renew() or getattr(self, '_stream_refetching', False):
             # Scrubbing a stream that has stopped answering does nothing at all, and that is how
             # the whole problem hid: the slider moved and libVLC ignored it. Keep the position
@@ -12711,9 +12900,30 @@ class MainApp(QMainWindow):
                     else:
                         self._ended_trigger = True
                         self._has_played_current = False
+                        # A media that stopped well short of its own reported length is a stream
+                        # that gave out rather than a track that finished - the same call the
+                        # branch above just made, and its answer only reaches here when that branch
+                        # declined to reload it. Such a track keeps the promise it has always had:
+                        # a Play press or a scrub goes through _stream_needs_renew() and picks it up
+                        # where it stopped. Only a media that genuinely reached its end can be held
+                        # with a replay button.
+                        finished = not self._stream_ended_short(total_ms, ms)
                         # "Stop after current" armed: hold on this track instead of advancing.
-                        if getattr(self, 'stop_after_current', STOP_AFTER_OFF):
+                        stop_mode = int(getattr(self, 'stop_after_current', STOP_AFTER_OFF))
+                        if stop_mode:
                             self._finish_stop_after_current()
+                            if finished:
+                                # Held on purpose, so the button that can do something with a
+                                # finished media - start it again - is the one the listener sees.
+                                self._hold_finished_track(stop_mode)
+                        elif finished and self._next_playback_preview() is None:
+                            # _next_playback_preview is the same look-ahead the read-ahead uses to
+                            # decide whether a successor is worth resolving. Nothing follows this
+                            # track, so there is nothing to advance to: the finished track is what
+                            # the listener is left sitting on, and the replay button is the way to
+                            # hear it again. Something does follow - or this is a stream that gave
+                            # out - so it advances as it always did.
+                            self._hold_finished_track()
                         else:
                             self.play_next()
                 
