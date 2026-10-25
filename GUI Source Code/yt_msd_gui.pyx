@@ -6860,6 +6860,9 @@ class MainApp(QMainWindow):
         self.shuffle_order = []
         # "Stop after current": off / once / always, cycled by the player-bar button
         # and the tray entry (see the prefetch and stop-after block near play_result).
+        # "always" is kept in gui_config.json and read back by load_config() so the next
+        # window opens still stopping after every track; "once" is never restored, because
+        # the track it was armed for does not exist in a new session.
         self.stop_after_current = STOP_AFTER_OFF
         # Which track an automatic "once" belongs to. A new search arms one for the
         # stream that is playing (see _arm_stop_after_for_new_search), and this id is
@@ -8003,6 +8006,29 @@ class MainApp(QMainWindow):
                     self.disable_update_checks = c.get('disable_update_checks', False)
                     self.disable_ytdlp_updates = c.get('disable_ytdlp_updates', False)
                     self.ytdlp_last_update_check = float(c.get('ytdlp_last_update_check', 0.0) or 0.0)
+                    # "Stop after current" is the one playback choice that outlives the window it was
+                    # made in, and only when it is "always": that state is a standing instruction the
+                    # user takes back himself by clicking the button again, so a window coming back
+                    # with it off would have him re-arming it before every track. "once" is not a
+                    # preference at all but a promise about one track - the one that was playing when
+                    # it was armed - and that track is not part of the new session, so an armed "once"
+                    # left in the file is spent here instead of being kept to stop the first track the
+                    # user starts after launch. The marker naming the track a search armed it for
+                    # belongs to that dropped promise and goes with it; a restored "always" is the
+                    # user's own choice, so nothing is armed for it. A value that is none of the three
+                    # states - a hand-edit gone wrong, a number written by a future version - falls
+                    # back to off the way a format the app no longer offers does.
+                    persisted_stop_after = c.get('stop_after_current', STOP_AFTER_OFF)
+                    try:
+                        persisted_stop_after = int(persisted_stop_after)
+                    except (TypeError, ValueError):
+                        persisted_stop_after = STOP_AFTER_OFF
+                    if persisted_stop_after not in (STOP_AFTER_OFF, STOP_AFTER_ONCE, STOP_AFTER_ALWAYS):
+                        persisted_stop_after = STOP_AFTER_OFF
+                    if persisted_stop_after == STOP_AFTER_ONCE:
+                        persisted_stop_after = STOP_AFTER_OFF
+                    self.stop_after_current = persisted_stop_after
+                    self._search_stop_after_track = None
                     if hasattr(self, 'local_rescan_timer'):
                         self._update_local_rescan_timer()
                     if self.save_place:
@@ -8057,6 +8083,10 @@ class MainApp(QMainWindow):
             'disable_update_checks': getattr(self, 'disable_update_checks', False),
             'disable_ytdlp_updates': getattr(self, 'disable_ytdlp_updates', False),
             'ytdlp_last_update_check': getattr(self, 'ytdlp_last_update_check', 0.0),
+            # The state as it stands when the window closes. "always" is read straight back by
+            # load_config(); a "once" that was still armed is spent on the way in rather than
+            # carried into a session where the track it was armed for no longer exists.
+            'stop_after_current': getattr(self, 'stop_after_current', STOP_AFTER_OFF),
             'session_data': {
                 'search_results': self.search_results,
                 'playback_index': self.playback_index,
@@ -8455,6 +8485,13 @@ class MainApp(QMainWindow):
         self.show_local_metadata = False
         self.host_window_geometry = ""
         self.ytdlp_last_update_check = 0.0
+        # "Stop after current" is now in the list save_config() writes, so leaving the attribute as
+        # it was would have put an "always" straight back into the file this reset had just removed -
+        # the same way the two update opt-outs survived the reset before they were cleared here. The
+        # search arming goes with it, and apply_theme() below repaints the button through
+        # _update_stop_after_ui().
+        self.stop_after_current = STOP_AFTER_OFF
+        self._search_stop_after_track = None
         # ...and the widgets that display those values, because save_config() reads the format, the
         # bitrate and the download folder straight off them. Left where they were, they would put the
         # old values back into the new file on the next save. Signals are blocked so no handler runs
@@ -12109,6 +12146,15 @@ class MainApp(QMainWindow):
         # behind is no longer what he wants and goes with it.
         self._search_stop_after_track = None
         self.set_stop_after_current((int(current) + 1) % 3)
+        # A click is the only way this state is ever chosen, so this is where the choice
+        # is written out - the same as every control in the Settings dialog, and before
+        # the close: a crash, a killed process or a Windows shutdown never reach
+        # closeEvent(), and "always" is a standing instruction the user expects to still
+        # be there when the window comes back. The automatic handlings deliberately do
+        # not write: a "once" armed by a new search, released by another track or spent by
+        # a finished one is not something the user chose, and load_config() never restores
+        # it anyway.
+        self.save_config()
 
     def set_stop_after_current(self, state):
         try:
