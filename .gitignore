@@ -20,7 +20,7 @@ build_dir_gui/
 ffmpeg_extracted/
 dist/
 .test_harness/
-GUI Test Suite/
+GUI Source Code/GUI Test Suite/
 
 # Python artifacts
 __pycache__/
