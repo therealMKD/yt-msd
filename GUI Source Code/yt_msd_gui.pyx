@@ -148,13 +148,13 @@ SILENCE_KEEP = "0.5"
 CUSTOM_NORM_CMD = ""  # Optional override of ONLY the loudnorm part of the ffmpeg -af chain
 
 # Internal version number - the numeric part of the latest GitHub release tag.
-# (RELEASE-3.2 is tagged as "RELEASE-3.2" and read here as "3.2":
+# (RELEASE-3.3 is tagged as "RELEASE-3.3" and read here as "3.3":
 # _extract_version_number() reduces both sides to their numbers before comparing
 # them, so a tag is still recognised as this version or as a newer one. The same
 # numbers are what build_gui_exe.py puts in the installer and in the version
 # resource of the exe, so the app, the setup program and the file's own
 # Properties dialog all report one version.)
-APP_VERSION = "3.2"
+APP_VERSION = "3.3"
 
 # GitHub repository whose releases page is polled for newer versions.
 UPDATE_REPO = "therealMKD/yt-msd"
@@ -852,10 +852,19 @@ PREFETCH_CACHE_LIMIT = 4        # resolved stream URLs held at most
 # it stops answering, and libVLC reports that as nothing useful. The media on the player
 # either falls to vlc.State.Error or goes on claiming Playing with a position that has
 # stopped moving, and in both cases scrubbing does nothing and Play does nothing, so the only
-# way back was to pick the track again. STREAM_STALL_SECONDS is how long a reported position
-# may stand still while the player claims Playing before the stream counts as dead; a dead
-# stream the listener never asked to stop is re-resolved by itself, keeping its position, up
-# to STREAM_REFETCH_LIMIT times per track. STREAM_URL_MAX_AGE is the backstop: a loaded URL
+# way back was to pick the track again. The rule every re-resolution is measured against first
+# is the opposite one: a stream that is measurably answering is left alone, which
+# _stream_is_playing_now() is the question of (see _stream_needs_renew). STREAM_STALL_SECONDS is
+# how long a reported position may stand still while the player claims Playing before the stream
+# counts as dead; a dead stream the listener never asked to stop is re-resolved by itself,
+# keeping its position, up to STREAM_REFETCH_LIMIT times per track. STREAM_RESUME_GRACE is how
+# long a track the listener had stopped gets once it is playing again - a paused stream has to
+# reconnect before it reports a moving position, so the first still position after a resume is not
+# the evidence a still position is in a track that has been running the whole time. Neither clock
+# runs at all while the listener has the track stopped (see _watch_stream_liveness), which is what
+# used to reload a paused track for nothing: pause one for longer than STREAM_STALL_SECONDS and the
+# first tick after Play convicted it on the position it had left behind before the pause.
+# STREAM_URL_MAX_AGE is the backstop: a loaded URL
 # that old is re-resolved the moment the user scrubs or presses Play, unless the player is
 # measurably advancing on it - a stream that is working is left alone however old its URL is,
 # and so is a stream that was only ever loaded and left sitting, which is the track the session
@@ -865,6 +874,7 @@ PREFETCH_CACHE_LIMIT = 4        # resolved stream URLs held at most
 # STREAM_END_SLACK_MS is how far short of its own reported length a media may "end" before
 # that ending is read as a stream that gave up rather than a track that finished.
 STREAM_STALL_SECONDS = 8
+STREAM_RESUME_GRACE = 20          # seconds a track the listener had stopped gets, once playing again, before a still position counts as a stall
 STREAM_URL_MAX_AGE = 30 * 60      # seconds the URL on the player may be before a scrub or Play re-resolves it
 STREAM_REFETCH_LIMIT = 3          # self-healing re-resolutions per track before the player says so and waits
 STREAM_RENEW_COOLDOWN = 10        # seconds between two re-resolutions of the same track
@@ -6891,6 +6901,11 @@ class MainApp(QMainWindow):
         self._loaded_stream_at = None
         self._stream_seen_ms = -1
         self._stream_moved_at = None
+        # Whether the media on the player is one the listener stopped and has not yet been heard
+        # advancing again. While it is true the stall clock does not run, and the track gets
+        # STREAM_RESUME_GRACE once it is playing again instead of the ordinary STREAM_STALL_SECONDS
+        # verdict. See _watch_stream_liveness.
+        self._stream_resuming = False
         self._stream_dead = False
         # Only a stream that has been heard advancing can count as having gone idle, which is the
         # only case where the age of its URL is on its own a reason to re-resolve it. A track the
@@ -11838,8 +11853,10 @@ class MainApp(QMainWindow):
         self._stream_seen_ms = -1
         # None rather than "now": the stall clock for a fresh media starts the first time the
         # player actually reports Playing, so a stream that takes a while to open is not
-        # judged for taking a while to open.
+        # judged for taking a while to open. Fresh media has not been stopped by the listener
+        # either, so it is not a resumed one and does not get the longer clock one of those gets.
         self._stream_moved_at = None
+        self._stream_resuming = False
         self._stream_dead = False
         self._stream_refetch_attempts = 0
         # Whether anybody has heard this particular media advancing. A refresh of a stream that
@@ -11873,6 +11890,36 @@ class MainApp(QMainWindow):
         moved_at = getattr(self, '_stream_moved_at', None)
         return moved_at is not None and (time.monotonic() - moved_at) <= STREAM_STALL_SECONDS
 
+    def _stream_is_playing_now(self):
+        """Whether the media on the player is, at this moment, a stream that is answering.
+
+        The question every re-resolution is turned down by before anything else is weighed,
+        because re-resolving a stream that is carrying the music replaces media that is working
+        with a fetch that costs the listener time for nothing. libVLC answers it two ways: the
+        state it reports, and the position it reports. Playing plus a position that has moved
+        since the watchdog last looked is a stream that is working. Playing with a position that
+        last moved further back than STREAM_STALL_SECONDS, a media that is paused or opening or
+        buffering or ended, and a player that will not answer at all, are each a stream that
+        cannot be *shown* to be working - which is not the same as a verdict that it is dead, and
+        is why this only ever refuses a re-resolution rather than deciding anything.
+        """
+        if not getattr(self, '_loaded_stream', None) or self._stream_is_switching():
+            return False
+        player = getattr(self, 'vlc_player', None)
+        if player is None:
+            return False
+        try:
+            state = player.get_state()
+            ms = player.get_time()
+        except Exception:
+            return False  # a player that will not answer is not one that is provably playing
+        advanced = ms is not None and int(ms or 0) != int(getattr(self, '_stream_seen_ms', -1))
+        if state == vlc.State.Playing and advanced:
+            return True  # the position has moved since the watchdog last looked at it
+        if state != vlc.State.Playing:
+            return False
+        return self._stream_is_moving()
+
     def _stream_is_switching(self):
         """True while the player is already being handed something else: a track still being
         fetched, or a dead stream already being re-resolved. Nothing in this block acts during
@@ -11883,7 +11930,13 @@ class MainApp(QMainWindow):
     def _stream_needs_renew(self):
         """Whether the stream on the player should be re-resolved before it is asked for anything.
 
-        Two answers are yes: it was noticed dead - a position that stopped moving, or
+        Asked and answered first, every time: is this media playing right now? A stream libVLC
+        reports as advancing is left exactly where it is, because a Play press and a scrub are both
+        things a working stream answers, and swapping out the media that is carrying the music is
+        the one thing this block must never do. Only a stream that cannot be shown to be advancing
+        gets as far as the two answers below.
+
+        Those two answers are yes: it was noticed dead - a position that stopped moving, or
         vlc.State.Error - and it is a stream the listener has actually been hearing whose URL has
         outlived STREAM_URL_MAX_AGE while the player is not advancing on it, which is the track
         left running into a link that has since died, or left idle on the player for longer than
@@ -11901,6 +11954,8 @@ class MainApp(QMainWindow):
         """
         if not getattr(self, '_loaded_stream', None) or self._stream_is_switching():
             return False
+        if self._stream_is_playing_now():
+            return False  # a stream that is answering is not a stream that is due for a new URL
         if getattr(self, '_stream_dead', False):
             return True
         if self._loaded_stream_age() <= STREAM_URL_MAX_AGE or self._stream_is_moving():
@@ -11913,10 +11968,13 @@ class MainApp(QMainWindow):
             return
         self._stream_dead = True
         title = (getattr(self, 'current_playing_title', '') or 'this track')
-        if getattr(self, '_stream_refetch_attempts', 0) < STREAM_REFETCH_LIMIT:
-            self._on_status_update(f"Stream stopped responding - reloading it: {title}", False, "#FF8C00")
-        elif not getattr(self, 'is_playing', False):
+        if not getattr(self, 'is_playing', False):
+            # Nothing reloads itself while the listener has the track stopped - the self-heal is
+            # only for a stream he never asked to stop - so what this one needs is the play button,
+            # which goes through the same verdict the watchdog just made.
             self._on_status_update(f"Stream stopped responding - Play will reload it: {title}", False, "#FF8C00")
+        elif getattr(self, '_stream_refetch_attempts', 0) < STREAM_REFETCH_LIMIT:
+            self._on_status_update(f"Stream stopped responding - reloading it: {title}", False, "#FF8C00")
         else:
             self._on_status_update(
                 f"Stream stopped responding and would not reload - pick the track to start it again: {title}",
@@ -11929,10 +11987,17 @@ class MainApp(QMainWindow):
         vlc.State.Error or goes on claiming Playing with a position that has stopped moving,
         and those are the two things this can see. A position that moves is remembered, and if
         the stream had been marked dead it clears that and its allowance of self-healing
-        attempts - a stream that dropped for a moment is not punished for it. A position that
-        does not move while the app wants the track playing is a dead stream: a pause is a
-        still position by request, so it is not a stall. A dead stream the listener never asked
-        to stop is reloaded on its own.
+        attempts - a stream that dropped for a moment is not punished for it.
+
+        What is not evidence of anything is a track the listener stopped. While the app does not
+        want the audio - or libVLC reports the media Paused, Stopped or nothing at all - nothing
+        here is expected to advance, so the stall clock is emptied rather than left running: a
+        resume is judged on what the media does after it, never on the position it left behind.
+        Read off a clock that kept counting through the pause, a track paused for longer than
+        STREAM_STALL_SECONDS was convicted on the first tick after Play, before it had had the
+        chance to reconnect and catch up, which re-fetched a stream that was still perfectly
+        playable. A resumed track gets STREAM_RESUME_GRACE for the same reason. A dead stream the
+        listener never asked to stop is reloaded on its own.
         """
         if not getattr(self, '_loaded_stream', None) or self._stream_is_switching():
             return
@@ -11940,13 +12005,27 @@ class MainApp(QMainWindow):
             self._mark_stream_dead()
             self._recover_stream_if_possible()
             return
+        listener_stopped = (not getattr(self, 'is_playing', False)
+                            or state in (vlc.State.Paused, vlc.State.Stopped, vlc.State.NothingSpecial))
+        if listener_stopped:
+            # A still position by request is not a stall, and the track is a resumed one from
+            # here on: the clock starts again the first time the player is worth watching.
+            self._stream_moved_at = None
+            self._stream_resuming = True
+            return
         if state != vlc.State.Playing:
+            # Opening or Buffering: this media has not been given the chance to report a moving
+            # position yet, so the clock is armed if nothing has armed it and nothing is judged
+            # off it. A stream that takes a while to open is not judged for taking a while to open.
+            if getattr(self, '_stream_moved_at', None) is None:
+                self._stream_moved_at = time.monotonic()  # first tick this media has been worth watching
             return
         if getattr(self, '_stream_moved_at', None) is None:
             self._stream_moved_at = time.monotonic()  # first tick this media has been worth watching
         if ms is not None and ms != getattr(self, '_stream_seen_ms', -1):
             self._stream_seen_ms = ms
             self._stream_moved_at = time.monotonic()
+            self._stream_resuming = False  # heard advancing: the grace a resumed track gets is paid for
             if getattr(self, 'is_playing', False) and int(ms or 0) > 0:
                 # Somebody is hearing this media: from here on it is a stream that can go idle on
                 # the listener's hands, which is the only kind the age of its URL is a reason to
@@ -11956,9 +12035,12 @@ class MainApp(QMainWindow):
                 self._stream_dead = False
                 self._stream_refetch_attempts = 0
             return
-        if not getattr(self, 'is_playing', False) or getattr(self, '_stream_dead', False):
+        if getattr(self, '_stream_dead', False):
             return
-        if (time.monotonic() - self._stream_moved_at) > STREAM_STALL_SECONDS:
+        still_for = time.monotonic() - self._stream_moved_at
+        allowed = STREAM_RESUME_GRACE if getattr(self, '_stream_resuming', False) else STREAM_STALL_SECONDS
+        if still_for > allowed:
+            self._stream_resuming = False  # the verdict is made; what follows is judged as ordinary playback
             self._mark_stream_dead()
             self._recover_stream_if_possible()
 
@@ -12419,6 +12501,12 @@ class MainApp(QMainWindow):
             self._pending_stream_seek_at = time.monotonic()
             return
         if self.vlc_player.is_playing():
+            # The stall clock stops with the pause instead of running through it, so a track
+            # resumed later is judged on what it does after the resume and never on the position it
+            # left behind (see _watch_stream_liveness). The watchdog holds it tick by tick as well;
+            # this is what covers a pause and a Play that fall inside one 16 ms tick.
+            self._stream_moved_at = None
+            self._stream_resuming = True
             self.vlc_player.pause()
             self.play_btn.setText("\uE768")
             self.is_playing = False
