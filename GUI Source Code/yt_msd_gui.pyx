@@ -5436,7 +5436,9 @@ class ExportDialog(QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.parent = parent
+        # Named main_app and not parent, for the reason spelled out in SettingsDialog:
+        # self.parent would replace the Qt method of the same name on this dialog.
+        self.main_app = parent
         self.setWindowTitle("Export Package")
         self.setMinimumWidth(620)
         self.music_rows: List[dict] = []      # {'path': str, 'check': QCheckBox, 'row': QWidget}
@@ -5636,7 +5638,7 @@ class ExportDialog(QDialog):
         if options is None:
             return
         default_name = f"yt-msd-export-{time.strftime('%Y-%m-%d')}.zip"
-        start_dir = getattr(self.parent, 'download_path', '') or os.path.expanduser("~")
+        start_dir = getattr(self.main_app, 'download_path', '') or os.path.expanduser("~")
         target, _ = QFileDialog.getSaveFileName(self, "Save Export Package",
                                                os.path.join(start_dir, default_name),
                                                "yt-msd Package (*.zip)")
@@ -5645,14 +5647,25 @@ class ExportDialog(QDialog):
         if not target.lower().endswith(".zip"):
             target += ".zip"
         options['zip_path'] = target
-        self.parent.start_export(options)
+        self.main_app.start_export(options)
         self.accept()
 
 
 class SettingsDialog(QDialog):
     def __init__(self, parent):
         super().__init__(parent)
-        self.parent = parent
+        # The window that opened this dialog, held under a name that is not 'parent'.
+        # It used to be self.parent, and that meant the name of a Qt method this dialog
+        # inherits: QDialog.parent() is how Qt hands back the widget a dialog sits inside,
+        # and an instance attribute of the same name replaces it for Python callers.
+        # MainApp installs itself as an application-wide event filter, and every key press
+        # makes it walk up from the focused control asking each widget for its parent -
+        # so while this dialog was open, a key typed into any box of it reached the
+        # MainApp window through self.parent and asked the window to be called as a
+        # method. That is the "TypeError: 'MainApp' object is not callable" the installed
+        # exe logged on every keystroke in Settings, and why only typing was affected and
+        # not the spin-box arrows, which are clicks and not key presses.
+        self.main_app = parent
         self.setWindowTitle("Settings")
         self.setMinimumWidth(820)
         
@@ -5696,7 +5709,10 @@ class SettingsDialog(QDialog):
             btn.setFixedSize(32, 32)
             c_val = get_system_accent_color() if color == "System" else THEME_COLORS[color][0]
             btn.setStyleSheet(f"background-color: {c_val}; border-radius: 6px; border: {'2px solid white' if parent.accent_color_name == color else 'none'};")
-            if color == "System": btn.setText("\uE771"); btn.setFont(QFont("Segoe MDL2 Assets", 12))
+            # The System chip is a plain swatch of the live Windows accent colour, exactly like the
+            # THEME_COLORS chips. It used to paint a glyph (U+E771) in Segoe MDL2 Assets on top of the
+            # swatch, but that codepoint has no glyph in the font here, so the chip showed a tofu box.
+            # The background colour alone already says "system", so the chip carries no text at all.
             btn.clicked.connect(lambda checked=False, clr=color: self._change_accent(clr))
             grid.addWidget(btn, r, c)
             self.accent_btns[color] = btn
@@ -5982,8 +5998,8 @@ class SettingsDialog(QDialog):
         self.update_styles()
 
     def update_styles(self):
-        accent = get_accent_color(self.parent.accent_color_name)
-        mode = self.parent.appearance_mode
+        accent = get_accent_color(self.main_app.accent_color_name)
+        mode = self.main_app.appearance_mode
         if mode == "System": mode = get_system_appearance_mode()
         is_light = mode == "Light"
         
@@ -5994,42 +6010,42 @@ class SettingsDialog(QDialog):
         accent_fg = "black" if brightness > 150 else "white"
         
         for m, b in self.mode_btns.items():
-            if m == self.parent.appearance_mode:
+            if m == self.main_app.appearance_mode:
                 b.setStyleSheet(f"background-color: {accent}; color: {accent_fg}; border-radius: 4px;")
             else:
                 b.setStyleSheet(f"background-color: {'#ddd' if is_light else '#444'}; color: {'black' if is_light else 'white'}; border-radius: 4px;")
         
         for color, btn in self.accent_btns.items():
             c_val = get_system_accent_color() if color == "System" else THEME_COLORS[color][0]
-            border = f"2px solid {'black' if is_light else 'white'}" if self.parent.accent_color_name == color else "none"
+            border = f"2px solid {'black' if is_light else 'white'}" if self.main_app.accent_color_name == color else "none"
             btn.setStyleSheet(f"background-color: {c_val}; border-radius: 6px; border: {border};")
 
         for m, btn in self.norm_btns.items():
-            if m == self.parent.normalization_mode:
+            if m == self.main_app.normalization_mode:
                 btn.setStyleSheet(f"background-color: {accent}; color: {accent_fg}; border-radius: 4px;")
             else:
                 btn.setStyleSheet(f"background-color: {'#ddd' if is_light else '#444'}; color: {'black' if is_light else 'white'}; border-radius: 4px;")
 
     def _change_mode(self, mode):
-        self.parent.appearance_mode = mode
-        self.parent.apply_theme()
+        self.main_app.appearance_mode = mode
+        self.main_app.apply_theme()
         self.update_styles()
-        self.parent.save_config()
+        self.main_app.save_config()
 
     def _change_accent(self, color):
-        self.parent.accent_color_name = color
-        self.parent.apply_theme()
+        self.main_app.accent_color_name = color
+        self.main_app.apply_theme()
         self.update_styles()
-        self.parent.save_config()
+        self.main_app.save_config()
         
     def _toggle_args(self, state):
-        self.parent.use_custom_args = state
+        self.main_app.use_custom_args = state
         self.args_edit.setEnabled(state)
-        self.parent.save_config()
+        self.main_app.save_config()
         
     def _update_args(self, text):
-        self.parent.custom_args = text
-        self.parent.save_config()
+        self.main_app.custom_args = text
+        self.main_app.save_config()
         
     def set_ytdlp_version(self, version):
         """Show the yt-dlp version found by a background thread in the main window."""
@@ -6038,43 +6054,43 @@ class SettingsDialog(QDialog):
 
     def _update_yt_dlp(self):
         """Ask the main window to run the winget upgrade for yt-dlp."""
-        self.parent.update_yt_dlp_now()
+        self.main_app.update_yt_dlp_now()
 
     def _toggle_ytdlp_updates(self, state):
-        self.parent.disable_ytdlp_updates = state
-        self.parent.save_config()
+        self.main_app.disable_ytdlp_updates = state
+        self.main_app.save_config()
         
     def _toggle_startup(self, state):
         set_run_on_startup(bool(state))
 
     def _toggle_tray(self, state):
-        self.parent.minimize_to_tray = state
-        self.parent.save_config()
+        self.main_app.minimize_to_tray = state
+        self.main_app.save_config()
         
     def _toggle_session(self, state):
-        self.parent.save_place = state
-        self.parent.save_config()
+        self.main_app.save_place = state
+        self.main_app.save_config()
 
     # --- MP3 Renamer settings ---
     def _set_norm_mode(self, mode):
-        self.parent.normalization_mode = mode
+        self.main_app.normalization_mode = mode
         for m, btn in self.norm_btns.items():
             btn.setChecked(m == mode)
-        self.parent.save_config()
+        self.main_app.save_config()
         self.update_styles()
 
     def _toggle_auto_rename(self, state):
-        self.parent.auto_rename = state
-        self.parent.save_config()
+        self.main_app.auto_rename = state
+        self.main_app.save_config()
 
     def _update_silence_pad(self, text):
         try:
             val = float(text)
             if val >= 0:
-                self.parent.silence_pad_dur = val
+                self.main_app.silence_pad_dur = val
                 global SILENCE_PAD_DUR
                 SILENCE_PAD_DUR = val
-                self.parent.save_config()
+                self.main_app.save_config()
         except ValueError:
             pass
 
@@ -6082,53 +6098,53 @@ class SettingsDialog(QDialog):
         try:
             val = int(text)
             if val > 0:
-                self.parent.download_threads = val
-                self.parent.save_config()
+                self.main_app.download_threads = val
+                self.main_app.save_config()
         except ValueError:
             pass
 
     def _update_rescan_interval(self, index):
         mins = self.rescan_combo.itemData(index)
         if mins is not None:
-            self.parent.local_rescan_interval = mins
-            self.parent._update_local_rescan_timer()
-            self.parent.save_config()
+            self.main_app.local_rescan_interval = mins
+            self.main_app._update_local_rescan_timer()
+            self.main_app.save_config()
 
     def _update_norm_threads(self, val):
-        self.parent.normalization_threads = val
-        self.parent.save_config()
+        self.main_app.normalization_threads = val
+        self.main_app.save_config()
 
     def _toggle_silence_trim(self, state):
-        self.parent.silence_trim = state
+        self.main_app.silence_trim = state
         global SILENCE_TRIM
         SILENCE_TRIM = state
-        self.parent.save_config()
+        self.main_app.save_config()
 
     def _toggle_norm_cmd(self, state):
-        self.parent.use_custom_norm_cmd = state
+        self.main_app.use_custom_norm_cmd = state
         self.norm_cmd_edit.setEnabled(state)
         if state and not self.norm_cmd_edit.text().strip():
             self.norm_cmd_edit.setText(f"loudnorm=I={TARGET_LUFS}:TP={TRUE_PEAK}:LRA={LOUDNESS_RANGE}")
         global CUSTOM_NORM_CMD
-        CUSTOM_NORM_CMD = self.parent.custom_norm_cmd if state else ""
-        self.parent.save_config()
+        CUSTOM_NORM_CMD = self.main_app.custom_norm_cmd if state else ""
+        self.main_app.save_config()
 
     def _update_norm_cmd(self, text):
-        self.parent.custom_norm_cmd = text
+        self.main_app.custom_norm_cmd = text
         global CUSTOM_NORM_CMD
-        if self.parent.use_custom_norm_cmd:
+        if self.main_app.use_custom_norm_cmd:
             CUSTOM_NORM_CMD = text
-        self.parent.save_config()
+        self.main_app.save_config()
 
     def _toggle_custom_script(self, state):
         # The checkbox only gates whether the script runs after a download; the
         # path field and browse button stay usable so a path can always be set.
-        self.parent.run_custom_script = state
-        self.parent.save_config()
+        self.main_app.run_custom_script = state
+        self.main_app.save_config()
 
     def _update_custom_script(self, text):
-        self.parent.custom_script_path = text.strip()
-        self.parent.save_config()
+        self.main_app.custom_script_path = text.strip()
+        self.main_app.save_config()
 
     def _browse_custom_script(self):
         start = self.custom_script_edit.text().strip() or ""
@@ -6138,18 +6154,18 @@ class SettingsDialog(QDialog):
         )
         if f:
             self.custom_script_edit.setText(f)
-            self.parent.custom_script_path = f
-            self.parent.save_config()
+            self.main_app.custom_script_path = f
+            self.main_app.save_config()
 
     def _make_info_btn(self, text):
         """Small 'i' info button; the description is shown as a hover tooltip."""
-        mode = self.parent.appearance_mode
+        mode = self.main_app.appearance_mode
         if mode == "System":
             mode = get_system_appearance_mode()
         is_light = (mode == "Light")
         fg = "#1a1a1a" if is_light else "#ffffff"
         border = "#ccc" if is_light else "#555"
-        accent = get_accent_color(self.parent.accent_color_name)
+        accent = get_accent_color(self.main_app.accent_color_name)
         btn = QPushButton("i")
         btn.setObjectName("infoBtn")
         btn.setFixedSize(24, 24)
@@ -6166,16 +6182,16 @@ class SettingsDialog(QDialog):
 
     def _open_export_dialog(self):
         """Pack the selected pieces into a .zip export package."""
-        dialog = ExportDialog(self.parent)
+        dialog = ExportDialog(self.main_app)
         dialog.exec()
 
     def _open_import_package(self):
         """Pick a .zip export package and restore it."""
-        self.parent.open_import_dialog()
+        self.main_app.open_import_dialog()
 
     def _open_sync_manager(self):
         # Leave the settings dialog open in the background, open sync manager in foreground
-        self.parent.open_sync_manager(parent_dialog=self)
+        self.main_app.open_sync_manager(parent_dialog=self)
 
     def _reset_defaults(self):
         # Wording that matches what reset_to_defaults() actually clears: every stored setting and
@@ -6188,7 +6204,7 @@ class SettingsDialog(QDialog):
                    "An initialised drive keeps its marker on the device, so its card comes back "
                    "while it is plugged in. Your music files are not touched. Continue?")
         if QMessageBox.question(self, "Confirm Reset", warning) == QMessageBox.Yes:
-            self.parent.reset_to_defaults()
+            self.main_app.reset_to_defaults()
             self.accept()
 
 class PlaylistDialog(QDialog):
@@ -10349,13 +10365,24 @@ class MainApp(QMainWindow):
             self._on_local_click(items[0])
 
     def _focus_is_in_local_pane(self, widget=None) -> bool:
+        """True when that widget - or the one holding focus when none is given - sits
+        inside the local file list.
+
+        The walk goes through parentWidget and not parent, because two of this
+        program's dialogs keep the window that opened them in an attribute named parent,
+        which replaces the Qt method of the same name on those instances. Walking with
+        parent() from a control inside such a dialog therefore ends up calling the
+        MainApp window itself, which is what raised
+        "TypeError: 'MainApp' object is not callable" out of eventFilter on every key
+        typed into Settings. parentWidget is a name the dialogs here never reassign.
+        """
         w = widget if widget is not None else QApplication.focusWidget()
         if w is None or not hasattr(self, 'local_list'):
             return False
         while w is not None:
             if w is self.local_list or w is self.local_content:
                 return True
-            w = w.parent()
+            w = w.parentWidget()
         return False
 
     # ------------------------------------------------------------------
