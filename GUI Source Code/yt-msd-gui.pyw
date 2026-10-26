@@ -9241,9 +9241,17 @@ class MainApp(QMainWindow):
         # normal text glyph that Segoe MDL2 Assets (the family the #stopAfterBtn rule
         # asks for), Segoe UI and the fallback fonts all have, so it paints as a filled
         # square whichever font the rule resolves to.
+        #
+        # 24 rather than the 36 the neighbouring controls use, measured rather than guessed:
+        # this caption's ink is 10x9 px at the 20px the rule asks for, so a 36px box was a wide
+        # coloured field with the square a speck in the middle of it. 24 leaves ~7px of colour on
+        # every side, which is the margin the other controls give their own glyphs. The
+        # #stopAfterBtn rule also carries 6px of bottom padding for the same reason: the ink sits
+        # low in its own line box (17px of colour above it, 10px below at 36px), and without that
+        # padding the square looks parked at the bottom of whatever box draws it.
         self.stop_after_btn = QPushButton("\u25A0")
         self.stop_after_btn.setObjectName("stopAfterBtn")
-        self.stop_after_btn.setFixedSize(36, 36)
+        self.stop_after_btn.setFixedSize(24, 24)
         self.stop_after_btn.setProperty("stop_after_state", STOP_AFTER_STATE_NAMES[self.stop_after_current])
         self.stop_after_btn.setToolTip(STOP_AFTER_TOOLTIPS[self.stop_after_current])
         self.stop_after_btn.clicked.connect(self.cycle_stop_after_current)
@@ -9717,7 +9725,7 @@ class MainApp(QMainWindow):
                 font-size: 20px;
                 font-weight: normal;
                 border-radius: 6px;
-                padding: 0px;
+                padding: 0px 0px 6px 0px;
             }}
             QPushButton#stopAfterBtn:hover {{
                 background-color: {btn_hover};
