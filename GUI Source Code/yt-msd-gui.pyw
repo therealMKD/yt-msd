@@ -1088,6 +1088,12 @@ def _clean_reported_path(text):
 
 def _match_reported_path(line):
     """('final'|'staged', path) for a yt-dlp line naming a file, else (None, '')."""
+    # Fast reject: every path pattern anchors at a specific prefix. The vast
+    # majority of yt-dlp output lines are progress updates ([download] 25%,
+    # [info] ..., [hlsnative] ...) that can never match any pattern. Checking
+    # the prefix first avoids trying 8 regexes on every line.
+    if not line.startswith(('[ExtractAudio]', '[Merger]', '[download]', 'Not converting')):
+        return None, ''
     for pattern in _YTDLP_FINAL_PATH_PATTERNS:
         match = pattern.match(line)
         if match:
@@ -1123,7 +1129,7 @@ def _title_matches_filename(title, filename):
     return len(shorter) >= 12 and longer.startswith(shorter)
 
 
-def run_yt_dlp_download(args, progress_cb=None, cancelled_cb=None):
+def run_yt_dlp_download(args, progress_cb=None, cancelled_cb=None, proc_cb=None):
     """Run a real yt-dlp download and report its progress while it runs.
 
     Returns the path of the finished file. Returning None does NOT mean the
@@ -1131,6 +1137,9 @@ def run_yt_dlp_download(args, progress_cb=None, cancelled_cb=None):
     version recognises, and the caller has to look the file up itself.
     Raises when yt-dlp is missing, when the download failed, or when the user
     cancelled - the same contract the old progress hooks had.
+
+    proc_cb: optional callable receiving the Popen object immediately after
+    spawn, so the caller can kill the subprocess from outside if cancelled.
     """
     exe = find_yt_dlp_executable()
     if not exe:
@@ -1140,6 +1149,8 @@ def run_yt_dlp_download(args, progress_cb=None, cancelled_cb=None):
     proc = subprocess.Popen([exe] + list(args), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, encoding="utf-8", errors="replace",
                             bufsize=1, env=_child_utf8_env(), **_hidden_window_kwargs())
+    if proc_cb:
+        proc_cb(proc)
     final_path = None
     staged_path = None
     errors = []
@@ -6770,6 +6781,10 @@ class MainApp(QMainWindow):
         self.is_muted = False
         self.active_downloads = {}
         self.active_downloads_lock = threading.Lock()
+        # yt-dlp subprocess handles so cancel_batch_download can kill them
+        # immediately instead of waiting for a readline() to return a line.
+        self._active_ytdlp_procs = []
+        self._active_ytdlp_procs_lock = threading.Lock()
         self.sync_manager_dialog = None
         self.last_wifi_ssid = get_current_wifi_ssid()
         # Persistent sync thread registry - lives at MainApp level so it survives dialog close/reopen
@@ -11039,6 +11054,17 @@ class MainApp(QMainWindow):
         self.cancel_download = True
         self.cancel_btn.setText("Cancelling...")
         self.cancel_btn.setEnabled(False)
+        # Kill all running yt-dlp subprocesses immediately. Without this, a
+        # download thread stuck in proc.stdout.readline() (waiting for yt-dlp
+        # to finish its extraction retries) would not notice the cancel until
+        # the subprocess eventually outputs a line — which can be 30-60s with
+        # --retries 15. Killing the process gives readline an EOF right away.
+        with self._active_ytdlp_procs_lock:
+            for proc in list(self._active_ytdlp_procs):
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
 
     def start_batch_download(self):
         if self.is_downloading: return
@@ -11053,7 +11079,6 @@ class MainApp(QMainWindow):
         self.cancel_btn.setText("Cancel")
         self.cancel_btn.setEnabled(True)
         self.cancel_btn.setVisible(True)
-        self.save_config()
         # Everything read from a widget is read here, on the GUI thread. Qt
         # objects belong to the thread that created them, and reading the
         # settings once also stops a mid-batch change of format, bitrate or
@@ -11082,6 +11107,7 @@ class MainApp(QMainWindow):
                 self.active_downloads.clear()
 
             threads_count = max(1, int(getattr(self, 'download_threads', 3)))
+            self._dl_finished_count = 0
             downloaded_filepaths = []
             downloaded_lock = threading.Lock()
             # id(queue item) -> the file that item produced. Kept out of the
@@ -11098,6 +11124,11 @@ class MainApp(QMainWindow):
             title_locks_guard = threading.Lock()
             start_slot_guard = threading.Lock()
             start_slot = [0]
+            # Lightweight counter for the progress prefix. Incremented once per
+            # download completion (inside download_single) instead of rescanning
+            # all queue_items on every yt-dlp progress line.
+            finished_counter = [0]
+            finished_counter_guard = threading.Lock()
 
             def title_lock_for(title):
                 key = _title_match_key(title) or title
@@ -11192,9 +11223,15 @@ class MainApp(QMainWindow):
                 # YouTube for a stream in the same instant is what gets the
                 # requests throttled, and a throttled request is what used to
                 # come back as a song that "skipped".
+                #
+                # Only the first max_workers items start simultaneously and
+                # need staggering. Items beyond that wait for a previous
+                # download to finish (~20-30s), which is already a far larger
+                # gap than any stagger we could add — an extra 2s sleep on
+                # those items was pure dead time.
                 slot = take_start_slot()
-                if slot > 0:
-                    time.sleep(min(0.4 * slot, 2.0))
+                if 0 < slot < max_workers:
+                    time.sleep(0.4 * slot)
 
                 downloaded_file = None
                 failure = None
@@ -11205,11 +11242,34 @@ class MainApp(QMainWindow):
                         attempt_started = time.time()
                         failure = None
                         try:
-                            downloaded_file = run_yt_dlp_download(
-                                cli_args,
-                                progress_cb=lambda pct: self._dl_progress_percent(vid_id, pct),
-                                cancelled_cb=lambda: getattr(self, 'cancel_download', False),
-                            )
+                            def _register_proc(p, _self=self):
+                                with _self._active_ytdlp_procs_lock:
+                                    _self._active_ytdlp_procs.append(p)
+
+                            def _unregister_proc(p, _self=self):
+                                with _self._active_ytdlp_procs_lock:
+                                    try:
+                                        _self._active_ytdlp_procs.remove(p)
+                                    except ValueError:
+                                        pass
+
+                            downloaded_file = None
+                            _proc_ref = [None]  # so unregister can find it after
+
+                            def _proc_and_track(p, _reg=_register_proc, _ref=_proc_ref):
+                                _reg(p)
+                                _ref[0] = p
+
+                            try:
+                                downloaded_file = run_yt_dlp_download(
+                                    cli_args,
+                                    progress_cb=lambda pct: self._dl_progress_percent(vid_id, pct),
+                                    cancelled_cb=lambda: getattr(self, 'cancel_download', False),
+                                    proc_cb=_proc_and_track,
+                                )
+                            finally:
+                                if _proc_ref[0] is not None:
+                                    _unregister_proc(_proc_ref[0])
                             # run_yt_dlp_download raises for anything that truly
                             # failed, so getting here means the track is on
                             # disk. Only its name is uncertain.
@@ -11228,7 +11288,7 @@ class MainApp(QMainWindow):
                                 q['permanent_failure'] = True
                                 break
                             if attempt < DOWNLOAD_ITEM_ATTEMPTS:
-                                time.sleep(min(2.0 * attempt, 8.0))
+                                time.sleep(min(1.5 * attempt, 5.0))
 
                 with self.active_downloads_lock:
                     if vid_id in self.active_downloads:
@@ -11244,6 +11304,9 @@ class MainApp(QMainWindow):
                             downloaded_filepaths.append(downloaded_file)
                         produced_files[id(q)] = downloaded_file
                     q['status'] = "Finished"
+                    with finished_counter_guard:
+                        finished_counter[0] += 1
+                    self._dl_finished_count = finished_counter[0]
                 else:
                     q['status'] = "Pending"
 
@@ -11251,7 +11314,8 @@ class MainApp(QMainWindow):
                     q['status'] = "Pending"
                 repaint(q)
 
-                finished_cnt = len([item_q for item_q in getattr(self, 'queue_items', []) if item_q.get('status') == "Finished"])
+                with finished_counter_guard:
+                    finished_cnt = finished_counter[0]
                 total_cnt = getattr(self, '_batch_total_count', len(getattr(self, 'queue_items', [])))
                 prog_prefix = f"({finished_cnt}/{total_cnt}) " if total_cnt > 0 else ""
                 with self.active_downloads_lock:
@@ -11280,7 +11344,7 @@ class MainApp(QMainWindow):
                         f"Re-checking queue (Pass {pass_num}: retrying {len(pending_items)} pending downloads)...",
                         False, "#FF8C00"
                     )
-                    time.sleep(min(1.5 * pass_num, 8.0))
+                    time.sleep(min(1.0 * pass_num, 4.0))
 
                 max_workers = min(threads_count, len(pending_items))
                 reset_start_slots()
@@ -11305,6 +11369,52 @@ class MainApp(QMainWindow):
                 # count and matched raw titles against sanitized filenames, so
                 # any title holding a ':' or a '/' looked missing and was
                 # downloaded all over again for no reason.
+                #
+                # Build a single file-entry list once (one scandir) instead of
+                # re-scanning the folder for each finished item that needs a
+                # lookup. This is the difference between N × folder-scan syscalls
+                # and 1 scan + N in-memory matches.
+                _verify_entries = None  # lazily built: [(match_key, path, mtime)]
+
+                def _ensure_verify_entries():
+                    nonlocal _verify_entries
+                    if _verify_entries is not None:
+                        return _verify_entries
+                    try:
+                        raw = list(os.scandir(folder))
+                    except OSError:
+                        _verify_entries = []
+                        return _verify_entries
+                    entries = []
+                    for entry in raw:
+                        try:
+                            if not entry.is_file():
+                                continue
+                            info = entry.stat()
+                            if info.st_size <= 1024:
+                                continue
+                            mk = _title_match_key(os.path.splitext(entry.name)[0])
+                            if mk:
+                                entries.append((mk, entry.path, info.st_mtime))
+                        except OSError:
+                            continue
+                    _verify_entries = entries
+                    return _verify_entries
+
+                def _find_from_verify_entries(title, not_before=0.0):
+                    """Match a title against the pre-scanned folder entries."""
+                    wanted = _title_match_key(title)
+                    if not wanted:
+                        return None
+                    best = None
+                    for mk, path, mtime in _ensure_verify_entries():
+                        if mtime < not_before - 5:
+                            continue
+                        if mk == wanted or (len(wanted) >= 12 and mk.startswith(wanted)) or (len(mk) >= 12 and wanted.startswith(mk)):
+                            if best is None or mtime > best[1]:
+                                best = (path, mtime)
+                    return best[0] if best else None
+
                 missing_items = []
                 for idx, q in enumerate(list(self.queue_items)):
                     if q['status'] != "Finished":
@@ -11312,7 +11422,7 @@ class MainApp(QMainWindow):
                     path = produced_files.get(id(q))
                     if path and os.path.isfile(path) and os.path.getsize(path) > 1024:
                         continue
-                    path = find_downloaded_file(q['video'].get('title', ''))
+                    path = _find_from_verify_entries(q['video'].get('title', ''))
                     if path:
                         produced_files[id(q)] = path
                         continue
@@ -11326,6 +11436,12 @@ class MainApp(QMainWindow):
                         f"Verification: {len(missing_items)} files missing on disk. Redownloading missing tracks...",
                         False, "#FF8C00"
                     )
+                    # Sync the lightweight counter with reality: verification
+                    # reset some items back to Pending, so the counter is now
+                    # inflated by however many were demoted.
+                    with finished_counter_guard:
+                        finished_counter[0] -= len(missing_items)
+                        self._dl_finished_count = finished_counter[0]
                     reset_start_slots()
                     with ThreadPoolExecutor(max_workers=min(threads_count, len(missing_items))) as executor:
                         futures = [executor.submit(download_single, item) for item in missing_items]
@@ -11361,6 +11477,11 @@ class MainApp(QMainWindow):
                     self.status_signal.emit("Batch complete!", False, "#1abd33")
 
         threading.Thread(target=bg_download, daemon=True).start()
+        # Config save deferred until after the download thread is launched:
+        # the thread already has its own captured settings, so this write
+        # (which serialises search_results) overlapping with yt-dlp startup
+        # means it no longer delays the first download attempt.
+        self.save_config()
         
     def _on_batch_complete(self):
         self.is_downloading = False
@@ -11507,7 +11628,7 @@ class MainApp(QMainWindow):
         if not vid_id or not percent:
             return
 
-        finished_cnt = len([q for q in getattr(self, 'queue_items', []) if q.get('status') == "Finished"])
+        finished_cnt = getattr(self, '_dl_finished_count', 0)
         total_cnt = getattr(self, '_batch_total_count', len(getattr(self, 'queue_items', [])))
         prog_prefix = f"({finished_cnt}/{total_cnt}) " if total_cnt > 0 else ""
 
@@ -11529,7 +11650,7 @@ class MainApp(QMainWindow):
                 self.status_label.setStyleSheet("font-size: 11px; margin-top: -2px;")
             else:
                 self.status_label.setStyleSheet(f"color: {color}; font-size: 11px; margin-top: -2px;")
-        if "Batch complete" in text:
+        if "Batch complete" in text or "Download cancelled" in text:
             self.dl_progress_signal.emit("")
             self._on_batch_complete()
 

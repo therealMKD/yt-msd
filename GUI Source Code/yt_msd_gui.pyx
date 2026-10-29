@@ -50,6 +50,8 @@ except ImportError:
     winreg = None
 import webbrowser
 import urllib.request
+import urllib.parse
+import html
 import io
 try:
     import vlc
@@ -377,7 +379,14 @@ def clean_youtube_title(filename):
 
     title = re.sub(r'[\(\)\{\}\[\]]', '', title)
     title = re.sub(r'\b(hd|version|original|official|4k|uhd|upgraded|upscaled|remastered|lyrics)\b', '', title, flags=re.IGNORECASE)
-    title = re.compile(r'\b(ft|feat|featuring)\b\.?', re.IGNORECASE).split(title)[0]
+    # Strip "feat/ft/featuring" credits only from the title side so an artist
+    # whose name begins with those letters (e.g. "FT Island") is not destroyed.
+    if " - " in title:
+        _feat_re = re.compile(r'\s*\b(ft|feat|featuring)\b\.?.*$', re.IGNORECASE)
+        _artist_part, _title_part = title.split(" - ", 1)
+        title = f"{_artist_part.strip()} - {_feat_re.split(_title_part)[0].strip()}"
+    else:
+        title = re.compile(r'\s*\b(ft|feat|featuring)\b\.?.*$', re.IGNORECASE).split(title)[0]
     title = re.sub(r'#\S+', '', title)
 
     # Quote handling:
@@ -514,20 +523,6 @@ def _add_placeholder_tag(filepath):
                 pass
     except Exception:
         pass
-
-def _has_placeholder_tag(filepath):
-    if not os.path.exists(filepath): return False
-    ext = os.path.splitext(filepath)[1].lower()
-    try:
-        if ext == ".mp3":
-            audio = ID3(filepath)
-            return any('YTMSD_PENDING_VERIFY' in str(c.text) for c in audio.getall('COMM'))
-        elif ext == ".m4a":
-            tags = EasyMP4(filepath)
-            return 'YTMSD_PENDING_VERIFY' in tags.get('comment', [])
-    except Exception:
-        return False
-    return False
 
 def _remove_placeholder_tag(filepath):
     if not os.path.exists(filepath): return
@@ -812,11 +807,7 @@ def clean_and_tag_files(folder_path, start_auto=False):
 
 def check_ffmpeg_available():
     try:
-        startupinfo = None
-        if sys.platform == "win32":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        subprocess.run([_ffmpeg_binary(), "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, check=True, startupinfo=startupinfo)
+        subprocess.run([_ffmpeg_binary(), "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, check=True, **_hidden_window_kwargs())
         return True
     except Exception:
         return False
@@ -1119,6 +1110,12 @@ def _clean_reported_path(text):
 
 def _match_reported_path(line):
     """('final'|'staged', path) for a yt-dlp line naming a file, else (None, '')."""
+    # Fast reject: every path pattern anchors at a specific prefix. The vast
+    # majority of yt-dlp output lines are progress updates ([download] 25%,
+    # [info] ..., [hlsnative] ...) that can never match any pattern. Checking
+    # the prefix first avoids trying 8 regexes on every line.
+    if not line.startswith(('[ExtractAudio]', '[Merger]', '[download]', 'Not converting')):
+        return None, ''
     for pattern in _YTDLP_FINAL_PATH_PATTERNS:
         match = pattern.match(line)
         if match:
@@ -1154,7 +1151,7 @@ def _title_matches_filename(title, filename):
     return len(shorter) >= 12 and longer.startswith(shorter)
 
 
-def run_yt_dlp_download(args, progress_cb=None, cancelled_cb=None):
+def run_yt_dlp_download(args, progress_cb=None, cancelled_cb=None, proc_cb=None):
     """Run a real yt-dlp download and report its progress while it runs.
 
     Returns the path of the finished file. Returning None does NOT mean the
@@ -1162,6 +1159,9 @@ def run_yt_dlp_download(args, progress_cb=None, cancelled_cb=None):
     version recognises, and the caller has to look the file up itself.
     Raises when yt-dlp is missing, when the download failed, or when the user
     cancelled - the same contract the old progress hooks had.
+
+    proc_cb: optional callable receiving the Popen object immediately after
+    spawn, so the caller can kill the subprocess from outside if cancelled.
     """
     exe = find_yt_dlp_executable()
     if not exe:
@@ -1171,6 +1171,8 @@ def run_yt_dlp_download(args, progress_cb=None, cancelled_cb=None):
     proc = subprocess.Popen([exe] + list(args), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, encoding="utf-8", errors="replace",
                             bufsize=1, env=_child_utf8_env(), **_hidden_window_kwargs())
+    if proc_cb:
+        proc_cb(proc)
     final_path = None
     staged_path = None
     errors = []
@@ -1241,21 +1243,6 @@ def _is_permanent_download_error(message):
     return any(marker in text for marker in _PERMANENT_DOWNLOAD_ERROR_MARKERS)
 
 
-def check_vlc_available():
-    if not _VLC_MODULE_AVAILABLE or vlc is None:
-        return False, getattr(sys.modules[__name__], '_VLC_IMPORT_ERROR', 'python-vlc not available')
-    try:
-        instance = vlc.Instance('--quiet', '--no-video')
-        if instance is None:
-            return False, "libvlc.dll not found. Please install VLC Media Player."
-        player = instance.media_player_new()
-        if player is None:
-            return False, "Failed to create VLC media player instance."
-        return True, "OK"
-    except Exception as e:
-        return False, str(e)
-
-
 def measure_loudness(filepath):
     command = [
         _ffmpeg_binary(),
@@ -1267,11 +1254,6 @@ def measure_loudness(filepath):
         "-"
     ]
     try:
-        startupinfo = None
-        if sys.platform == "win32":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            
         result = subprocess.run(
             command,
             stdin=subprocess.DEVNULL,
@@ -1280,7 +1262,7 @@ def measure_loudness(filepath):
             text=True,
             encoding='utf-8',
             errors='ignore',
-            startupinfo=startupinfo
+            **_hidden_window_kwargs()
         )
         if result.returncode != 0:
             return None, None, f"FFmpeg exited with code {result.returncode}"
@@ -1288,7 +1270,6 @@ def measure_loudness(filepath):
         stderr_output = result.stderr
         json_match = re.search(r'\{\s*"input_i".*?\}', stderr_output, re.DOTALL)
         if json_match:
-            import json
             data = json.loads(json_match.group(0))
             input_i = float(data.get("input_i", TARGET_LUFS))
             input_tp = float(data.get("input_tp", TRUE_PEAK))
@@ -1333,14 +1314,10 @@ def _probe_format_block(filepath):
     '-v' for option 'nostdin'" and no duration was ever returned. Closing stdin with
     DEVNULL, as this does, is what that switch was for."""
     try:
-        startupinfo = None
-        if sys.platform == "win32":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         cmd = [_ffprobe_binary(), "-v", "quiet", "-print_format", "json", "-show_format", str(filepath)]
         result = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, encoding='utf-8', errors='ignore',
-                                startupinfo=startupinfo)
+                                **_hidden_window_kwargs())
         if result.returncode == 0 and result.stdout:
             data = json.loads(result.stdout)
             return data.get('format') or None
@@ -1398,8 +1375,9 @@ def normalize_file(index, total, filepath, custom_norm_cmd=None):
     suffix = filepath.suffix.lower()
     artist, title = read_metadata_tags(filepath)
 
-    # Measure original duration before processing
-    orig_duration = _get_audio_duration(filepath)
+    # Measure original duration only when silence-trim reporting needs it (saves a
+    # ffprobe subprocess per file when trimming is off).
+    orig_duration = _get_audio_duration(filepath) if SILENCE_TRIM else None
     
     input_i, input_tp, err = measure_loudness(filepath)
     if err:
@@ -1452,18 +1430,13 @@ def normalize_file(index, total, filepath, custom_norm_cmd=None):
     command.append(temp_path)
     
     try:
-        startupinfo = None
-        if sys.platform == "win32":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            
         result = subprocess.run(
             command,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            startupinfo=startupinfo
+            **_hidden_window_kwargs()
         )
     except Exception as e:
         try: os.remove(temp_path)
@@ -1481,7 +1454,7 @@ def normalize_file(index, total, filepath, custom_norm_cmd=None):
         return False, filepath.name, f"Failed to replace original file with temp: {e}"
     
     # Report silence removal stats (only meaningful when the trim filters ran)
-    new_duration = _get_audio_duration(filepath)
+    new_duration = _get_audio_duration(filepath) if SILENCE_TRIM else None
     if SILENCE_TRIM and orig_duration is not None and new_duration is not None:
         total_removed = orig_duration - new_duration
         pad_added = SILENCE_PAD_DUR if SILENCE_PAD_DUR > 0 else 0.0
@@ -1550,118 +1523,6 @@ def run_loudness_normalization(folder_path, skip_files=None):
     print(f"  {Colors.GREEN}Success: {completed}{Colors.END} | {Colors.RED}Failed: {failed}{Colors.END}\n")
     return completed, failed
 
-def trim_silence_file(index, total, filepath):
-    _safe_print(f"[{index}/{total}] {Colors.CYAN}Trimming silence:{Colors.END} {filepath.name}...")
-    suffix = filepath.suffix.lower()
-    artist, title = read_metadata_tags(filepath)
-
-    try:
-        temp_fd, temp_path = tempfile.mkstemp(suffix=suffix)
-        os.close(temp_fd)
-    except Exception as e:
-        return False, filepath.name, f"Failed to create temp file: {e}"
-    
-    # Silence trimming only. The loudnorm/EQ override is never applied to this pass.
-    af_chain = build_af_chain(include_pad=False)
-    command = [_ffmpeg_binary(), "-nostdin", "-y", "-i", str(filepath), "-af", af_chain]
-    
-    if suffix == ".mp3":
-        command += ["-codec:a", "libmp3lame", "-b:a", BITRATE]
-    elif suffix == ".m4a":
-        command += ["-codec:a", "aac", "-b:a", BITRATE]
-    else:
-        command += ["-b:a", BITRATE]
-    
-    command += ["-map_metadata", "0"]
-    if suffix == ".m4a":
-        command += ["-movflags", "+faststart"]
-    command.append(temp_path)
-    
-    try:
-        startupinfo = None
-        if sys.platform == "win32":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        result = subprocess.run(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            startupinfo=startupinfo
-        )
-    except Exception as e:
-        try: os.remove(temp_path)
-        except: pass
-        return False, filepath.name, f"FFmpeg execution failed: {e}"
-    
-    if result.returncode != 0:
-        try: os.remove(temp_path)
-        except: pass
-        return False, filepath.name, result.stderr
-    
-    try:
-        os.replace(temp_path, str(filepath))
-    except Exception as e:
-        return False, filepath.name, f"Failed to replace original file with temp: {e}"
-    
-    if (artist or title):
-        write_metadata_tags(filepath, artist or "", title or "")
-    
-    return True, filepath.name, None
-
-def run_silence_trim(folder_path, skip_files=None):
-    print(f"\n{Colors.CYAN}{Colors.BOLD}====================================={Colors.END}")
-    print(f"{Colors.CYAN}{Colors.BOLD}=== SILENCE TRIM PASS ==============={Colors.END}")
-    print(f"{Colors.CYAN}{Colors.BOLD}====================================={Colors.END}\n")
-    
-    if not SILENCE_TRIM:
-        print(f"{Colors.YELLOW}[!] Silence trimming is disabled in settings.{Colors.END}")
-        print(f"{Colors.DIM}    Skipping silence trim pass.{Colors.END}\n")
-        return 0, 0
-
-    if not check_ffmpeg_available():
-        print(f"{Colors.YELLOW}[!] FFmpeg was not found in your system's PATH.{Colors.END}")
-        print(f"{Colors.DIM}    Skipping silence trim pass.{Colors.END}\n")
-        return 0, 0
-    
-    extensions = TAGGABLE_EXTENSIONS
-    files = sorted([f for f in folder_path.iterdir() if f.is_file() and f.suffix.lower() in extensions])
-
-    # Filter out files that were already tagged before the renaming pass started
-    if skip_files:
-        pre_skip_count = len([f for f in files if f in skip_files])
-        files = [f for f in files if f not in skip_files]
-        if pre_skip_count:
-            print(f"{Colors.DIM}Skipping {pre_skip_count} already-tagged file(s) from silence trim.{Colors.END}")
-
-    if not files:
-        print(f"{Colors.YELLOW}No MP3 or M4A files found to trim.{Colors.END}\n")
-        return 0, 0
-
-    print(f"{Colors.GREEN}Trimming silence on {len(files)} files with {MAX_WORKERS} worker threads...{Colors.END}")
-    print(f"{Colors.DIM}Threshold: {SILENCE_THRESHOLD} | Min silence duration: {SILENCE_DURATION}s | Silence kept: {SILENCE_KEEP}s{Colors.END}\n")
-    
-    completed = 0
-    failed = 0
-    
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(trim_silence_file, idx, len(files), file)
-                   for idx, file in enumerate(files, 1)]
-        for future in as_completed(futures):
-            success, filename, error = future.result()
-            if success:
-                completed += 1
-                _safe_print(f"  {Colors.GREEN}✔ Trimmed:{Colors.END} {filename}")
-            else:
-                failed += 1
-                _safe_print(f"\n  {Colors.RED}✘ Failed to trim {filename}:{Colors.END}")
-                _safe_print(f"{Colors.DIM}{error}{Colors.END}\n")
-    
-    print(f"\n{Colors.CYAN}{Colors.BOLD}Silence Trim Complete!{Colors.END}")
-    print(f"  {Colors.GREEN}Success: {completed}{Colors.END} | {Colors.RED}Failed: {failed}{Colors.END}\n")
-    return completed, failed
-
 def run_integrated_renamer_cli():
     if sys.platform == "win32":
         os.system("")
@@ -1727,7 +1588,6 @@ def run_integrated_renamer_cli():
     renamed_count, tagged_count, skipped_count, already_formatted_count = clean_and_tag_files(folder, start_auto=start_auto)
 
     norm_completed, norm_failed = 0, 0
-    trim_completed, trim_failed = 0, 0
 
     try:
         if norm_mode == 'on':
@@ -1755,9 +1615,6 @@ def run_integrated_renamer_cli():
     if norm_completed or norm_failed:
         print(f"  {Colors.GREEN}Volume-equalized:           {Colors.END} {norm_completed}  "
               f"{Colors.RED}(failed: {norm_failed}){Colors.END}")
-    if trim_completed or trim_failed:
-        print(f"  {Colors.GREEN}Silence-trimmed:            {Colors.END} {trim_completed}  "
-              f"{Colors.RED}(failed: {trim_failed}){Colors.END}")
     print(f"{Colors.CYAN}{Colors.BOLD}{'═' * 50}{Colors.END}")
     print(f"\n{Colors.CYAN}{Colors.BOLD}All processes complete.{Colors.END}")
 
@@ -2145,8 +2002,9 @@ class DraggableQueueWidget(QWidget):
         if dst_idx is None:
             dst_idx = self.layout().count() - 1
         if src_idx != dst_idx and dst_idx >= 0:
-            self.order_changed.emit()
-            # Emit signal with indices – parent will do the actual reorder
+            # Store the indices then emit once - the handler reads _pending_reorder
+            # to do the actual reorder. Emitting before the store would fire the
+            # handler with the previous drop's stale indices.
             self._pending_reorder = (src_idx, dst_idx)
             self.order_changed.emit()
         event.acceptProposedAction()
@@ -2297,8 +2155,6 @@ def get_current_wifi_ssid() -> Optional[str]:
     if sys.platform != 'win32':
         return None
     try:
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         res = subprocess.run(
             ["netsh", "wlan", "show", "interfaces"],
             stdout=subprocess.PIPE,
@@ -2306,7 +2162,7 @@ def get_current_wifi_ssid() -> Optional[str]:
             text=True,
             encoding='utf-8',
             errors='ignore',
-            startupinfo=startupinfo
+            **_hidden_window_kwargs()
         )
         if res.returncode == 0:
             for line in res.stdout.splitlines():
@@ -2327,7 +2183,6 @@ def is_run_on_startup_enabled() -> bool:
     if sys.platform != 'win32':
         return False
     try:
-        import winreg
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
         try:
             val, _ = winreg.QueryValueEx(key, "yt-msd")
@@ -2345,7 +2200,6 @@ def set_run_on_startup(enable: bool) -> bool:
     if sys.platform != 'win32':
         return False
     try:
-        import winreg
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_ALL_ACCESS)
         app_name = "yt-msd"
         if enable:
@@ -3557,7 +3411,6 @@ class SyncRemovableWorker:
     def sync_local_folders(src_dir: Path, dest_dir: Path, deletion_mode: str = 'mirror',
                            status_cb: Optional[Callable[[str], None]] = None,
                            progress_cb: Optional[Callable[[int, int, str, int, int], None]] = None) -> Tuple[bool, str, int, int]:
-        import shutil
         progress_cb = make_throttled_progress_cb(progress_cb)
         if not src_dir.is_dir():
             return False, f"Source directory '{src_dir}' does not exist.", 0, 0
@@ -6950,6 +6803,10 @@ class MainApp(QMainWindow):
         self.is_muted = False
         self.active_downloads = {}
         self.active_downloads_lock = threading.Lock()
+        # yt-dlp subprocess handles so cancel_batch_download can kill them
+        # immediately instead of waiting for a readline() to return a line.
+        self._active_ytdlp_procs = []
+        self._active_ytdlp_procs_lock = threading.Lock()
         self.sync_manager_dialog = None
         self.last_wifi_ssid = get_current_wifi_ssid()
         # Persistent sync thread registry - lives at MainApp level so it survives dialog close/reopen
@@ -8663,10 +8520,6 @@ class MainApp(QMainWindow):
         self._on_status_update("Settings, recent data and sync chains reset to defaults.", False, "#3B8ED0")
 
     # ── EXPORT / IMPORT PACKAGES ──────────────────────────────────────────────
-    def open_export_dialog(self):
-        dialog = ExportDialog(self)
-        dialog.exec()
-
     def start_export(self, options: dict):
         """Build the .zip package on a worker thread: copying music or reading a
         config off a slow drive must never block the window."""
@@ -9018,7 +8871,6 @@ class MainApp(QMainWindow):
         class ResetHandle(QSplitterHandle):
             _last_click = 0
             def mousePressEvent(self, e):
-                import time
                 now = time.time()
                 if now - ResetHandle._last_click < 0.35:
                     sp = self.splitter()
@@ -9481,9 +9333,8 @@ class MainApp(QMainWindow):
         accent_fg = "#000000" if brightness > 150 else "#ffffff"
         
         # Write checkmark SVG to a temp file
-        import tempfile, os as _os
         checkmark_svg = f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="{accent_fg}" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>'
-        if not hasattr(self, '_checkmark_svg_path') or not _os.path.exists(self._checkmark_svg_path):
+        if not hasattr(self, '_checkmark_svg_path') or not os.path.exists(self._checkmark_svg_path):
             tmp = tempfile.NamedTemporaryFile(suffix='.svg', delete=False, mode='w', encoding='utf-8')
             tmp.write(checkmark_svg)
             tmp.close()
@@ -9495,7 +9346,7 @@ class MainApp(QMainWindow):
         
         # Write downarrow SVG to a temp file
         downarrow_svg = f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="{accent_fg}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>'
-        if not hasattr(self, '_downarrow_svg_path') or not _os.path.exists(self._downarrow_svg_path):
+        if not hasattr(self, '_downarrow_svg_path') or not os.path.exists(self._downarrow_svg_path):
             tmp = tempfile.NamedTemporaryFile(suffix='.svg', delete=False, mode='w', encoding='utf-8')
             tmp.write(downarrow_svg)
             tmp.close()
@@ -10096,14 +9947,6 @@ class MainApp(QMainWindow):
             pass
         items.sort(key=lambda x: (not x['is_dir'], x['name'].lower()))
         return items
-
-    def _build_local_rows(self, items):
-        """Render a list that is already fully known in one pass. Folder switches use
-        _start_local_render, which streams the rows in batch by batch; this is kept for
-        callers that have the whole listing in hand."""
-        self._reset_local_rows()
-        self._append_local_rows(items or [])
-        self._finish_local_render()
 
     def _reset_local_rows(self):
         """Tear down the rows of the folder being replaced. What was selected survives,
@@ -11086,7 +10929,6 @@ class MainApp(QMainWindow):
         st = "\uE73E " if q['status'] == "Finished" else ("\uE896 " if q['status'] == "Downloading" else "")
         t = q['video'].get('title', 'Unknown')
         if len(t) > 40: t = t[:37] + "..."
-        import html
         t_escaped = html.escape(t)
         
         lbl = QLabel(f"<span style='font-family: \"Segoe MDL2 Assets\";'>{st}</span> {t_escaped}")
@@ -11124,7 +10966,6 @@ class MainApp(QMainWindow):
                 st = "\uE73E " if q['status'] == "Finished" else ("\uE896 " if q['status'] == "Downloading" else "")
                 t = q['video'].get('title', 'Unknown')
                 if len(t) > 40: t = t[:37] + "..."
-                import html
                 labels[0].setText(f"<span style='font-family: \"Segoe MDL2 Assets\";'>{st}</span> {html.escape(t)}")
             new_name = "queueItemFinished" if q['status'] == "Finished" else "queueItemPending"
             if placeholder.objectName() != new_name:
@@ -11235,6 +11076,17 @@ class MainApp(QMainWindow):
         self.cancel_download = True
         self.cancel_btn.setText("Cancelling...")
         self.cancel_btn.setEnabled(False)
+        # Kill all running yt-dlp subprocesses immediately. Without this, a
+        # download thread stuck in proc.stdout.readline() (waiting for yt-dlp
+        # to finish its extraction retries) would not notice the cancel until
+        # the subprocess eventually outputs a line — which can be 30-60s with
+        # --retries 15. Killing the process gives readline an EOF right away.
+        with self._active_ytdlp_procs_lock:
+            for proc in list(self._active_ytdlp_procs):
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
 
     def start_batch_download(self):
         if self.is_downloading: return
@@ -11249,7 +11101,6 @@ class MainApp(QMainWindow):
         self.cancel_btn.setText("Cancel")
         self.cancel_btn.setEnabled(True)
         self.cancel_btn.setVisible(True)
-        self.save_config()
         # Everything read from a widget is read here, on the GUI thread. Qt
         # objects belong to the thread that created them, and reading the
         # settings once also stops a mid-batch change of format, bitrate or
@@ -11272,13 +11123,13 @@ class MainApp(QMainWindow):
                 self.status_signal.emit(f"Batch complete (stopped early: {e}).", False, "#E31E24")
 
         def _run_batch():
-            import time
             from concurrent.futures.thread import ThreadPoolExecutor  # see the note at the top
 
             with self.active_downloads_lock:
                 self.active_downloads.clear()
 
             threads_count = max(1, int(getattr(self, 'download_threads', 3)))
+            self._dl_finished_count = 0
             downloaded_filepaths = []
             downloaded_lock = threading.Lock()
             # id(queue item) -> the file that item produced. Kept out of the
@@ -11295,6 +11146,11 @@ class MainApp(QMainWindow):
             title_locks_guard = threading.Lock()
             start_slot_guard = threading.Lock()
             start_slot = [0]
+            # Lightweight counter for the progress prefix. Incremented once per
+            # download completion (inside download_single) instead of rescanning
+            # all queue_items on every yt-dlp progress line.
+            finished_counter = [0]
+            finished_counter_guard = threading.Lock()
 
             def title_lock_for(title):
                 key = _title_match_key(title) or title
@@ -11389,9 +11245,15 @@ class MainApp(QMainWindow):
                 # YouTube for a stream in the same instant is what gets the
                 # requests throttled, and a throttled request is what used to
                 # come back as a song that "skipped".
+                #
+                # Only the first max_workers items start simultaneously and
+                # need staggering. Items beyond that wait for a previous
+                # download to finish (~20-30s), which is already a far larger
+                # gap than any stagger we could add — an extra 2s sleep on
+                # those items was pure dead time.
                 slot = take_start_slot()
-                if slot > 0:
-                    time.sleep(min(0.4 * slot, 2.0))
+                if 0 < slot < max_workers:
+                    time.sleep(0.4 * slot)
 
                 downloaded_file = None
                 failure = None
@@ -11402,11 +11264,34 @@ class MainApp(QMainWindow):
                         attempt_started = time.time()
                         failure = None
                         try:
-                            downloaded_file = run_yt_dlp_download(
-                                cli_args,
-                                progress_cb=lambda pct: self._dl_progress_percent(vid_id, pct),
-                                cancelled_cb=lambda: getattr(self, 'cancel_download', False),
-                            )
+                            def _register_proc(p, _self=self):
+                                with _self._active_ytdlp_procs_lock:
+                                    _self._active_ytdlp_procs.append(p)
+
+                            def _unregister_proc(p, _self=self):
+                                with _self._active_ytdlp_procs_lock:
+                                    try:
+                                        _self._active_ytdlp_procs.remove(p)
+                                    except ValueError:
+                                        pass
+
+                            downloaded_file = None
+                            _proc_ref = [None]  # so unregister can find it after
+
+                            def _proc_and_track(p, _reg=_register_proc, _ref=_proc_ref):
+                                _reg(p)
+                                _ref[0] = p
+
+                            try:
+                                downloaded_file = run_yt_dlp_download(
+                                    cli_args,
+                                    progress_cb=lambda pct: self._dl_progress_percent(vid_id, pct),
+                                    cancelled_cb=lambda: getattr(self, 'cancel_download', False),
+                                    proc_cb=_proc_and_track,
+                                )
+                            finally:
+                                if _proc_ref[0] is not None:
+                                    _unregister_proc(_proc_ref[0])
                             # run_yt_dlp_download raises for anything that truly
                             # failed, so getting here means the track is on
                             # disk. Only its name is uncertain.
@@ -11425,7 +11310,7 @@ class MainApp(QMainWindow):
                                 q['permanent_failure'] = True
                                 break
                             if attempt < DOWNLOAD_ITEM_ATTEMPTS:
-                                time.sleep(min(2.0 * attempt, 8.0))
+                                time.sleep(min(1.5 * attempt, 5.0))
 
                 with self.active_downloads_lock:
                     if vid_id in self.active_downloads:
@@ -11441,6 +11326,9 @@ class MainApp(QMainWindow):
                             downloaded_filepaths.append(downloaded_file)
                         produced_files[id(q)] = downloaded_file
                     q['status'] = "Finished"
+                    with finished_counter_guard:
+                        finished_counter[0] += 1
+                    self._dl_finished_count = finished_counter[0]
                 else:
                     q['status'] = "Pending"
 
@@ -11448,7 +11336,8 @@ class MainApp(QMainWindow):
                     q['status'] = "Pending"
                 repaint(q)
 
-                finished_cnt = len([item_q for item_q in getattr(self, 'queue_items', []) if item_q.get('status') == "Finished"])
+                with finished_counter_guard:
+                    finished_cnt = finished_counter[0]
                 total_cnt = getattr(self, '_batch_total_count', len(getattr(self, 'queue_items', [])))
                 prog_prefix = f"({finished_cnt}/{total_cnt}) " if total_cnt > 0 else ""
                 with self.active_downloads_lock:
@@ -11477,7 +11366,7 @@ class MainApp(QMainWindow):
                         f"Re-checking queue (Pass {pass_num}: retrying {len(pending_items)} pending downloads)...",
                         False, "#FF8C00"
                     )
-                    time.sleep(min(1.5 * pass_num, 8.0))
+                    time.sleep(min(1.0 * pass_num, 4.0))
 
                 max_workers = min(threads_count, len(pending_items))
                 reset_start_slots()
@@ -11502,6 +11391,52 @@ class MainApp(QMainWindow):
                 # count and matched raw titles against sanitized filenames, so
                 # any title holding a ':' or a '/' looked missing and was
                 # downloaded all over again for no reason.
+                #
+                # Build a single file-entry list once (one scandir) instead of
+                # re-scanning the folder for each finished item that needs a
+                # lookup. This is the difference between N × folder-scan syscalls
+                # and 1 scan + N in-memory matches.
+                _verify_entries = None  # lazily built: [(match_key, path, mtime)]
+
+                def _ensure_verify_entries():
+                    nonlocal _verify_entries
+                    if _verify_entries is not None:
+                        return _verify_entries
+                    try:
+                        raw = list(os.scandir(folder))
+                    except OSError:
+                        _verify_entries = []
+                        return _verify_entries
+                    entries = []
+                    for entry in raw:
+                        try:
+                            if not entry.is_file():
+                                continue
+                            info = entry.stat()
+                            if info.st_size <= 1024:
+                                continue
+                            mk = _title_match_key(os.path.splitext(entry.name)[0])
+                            if mk:
+                                entries.append((mk, entry.path, info.st_mtime))
+                        except OSError:
+                            continue
+                    _verify_entries = entries
+                    return _verify_entries
+
+                def _find_from_verify_entries(title, not_before=0.0):
+                    """Match a title against the pre-scanned folder entries."""
+                    wanted = _title_match_key(title)
+                    if not wanted:
+                        return None
+                    best = None
+                    for mk, path, mtime in _ensure_verify_entries():
+                        if mtime < not_before - 5:
+                            continue
+                        if mk == wanted or (len(wanted) >= 12 and mk.startswith(wanted)) or (len(mk) >= 12 and wanted.startswith(mk)):
+                            if best is None or mtime > best[1]:
+                                best = (path, mtime)
+                    return best[0] if best else None
+
                 missing_items = []
                 for idx, q in enumerate(list(self.queue_items)):
                     if q['status'] != "Finished":
@@ -11509,7 +11444,7 @@ class MainApp(QMainWindow):
                     path = produced_files.get(id(q))
                     if path and os.path.isfile(path) and os.path.getsize(path) > 1024:
                         continue
-                    path = find_downloaded_file(q['video'].get('title', ''))
+                    path = _find_from_verify_entries(q['video'].get('title', ''))
                     if path:
                         produced_files[id(q)] = path
                         continue
@@ -11523,6 +11458,12 @@ class MainApp(QMainWindow):
                         f"Verification: {len(missing_items)} files missing on disk. Redownloading missing tracks...",
                         False, "#FF8C00"
                     )
+                    # Sync the lightweight counter with reality: verification
+                    # reset some items back to Pending, so the counter is now
+                    # inflated by however many were demoted.
+                    with finished_counter_guard:
+                        finished_counter[0] -= len(missing_items)
+                        self._dl_finished_count = finished_counter[0]
                     reset_start_slots()
                     with ThreadPoolExecutor(max_workers=min(threads_count, len(missing_items))) as executor:
                         futures = [executor.submit(download_single, item) for item in missing_items]
@@ -11558,6 +11499,11 @@ class MainApp(QMainWindow):
                     self.status_signal.emit("Batch complete!", False, "#1abd33")
 
         threading.Thread(target=bg_download, daemon=True).start()
+        # Config save deferred until after the download thread is launched:
+        # the thread already has its own captured settings, so this write
+        # (which serialises search_results) overlapping with yt-dlp startup
+        # means it no longer delays the first download attempt.
+        self.save_config()
         
     def _on_batch_complete(self):
         self.is_downloading = False
@@ -11571,12 +11517,6 @@ class MainApp(QMainWindow):
             self.run_mp3_renamer()
         if getattr(self, 'run_custom_script', False):
             self._run_custom_post_download_script()
-
-    def copy_download_path_to_clipboard(self):
-        path = self.path_combo.currentText()
-        if path:
-            QApplication.clipboard().setText(path)
-            self._on_status_update(f"Copied download path to clipboard: {path}", False, "#3B8ED0")
 
     def on_run_renamer_toggled(self, checked):
         self.run_renamer = checked
@@ -11710,7 +11650,7 @@ class MainApp(QMainWindow):
         if not vid_id or not percent:
             return
 
-        finished_cnt = len([q for q in getattr(self, 'queue_items', []) if q.get('status') == "Finished"])
+        finished_cnt = getattr(self, '_dl_finished_count', 0)
         total_cnt = getattr(self, '_batch_total_count', len(getattr(self, 'queue_items', [])))
         prog_prefix = f"({finished_cnt}/{total_cnt}) " if total_cnt > 0 else ""
 
@@ -11732,7 +11672,7 @@ class MainApp(QMainWindow):
                 self.status_label.setStyleSheet("font-size: 11px; margin-top: -2px;")
             else:
                 self.status_label.setStyleSheet(f"color: {color}; font-size: 11px; margin-top: -2px;")
-        if "Batch complete" in text:
+        if "Batch complete" in text or "Download cancelled" in text:
             self.dl_progress_signal.emit("")
             self._on_batch_complete()
 
@@ -12585,7 +12525,6 @@ class MainApp(QMainWindow):
                 if paused_at_start:
                     self.vlc_player.audio_set_mute(True)
                     self.vlc_player.play()
-                    import time
                     time.sleep(0.25)
                     self.vlc_player.set_pause(1)
                     self.vlc_player.set_position(0)
@@ -12648,7 +12587,6 @@ class MainApp(QMainWindow):
         return super().eventFilter(obj, event)
 
     def open_search_on_youtube(self):
-        import webbrowser, urllib.parse
         query = self.search_entry.text().strip()
         if not query: return
         if 'youtube.com' in query or 'youtu.be' in query:
@@ -12994,7 +12932,7 @@ class MainApp(QMainWindow):
 
         try:
             url = f"https://i.ytimg.com/vi/{vid_id}/mqdefault.jpg"
-            with urllib.request.urlopen(url) as req:
+            with urllib.request.urlopen(url, timeout=10) as req:
                 data = req.read()
                 if self.thumbnail_cache_size + len(data) > 256 * 1024 * 1024:
                     self.thumbnail_cache.clear(); self.thumbnail_cache_size = 0
