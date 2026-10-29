@@ -3,7 +3,7 @@
 This is the full readme for the GUI version, with information on every single feature inside of yt-msd. For the CLI readme, go back to the main readme, at the bottom.
 
 >[!WARNING]
->I'm currently in the process of a few minor updates, along with other stuff. Because of that, this readme is not complete, and some information may be subject to change. This warning will be removed once the readme is finished.
+>I'm currently in the process of a few minor updates, along with other stuff. Because of that, this readme is not complete, and some information may be subject to change. This warning will be removed once the readme is finished. I'm writing this readme by hand, because I refuse to use AI for my docs (ironic since the program is vibe coded), so bear with me.
 
 ## Table of Contents
 This is the main table of contents, these main sections also have their own tables of contents for subsections.
@@ -167,7 +167,42 @@ The loudnorm/EQ override box allows you to add or change the loudnorm and equali
 
 ## How the renamer works
 
+First of all, the renamer gets it's folder from the main program. This folder is the download path, where your files just got downloaded. On open, it scans that folder and looks for **untagged** files, matching the correct format.
 
+If a file is NOT an `.mp3` or `.m4a`, OR the file has tags (Artist, Title, Album, etc.), it will not be listed. Subfolders are NOT scanned.
+
+Downloaded files originally get their video title, as verified by yt-dlp. If that original title contains an illegal windows character, it will be changed by yt-dlp into a safe ASCII equivalent.
+
+Once it has identified the files needing to be tagged, it calls `clean_youtube_title` on each file, alphabetically sorted by filename.
+
+That function runs the following steps on the title, in order:
+1. Convert all dashes into `U+002D`, or the "Minus Hyphen" `-` character. This includes `U+2010`,`U+2015`, the em dash (`U+2014`), plus (`U+002B`) and dual hyphens.
+2. Convert all vertical bars into `U+007C`. This includes characters like `U+00A6` (broken bar), `U+2502`, `U+2310` and `U+2503`.
+3. Convert fullwidth colon (`U+FF1A`) into normal `U+003A`. Convert all single quotes and backticks into `U+0027` and all quotes into `U+0022`.
+4. Bracket masking: Separators inside of brackets are preserved, so they don't disappear when brackets are removed.
+5. Colon turns into separator (`-`). Solves `Artist: Title` case.
+6. First pipe becomes separator (`-`). Any sequential pipes are removed, as well as all characters after them. Solves `Artist | Title | Official Video`
+7. Space normalization around separator (`-`). Any extra spaces are removed, to one space on either side. (` - `)
+8. Any sequential separators (`-`) are removed, as well as any characters after them. Solves `Artist - Title - Official Video`
+9. Separators inside of brackets are unmasked.
+10. Non-romanized title solving. If the TITLE portion is not romanized, the renamer looks for brackets, and attempts to solve as `Artist - <Native Title> [Romanized Title]`. Brackets remain, but will be removed later.
+11. Any artists besides the first listed artist are trimmed. Separators are `&`, ` x `, ` X `. Solves `Artist 1 X Artist 2 - Title`
+12. Bracket removal. All brackets are removed (`([{}])`). Paired brackets are removed first. If the title is non romanized, content inside the first set of brackets is preserved. If title IS romanized, content inside brackets is removed. Solves `Artist - Title (Official Audio)`
+13. Garbage word removal. A flat deletion of: `hd, version, original, official, 4k, uhd, upgraded, upscaled, remastered, lyrics`. Very few song titles contain any of these words. Solves `Artist - Title Lyrics`
+14. Featuring cut. Any characters after `ft, feat, featuring` is removed. Again, very few song titles are affected by this. Solves `Artist - Title feat Artist 2`
+15. Hashtag removal. Hashtags (`#`) and any characters attached after them are removed. Solves `Artist - Title #Coachella2026`
+16. Double quotes removed. At this point, they should all be the ASCII `U+0022`, but non ASCII quotes are rechecked here, just in case.
+17. Contractions (`Don't, Can't, Won't, etc.`) are protected from removal. This prevents their single quote from being deleted in step 20.
+18. Single quote title solving. With Kpop especially, it's often hard to fine `Artist - Title` videos. Instead, they are often `Artist 'Title'`. If no separator exists, the first group of single quote enclosed characters become the title. Solves `Artist 'Title'`
+19. Paired single quotes are removed, keeping their content.
+20. Unattached single quotes are removed, except those touching a letter.
+21. Contractions masked in step 16 are unmasked
+22. Emojis and symbols (like dingbats) are removed. This can sometimes fail, it's wrapped in a try block.
+23. Whitespace is shrunk to a single space wherever applicable.
+24. Multiple artist outlier handling. Removes anything in the artist block after a comma. Solves `Artist, Artist 2 - Title`
+25. Illegal windows characters are replaced with a space, and then whitespace collapse is run again.
+
+All of that happens almost instantly, to give you the suggested title. If you use the `f` command, all of this gets re run on the flipped title.
 
 # Local File Features
 
@@ -177,7 +212,8 @@ The loudnorm/EQ override box allows you to add or change the loudnorm and equali
 
 # Troubleshooting
 [Python Version Specific Troubleshooting](#python-version-specific-troubleshooting)\
-[General Troubleshooting (Both python and exe versions)](#general-troubleshooting)
+[General Troubleshooting (Both python and exe versions)](#general-troubleshooting)\
+[Known Issues](#known-issues)
 
 > [!WARNING]
 Before doing ANY of these troubleshooting steps, check for a newer yt-msd version! If the problem is related to yt-msd itself, chances are that I've found and fixed it already! Also, CLOSE yt-msd and reopen it! If you've had it running for a long time, it could start acting weird.
@@ -263,5 +299,12 @@ You are either getting rate limited by Youtube, or yt-dlp or ffmpeg isn't instal
 ### GUI Bugs
 Make sure your graphics drivers are updated. Restart yt-msd. If the issues persist, delete `gui-config.json` (WHILE YT-MSD IS CLOSED).
 
+### Won't fetch a stream, won't play anything, very laggy
+This is caused by windows audio drivers getting messed up. Check your audio device. If it's blank, then windows is trying to play audio on a device where the driver has crashed. You'll notice that other applications will act similar when playing sound. This is a problem with windows, because it doesn't have error handling if the audio pipeline fails. Unplug the problematic audio device and try again. If it still fails, your audio device is probably dying. (This happens to me occasionally when I use my half dead earbuds)
+
+## Known Issues
+
+These are things that are either not easily reproduceable (so I can't easily figure out the cause) or things that might seem like bugs, but are features (heh)
+
 ### Youtube streams won't start immediately after startup
-This is an uncommon issue that sometimes happens if you try to play a youtube video while yt-msd is already fetching the stream during the startup sequence. I'm not able to reproduce it, it seems to happen randomly. Either wait a bit (30 seconds or so) while spam clicking the play button, or close yt-msd and restart it.
+This is an uncommon issue that sometimes happens if you try to play a youtube video while yt-msd is already fetching the stream during the startup sequence. I'm not able to reproduce it, it seems to happen randomly. Either wait a bit (30 seconds or so) while spam clicking the play button, or close yt-msd and restart it. This may or may not have been fixed in the 3.3 update, or it might have just gotten less common.
