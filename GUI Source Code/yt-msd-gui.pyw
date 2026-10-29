@@ -493,20 +493,6 @@ def _add_placeholder_tag(filepath):
     except Exception:
         pass
 
-def _has_placeholder_tag(filepath):
-    if not os.path.exists(filepath): return False
-    ext = os.path.splitext(filepath)[1].lower()
-    try:
-        if ext == ".mp3":
-            audio = ID3(filepath)
-            return any('YTMSD_PENDING_VERIFY' in str(c.text) for c in audio.getall('COMM'))
-        elif ext == ".m4a":
-            tags = EasyMP4(filepath)
-            return 'YTMSD_PENDING_VERIFY' in tags.get('comment', [])
-    except Exception:
-        return False
-    return False
-
 def _remove_placeholder_tag(filepath):
     if not os.path.exists(filepath): return
     ext = os.path.splitext(filepath)[1].lower()
@@ -1219,21 +1205,6 @@ def _is_permanent_download_error(message):
     return any(marker in text for marker in _PERMANENT_DOWNLOAD_ERROR_MARKERS)
 
 
-def check_vlc_available():
-    if not _VLC_MODULE_AVAILABLE or vlc is None:
-        return False, getattr(sys.modules[__name__], '_VLC_IMPORT_ERROR', 'python-vlc not available')
-    try:
-        instance = vlc.Instance('--quiet', '--no-video')
-        if instance is None:
-            return False, "libvlc.dll not found. Please install VLC Media Player."
-        player = instance.media_player_new()
-        if player is None:
-            return False, "Failed to create VLC media player instance."
-        return True, "OK"
-    except Exception as e:
-        return False, str(e)
-
-
 def measure_loudness(filepath):
     command = [
         _ffmpeg_binary(),
@@ -1528,118 +1499,6 @@ def run_loudness_normalization(folder_path, skip_files=None):
     print(f"  {Colors.GREEN}Success: {completed}{Colors.END} | {Colors.RED}Failed: {failed}{Colors.END}\n")
     return completed, failed
 
-def trim_silence_file(index, total, filepath):
-    _safe_print(f"[{index}/{total}] {Colors.CYAN}Trimming silence:{Colors.END} {filepath.name}...")
-    suffix = filepath.suffix.lower()
-    artist, title = read_metadata_tags(filepath)
-
-    try:
-        temp_fd, temp_path = tempfile.mkstemp(suffix=suffix)
-        os.close(temp_fd)
-    except Exception as e:
-        return False, filepath.name, f"Failed to create temp file: {e}"
-    
-    # Silence trimming only. The loudnorm/EQ override is never applied to this pass.
-    af_chain = build_af_chain(include_pad=False)
-    command = [_ffmpeg_binary(), "-nostdin", "-y", "-i", str(filepath), "-af", af_chain]
-    
-    if suffix == ".mp3":
-        command += ["-codec:a", "libmp3lame", "-b:a", BITRATE]
-    elif suffix == ".m4a":
-        command += ["-codec:a", "aac", "-b:a", BITRATE]
-    else:
-        command += ["-b:a", BITRATE]
-    
-    command += ["-map_metadata", "0"]
-    if suffix == ".m4a":
-        command += ["-movflags", "+faststart"]
-    command.append(temp_path)
-    
-    try:
-        startupinfo = None
-        if sys.platform == "win32":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        result = subprocess.run(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            startupinfo=startupinfo
-        )
-    except Exception as e:
-        try: os.remove(temp_path)
-        except: pass
-        return False, filepath.name, f"FFmpeg execution failed: {e}"
-    
-    if result.returncode != 0:
-        try: os.remove(temp_path)
-        except: pass
-        return False, filepath.name, result.stderr
-    
-    try:
-        os.replace(temp_path, str(filepath))
-    except Exception as e:
-        return False, filepath.name, f"Failed to replace original file with temp: {e}"
-    
-    if (artist or title):
-        write_metadata_tags(filepath, artist or "", title or "")
-    
-    return True, filepath.name, None
-
-def run_silence_trim(folder_path, skip_files=None):
-    print(f"\n{Colors.CYAN}{Colors.BOLD}====================================={Colors.END}")
-    print(f"{Colors.CYAN}{Colors.BOLD}=== SILENCE TRIM PASS ==============={Colors.END}")
-    print(f"{Colors.CYAN}{Colors.BOLD}====================================={Colors.END}\n")
-    
-    if not SILENCE_TRIM:
-        print(f"{Colors.YELLOW}[!] Silence trimming is disabled in settings.{Colors.END}")
-        print(f"{Colors.DIM}    Skipping silence trim pass.{Colors.END}\n")
-        return 0, 0
-
-    if not check_ffmpeg_available():
-        print(f"{Colors.YELLOW}[!] FFmpeg was not found in your system's PATH.{Colors.END}")
-        print(f"{Colors.DIM}    Skipping silence trim pass.{Colors.END}\n")
-        return 0, 0
-    
-    extensions = TAGGABLE_EXTENSIONS
-    files = sorted([f for f in folder_path.iterdir() if f.is_file() and f.suffix.lower() in extensions])
-
-    # Filter out files that were already tagged before the renaming pass started
-    if skip_files:
-        pre_skip_count = len([f for f in files if f in skip_files])
-        files = [f for f in files if f not in skip_files]
-        if pre_skip_count:
-            print(f"{Colors.DIM}Skipping {pre_skip_count} already-tagged file(s) from silence trim.{Colors.END}")
-
-    if not files:
-        print(f"{Colors.YELLOW}No MP3 or M4A files found to trim.{Colors.END}\n")
-        return 0, 0
-
-    print(f"{Colors.GREEN}Trimming silence on {len(files)} files with {MAX_WORKERS} worker threads...{Colors.END}")
-    print(f"{Colors.DIM}Threshold: {SILENCE_THRESHOLD} | Min silence duration: {SILENCE_DURATION}s | Silence kept: {SILENCE_KEEP}s{Colors.END}\n")
-    
-    completed = 0
-    failed = 0
-    
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(trim_silence_file, idx, len(files), file)
-                   for idx, file in enumerate(files, 1)]
-        for future in as_completed(futures):
-            success, filename, error = future.result()
-            if success:
-                completed += 1
-                _safe_print(f"  {Colors.GREEN}✔ Trimmed:{Colors.END} {filename}")
-            else:
-                failed += 1
-                _safe_print(f"\n  {Colors.RED}✘ Failed to trim {filename}:{Colors.END}")
-                _safe_print(f"{Colors.DIM}{error}{Colors.END}\n")
-    
-    print(f"\n{Colors.CYAN}{Colors.BOLD}Silence Trim Complete!{Colors.END}")
-    print(f"  {Colors.GREEN}Success: {completed}{Colors.END} | {Colors.RED}Failed: {failed}{Colors.END}\n")
-    return completed, failed
-
 def run_integrated_renamer_cli():
     if sys.platform == "win32":
         os.system("")
@@ -1705,7 +1564,6 @@ def run_integrated_renamer_cli():
     renamed_count, tagged_count, skipped_count, already_formatted_count = clean_and_tag_files(folder, start_auto=start_auto)
 
     norm_completed, norm_failed = 0, 0
-    trim_completed, trim_failed = 0, 0
 
     try:
         if norm_mode == 'on':
@@ -1733,9 +1591,6 @@ def run_integrated_renamer_cli():
     if norm_completed or norm_failed:
         print(f"  {Colors.GREEN}Volume-equalized:           {Colors.END} {norm_completed}  "
               f"{Colors.RED}(failed: {norm_failed}){Colors.END}")
-    if trim_completed or trim_failed:
-        print(f"  {Colors.GREEN}Silence-trimmed:            {Colors.END} {trim_completed}  "
-              f"{Colors.RED}(failed: {trim_failed}){Colors.END}")
     print(f"{Colors.CYAN}{Colors.BOLD}{'═' * 50}{Colors.END}")
     print(f"\n{Colors.CYAN}{Colors.BOLD}All processes complete.{Colors.END}")
 
@@ -8641,10 +8496,6 @@ class MainApp(QMainWindow):
         self._on_status_update("Settings, recent data and sync chains reset to defaults.", False, "#3B8ED0")
 
     # ── EXPORT / IMPORT PACKAGES ──────────────────────────────────────────────
-    def open_export_dialog(self):
-        dialog = ExportDialog(self)
-        dialog.exec()
-
     def start_export(self, options: dict):
         """Build the .zip package on a worker thread: copying music or reading a
         config off a slow drive must never block the window."""
@@ -10074,14 +9925,6 @@ class MainApp(QMainWindow):
             pass
         items.sort(key=lambda x: (not x['is_dir'], x['name'].lower()))
         return items
-
-    def _build_local_rows(self, items):
-        """Render a list that is already fully known in one pass. Folder switches use
-        _start_local_render, which streams the rows in batch by batch; this is kept for
-        callers that have the whole listing in hand."""
-        self._reset_local_rows()
-        self._append_local_rows(items or [])
-        self._finish_local_render()
 
     def _reset_local_rows(self):
         """Tear down the rows of the folder being replaced. What was selected survives,
@@ -11549,12 +11392,6 @@ class MainApp(QMainWindow):
             self.run_mp3_renamer()
         if getattr(self, 'run_custom_script', False):
             self._run_custom_post_download_script()
-
-    def copy_download_path_to_clipboard(self):
-        path = self.path_combo.currentText()
-        if path:
-            QApplication.clipboard().setText(path)
-            self._on_status_update(f"Copied download path to clipboard: {path}", False, "#3B8ED0")
 
     def on_run_renamer_toggled(self, checked):
         self.run_renamer = checked
