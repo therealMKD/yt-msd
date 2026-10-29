@@ -28,6 +28,8 @@ except ImportError:
     winreg = None
 import webbrowser
 import urllib.request
+import urllib.parse
+import html
 import io
 try:
     import vlc
@@ -355,7 +357,14 @@ def clean_youtube_title(filename):
 
     title = re.sub(r'[\(\)\{\}\[\]]', '', title)
     title = re.sub(r'\b(hd|version|original|official|4k|uhd|upgraded|upscaled|remastered|lyrics)\b', '', title, flags=re.IGNORECASE)
-    title = re.compile(r'\b(ft|feat|featuring)\b\.?', re.IGNORECASE).split(title)[0]
+    # Strip "feat/ft/featuring" credits only from the title side so an artist
+    # whose name begins with those letters (e.g. "FT Island") is not destroyed.
+    if " - " in title:
+        _feat_re = re.compile(r'\s*\b(ft|feat|featuring)\b\.?.*$', re.IGNORECASE)
+        _artist_part, _title_part = title.split(" - ", 1)
+        title = f"{_artist_part.strip()} - {_feat_re.split(_title_part)[0].strip()}"
+    else:
+        title = re.compile(r'\s*\b(ft|feat|featuring)\b\.?.*$', re.IGNORECASE).split(title)[0]
     title = re.sub(r'#\S+', '', title)
 
     # Quote handling:
@@ -776,11 +785,7 @@ def clean_and_tag_files(folder_path, start_auto=False):
 
 def check_ffmpeg_available():
     try:
-        startupinfo = None
-        if sys.platform == "win32":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        subprocess.run([_ffmpeg_binary(), "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, check=True, startupinfo=startupinfo)
+        subprocess.run([_ffmpeg_binary(), "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, check=True, **_hidden_window_kwargs())
         return True
     except Exception:
         return False
@@ -1216,11 +1221,6 @@ def measure_loudness(filepath):
         "-"
     ]
     try:
-        startupinfo = None
-        if sys.platform == "win32":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            
         result = subprocess.run(
             command,
             stdin=subprocess.DEVNULL,
@@ -1229,7 +1229,7 @@ def measure_loudness(filepath):
             text=True,
             encoding='utf-8',
             errors='ignore',
-            startupinfo=startupinfo
+            **_hidden_window_kwargs()
         )
         if result.returncode != 0:
             return None, None, f"FFmpeg exited with code {result.returncode}"
@@ -1237,7 +1237,6 @@ def measure_loudness(filepath):
         stderr_output = result.stderr
         json_match = re.search(r'\{\s*"input_i".*?\}', stderr_output, re.DOTALL)
         if json_match:
-            import json
             data = json.loads(json_match.group(0))
             input_i = float(data.get("input_i", TARGET_LUFS))
             input_tp = float(data.get("input_tp", TRUE_PEAK))
@@ -1282,14 +1281,10 @@ def _probe_format_block(filepath):
     '-v' for option 'nostdin'" and no duration was ever returned. Closing stdin with
     DEVNULL, as this does, is what that switch was for."""
     try:
-        startupinfo = None
-        if sys.platform == "win32":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         cmd = [_ffprobe_binary(), "-v", "quiet", "-print_format", "json", "-show_format", str(filepath)]
         result = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, encoding='utf-8', errors='ignore',
-                                startupinfo=startupinfo)
+                                **_hidden_window_kwargs())
         if result.returncode == 0 and result.stdout:
             data = json.loads(result.stdout)
             return data.get('format') or None
@@ -1347,8 +1342,9 @@ def normalize_file(index, total, filepath, custom_norm_cmd=None):
     suffix = filepath.suffix.lower()
     artist, title = read_metadata_tags(filepath)
 
-    # Measure original duration before processing
-    orig_duration = _get_audio_duration(filepath)
+    # Measure original duration only when silence-trim reporting needs it (saves a
+    # ffprobe subprocess per file when trimming is off).
+    orig_duration = _get_audio_duration(filepath) if SILENCE_TRIM else None
     
     input_i, input_tp, err = measure_loudness(filepath)
     if err:
@@ -1401,18 +1397,13 @@ def normalize_file(index, total, filepath, custom_norm_cmd=None):
     command.append(temp_path)
     
     try:
-        startupinfo = None
-        if sys.platform == "win32":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            
         result = subprocess.run(
             command,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            startupinfo=startupinfo
+            **_hidden_window_kwargs()
         )
     except Exception as e:
         try: os.remove(temp_path)
@@ -1430,7 +1421,7 @@ def normalize_file(index, total, filepath, custom_norm_cmd=None):
         return False, filepath.name, f"Failed to replace original file with temp: {e}"
     
     # Report silence removal stats (only meaningful when the trim filters ran)
-    new_duration = _get_audio_duration(filepath)
+    new_duration = _get_audio_duration(filepath) if SILENCE_TRIM else None
     if SILENCE_TRIM and orig_duration is not None and new_duration is not None:
         total_removed = orig_duration - new_duration
         pad_added = SILENCE_PAD_DUR if SILENCE_PAD_DUR > 0 else 0.0
@@ -1978,8 +1969,9 @@ class DraggableQueueWidget(QWidget):
         if dst_idx is None:
             dst_idx = self.layout().count() - 1
         if src_idx != dst_idx and dst_idx >= 0:
-            self.order_changed.emit()
-            # Emit signal with indices – parent will do the actual reorder
+            # Store the indices then emit once - the handler reads _pending_reorder
+            # to do the actual reorder. Emitting before the store would fire the
+            # handler with the previous drop's stale indices.
             self._pending_reorder = (src_idx, dst_idx)
             self.order_changed.emit()
         event.acceptProposedAction()
@@ -2130,8 +2122,6 @@ def get_current_wifi_ssid() -> Optional[str]:
     if sys.platform != 'win32':
         return None
     try:
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         res = subprocess.run(
             ["netsh", "wlan", "show", "interfaces"],
             stdout=subprocess.PIPE,
@@ -2139,7 +2129,7 @@ def get_current_wifi_ssid() -> Optional[str]:
             text=True,
             encoding='utf-8',
             errors='ignore',
-            startupinfo=startupinfo
+            **_hidden_window_kwargs()
         )
         if res.returncode == 0:
             for line in res.stdout.splitlines():
@@ -2160,7 +2150,6 @@ def is_run_on_startup_enabled() -> bool:
     if sys.platform != 'win32':
         return False
     try:
-        import winreg
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
         try:
             val, _ = winreg.QueryValueEx(key, "yt-msd")
@@ -2178,7 +2167,6 @@ def set_run_on_startup(enable: bool) -> bool:
     if sys.platform != 'win32':
         return False
     try:
-        import winreg
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_ALL_ACCESS)
         app_name = "yt-msd"
         if enable:
@@ -3390,7 +3378,6 @@ class SyncRemovableWorker:
     def sync_local_folders(src_dir: Path, dest_dir: Path, deletion_mode: str = 'mirror',
                            status_cb: Optional[Callable[[str], None]] = None,
                            progress_cb: Optional[Callable[[int, int, str, int, int], None]] = None) -> Tuple[bool, str, int, int]:
-        import shutil
         progress_cb = make_throttled_progress_cb(progress_cb)
         if not src_dir.is_dir():
             return False, f"Source directory '{src_dir}' does not exist.", 0, 0
@@ -8847,7 +8834,6 @@ class MainApp(QMainWindow):
         class ResetHandle(QSplitterHandle):
             _last_click = 0
             def mousePressEvent(self, e):
-                import time
                 now = time.time()
                 if now - ResetHandle._last_click < 0.35:
                     sp = self.splitter()
@@ -9310,9 +9296,8 @@ class MainApp(QMainWindow):
         accent_fg = "#000000" if brightness > 150 else "#ffffff"
         
         # Write checkmark SVG to a temp file
-        import tempfile, os as _os
         checkmark_svg = f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="{accent_fg}" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>'
-        if not hasattr(self, '_checkmark_svg_path') or not _os.path.exists(self._checkmark_svg_path):
+        if not hasattr(self, '_checkmark_svg_path') or not os.path.exists(self._checkmark_svg_path):
             tmp = tempfile.NamedTemporaryFile(suffix='.svg', delete=False, mode='w', encoding='utf-8')
             tmp.write(checkmark_svg)
             tmp.close()
@@ -9324,7 +9309,7 @@ class MainApp(QMainWindow):
         
         # Write downarrow SVG to a temp file
         downarrow_svg = f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="{accent_fg}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>'
-        if not hasattr(self, '_downarrow_svg_path') or not _os.path.exists(self._downarrow_svg_path):
+        if not hasattr(self, '_downarrow_svg_path') or not os.path.exists(self._downarrow_svg_path):
             tmp = tempfile.NamedTemporaryFile(suffix='.svg', delete=False, mode='w', encoding='utf-8')
             tmp.write(downarrow_svg)
             tmp.close()
@@ -10907,7 +10892,6 @@ class MainApp(QMainWindow):
         st = "\uE73E " if q['status'] == "Finished" else ("\uE896 " if q['status'] == "Downloading" else "")
         t = q['video'].get('title', 'Unknown')
         if len(t) > 40: t = t[:37] + "..."
-        import html
         t_escaped = html.escape(t)
         
         lbl = QLabel(f"<span style='font-family: \"Segoe MDL2 Assets\";'>{st}</span> {t_escaped}")
@@ -10945,7 +10929,6 @@ class MainApp(QMainWindow):
                 st = "\uE73E " if q['status'] == "Finished" else ("\uE896 " if q['status'] == "Downloading" else "")
                 t = q['video'].get('title', 'Unknown')
                 if len(t) > 40: t = t[:37] + "..."
-                import html
                 labels[0].setText(f"<span style='font-family: \"Segoe MDL2 Assets\";'>{st}</span> {html.escape(t)}")
             new_name = "queueItemFinished" if q['status'] == "Finished" else "queueItemPending"
             if placeholder.objectName() != new_name:
@@ -11093,7 +11076,6 @@ class MainApp(QMainWindow):
                 self.status_signal.emit(f"Batch complete (stopped early: {e}).", False, "#E31E24")
 
         def _run_batch():
-            import time
             from concurrent.futures.thread import ThreadPoolExecutor  # see the note at the top
 
             with self.active_downloads_lock:
@@ -12400,7 +12382,6 @@ class MainApp(QMainWindow):
                 if paused_at_start:
                     self.vlc_player.audio_set_mute(True)
                     self.vlc_player.play()
-                    import time
                     time.sleep(0.25)
                     self.vlc_player.set_pause(1)
                     self.vlc_player.set_position(0)
@@ -12463,7 +12444,6 @@ class MainApp(QMainWindow):
         return super().eventFilter(obj, event)
 
     def open_search_on_youtube(self):
-        import webbrowser, urllib.parse
         query = self.search_entry.text().strip()
         if not query: return
         if 'youtube.com' in query or 'youtu.be' in query:
@@ -12809,7 +12789,7 @@ class MainApp(QMainWindow):
 
         try:
             url = f"https://i.ytimg.com/vi/{vid_id}/mqdefault.jpg"
-            with urllib.request.urlopen(url) as req:
+            with urllib.request.urlopen(url, timeout=10) as req:
                 data = req.read()
                 if self.thumbnail_cache_size + len(data) > 256 * 1024 * 1024:
                     self.thumbnail_cache.clear(); self.thumbnail_cache_size = 0
