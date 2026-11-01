@@ -1,4 +1,4 @@
-# yt-msd GUI Readme
+# Yt-msd GUI Readme
 
 This is the full readme for the GUI version, with information on every single feature inside of yt-msd. For the CLI readme, go back to the main readme, at the bottom.
 
@@ -298,6 +298,9 @@ You are either getting rate limited by Youtube, or yt-dlp or ffmpeg isn't instal
 
 ### GUI Bugs
 Make sure your graphics drivers are updated. Restart yt-msd. If the issues persist, delete `gui-config.json` (WHILE YT-MSD IS CLOSED).
+
+### Program throws error dialog boxes, but doesn't actually crash
+Make an issue report, and tell me how you created the error. Since adding the error messages, I've been occasionally finding silent errors in certain places, that never crash the program or show up otherwise. Your only option is to not do whatever is causing the errors, and wait for me to fix the issue in a bugfix.
 
 ### Won't fetch a stream, won't play anything, very laggy
 This is caused by windows audio drivers getting messed up. Check your audio device. If it's blank, then windows is trying to play audio on a device where the driver has crashed. You'll notice that other applications will act similar when playing sound. This is a problem with windows, because it doesn't have error handling if the audio pipeline fails. Unplug the problematic audio device and try again. If it still fails, your audio device is probably dying. (This happens to me occasionally when I use my half dead earbuds)
