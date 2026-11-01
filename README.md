@@ -9,9 +9,15 @@
 > 
 > If you want to contribute to this project, you're welcome to use an AI model, HOWEVER, you **MUST** say that in the pull request, along with a detailed explanation of your change, to prove to me you understand it.
 
+## What is this, and what does it do?
+
+Yt-msd is the most powerful yt-dlp wrapper for music. Other yt-dlp wrappers exist, but none of them are specific to music, and none of them have the same features as yt-msd. Yt-msd allows you to put your music in a normal youtube playlist, and then download that playlist. It supports multithreaded batch downloading, and also has a built in renamer/normalizer program to rename your files correctly, and normalize the audio to the same level, without compromising your music's nuances. 
+
+It also has a seamless sync feature letting you sync entire folders between yt-msd clients on your local network, and auto sync to removable drives, like MP3 players. You can search youtube inside the program, play local files, and songs from youtube, and open unlisted or public playlists. All of this is bundled into one application, programmed in Python with Pyside6, allowing for very fast, high performance operation, using less RAM than Windows Explorer.
+
 ## Why did I make this program?
 
-I don't want to deal with spotify's ads (Or pay for premium), and youtube playlists don't have working shuffle features, so I started downloading the mp3s of my playlist with yt-dlp. That was still annoying to do from the command line, so I created this. This program WILL function as a bare bones music player, but I would highly recommend using a dedicated program (I use MusicBee) that has more options. (Note, there is a plugin for MusicBee that directly integrates yt-msd into it.) However, if you just want to have your music in a folder and listen to it, this will do it for you. 
+I don't want to deal with spotify's ads (Or pay for premium), and youtube playlists don't have working shuffle features, so I started downloading the mp3s of my playlist with yt-dlp. That was still annoying to do from the command line, so I created this. This program WILL function as a bare bones music player, but I would highly recommend using a dedicated program (I use MusicBee) that has more options. (Note, there is a plugin for MusicBee that directly integrates yt-msd into it.)
 
 ### Table of Contents:
 
