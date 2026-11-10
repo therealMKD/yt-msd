@@ -3,7 +3,7 @@
 This is the full readme for the GUI version, with information on every single feature inside of yt-msd. For the CLI readme, go back to the main readme, at the bottom.
 
 >[!WARNING]
->I'm currently in the process of a few minor updates, along with other stuff. Because of that, this readme is not complete, and some information may be subject to change. This warning will be removed once the readme is finished. I'm writing this readme by hand, because I refuse to use AI for my docs (ironic since the program is vibe coded), so bear with me.
+>I'm currently in the process of a few minor updates, along with other stuff. Because of that, this readme is not complete, and some information may be subject to change. This warning will be removed once the readme is finished. I'm writing this readme by hand, because I refuse to use AI for my docs (ironic since the program is vibe coded), so bear with me. I'm also currently waiting on my winget package to be accepted (So far it's been 2 weeks) and I won't be making any changes to this readme until that happens.
 
 ## Table of Contents
 This is the main table of contents, these main sections also have their own tables of contents for subsections.
