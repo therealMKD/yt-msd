@@ -24,8 +24,7 @@
 # PySide6 version of yt-msd
 # Programmed with Qwen, if you don't like it, don't use it.
 # Yeah it's all one file, what are you going to do about it?
-# Modular file systems are for sane people, and this repo operates on the philosophy of "F it, we ball"
-# I'm so edgy and funny, aren't I? This line and the 3 before it are the only human written lines in this program
+# Modular file systems are for sane people
 
 import os
 import re
@@ -1148,6 +1147,79 @@ def run_yt_dlp_json(args, timeout=YTDLP_EXTRACT_TIMEOUT):
         tail = [line for line in (result_stderr or "").splitlines() if line.strip()]
         raise RuntimeError(tail[-1] if tail else f"yt-dlp exited with code {proc.returncode}")
     return json.loads(result_stdout or "")
+
+
+# A result row's channel name is read out of the search entry, and a flat search entry
+# carries only what YouTube's search response happened to include. Asked the same query
+# twice in a row, yt-dlp has answered with channel names on all fifteen entries and with
+# none at all - the entry reduced to id / title / url / duration, with channel,
+# channel_url, uploader and uploader_id all null. Which of the two shapes YouTube serves
+# is not something the GUI can decide: pinning youtube:player_client on the search
+# changed nothing, every client following whatever that run was already going to be. A
+# search is therefore retried when it comes back nameless, and a row reads whichever
+# field the entry did manage to carry.
+SEARCH_CHANNEL_RETRIES = 2
+# A retry is a bonus on top of the search that already answered, so it is not waited on
+# as long as the search itself is.
+SEARCH_RETRY_TIMEOUT = 90
+
+
+def entry_channel_name(video):
+    """The channel a search entry names for its row, or '' when the entry names none."""
+    for key in ('channel', 'uploader', 'artist', 'byline'):
+        value = video.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    # The responses that name an owner without spelling it out still give the handle.
+    for key in ('uploader_id', 'channel_id'):
+        value = video.get(key)
+        handle = value.strip() if isinstance(value, str) else ""
+        if handle.startswith("@") and len(handle) > 1:
+            return handle[1:]
+    for key in ('uploader_url', 'channel_url'):
+        if isinstance(video.get(key), str):
+            found = re.search(r"/@([^/?#]+)", video[key])
+            if found:
+                return found.group(1)
+    # A /channel/UC... link is an id, not a name, and is not used as one.
+    return ""
+
+
+def run_yt_dlp_text_search(query, status_cb=None, retries=SEARCH_CHANNEL_RETRIES,
+                           retry_timeout=SEARCH_RETRY_TIMEOUT):
+    """The flat entries of a typed-in search, retried while no entry names a channel.
+
+    Retrying costs a search only in the case worth paying for: an answer where not one
+    entry has an owner, which is the answer that strips a channel name and usually a
+    duration off every row it produced, and which a second request often answers rich
+    instead of sparse. An answer with a channel somewhere is taken as it stands - a row
+    without a channel next to nine with one is a track YouTube really does list without
+    an owner, and asking again cannot change that.
+    """
+    best = []
+    for attempt in range(1, retries + 2):
+        # Only the answer the search is waiting for is waited on patiently. A retry is a
+        # bonus, and a retry that is slow or gives up must not cost the results already in
+        # hand - which is why the first attempt's errors still fly as they always did.
+        try:
+            info = run_yt_dlp_json(["--flat-playlist", "-J", f"ytsearch15:{query}"],
+                                   timeout=YTDLP_EXTRACT_TIMEOUT if attempt == 1
+                                   else retry_timeout)
+        except Exception:
+            if attempt == 1:
+                raise
+            break
+        entries = [e for e in ((info or {}).get('entries') or [])
+                   if isinstance(e, dict) and e.get('id')]
+        if not entries:
+            return best or entries
+        if any(entry_channel_name(entry) for entry in entries):
+            return entries
+        if len(entries) > len(best):
+            best = entries
+        if attempt <= retries and status_cb is not None:
+            status_cb("Searching... (results with no channels, asking again)")
+    return best
 
 
 def stream_cli_args():
@@ -10813,8 +10885,8 @@ class MainApp(QMainWindow):
                     else:
                         res = [info] if info else []
                 else:
-                    info = run_yt_dlp_json(["--flat-playlist", "-J", f"ytsearch15:{query}"])
-                    res = [e for e in info['entries'] if e.get('id')]
+                    res = run_yt_dlp_text_search(
+                        query, status_cb=lambda text: self.status_signal.emit(text, False, "#3B8ED0"))
                         
                 if is_playlist and ('youtube.com' in query or 'youtu.be' in query):
                     title = info.get('title', query) if isinstance(info, dict) else query
@@ -10976,7 +11048,7 @@ class MainApp(QMainWindow):
         l.addWidget(cb, 1)
         
         # Channel name (to the left of duration/timestamp)
-        channel = video.get('channel') or video.get('uploader') or ''
+        channel = entry_channel_name(video)
         if channel:
             if len(channel) > 25:
                 channel = channel[:23] + '…'
