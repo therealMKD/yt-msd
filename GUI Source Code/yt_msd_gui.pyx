@@ -22,7 +22,10 @@
 # ---- END OF CYTHON HEADER - the unchanged yt-msd-gui.pyw source follows ----
 # Open Source Software under the Apache License, Version 2.0
 # PySide6 version of yt-msd
-# Programmed with Antigravity, if you don't like it, don't use it.
+# Programmed with Qwen, if you don't like it, don't use it.
+# Yeah it's all one file, what are you going to do about it?
+# Modular file systems are for sane people, and this repo operates on the philosophy of "F it, we ball"
+# I'm so edgy and funny, aren't I? This line and the 3 before it are the only human written lines in this program
 
 import os
 import re
@@ -1028,18 +1031,123 @@ def latest_yt_dlp_release():
         return ""
 
 
+# ---------------------------------------------------------------------------
+# Stream URL fetches that can be stopped mid-flight
+# ---------------------------------------------------------------------------
+# Resolving one track's stream URL is a yt-dlp run that takes seconds of network
+# time. It is worth stopping that run when something newer makes its answer
+# pointless - the listener clicked a different track, or started a new search -
+# because the URL is going to be thrown away either way, and a request that is no
+# longer wanted is still competing for the same network with the one that now
+# matters. Every yt-dlp run that resolves a stream URL registers itself here while
+# it runs, tagged with the track it is resolving and with the thread that started
+# it. resolve_stream_url() is the only caller that registers: search extraction and
+# downloading ask different questions and are not superseded this way.
+_stream_fetches_lock = threading.Lock()
+_stream_fetches = []                      # live stream URL resolutions
+_stream_fetch_owner = threading.local()   # .vid_id / .entries for the thread doing the resolving
+
+
+class StreamFetchSupersededError(RuntimeError):
+    """The stream URL fetch was stopped because a newer pick made its answer pointless.
+
+    Distinct from a track that failed to resolve: nothing went wrong with the track, the
+    listener simply stopped wanting it, and the caller must not report it as a failure.
+    """
+
+
+def begin_stream_fetch(vid_id):
+    """Open a cancellable window for this thread's resolution of vid_id's stream URL."""
+    _stream_fetch_owner.vid_id = vid_id
+    _stream_fetch_owner.entries = []
+
+
+def end_stream_fetch():
+    """Close it: a resolution that has finished cannot be cancelled and is not tracked."""
+    entries = getattr(_stream_fetch_owner, "entries", None)
+    _stream_fetch_owner.vid_id = None
+    _stream_fetch_owner.entries = None
+    if not entries:
+        return
+    with _stream_fetches_lock:
+        for entry in entries:
+            try:
+                _stream_fetches.remove(entry)
+            except ValueError:
+                pass
+
+
+def stream_fetch_vid_for_this_thread():
+    """The track this thread is resolving a URL for, or None for any other yt-dlp run."""
+    return getattr(_stream_fetch_owner, "vid_id", None)
+
+
+def note_stream_fetch_process(proc, vid_id):
+    """Called by run_yt_dlp_json for the process it just spawned on a stream URL resolution."""
+    if vid_id is None:
+        return
+    entry = {"proc": proc, "vid_id": vid_id, "superseded": False}
+    with _stream_fetches_lock:
+        _stream_fetches.append(entry)
+    entries = getattr(_stream_fetch_owner, "entries", None)
+    if entries is not None:
+        entries.append(entry)
+
+
+def stream_fetch_was_superseded():
+    """True when this thread's resolution was cancelled while its yt-dlp was still running."""
+    return any(entry["superseded"] for entry in (getattr(_stream_fetch_owner, "entries", None) or []))
+
+
+def cancel_stream_fetches(keep_vid_id=None):
+    """Kill the yt-dlp runs resolving stream URLs right now, and return how many were stopped.
+
+    keep_vid_id is the track that still owns an answer worth having - the one the user has just
+    picked, or the one still on the player - and its resolution is left to finish.
+    """
+    stopped = 0
+    with _stream_fetches_lock:
+        for entry in list(_stream_fetches):
+            if keep_vid_id is not None and entry["vid_id"] == keep_vid_id:
+                continue
+            # Marked before the kill so the waiting thread can tell its own cancellation apart
+            # from a yt-dlp failure, and does not report the track as unplayable.
+            entry["superseded"] = True
+            try:
+                entry["proc"].kill()
+                stopped += 1
+            except Exception:
+                pass
+    return stopped
+
+
 def run_yt_dlp_json(args, timeout=YTDLP_EXTRACT_TIMEOUT):
     """Run yt-dlp with -J and return the info dictionary it prints."""
     exe = find_yt_dlp_executable()
     if not exe:
         raise YtDlpMissingError("yt-dlp is not installed on this system")
-    result = subprocess.run([exe] + list(args), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+    # Popen rather than subprocess.run: a stream URL resolution is cancellable, and cancelling
+    # needs the handle to the process while it runs (see cancel_stream_fetches).
+    proc = subprocess.Popen([exe] + list(args), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, encoding="utf-8", errors="replace",
-                            timeout=timeout, env=_child_utf8_env(), **_hidden_window_kwargs())
-    if result.returncode != 0:
-        tail = [line for line in (result.stderr or "").splitlines() if line.strip()]
-        raise RuntimeError(tail[-1] if tail else f"yt-dlp exited with code {result.returncode}")
-    return json.loads(result.stdout or "")
+                            env=_child_utf8_env(), **_hidden_window_kwargs())
+    note_stream_fetch_process(proc, stream_fetch_vid_for_this_thread())
+    try:
+        result_stdout, result_stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.communicate()
+        except Exception:
+            pass
+        raise
+    if stream_fetch_was_superseded():
+        # The kill came from in here, not from yt-dlp giving up on the track.
+        raise StreamFetchSupersededError("Stream URL fetch superseded by a newer pick")
+    if proc.returncode != 0:
+        tail = [line for line in (result_stderr or "").splitlines() if line.strip()]
+        raise RuntimeError(tail[-1] if tail else f"yt-dlp exited with code {proc.returncode}")
+    return json.loads(result_stdout or "")
 
 
 def stream_cli_args():
@@ -1060,8 +1168,17 @@ def stream_cli_args():
 
 
 def resolve_stream_url(vid_id):
-    """(stream url, user agent) for a video id, or raises when there is no stream."""
-    info = run_yt_dlp_json(stream_cli_args() + [f"https://www.youtube.com/watch?v={vid_id}"])
+    """(stream url, user agent) for a video id, or raises when there is no stream.
+
+    The yt-dlp run is registered while it runs so that picking another track or starting a new
+    search can stop it; that raises StreamFetchSupersededError instead of handing back a URL
+    nobody is going to play.
+    """
+    begin_stream_fetch(vid_id)
+    try:
+        info = run_yt_dlp_json(stream_cli_args() + [f"https://www.youtube.com/watch?v={vid_id}"])
+    finally:
+        end_stream_fetch()
     url = info.get('url') if info else None
     if not url and info and 'formats' in info:
         for f in reversed(info['formats']):
@@ -8930,6 +9047,24 @@ class MainApp(QMainWindow):
             self.main_splitter.setSizes([300, 1340])
             self.content_splitter.setSizes([1000, 300])
 
+        # Where the two dividers sit is the user's choice, and nothing else. Every pane on the
+        # right of the local column gets an ignored horizontal size policy, which stops a pane
+        # from asking the splitter for width when its own contents grow - a longer "Playing:" or
+        # "Found N results" line, a download progress line naming five tracks, the queue label
+        # counting a thousand items, the first vertical scrollbar eating 16px of the results
+        # pane. Left as they were, each of those raised the pane's minimum width and QSplitter
+        # answered by moving the divider, so a search moved the local column out from under the
+        # user and the right pane was pushed past the edge of the window. With the policy ignored
+        # the panes keep whatever width they were given and the layout inside them absorbs the
+        # change instead: too much text is clipped by its own pane rather than shoveled into the
+        # neighbour's. The columns still resize with the window; only dragging a handle,
+        # double-clicking one, or toggling the local pane can move a divider now.
+        for _fixed_pane in (self.right_content,
+                            self.content_splitter.widget(0), self.content_splitter.widget(1)):
+            _pane_policy = _fixed_pane.sizePolicy()
+            _pane_policy.setHorizontalPolicy(QSizePolicy.Ignored)
+            _fixed_pane.setSizePolicy(_pane_policy)
+
         # Controls UI
         controls_frame = QFrame()
         c_layout = QVBoxLayout(controls_frame)
@@ -9170,7 +9305,7 @@ class MainApp(QMainWindow):
             for p in self.recent_playlists:
                 if isinstance(p, dict) and p.get("url") == self.last_search: is_pl = True; break
                 elif p == self.last_search: is_pl = True; break
-            self.perform_search(is_playlist=is_pl)
+            self.perform_search(is_playlist=is_pl, keep_fetch_vid_id=v_id)
 
 
     def toggle_local_pane(self):
@@ -10627,11 +10762,23 @@ class MainApp(QMainWindow):
             self.search_entry.setText(url)
             self.perform_search(is_playlist=True)
 
-    def perform_search(self, is_playlist=False):
+    def perform_search(self, is_playlist=False, keep_fetch_vid_id=None):
         query = self.search_entry.text()
         if not query: return
         # A new search is read from its first row, not from wherever the last one was left
         self._reset_results_scroll()
+        # A stream URL still being resolved is a request for the track the listener had just
+        # picked, and this search is what they want now: the read-ahead's successor and any
+        # earlier click are stopped rather than left to finish and be discarded. The resolution
+        # for the track still on the player is kept - that track is still playing, and if its
+        # URL died the watchdog is midway through reloading it. keep_fetch_vid_id covers the one
+        # caller that starts a fetch and a search back to back on purpose (the session restore
+        # preload), where nothing has been overridden and the fetch must be left alone.
+        keep = keep_fetch_vid_id or getattr(self, 'current_video_id', None)
+        self._cancel_superseded_stream_fetches(keep_vid_id=keep)
+        # Nothing is waiting on the player any more, so nothing owns it either.
+        self._pending_fetch_id = None
+        self._is_loading_stream = False
         self._on_status_update("Searching...", False, "#3B8ED0")
         self.search_btn.setEnabled(False)
         
@@ -11091,7 +11238,11 @@ class MainApp(QMainWindow):
     def start_batch_download(self):
         if self.is_downloading: return
         pending = [q for q in self.queue_items if q['status'] == "Pending"]
-        if not pending: return
+        if not pending:
+            # Said out loud on purpose: a press that changed nothing used to look exactly like
+            # a download that was taking its time to start.
+            self._on_status_update("Nothing in the queue to download.", False, "#FF8C00")
+            return
 
         self.is_downloading = True
         self.cancel_download = False
@@ -11254,6 +11405,14 @@ class MainApp(QMainWindow):
                 slot = take_start_slot()
                 if 0 < slot < max_workers:
                     time.sleep(0.4 * slot)
+
+                # Say this track has been asked for, now. yt-dlp still has to reach YouTube and
+                # find the stream before a single byte arrives - a few seconds on a good day,
+                # longer when a track has to be retried - and every line the status bar showed
+                # until then came from that resolution. A batch that had already started looked
+                # like it had not started at all, so the queue is reported as working from the
+                # moment each thread hands its track to yt-dlp.
+                self._dl_progress_percent(vid_id, "0%")
 
                 downloaded_file = None
                 failure = None
@@ -11497,6 +11656,15 @@ class MainApp(QMainWindow):
                         self.status_signal.emit(f"Batch completed ({len(remaining)} failed).", False, "#FF8C00")
                 else:
                     self.status_signal.emit("Batch complete!", False, "#1abd33")
+
+        # The button already reads "Downloading..." and the first queue rows have flipped, but
+        # the first thing the status bar could say about the work itself used to come from yt-dlp
+        # reporting a percentage - seconds after this, once an in-flight track had been resolved
+        # and had bytes moving. Nothing in between looked like a start, so the batch announces
+        # itself here, on the GUI thread, in the same click that asked for it.
+        self.dl_progress_signal.emit(f"(0/{self._batch_total_count}) Starting "
+                                     f"{self._batch_total_count} download"
+                                     f"{'s' if self._batch_total_count != 1 else ''}...")
 
         threading.Thread(target=bg_download, daemon=True).start()
         # Config save deferred until after the download thread is launched:
@@ -11808,6 +11976,19 @@ class MainApp(QMainWindow):
         self._prefetch_trigger_key = None
         with self._prefetch_lock:
             self._prefetched_streams.clear()
+
+    def _cancel_superseded_stream_fetches(self, keep_vid_id=None):
+        """Stop the yt-dlp runs resolving stream URLs for tracks the listener no longer wants.
+
+        Forgetting a URL that was already resolved is one thing (invalidate_next_track_prefetch);
+        this is the other half - a resolution that is still running. Its answer is going to be
+        discarded, it spends the seconds and the bandwidth a newer pick needs, and until now it
+        ran to completion regardless. keep_vid_id is the track whose answer is still wanted:
+        the one just clicked, or the one still on the player when a search is what superseded it.
+        A killed run raises StreamFetchSupersededError in its own thread, which is how that
+        thread knows to stay quiet rather than report the track as unplayable.
+        """
+        return cancel_stream_fetches(keep_vid_id=keep_vid_id)
 
     # ------------------------------------------------------------------
     # Keeping one track playing - a stream URL that stops answering
@@ -12127,6 +12308,12 @@ class MainApp(QMainWindow):
         def bg_renew():
             try:
                 url, user_agent = resolve_stream_url(vid_id)
+            except StreamFetchSupersededError:
+                # Another track was picked while this reload was running, and its own fetch owns
+                # the player now. The in-flight flag has to come off here: it is what lets the
+                # watchdog reload the next dead stream, and this refresh is never finishing.
+                self._stream_refetching = False
+                return
             except Exception as e:
                 print(f"Stream refresh error: {e}")
                 self._stream_refetching = False
@@ -12490,6 +12677,16 @@ class MainApp(QMainWindow):
         # dropped here instead of stopping this track after it ends.
         self._release_search_stop_after(vid_id)
         self._pending_fetch_id = vid_id
+        # This track now owns the player, so every stream URL still being resolved for another
+        # one - the read-ahead's pick, an earlier click, a reload of the track just replaced -
+        # is stopped instead of running to completion for an answer that is about to be thrown
+        # away. The resolution belonging to this track is left alone, including the prefetched
+        # URL that bg_fetch below may be about to pick up.
+        if self._cancel_superseded_stream_fetches(keep_vid_id=vid_id):
+            # A reload of the track just replaced was the only thing holding the "a refresh is
+            # in flight" flag, and that refresh can never finish now. Left set, it would make
+            # _renew_loaded_stream refuse to reload any later stream either.
+            self._stream_refetching = False
         self._is_loading_stream = True
         self._has_played_current = False
         self._ended_trigger = True
@@ -12538,6 +12735,10 @@ class MainApp(QMainWindow):
                 # picked up where it stopped.
                 self._note_loaded_stream(vid_id, url, user_agent, url_age)
                 self.playback_started_signal.emit(video.get('title', 'Unknown'), vid_id, paused_at_start)
+            except StreamFetchSupersededError:
+                # Stopped on purpose by a newer pick. That pick reports its own state, so this
+                # track is not a failure and the status line is not touched by it.
+                return
             except Exception as e:
                 print(f"Stream error: {e}")
                 if getattr(self, '_pending_fetch_id', None) == vid_id:
