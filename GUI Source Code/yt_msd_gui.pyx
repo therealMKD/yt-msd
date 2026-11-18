@@ -86,7 +86,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QSystemTrayIcon, QMenu, QFrame, QGridLayout,
                                QSizePolicy, QStyle, QToolTip, QStyleOption, QSpinBox, QProgressBar, QInputDialog)
 from PySide6.QtCore import Qt, Signal, QTimer, Slot, QPoint, QRect, QMargins, QThread, QEvent, QObject, QByteArray
-from PySide6.QtGui import QIcon, QPixmap, QImage, QAction, QColor, QPalette, QPainter, QPainterPath, QBrush, QFont, QDrag, QFontMetrics
+from PySide6.QtGui import QIcon, QPixmap, QImage, QAction, QColor, QPalette, QPainter, QPainterPath, QBrush, QFont, QDrag, QFontMetrics, QCursor
 from PySide6.QtCore import QMimeData, QUrl
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
@@ -2240,6 +2240,19 @@ THUMB_BOX_PAUSED = "#FF8C00"    # the box of the loaded track, held where it sto
 # rows carry as their play_state property - and the colour the thumbnail box wears for it.
 THUMB_BOX_COLORS = {"playing": THUMB_BOX_PLAYING, "paused": THUMB_BOX_PAUSED}
 
+# The play button on a thumbnail belongs to the pointer, not to the row: it is there while the
+# pointer is on that thumbnail and gone the moment it is not. Qt is what normally says when that
+# changes, and it can fail to say so. Scrolling the results list moves a row out from under a
+# pointer that never moved, and Qt sends no Leave for a pointer that did not move; a row torn
+# down by that same scroll still paints - with its button up - until its deleteLater lands, which
+# leaves the button of a row that no longer exists sitting on whatever row is now there; and a
+# row built by that same scroll can land under a pointer that never moved, for which Qt sends no
+# Enter at all. So the button is decided by asking the pointer where it is rather than by
+# trusting whichever event last arrived, and while a button is up that question is asked again on
+# this interval - a cost that only exists while a row is actually being pointed at.
+# See ThumbnailWidget._pointer_on_tile and MainApp._recheck_thumb_hover.
+THUMB_HOVER_RECHECK_MS = 200
+
 
 def cover_thumbnail(pixmap, width=THUMB_BOX_W, height=THUMB_BOX_H, radius=THUMB_IMG_RADIUS):
     """Scale a thumbnail until it covers width x height, cut back to that size keeping the
@@ -2299,16 +2312,91 @@ class ThumbnailWidget(QWidget):
         self.play_btn.clicked.connect(self.on_play)
         self.play_btn.hide()
         
+    def _pointer_on_tile(self):
+        """True when the pointer is on this tile right now.
+
+        Asked of the pointer rather than remembered from the last Enter or Leave, because a
+        row can be handed an Enter by a pointer that has since moved off it, and a row can be
+        left holding its button up by a departure Qt never announced: scrolling the results
+        list moves rows out from under a pointer that stayed where it was, and Qt sends no
+        Leave for a pointer that did not move. What a position cannot tell is another
+        application's window sitting on top of this one at the same coordinates - there the
+        pointer genuinely is over these pixels - and that case is left to Qt, which does report
+        it as a Leave once the cursor physically leaves the window.
+        """
+        try:
+            if not self.isVisible():
+                # A row the pane has scrolled out of, or one being torn down, is not under the
+                # pointer whatever its rectangle says, and its button must not survive it.
+                return False
+            return self.rect().contains(self.mapFromGlobal(QCursor.pos()))
+        except RuntimeError:
+            return False  # the row was torn down between the asking and the answering
+
+    def set_pointer_hover(self, on):
+        """Put the play button in the state the pointer warrants, and tell the app which row
+        owns it.
+
+        Only one row at a time may show the button. That is what limits the damage from a
+        departure Qt never reported: the stale button is taken off as soon as any other row is
+        pointed at, and MainApp._recheck_thumb_hover catches the case where no other row ever
+        is. The button is raised on its tile as it is shown, so a row rebuilt around it cannot
+        end up with the picture painted over the button.
+        """
+        try:
+            if on:
+                self.play_btn.show()
+                self.play_btn.raise_()
+                self.parent_app._note_thumb_hover(self)
+            else:
+                self.play_btn.hide()
+                self.parent_app._forget_thumb_hover(self)
+        except RuntimeError:
+            pass  # this row was torn down partway through claiming it
+
+    def refresh_play_button(self):
+        """Show the button when the pointer is on this tile and hide it when it is not, reading
+        the pointer rather than whichever event last happened to arrive."""
+        self.set_pointer_hover(self._pointer_on_tile())
+
+    def _refresh_after_layout(self):
+        """The deferred half of showEvent: the row is not yet where the layout is going to put
+        it, and the button has to be decided against the position it ends up at."""
+        try:
+            self.refresh_play_button()
+        except RuntimeError:
+            pass  # the row was torn down before the deferral landed
+
     def on_play(self, checked=False):
         self.parent_app.play_result(self.video)
         
     def enterEvent(self, event):
-        self.play_btn.show()
+        # Qt says the pointer came onto the row; the pointer is still what decides, because a
+        # row can be handed an Enter by a pointer that has already moved off it.
+        self.set_pointer_hover(self._pointer_on_tile())
         super().enterEvent(event)
         
     def leaveEvent(self, event):
-        self.play_btn.hide()
+        self.set_pointer_hover(False)
         super().leaveEvent(event)
+
+    def showEvent(self, event):
+        # A lazy build puts a row under a pointer that has not moved, and Qt sends no Enter for
+        # a pointer that has not moved - which is the row whose button never appears until the
+        # mouse is wiggled. Deferred because the layout has not placed the row yet, and skipped
+        # outright when the pointer is not even in this window, which is most rows most of the
+        # time: scrolling a list while the pointer sits over the player bar builds rows that
+        # have no hope of being pointed at.
+        window = self.window()
+        if window is not None and window.rect().contains(window.mapFromGlobal(QCursor.pos())):
+            QTimer.singleShot(0, self._refresh_after_layout)
+        super().showEvent(event)
+
+    def hideEvent(self, event):
+        # The row went away under the pointer - the pane scrolled it out, or it is being torn
+        # down - and nothing else is going to tell this row the pointer is no longer on it.
+        self.set_pointer_hover(False)
+        super().hideEvent(event)
 
     def _box_style(self, style):
         """Put the colour of the box on the tile rather than on the label. The label is a
@@ -6920,6 +7008,14 @@ class MainApp(QMainWindow):
         # The row currently carrying the playing/paused colour: (pane, key, state), or None.
         # Compared against on every player tick so the colour moves only when it has to.
         self._playback_box = None
+        # Which thumbnail row is holding its play button, and the timer that keeps asking the
+        # pointer whether that row is still the one it is on. The timer only runs while a row is
+        # holding the button, so nothing is polled while nobody is pointing at the list - see
+        # THUMB_HOVER_RECHECK_MS and _recheck_thumb_hover.
+        self._hover_tile = None
+        self._thumb_hover_timer = QTimer(self)
+        self._thumb_hover_timer.setInterval(THUMB_HOVER_RECHECK_MS)
+        self._thumb_hover_timer.timeout.connect(self._recheck_thumb_hover)
         self.is_shuffled = False
         self.shuffle_history = []
         self.shuffle_order = []
@@ -10654,6 +10750,71 @@ class MainApp(QMainWindow):
             return
         self._apply_playback_box(box)
 
+    def _note_thumb_hover(self, tile):
+        """Record that this thumbnail row is showing its play button, and take the button off
+        whichever row had it before.
+
+        One row at a time owns the button, which is what puts a limit on the departures Qt does
+        not report (see THUMB_HOVER_RECHECK_MS): a row left holding its button up by a scroll, a
+        teardown or a flick that produced no Leave loses it as soon as the pointer is genuinely
+        on another row. The recheck timer runs only while a row is holding the button, so a list
+        nobody is pointing at costs nothing.
+        """
+        previous = getattr(self, '_hover_tile', None)
+        if previous is not None and previous is not tile:
+            try:
+                previous.play_btn.hide()
+            except RuntimeError:
+                pass  # that row has already been torn down
+        self._hover_tile = tile
+        timer = getattr(self, '_thumb_hover_timer', None)
+        if timer is not None and not timer.isActive():
+            timer.start()
+
+    def _forget_thumb_hover(self, tile=None):
+        """Take the button off the row holding it, and stop asking after it.
+
+        Called by a row that is no longer being pointed at, is going away, or is being torn down.
+        A row that was not the one holding the button has nothing to clear - its button is already
+        hidden - and it must not switch off the recheck belonging to the row that is. With no tile
+        named, it is the whole list going away.
+        """
+        tracked = getattr(self, '_hover_tile', None)
+        if tracked is None or (tile is not None and tracked is not tile):
+            return
+        try:
+            tracked.play_btn.hide()
+        except RuntimeError:
+            pass  # the row was torn down before it could be let go
+        self._hover_tile = None
+        timer = getattr(self, '_thumb_hover_timer', None)
+        if timer is not None:
+            timer.stop()
+
+    def _recheck_thumb_hover(self):
+        """Ask the pointer again whether the row holding the play button is still the row it is
+        on - the catch for the ways Qt fails to say so, any of the ones named by
+        THUMB_HOVER_RECHECK_MS: a scroll moves a row out from under a pointer that never moved,
+        a row is torn down under it, a row is built under it without an Enter ever arriving.
+        Cheap by construction: there is only ever one row to ask about, and only while a button
+        is showing.
+        """
+        tracked = getattr(self, '_hover_tile', None)
+        if tracked is None:
+            return  # no row is holding a button, which is the case a moment to spare
+        try:
+            on_it = tracked._pointer_on_tile()
+        except RuntimeError:
+            on_it = False  # the row holding the button has already been torn down
+        if not on_it:
+            self._forget_thumb_hover(tracked)
+
+    def _clear_thumb_hover(self):
+        """The results list is being thrown away wholesale, so the row holding the play button goes
+        with it. A button left on a row that has been deleted is exactly the stuck one a user
+        sees, and there is nothing left here worth rechecking."""
+        self._forget_thumb_hover()
+
     def _apply_local_selection_styles(self):
         selected_paths = getattr(self, 'local_selected_paths', set())
         for row_w, btn, dur_lbl, row_item, _ in getattr(self, 'local_rows', []):
@@ -10919,6 +11080,10 @@ class MainApp(QMainWindow):
         # colouring goes with them and cannot be coloured back to plain later.
         self._forget_playback_box()
         
+        # Every row these results had is going away, and with them the play button whichever one
+        # of them was holding. A button left on a row that is being thrown away is the stuck one.
+        self._clear_thumb_hover()
+
         while self.results_vbox.count():
             item = self.results_vbox.takeAt(0)
             if item.widget(): item.widget().deleteLater()
@@ -11093,6 +11258,13 @@ class MainApp(QMainWindow):
                 del self._thumbnail_labels[video['id']]
             except KeyError:
                 pass
+
+        # The row is going away under whichever pointer happens to be on it - this is the scroll
+        # taking rows out of the pane - and its widgets stay visible until their deleteLater lands.
+        # Settle the play button first, so the button of a row that no longer exists is never left
+        # sitting on top of the rows that did.
+        for tile in placeholder.findChildren(ThumbnailWidget):
+            tile.set_pointer_hover(False)
             
         layout = placeholder.layout()
         if layout:
@@ -11140,6 +11312,12 @@ class MainApp(QMainWindow):
                 else:
                     if has_ui:
                         self.clear_result_ui(placeholder)
+
+        # A scroll moves rows around under a pointer that never moved, and Qt sends no Leave for a
+        # pointer that never moved - which is the row that keeps a play button nobody is pointing
+        # at. This is where that row finds out. Cheap by construction: one row gets asked, and no
+        # row gets asked when no button is showing.
+        self._recheck_thumb_hover()
 
     def build_queue_item_ui(self, placeholder, q, idx):
         l = QHBoxLayout(placeholder)
