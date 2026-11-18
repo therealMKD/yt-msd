@@ -29,7 +29,7 @@ I don't want to deal with spotify's ads (Or pay for premium), and youtube playli
 
 The GUI version is the main, and most advanced version of the program. It has two variants: the setup version (exe) and the python version (pyw). Both are IDENTICAL programs, the only difference is the way they are stored. For almost all cases, you will want to use the exe version, since the python version requires python and several other dependencies to be installed, while the setup version runs just like a normal windows program.
 
-The exe version is also significantly faster to launch over the python version, because it does not have to deal with Python to start up the dependencies. To see the full readme for both gui versions, go to the [GUI Readme](https://github.com/therealMKD/yt-msd/tree/main/GUI%20Source%20Code#readme). If you just want to install the program, here's how to do it:
+The exe version is also significantly faster to launch over the python version, because it does not have to deal with Python to start up the dependencies. To see the full readme for both GUI versions, go to the [GUI Readme](https://github.com/therealMKD/yt-msd/tree/main/GUI%20Source%20Code#readme). If you just want to install the program, here's how to do it:
 
 ## Exe version (Setup)
 
