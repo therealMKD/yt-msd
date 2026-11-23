@@ -20,7 +20,7 @@ It also has a seamless sync feature letting you sync entire folders between yt-m
 I don't want to deal with spotify's ads (Or pay for premium), and youtube playlists don't have working shuffle features, so I started downloading the mp3s of my playlist with yt-dlp. That was still annoying to do from the command line, so I created this. This program WILL function as a bare bones music player, but I would highly recommend using a dedicated program (I use MusicBee) that has more options. (Note, there is a plugin for MusicBee that directly integrates yt-msd into it.)
 
 > [!IMPORTANT]
-> **Changes in the upcoming 3.5 update**\
+> **Changes in the upcoming 3.5 update:**\
 > The 3.5 update is currently in progress! I will most likely be finishing it in a few weeks, but I'm in no hurry since I hope for my winget package to pass before the update. That most likely won't happen due to Microsoft apparently giving zero craps about winget, but we can always hope. This update will have a decent amount of fixes, but also some notable new features. Here is the current roadmap:
 >
 > - **No more python version!** Having a python version IS kind of nice, but the project is now 2,600 lines long, and an entire app in a single file is NOT best practice. 3.5 will modularize the program, and hopefully improve performance. That means that a single python file will not exist anymore, and the exe version will be the only version going forward. My apologies to anyone using the python version.
