@@ -19,8 +19,17 @@ build_dir/
 build_dir_gui/
 ffmpeg_extracted/
 dist/
-.test_harness/
-GUI Source Code/GUI Test Suite/
+# Scratch probes and throwaway copies from past debugging sessions are not part of the repo,
+# but the refactor tooling is: the wave plan, the wave splitter, the verification gate and the
+# record of every content edit it signed off. A refactor guarantee that only exists on one
+# machine is not a guarantee, and verify.py reads its baseline out of this repo's history.
+.test_harness/*
+!.test_harness/refactor/
+# The GUI regression suite is tracked - every refactor wave is checked against it, so the
+# checks themselves have to be part of the repo. Its throwaway import copies and the glyph
+# sheet it paints are build residue, not tests.
+GUI Source Code/GUI Test Suite/copy/
+GUI Source Code/GUI Test Suite/captions.png
 
 # Python artifacts
 __pycache__/
