@@ -1,5 +1,9 @@
 # Open Source Software under the Apache License, Version 2.0
-# Part of the yt-msd GUI package (yt_msd.ytdlp).
+# Part of the yt-msd GUI package (yt_msd.ytdlp.install).
+#
+# Finding the yt-dlp this system already has, driving winget to install or update
+# it, and asking GitHub what the newest release is. Nothing here runs yt-dlp to
+# answer a question about a video - that is yt_msd.ytdlp.runner.
 #
 # Extracted from yt-msd-gui.pyw during the 3.5 modularisation. The wording of everything
 # moved here is unchanged; only the imports needed to reach the rest of the program were
@@ -13,6 +17,7 @@ from pathlib import Path
 import urllib.request
 import urllib.parse
 from yt_msd.subproc import _hidden_window_kwargs
+from yt_msd.paths import program_folder
 
 
 # ============================================================
@@ -63,7 +68,7 @@ def _yt_dlp_lookup_paths():
         if getattr(sys, 'frozen', False):
             base_dir = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(sys.executable)))
         else:
-            base_dir = os.path.dirname(os.path.abspath(__file__))
+            base_dir = program_folder()
         candidates.append(os.path.join(base_dir, "yt-dlp.exe"))
     except Exception:
         pass

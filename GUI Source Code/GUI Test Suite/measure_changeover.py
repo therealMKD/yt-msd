@@ -24,6 +24,8 @@ import sys
 import time
 
 GUI_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # GUI Source Code, one folder up
+if GUI_DIR not in sys.path:
+    sys.path.insert(0, GUI_DIR)      # the source imports the yt_msd package, so it must be reachable
 SOURCE = os.path.join(GUI_DIR, "yt-msd-gui.pyw")
 
 # Set YTMSD_IDS to a comma separated list to keep a single run short.
@@ -55,10 +57,10 @@ def timed(fn):
 
 
 def main():
-    old_argv0 = sys.argv[0]
-    sys.argv[0] = SOURCE          # so the module finds icon.ico beside the source
+    # The source is imported here as a module rather than started as a program, so the helpers that
+    # answer "which folder was this program started from" answer about this tool. Nothing measured
+    # below depends on that answer - the yt-dlp this machine has is the winget one.
     mod = load_source()
-    sys.argv[0] = old_argv0
 
     exe = mod.find_yt_dlp_executable()
     print(f"yt-dlp executable: {exe}")

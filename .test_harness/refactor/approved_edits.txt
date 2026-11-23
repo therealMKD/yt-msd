@@ -4,9 +4,11 @@
 #        plain import or re-export the splitter writes by itself.
 # Review this file before accepting it: every line here is a promise that a
 # behaviour change was intended.
+LOST	"""Absolute path to icon-256x256.ico: inside the packaged app when frozen, next to this file otherwise."""
 LOST	# Apply the normalization globals from the loaded config immediately
 LOST	# The renamer half is a second copy of this program launched in a console, and it reads the
 LOST	# every renamer this window launched running with the pre-reset trim / pad / override until
+LOST	# icon-256x256.ico sits next to this file in the source tree and is bundled into
 LOST	# module globals above rather than the MainApp attributes. Resetting only the attributes left
 LOST	# same reason; a reset has to do it too.
 LOST	# the app was restarted. load_config() and _apply_imported_config() push the globals for the
@@ -34,6 +36,9 @@ LOST	SILENCE_TRIM = bool(self.silence_trim)
 LOST	SILENCE_TRIM = bool(self.silence_trim)
 LOST	SILENCE_TRIM = state
 LOST	_effective_norm_cmd = (custom_norm_cmd or CUSTOM_NORM_CMD or "").strip()
+LOST	base = os.path.dirname(os.path.abspath(__file__))
+LOST	base_dir = os.path.dirname(os.path.abspath(__file__))
+LOST	folders.append(os.path.dirname(os.path.abspath(__file__)))
 LOST	global CUSTOM_NORM_CMD
 LOST	global CUSTOM_NORM_CMD
 LOST	global SILENCE_PAD_DUR
@@ -52,18 +57,28 @@ LOST	parts.append(f"apad=pad_dur={SILENCE_PAD_DUR}")
 LOST	print(f"{Colors.BOLD}Using {MAX_WORKERS} CPU Threads for Processing{Colors.END}\n")
 LOST	print(f"{Colors.DIM}Silence trim: {'ON' if SILENCE_TRIM else 'OFF'} | End pad: {SILENCE_PAD_DUR}s | Loudnorm: {CUSTOM_NORM_CMD or 'built-in whole-track gain'}{Colors.END}\n")
 LOST	print(f"{Colors.GREEN}Starting static volume adjustment on {len(files)} files with {MAX_WORKERS} worker threads...{Colors.END}")
+LOST	script_path = os.path.abspath(__file__)
 LOST	trim_on = SILENCE_TRIM if include_silence_trim is None else include_silence_trim
 LOST	with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+NEW	"""
+NEW	"""Absolute path to icon-256x256.ico: inside the packaged app when frozen, next to the program otherwise."""
 NEW	"""Back to factory values. Called by MainApp.reset_to_defaults so the renamer this
 NEW	"""Take the settings MainApp holds. This is the one place that decides when a custom
 NEW	"""The audio half of the yt-msd GUI package: tuning, tagging, probing, normalizing, renaming."""
+NEW	"""The file this program was started as: the .pyw in the source tree, the exe once installed.
+NEW	"""The folder the program itself was started from.
 NEW	"""The four normalization settings the ffmpeg chain is built from, in one place."""
+NEW	"""The yt-dlp half of the yt-msd GUI package: installing it, updating it, and driving it."""
 NEW	1. silence trim    - _silence_trim_filters(), gated by the TUNING.silence_trim setting
 NEW	3. end-of-file pad - apad, gated by TUNING.silence_pad_dur
 NEW	DEFAULT_CUSTOM_NORM_CMD = ""  # Optional override of ONLY the loudnorm part of the ffmpeg -af chain
 NEW	DEFAULT_MAX_WORKERS = max(1, _available_threads // 2)
 NEW	DEFAULT_SILENCE_PAD_DUR = 2.0
 NEW	DEFAULT_SILENCE_TRIM = True  # Trim leading/trailing silence; independent of the loudnorm override
+NEW	Deliberately not `__file__`. Since the split, the code that asks lives under yt_msd/, and its
+NEW	FileSystemEventHandler = None
+NEW	Observer = None
+NEW	Returns "" when the process has no file it was started from at all.
 NEW	TUNING = Tuning()
 NEW	TUNING.custom_norm_cmd = args.custom_norm_cmd
 NEW	TUNING.custom_norm_cmd = self.main_app.custom_norm_cmd if state else ""
@@ -76,22 +91,42 @@ NEW	TUNING.silence_pad_dur = val
 NEW	TUNING.silence_trim = (args.silence_trim == 'on')
 NEW	TUNING.silence_trim = state
 NEW	_effective_norm_cmd = (custom_norm_cmd or TUNING.custom_norm_cmd or "").strip()
+NEW	base = program_folder()
+NEW	base_dir = program_folder()
 NEW	class Tuning:
 NEW	def __init__(self):
 NEW	def from_settings(self, silence_trim, silence_pad_dur, use_custom_norm_cmd, custom_norm_cmd):
+NEW	def program_file():
+NEW	def program_folder():
 NEW	def reset(self):
+NEW	entry = getattr(sys.modules.get("__main__"), "__file__", None)
+NEW	entry = sys.argv[0]
 NEW	except (TypeError, ValueError):
+NEW	folders.append(program_folder())
+NEW	gui_config.json, icon-256x256.ico, a bundled yt-dlp.exe and yt-msd-crash.log all live beside
 NEW	if TUNING.silence_trim and orig_duration is not None and new_duration is not None:
+NEW	if getattr(sys, "frozen", False):
 NEW	if include_pad and TUNING.silence_pad_dur > 0:
+NEW	if not entry and sys.argv:
+NEW	if not entry:
+NEW	in.
+NEW	is the folder of `program_file()`, for the same reason: a folder taken from the asking
+NEW	module's own `__file__` names a folder inside the package instead of the one the program sits
 NEW	new_duration = _get_audio_duration(filepath) if TUNING.silence_trim else None
 NEW	orig_duration = _get_audio_duration(filepath) if TUNING.silence_trim else None
 NEW	override = (custom_norm_cmd or "").strip()
 NEW	override counts - the entry point used to repeat that decision in three copies."""
+NEW	own `__file__` is a module inside the package rather than the program - which is what made the
 NEW	pad_added = TUNING.silence_pad_dur if TUNING.silence_pad_dur > 0 else 0.0
 NEW	parts.append(f"apad=pad_dur={TUNING.silence_pad_dur}")
 NEW	print(f"{Colors.BOLD}Using {TUNING.max_workers} CPU Threads for Processing{Colors.END}\n")
 NEW	print(f"{Colors.DIM}Silence trim: {'ON' if TUNING.silence_trim else 'OFF'} | End pad: {TUNING.silence_pad_dur}s | Loudnorm: {TUNING.custom_norm_cmd or 'built-in whole-track gain'}{Colors.END}\n")
 NEW	print(f"{Colors.GREEN}Starting static volume adjustment on {len(files)} files with {TUNING.max_workers} worker threads...{Colors.END}")
+NEW	return ""
+NEW	return os.path.abspath(entry)
+NEW	return os.path.abspath(sys.executable)
+NEW	return os.path.dirname(started_as) if started_as else ""
+NEW	script_path = program_file()
 NEW	self.custom_norm_cmd = DEFAULT_CUSTOM_NORM_CMD
 NEW	self.custom_norm_cmd = override if (use_custom_norm_cmd and override) else ""
 NEW	self.max_workers = DEFAULT_MAX_WORKERS
@@ -100,6 +135,9 @@ NEW	self.silence_pad_dur = float(silence_pad_dur)
 NEW	self.silence_trim = DEFAULT_SILENCE_TRIM
 NEW	self.silence_trim = bool(silence_trim)
 NEW	self.use_custom_norm_cmd, self.custom_norm_cmd)
+NEW	started_as = program_file()
+NEW	startup registry entry point at yt_msd/sync/startup.py, a file that starts nothing.
+NEW	the file the program was started as - the .pyw in the source tree, the exe once installed. It
 NEW	trim_on = TUNING.silence_trim if include_silence_trim is None else include_silence_trim
 NEW	try:
 NEW	window launches cannot keep running with pre-reset values."""

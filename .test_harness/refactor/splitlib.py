@@ -233,7 +233,8 @@ def analyze(wave=None):
         if len(targets) > 1:
             problems.append("block %s spans modules: %s" % (named, sorted(targets)))
 
-    picked = [b for b in blocks if wave and set(b["names"]) & set(wave_names(wave))]
+    picked = [b for b in blocks
+              if wave and b["kind"] not in IMPORT_KINDS and set(b["names"]) & set(wave_names(wave))]
     print("blocks total        : %d" % len(blocks))
     if wave:
         print("blocks in wave '%s' : %d  (%d lines)"
@@ -244,16 +245,29 @@ def analyze(wave=None):
         print("\nHAZARDS")
         for p in problems:
             print("  " + p)
+    decided = left_by_decision()
     uncovered = [b for b in blocks
                  if b["kind"] not in IMPORT_KINDS
-                 and any(n != "*" and n not in plan for n in b["names"])]
+                 and any(n != "*" and n not in plan and n not in decided for n in b["names"])]
+    left = [b for b in blocks
+            if b["kind"] not in IMPORT_KINDS
+            and any(n in decided for n in b["names"] if n != "*")
+            and all(n in decided or n in plan for n in b["names"] if n != "*")]
     covered = [b for b in blocks
                if b["kind"] in IMPORT_KINDS
                or all(n in plan for n in b["names"] if n != "*")]
-    print("\nTOP-LEVEL BLOCKS COVERED BY THE PLAN : %d of %d" % (len(covered), len(blocks)))
-    print("TOP-LEVEL BLOCKS NOT COVERED         : %d" % len(uncovered))
+    print("\nTOP-LEVEL BLOCKS MOVED BY THE PLAN   : %d of %d" % (len(covered), len(blocks)))
+    print("LEFT IN THE .pyw BY DECISION         : %d" % len(left))
+    for b in left:
+        print("  %-10s %5d-%-6d %s" % (b["kind"], b["start"], b["end"], ", ".join(b["names"])))
+        for name in b["names"]:
+            if name in decided:
+                print("      left here because: %s" % decided[name])
+    print("BLOCKS THE PLAN STILL OWES           : %d" % len(uncovered))
     for b in uncovered:
         print("  %-10s %5d-%-6d %s" % (b["kind"], b["start"], b["end"], ", ".join(b["names"])))
+    if not uncovered:
+        print("Nothing outstanding: every top-level block is moved above or closed out above.")
 
 
 # ---------------------------------------------------------------- checks
@@ -301,32 +315,57 @@ def module_of(dotted_groups, name):
 
 # The coupling a wave check cannot see from the source alone.
 #
-# The GUI Test Suite drives the program through the entry point's own namespace: it copies the
-# .pyw to a .py, imports it as `mod`, and then writes `mod.run_yt_dlp_json = fake` or inspects
-# `mod._stream_fetches` or replaces `mod.subprocess` before calling `mod.resolve_stream_url`.
+# The GUI Test Suite drives the program by replacing parts of it. It used to do that by writing
+# into the entry point's own namespace: `mod.run_yt_dlp_json = fake`, `mod.subprocess = fake`.
 # That only injects behaviour while those names resolve in the module the suite imported. Move
 # run_yt_dlp_json into a package module and resolve_stream_url - wherever it lives - starts
 # calling the copy in its own module: the patch lands on a name nothing reads, the check keeps
-# passing, and it now tests nothing. That is worse than a failing check, so a name the suite
-# assigns through mod. stays in the entry point until the suite is re-aimed at the module that
-# owns it. A name the suite only reads is safe, because the re-export keeps mod.X working.
-_ASSIGNED_RE = re.compile(r"\bmod\.([A-Za-z_][A-Za-z0-9_]*)\s*=[^=]")
+# passing, and it now tests nothing. Worse than a failing check, and invisible.
+#
+# The suite no longer writes there. GUI Test Suite/harness_seam.py writes to every module that
+# owns a name, found by reading the corpus, so a patch follows the name wherever a wave moves
+# it. What is left here is the guard against going back: a name the suite assigns through mod.
+# again is refused, because that is the shape that silently stops testing anything. A name the
+# suite only reads through mod. has always been safe - the re-export keeps mod.X alive.
 _ANY_RE = re.compile(r"\bmod\.([A-Za-z_][A-Za-z0-9_]*)")
 
 
 def harness_couplings():
-    """(assigned, read): names the test suite reaches through the entry point's namespace."""
+    """(assigned, read): names the test suite reaches through the entry point's namespace.
+
+    The writes are taken from the suite's syntax rather than from its text. A docstring
+    that quotes the old idiom - harness_seam.py does, to explain what it replaced - is
+    not a coupling, and only what runs can be.
+    """
     assigned, read = set(), set()
     if not os.path.isdir(HARNESS_DIR):
         return assigned, read
     for name in sorted(os.listdir(HARNESS_DIR)):
         if not name.endswith(".py"):
             continue
-        with open(os.path.join(HARNESS_DIR, name), "r", encoding="utf-8") as fh:
+        path = os.path.join(HARNESS_DIR, name)
+        with open(path, "r", encoding="utf-8") as fh:
             text = fh.read()
-        assigned |= set(_ASSIGNED_RE.findall(text))
         read |= set(_ANY_RE.findall(text))
+        try:
+            tree = ast.parse(text, filename=path)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+                targets = list(node.targets) if isinstance(node, ast.Assign) else [node.target]
+                for target in targets:
+                    if (isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name)
+                            and target.value.id == "mod"):
+                        assigned.add(target.attr)
+            elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id in ("setattr", "delattr") and len(node.args) > 1
+                    and isinstance(node.args[0], ast.Name) and node.args[0].id == "mod"
+                    and isinstance(node.args[1], ast.Constant)
+                    and isinstance(node.args[1].value, str)):
+                assigned.add(node.args[1].value)
     return assigned, read
+
 
 
 def harness_exemptions(wave):
@@ -335,6 +374,18 @@ def harness_exemptions(wave):
     sys.path.insert(0, HERE)
     import waves
     return getattr(waves, "HARNESS_EXEMPT", {}).get(wave, {})
+
+
+def left_by_decision():
+    """{name: reason} for the blocks the plan closes out by leaving in the .pyw.
+
+    waves.py owns the decision and the wording; this is the read that lets analyze() report
+    them as finished rather than as outstanding, and lets check_wave() refuse a wave that
+    moves one without reopening the decision where a human will see it.
+    """
+    sys.path.insert(0, HERE)
+    import waves
+    return dict(getattr(waves, "LEFT_BY_DECISION", {}))
 
 
 
@@ -349,7 +400,8 @@ def check_wave(wave, verbose=True):
     imps = import_table(tree)
     allowed = cumulative_names(wave)
     groups = wave_plan()[wave]
-    picked = [b for b in blocks if set(b["names"]) & set(wave_names(wave))]
+    picked = [b for b in blocks
+              if b["kind"] not in IMPORT_KINDS and set(b["names"]) & set(wave_names(wave))]
 
     blockers = []
     for b in picked:
@@ -365,6 +417,14 @@ def check_wave(wave, verbose=True):
             if name in imps and name not in plan:
                 continue                       # stdlib / third-party: copy the import
             blockers.append("%s <- %s : %s" % (target, sorted(own)[0], name))
+    decided = left_by_decision()
+    for b in picked:
+        own = {n for n in b["names"] if n != "*"}
+        for name in sorted(own & set(decided)):
+            blockers.append("%s would move %s, which the plan has closed out as left in the entry "
+                            "point by decision: %s  (to reopen it, delete LEFT_BY_DECISION[\"%s\"] "
+                            "from waves.py in a change a human reviews)"
+                            % (dotted_of(groups, own), name, decided[name], name))
     assigned, _read = harness_couplings()
     exempt = harness_exemptions(wave)
     for b in picked:
@@ -374,7 +434,8 @@ def check_wave(wave, verbose=True):
             if name in exempt:
                 continue
             blockers.append("%s would take %s out of the entry point, but the test suite "
-                            "writes mod.%s to drive the program" % (target, name, name))
+                            "still writes mod.%s directly - route it through "
+                            "harness_seam.patch() first" % (target, name, name))
 
     blockers = sorted(set(blockers))
     if verbose:
@@ -504,6 +565,33 @@ def add_source_dir_bootstrap(text):
     return text
 
 
+def names_not_to_forward(text, picked):
+    """Names the entry point must NOT be given a copy of.
+
+    `global X` inside a moved function rebinds X in the module that function now lives in. A copy
+    of X forwarded back into the .pyw is bound to the value X had before that rebinding and stays
+    there for the life of the process. When nothing left in the entry point reads the name the copy
+    is worse than useless: it is a second, permanently stale answer to the same question, which is
+    the exact hazard the wave plan warns about for `install_crash_reporting` and `_crash_reporter`.
+
+    So a name is left out of the re-export when both hold: a function that moved declares it
+    `global`, and no line remaining in the entry point reads it. A name that the entry point does
+    read is still forwarded - leaving it out would be a NameError instead of a stale value, and the
+    plan is what should change in that case, not the export.
+    """
+    rebound = set()
+    for b in picked:
+        for sub in ast.walk(b["node"]):
+            if isinstance(sub, ast.Global):
+                rebound |= set(sub.names)
+    if not rebound:
+        return set()
+    remaining = ast.parse(splice_pyw(text, picked, ""))
+    read_by_entry = {node.id for node in ast.walk(remaining)
+                     if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
+    return {name for name in rebound if name not in read_by_entry}
+
+
 def extract(wave):
     text, tree, blocks = parse_blocks()
     plan = plan_map()
@@ -518,8 +606,18 @@ def extract(wave):
             print("  " + line)
         return 1
 
-    picked = [b for b in blocks if set(b["names"]) & set(wave_names(wave))]
+    picked = [b for b in blocks
+              if b["kind"] not in IMPORT_KINDS and set(b["names"]) & set(wave_names(wave))]
+    if not picked:
+        # Re-running a wave is not a no-op: with nothing left to move it would rewrite
+        # each module this wave already created from just its header, quietly deleting
+        # the code that is already there. Refuse instead.
+        print("REFUSED: wave '%s' has no blocks left in %s. Its names have already been "
+              "moved, so re-extracting would overwrite the modules it created."
+              % (wave, os.path.relpath(PYW, ROOT)))
+        return 1
     per_module = {}
+
     for b in picked:
         per_module.setdefault(dotted_of(groups, {n for n in b["names"] if n != "*"}), []).append(b)
 
@@ -555,15 +653,22 @@ def extract(wave):
         written.append((dotted, path,
                         sorted(bound_here - maybe), sorted(maybe)))
 
+    held_back = names_not_to_forward(text, picked)
     shim = ["# These names moved out of this file during the 3.5 modularisation (wave %s) and are\n"
             "# re-exported here so the entry point keeps every name it has always had while the\n"
             "# split proceeds. The final wave replaces this with the package's own entry point.\n"
             % wave]
     for dotted, _p, always, maybe in written:
-        shim.append("from %s import (\n" % dotted)
-        for name in sorted(always):
-            shim.append("    %s,\n" % name)
-        shim.append(")\n")
+        forward = [name for name in always if name not in held_back]
+        if forward:
+            shim.append("from %s import (\n" % dotted)
+            for name in sorted(forward):
+                shim.append("    %s,\n" % name)
+            shim.append(")\n")
+        for name in sorted(set(always) & held_back):
+            shim.append("# %s is not forwarded: a function that moved out of here rebinds it with\n"
+                        "# `global`, so a copy in this file would keep the value from before that\n"
+                        "# rebinding - and nothing left in this file reads it to begin with.\n" % name)
         if maybe:
             parent, leaf = dotted.rsplit(".", 1)
             alias = "_%s_mod" % leaf
@@ -585,6 +690,9 @@ def extract(wave):
         note = "" if not maybe else "  (%s forwarded conditionally)" % ", ".join(maybe)
         print("  %-34s %3d names  %s%s" % (dotted, len(always) + len(maybe),
                                            os.path.relpath(path, ROOT), note))
+    if held_back:
+        print("  kept out of the re-export: %s  (rebound with `global` by the code that moved, "
+              "and nothing left in the entry point reads them)" % ", ".join(sorted(held_back)))
     print("yt-msd-gui.pyw is now %d lines (was %d)" % (len(new_text.splitlines()), len(text.splitlines())))
     return 0
 

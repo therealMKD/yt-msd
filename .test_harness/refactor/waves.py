@@ -9,14 +9,32 @@
 # wave when an out-edge points at the .pyw.
 #
 # Order matters: leaves first (no Qt, no app state), then the external-process layer,
-# then sync, then the widgets and dialogs, then the app-level helpers. MainApp itself is
-# deliberately last and is handled separately.
+# then sync, then the widgets and dialogs, then the app-level helpers. The plan runs to 5g
+# and stops there: MainApp stays in the entry point, recorded in LEFT_BY_DECISION below,
+# reported by analyze() as left by decision, and refused by check_wave() if a later wave
+# tries to move it anyway.
 
 # Names a wave may move even though the GUI Test Suite writes mod.<name> against the entry
 # point (see splitlib.harness_couplings). Every entry needs the reason and the harness change
 # that makes it safe, because moving one without updating the suite does not turn a check red -
 # it turns it into a check that passes while testing nothing.
 HARNESS_EXEMPT = {
+}
+
+# Blocks the plan closes out by deciding not to move them, with the reason on the same terms
+# as everything else in this file. Two things read it: splitlib.analyze() reports these as left
+# in the entry point by decision rather than as work the plan still owes, and splitlib.check_wave()
+# refuses any wave that lists one. Reopening a decision is therefore an edit to this dict, not a
+# wave written past it.
+LEFT_BY_DECISION = {
+    "MainApp": (
+        "Kept in yt-msd-gui.pyw as the single class it already is (lines 412-6920, 230 methods). "
+        "It is the last large piece the compiled build holds: build_gui_cython.py compiles the "
+        "entry point into one .pyd while yt_msd travels as plain Python, so moving it out costs "
+        "the player, the window and every handler their compilation and buys nothing at run time - "
+        "a class split across modules runs exactly as the one class does. Reopen only if the file "
+        "grows past being reviewable as a whole, and then as one move-whole wave, not a carving."
+    ),
 }
 
 WAVES = {
@@ -139,11 +157,327 @@ WAVES = {
     # get_yt_dlp_version calls it, so both stay. Moving the runner is a harness job first -
     # re-aim those patches at the module that will own them - not a splitter job.
     "3": [
-        ("yt_msd.ytdlp", [
+        ("yt_msd.ytdlp.install", [
             "YTDLP_WINGET_ID", "YTDLP_GITHUB_REPO", "YTDLP_UPDATE_CHECK_INTERVAL",
             "YTDLP_INSTALL_TIMEOUT", "YTDLP_EXTRACT_TIMEOUT",
             "YtDlpMissingError", "_yt_dlp_lookup_paths",
             "find_winget_executable", "run_winget", "latest_yt_dlp_release",
         ]),
     ],
+    # Wave 3b: driving yt-dlp for a video - as opposed to installing it - and the runs that
+    # can be stopped while they are still running.
+    #
+    # This wave was held back by the harness rather than by the graph, and the harness is what
+    # made it worth waiting for. The suite injects a fake yt-dlp (`run_yt_dlp_json`), a fake
+    # process (`subprocess.Popen`), a fake executable path (`find_yt_dlp_executable`) and reads
+    # the live fetch registry (`_stream_fetches`) through the entry point's namespace. Once a
+    # name lives in a package module, an injection made there stops reaching the caller that
+    # uses it - the check stays green and tests nothing. GUI Test Suite/harness_seam.py now
+    # injects into every module holding a name, so the injection follows the name here.
+    #
+    # `run_yt_dlp_json` and the fetch registry belong together for a reason that is in the code:
+    # the runner is the only thing that registers a run (note_stream_fetch_process) and the only
+    # thing that asks whether its own run was cancelled (stream_fetch_was_superseded). Separating
+    # the two would put the question on one side of a boundary and the answer on the other.
+    # Nothing here is redesigned - the registry, its lock and its thread-local owner move exactly
+    # as they are, because 446 checks read them through the entry point and re-export keeps
+    # them the same objects.
+    "3b": [
+        ("yt_msd.ytdlp.runner", [
+            "_ytdlp_exe_cache", "_ytdlp_exe_cache_lock", "find_yt_dlp_executable",
+            "get_yt_dlp_version",
+            "_stream_fetches_lock", "_stream_fetches", "_stream_fetch_owner",
+            "StreamFetchSupersededError", "begin_stream_fetch", "end_stream_fetch",
+            "stream_fetch_vid_for_this_thread", "note_stream_fetch_process",
+            "stream_fetch_was_superseded", "cancel_stream_fetches",
+            "run_yt_dlp_json", "SEARCH_CHANNEL_RETRIES", "SEARCH_RETRY_TIMEOUT",
+            "entry_channel_name", "run_yt_dlp_text_search",
+            "stream_cli_args", "resolve_stream_url",
+        ]),
+        ("yt_msd.ytdlp.download", [
+            "_YTDLP_FINAL_PATH_PATTERNS", "_YTDLP_STAGED_PATH_PATTERNS",
+            "_clean_reported_path", "_match_reported_path", "run_yt_dlp_download",
+            "DOWNLOAD_ITEM_ATTEMPTS", "_PERMANENT_DOWNLOAD_ERROR_MARKERS",
+            "_is_permanent_download_error",
+        ]),
+    ],
+    # Wave 4: sync chains - the host end, the client end, and the removable-media end of them.
+    #
+    # This wave was held back by coverage rather than by the graph: not one of these classes had
+    # a check against it. GUI Test Suite/probe_sync.py (119 checks, SY-A..SY-L) was written first
+    # so the move has something to preserve: the TAG.yaml marker a chain leaves on a drive and how
+    # it reads back, the two forms last_synced takes and the clock grace between them, the drive
+    # scan, chain persistence inside the config file MainApp also writes, the length-prefixed
+    # socket protocol, the host's answers, the client's download and delete decisions, the
+    # removable worker, and the failsafe that refuses to roll a newer drive back to an older copy.
+    #
+    # The dialogs stay in the .pyw (wave 5). They are the half of the sync layer that only exists
+    # to be looked at, and SyncManagerDialog is 747 lines of layout that wants the engine beneath
+    # it settled first.
+    #
+    # Where things went: `lan` is what this machine knows about the network it is on; `transfer`
+    # is the framing and hashing every link is built out of; `discovery` is how a client finds a
+    # host; `host` and `client` are the two ends of a chain over TCP; `tags` is the marker file
+    # that lets a drive carry a chain without the app; `config` is persistence; `removable` is the
+    # worker that writes a chain onto a stick, and `startup` is the Run-key entry the sync window
+    # offers. Nothing here is redesigned - every class moved exactly as it was.
+    "4": [
+        ("yt_msd.sync.lan", [
+            "SYNC_PORT_START", "SYNC_PORT_END", "UDP_BEACON_PORT", "SYNC_SOCKET_TIMEOUT",
+            "SYNC_CHUNK_SIZE", "get_current_wifi_ssid", "_CACHED_LOCAL_IP",
+            "_CACHED_LOCAL_IP_TIME", "get_local_ip", "get_broadcast_addresses",
+        ]),
+        ("yt_msd.sync.startup", [
+            "is_run_on_startup_enabled", "set_run_on_startup",
+        ]),
+        ("yt_msd.sync.transfer", [
+            "compute_file_sha256", "filter_audio_files", "_DRIVE_IO_LOCKS",
+            "_DRIVE_IO_LOCKS_GUARD", "get_drive_io_lock", "make_throttled_progress_cb",
+            "send_json_msg", "recv_json_msg", "_recv_all", "stream_file_to_socket",
+            "recv_file_from_socket",
+        ]),
+        ("yt_msd.sync.discovery", [
+            "UDPBeaconBroadcaster", "discover_hosts_on_lan", "discover_host_on_lan",
+            "send_lan_update_notification",
+        ]),
+        ("yt_msd.sync.host", [
+            "HostFolderWatcher", "SyncHostServer",
+        ]),
+        ("yt_msd.sync.client", [
+            "SyncClientWorker", "ClientSyncThread",
+        ]),
+        ("yt_msd.sync.tags", [
+            "SYNC_TAG_FILENAME", "write_sync_tag_file", "read_sync_tag_file",
+            "SYNC_TAG_TIME_FORMATS", "SYNC_RETROGRADE_GRACE_SECONDS", "parse_sync_timestamp",
+            "format_sync_timestamp", "drive_last_synced_timestamp",
+            "find_tagged_sync_folders_on_drive", "make_removable_chain_id",
+        ]),
+        ("yt_msd.sync.config", [
+            "is_client_chain_paused", "_CONFIG_WRITE_LOCK", "DEFAULT_SYNC_SETTINGS",
+            "SyncConfigManager",
+        ]),
+        ("yt_msd.sync.removable", [
+            "SyncRemovableWorker", "RemovableSyncThread", "RemovableInitThread",
+        ]),
+    ],
+    # Wave 5: what the program paints with - the theme it reads off Windows, and the small
+    # custom widgets its window is built out of.
+    #
+    # The theme goes in the same wave as the widgets because the widgets need it: ThumbnailWidget
+    # asks get_accent_color which colour its box wears, and get_accent_color is the only reader of
+    # THEME_COLORS. Widgets without the theme would be a package module reaching back into the
+    # .pyw, which is the one thing this split cannot do.
+    #
+    # The coverage here is not new, which is why this wave needs no new checks: `AC` in
+    # probe_playback drives a real ThumbnailWidget inside a real result row - the hover tile, the
+    # play button it grows, the timer that re-checks a pointer that never moved,
+    # THUMB_HOVER_RECHECK_MS itself - and check_glyphs measures what the captions on those buttons
+    # actually paint.
+    #
+    # The chunked-rendering constants (LOCAL_RENDER_*) stay: they tune how MainApp fills a folder,
+    # and nothing else reads them. Taking them now would be moving a name to a module that only
+    # exists to hold it.
+    "5": [
+        ("yt_msd.ui.theme", [
+            "THEME_COLORS", "get_system_accent_color", "get_system_appearance_mode",
+            "get_accent_color",
+        ]),
+        ("yt_msd.ui.widgets", [
+            "pil_to_qpixmap", "ClickableSlider", "DoubleClickButton", "_ElideTextFilter",
+            "DraggableQueueWidget", "cover_thumbnail", "ThumbnailWidget",
+            "THUMB_TILE_W", "THUMB_TILE_H", "THUMB_BOX_INSET", "THUMB_BOX_W", "THUMB_BOX_H",
+            "THUMB_BOX_RADIUS", "THUMB_IMG_RADIUS", "THUMB_BOX_PLAIN", "THUMB_BOX_PLAYING",
+            "THUMB_BOX_PAUSED", "THUMB_BOX_COLORS", "THUMB_HOVER_RECHECK_MS",
+        ]),
+    ],
+    # Wave 5b: the export package - one .zip carrying the settings, the chains and copies of the
+    # music folders, plus the window that asks for it.
+    #
+    # These travel together because they are one promise told twice: build_exported_config decides
+    # what settings may leave, build_export_manifest_text writes the manifest that describes them,
+    # read_import_package reads that manifest back, extract_package_music puts the music where the
+    # manifest says it belongs, and ExportDialog is the only thing that calls them in order.
+    # Separating the helpers from the window would leave the window reaching back into the .pyw.
+    #
+    # Nothing in this group had a check before it moved, so GUI Test Suite/probe_export.py was
+    # written first: what a package contains and what it must not contain (chain keys stay in
+    # unless they are asked for), the manifest round trip through the hand-written YAML helpers,
+    # the folder walk that skips the system directories, and a package built by one copy of the
+    # program being unpacked by another.
+    "5b": [
+        ("yt_msd.export", [
+            "EXPORT_MANIFEST_NAME", "EXPORT_CONFIG_ENTRY", "EXPORT_SYNC_ENTRY",
+            "EXPORT_FORMAT_VERSION", "SYNC_ONLY_CONFIG_KEYS", "EXPORT_SKIP_DIRS",
+            "default_export_config", "build_exported_config", "build_export_manifest_text",
+            "sanitize_archive_name", "unique_music_archive_name", "iter_folder_files",
+            "zip_folder_into", "read_import_package", "music_import_destination",
+            "extract_package_music", "ExportDialog",
+        ]),
+    ],
+
+    # Wave 5c: the four windows that build a chain, join one, and run one.
+    #
+    # They belong with the sync subpackage rather than with the other dialogs because every
+    # decision they make is already the sync engine's: a hosted chain is a folder plus a code
+    # (CreateHostChainDialog), a client chain is a host found on the LAN (ConnectClientChainDialog),
+    # a removable chain is a stick and an id (ConnectRemovableMediaDialog), and SyncManagerDialog is
+    # the panel that starts and stops all three. The graph says the same thing plainly: their only
+    # out-edges point at wave 4 names - SyncConfigManager, ClientSyncThread, make_removable_chain_id,
+    # send_lan_update_notification - and none of them names MainApp, only the object it was handed.
+    #
+    # probe_sync holds the engines these windows drive (SY-E persistence, SY-G the host's answers,
+    # SY-H the client's decisions, SY-J the failsafe against rolling a newer drive back), and
+    # section AD of probe_playback builds each of these windows for real and checks what they hand
+    # back.
+    "5c": [
+        ("yt_msd.sync.dialogs", [
+            "CreateHostChainDialog", "ConnectClientChainDialog",
+            "ConnectRemovableMediaDialog", "SyncManagerDialog",
+        ]),
+    ],
+    # Wave 5d: the windows that are not about chains - the settings, the playlist picker, the tray
+    # progress bubble, the three update windows, and the tag-renaming window.
+    #
+    # SettingsDialog is why this wave comes after 5 and 5b: it writes through the TUNING seam
+    # (wave 2a), reads the theme and the accent lookup (wave 5), and opens ExportDialog (5b). It is
+    # also the only window in the program that changes how audio is made, which is what
+    # probe_tuning_seam holds - that a write made from the entry point is visible to the module that
+    # reads it.
+    #
+    # The three update windows move as a set because they are one flow's three states: an update is
+    # available, an update is ready to apply, yt-dlp itself wants updating. They read nothing but
+    # wave 1 constants.
+    "5d": [
+        ("yt_msd.ui.dialogs", [
+            "SettingsDialog", "PlaylistDialog", "TrayProgressPopup",
+            "UpdateAvailableDialog", "UpdateReadyDialog", "YtDlpUpdateDialog",
+            "MetadataRenameDialog",
+        ]),
+    ],
+
+    # Wave 5e: the two pieces of plumbing that exist before any window does - the name that keeps a
+    # second copy from starting, and the reporting that catches what nothing else caught.
+    #
+    # They are apart from each other on purpose. `instance` answers "is another copy of me already
+    # running, and can I ask it to come forward"; `crash` answers "something failed that no part of
+    # this program caught, and this build has no console to say it in". The only thing they share is
+    # that both run before MainApp exists.
+    #
+    # `install_crash_reporting` is the only `global` statement left anywhere in the entry point, and
+    # it is why this wave is listed on its own: it rebinds `_crash_reporter`, so the function and
+    # the name must land in the same module or the re-export would leave the .pyw holding the value
+    # from before the rebinding. cross_module_globals refuses the wave when they are split, and
+    # here they are not.
+    #
+    # GUI Test Suite/probe_shell.py was written first: which folders the log may live in, what an
+    # entry says, how the log is kept from growing without bound, the throttle that logs a
+    # repeating fault instead of dialoguing it, the guards that stop a dialog being raised when
+    # there is no window to raise it in, and a second copy finding the first.
+    #
+    # Two things this wave had to fix rather than carry over, both found by probe_shell.py when it
+    # ran against the moved code:
+    #   - `_crash_reporter` is not re-exported back into the entry point. The wave keeps it beside
+    #     `install_crash_reporting` so the `global` has one home; forwarding a copy anyway would
+    #     leave the .pyw holding `None` for the life of the process, which is the hazard this wave
+    #     was separated out to avoid. `names_not_to_forward` in splitlib.py now leaves out any name
+    #     a moved function rebinds with `global` that nothing left in the entry point reads.
+    #   - `crash_log_folders()` took the folder to write the log into from its own `__file__`,
+    #     which was the .pyw when this code sat in the .pyw and is `yt_msd/crash.py` after the
+    #     move. The log would have moved into the package instead of staying beside the program and
+    #     its gui_config.json, so the folder now comes from `program_folder()` in yt_msd.paths,
+    #     which answers "which file was this program started as" wherever the asking code lives.
+    #     `_app_icon_path()` in the same module had the same problem from wave 1 - icon-256x256.ico
+    #     sits beside the program, not inside the package - and uses the same helper now.
+    "5e": [
+        ("yt_msd.instance", [
+            "SINGLE_INSTANCE_NAME", "ask_running_instance_to_show",
+            "take_single_instance_name", "accept_instance_request",
+        ]),
+        ("yt_msd.crash", [
+            "CRASH_LOG_NAME", "CRASH_LOG_MAX", "MAX_CRASH_DIALOGS_PER_MINUTE",
+            "_crash_state", "_crash_reporter", "traceback_text", "crash_log_folders",
+            "trim_crash_log", "crash_log_entry", "write_crash_log", "CrashReporter",
+            "crash_dialog_allowed", "open_crash_log", "show_crash_dialog", "report_crash",
+            "handle_unhandled_error", "handle_thread_error", "handle_unraisable_error",
+            "install_crash_reporting", "silence_crash_dialogs",
+        ]),
+    ],
+
+    # Wave 5f: the two clocks the player runs on - how far ahead of the current track it reads, and
+    # how long a track it is hearing gets before it counts as dead.
+    #
+    # They are the first residents of the playback subpackage, which is where the rest of the
+    # player's rules go. The two groups are apart because they answer different questions -
+    # "is the next track ready" and "is this track still answering" - and nothing in either group is
+    # used by the other. Every one of them is read by MainApp alone, and none of them is a setting:
+    # no `global` anywhere in the program writes them, which is why wave 2a had to carry its four
+    # settings as a Tuning object and these can move as plain constants.
+    #
+    # GUI Test Suite/probe_playback.py held this wave before it ran: A1-A3 and X1-X4 already assert
+    # every value, and sections C, K, X and Y drive the two clocks for real. Written for the wave is
+    # section AE, which patches a number through the seam and watches the player's own decision
+    # change and then change back. That is the check this kind of wave needs: a moved constant the
+    # harness reads while the player reads a stale copy still lets every older check pass.
+    "5f": [
+        ("yt_msd.playback.prefetch", [
+            "PREFETCH_SECONDS_BEFORE_END", "PREFETCH_URL_MAX_AGE", "PREFETCH_CACHE_LIMIT",
+        ]),
+        ("yt_msd.playback.stream", [
+            "STREAM_STALL_SECONDS", "STREAM_RESUME_GRACE", "STREAM_URL_MAX_AGE",
+            "STREAM_REFETCH_LIMIT", "STREAM_RENEW_COOLDOWN", "STREAM_END_SLACK_MS",
+            "STREAM_SEEK_RESTORE_TIMEOUT",
+        ]),
+    ],
+
+    # Wave 5g: how a folder arrives on the screen - the pacing of the chunked fill of the local pane.
+    #
+    # Five numbers, one promise: a folder is filled in chunks, the first chunk is the rows the user
+    # switched folders to look at, and every chunk after it is as big as this machine can build, lay
+    # out and paint inside about a frame - floored so an expensive folder is not dribbled out a row
+    # at a time, capped so the GUI thread is never held longer than that. None of them is a setting
+    # and no `global` writes any of them, so they move as they are. They belong with the ui
+    # subpackage rather than with playback because they are the pane's policy, not the player's.
+    #
+    # GUI Test Suite/probe_local_pane.py was written for this wave and did not exist before it -
+    # nothing in the suite touched the local pane at all. It drives `_local_screenful_rows` and
+    # `_fill_local_chunk` against a stand-in pane that holds nothing but a viewport height and a
+    # minimum height it was told, and it checks each of the five by moving it and watching the next
+    # chunk change size. That is the only check worth having here: the failure mode of a moved
+    # constant is a number the suite reads and the program does not.
+    "5g": [
+        ("yt_msd.ui.render", [
+            "LOCAL_RENDER_FIRST_CHUNK_ROWS", "LOCAL_RENDER_ROW_HEIGHT_GUESS",
+            "LOCAL_RENDER_CHUNK_MIN_ROWS", "LOCAL_RENDER_CHUNK_MAX_ROWS",
+            "LOCAL_RENDER_CHUNK_BUDGET_S",
+        ]),
+    ],
+
+    # The plan ends here. What remains in the entry point is MainApp (lines 412-6920, 230 methods)
+    # and the 487 lines of imports and entry-block glue around it. It is deliberately not listed as
+    # a wave: the decision is that it stays, recorded in LEFT_BY_DECISION at the top of this file,
+    # where analyze() reports it as left by decision and check_wave() refuses a wave that lists it.
+    #
+    # Measured against the rule this file exists to enforce, MainApp could move today: it reads 163
+    # names, 114 of them builtins or already in a moved module and every one of the other 49 an
+    # import, so check_wave finds no out-edge still pointing at the .pyw; it contains no `global`
+    # statement - and neither does anything else in the entry point now - so cross_module_globals
+    # has nothing to refuse; and no check in the suite writes mod.MainApp.
+    #
+    # What decides it is the build. The shipped program is one compiled module plus a plain-Python
+    # package: build_gui_cython.py writes GUI Source Code/yt_msd_gui.pyx as the .pyw's text byte for
+    # byte, build_gui_exe.py compiles that single module with MSVC into yt_msd_gui.pyd, and
+    # PyInstaller carries yt_msd as ordinary Python in the archive. Whatever leaves the entry point
+    # stops being compiled, and MainApp is the last large piece that still is - about 6,500 of the
+    # 7,000 lines the compiled module holds, against the 7,916 lines already sitting in yt_msd.
+    # Carving it into several modules moves the same code and more, and a class split across modules
+    # runs exactly as the one class does: where the time goes is VLC, ffmpeg and the network, not
+    # attribute lookup. A further split would be tidier and no faster.
+    #
+    # The deal, then: one file, compiled, for as long as it reads as one piece. If it outgrows that,
+    # the way back is a single move-whole wave - MainApp into one module, the .pyw down to its imports
+    # and the entry block - with the suite's 25 source-text anchors re-pointed as a change of their
+    # own (probe_playback's `W` section and `AD6`-`AD9`, and the few in probe_local_pane, probe_shell,
+    # probe_export, probe_sync and probe_windows). Deleting LEFT_BY_DECISION["MainApp"] is the edit
+    # that reopens it; the guard is there so it is reopened on purpose.
+
 }

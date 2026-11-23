@@ -23,4 +23,9 @@ try:
     from watchdog.events import FileSystemEventHandler
     _WATCHDOG_AVAILABLE = True
 except ImportError:
+    # Bound either way: the entry point re-exports these names, and HostFolderWatcher decides
+    # whether to use them by reading _WATCHDOG_AVAILABLE. Leaving them undefined here makes the
+    # re-export itself fail on a machine with no watchdog, which stops the program starting.
+    Observer = None
+    FileSystemEventHandler = None
     _WATCHDOG_AVAILABLE = False

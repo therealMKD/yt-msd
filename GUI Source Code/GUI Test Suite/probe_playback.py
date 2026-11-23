@@ -22,6 +22,8 @@ import sys
 import threading
 import time
 
+from pathlib import Path
+
 HERE = os.path.dirname(os.path.abspath(__file__))              # .../GUI Source Code/GUI Test Suite
 SRC = os.path.join(os.path.dirname(HERE), "yt-msd-gui.pyw")    # the master copy, one folder up
 SRC_DIR = os.path.dirname(SRC)       # GUI Source Code, which now also holds the yt_msd package
@@ -35,8 +37,17 @@ _spec = importlib.util.spec_from_file_location("yt_msd_under_test", TMP_PY)
 mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mod)
 
-_REAL_RESOLVE = mod.resolve_stream_url
-_REAL_YTDLP_JSON = mod.run_yt_dlp_json
+# Every replacement this suite makes goes through the seam below, never by writing
+# into the entry point. Writing there lands on a re-exported copy that nothing
+# calls once a name has moved into yt_msd.*, and the check then passes while
+# testing nothing. harness_seam.py explains it, and refuses a name nothing owns.
+import harness_seam as seam
+
+seam.install(mod, SRC_DIR)
+
+_REAL_RESOLVE = seam.original("resolve_stream_url")
+_REAL_YTDLP_JSON = seam.original("run_yt_dlp_json")
+
 CHECKS = 0
 FAILS = []
 
@@ -314,20 +325,107 @@ def patch_resolve(url="https://example.test/prefetched", user_agent="probe-agent
         if fail:
             raise RuntimeError("simulated stream failure")
         return url, user_agent
-    mod.resolve_stream_url = fake_resolve
+    seam.patch("resolve_stream_url", fake_resolve)
 
 
 def unpatch():
-    mod.resolve_stream_url = _REAL_RESOLVE
-    mod.run_yt_dlp_json = _REAL_YTDLP_JSON
+    seam.restore("resolve_stream_url")
+    seam.restore("run_yt_dlp_json")
     RESOLVE_CALLS.clear()
+
 
     def addWidget(self, w):
         self.widgets.append(w)
 
 
+# ---------------------------------------------------------------------------
+# SEAM. Where a replacement actually lands.
+#
+#     Every other check in this file only proves something if this section holds.
+#     A fake the program never reaches still lets its check pass, quietly, and a
+#     suite full of checks that pass while testing nothing is worse than no suite.
+#     So the suite checks its own instrument here, including the one hazard the
+#     split creates: a name that now lives in two places at once.
+# ---------------------------------------------------------------------------
+print("=" * 72)
+print("SEAM. where a replacement lands")
+
+
+def _seam_marker(args, timeout=None):
+    return "reached"
+
+
+def _seam_refuses(name):
+    """True when patching this name is refused rather than silently doing nothing."""
+    try:
+        seam.patch(name, None)
+    except seam.SeamError:
+        return True
+    seam.restore(name)
+    return False
+
+
+def _entry_point_writes(path):
+    """Names this suite file writes into the entry point, read out of its syntax."""
+    tree = ast.parse(Path(path).read_text(encoding="utf-8"), filename=str(path))
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+            continue
+        targets = list(node.targets) if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            if (isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name)
+                    and target.value.id == "mod"):
+                found.append(target.attr)
+    return found
+
+
+_seam_holders = seam.owners("run_yt_dlp_json")
+check("SEAM1 a name can already be held by several modules at once - the whole problem",
+      len(seam.owners("subprocess")) >= 2 and mod in seam.owners("subprocess"),
+      seam.owned_by("subprocess"))
+seam.patch("run_yt_dlp_json", _seam_marker)
+check("SEAM2 a patch lands on every module holding that name",
+      all(getattr(m, "run_yt_dlp_json") is _seam_marker for m in _seam_holders),
+      seam.owned_by("run_yt_dlp_json"))
+check("SEAM3 and on the entry point too, because MainApp still calls it from there",
+      mod in _seam_holders and mod.run_yt_dlp_json(["-J"]) == "reached")
+seam.restore("run_yt_dlp_json")
+check("SEAM4 restoring hands each module back the value it held for itself",
+      all(getattr(m, "run_yt_dlp_json") is _REAL_YTDLP_JSON for m in _seam_holders))
+check("SEAM5 a name nothing owns is refused instead of a patch that does nothing",
+      _seam_refuses("run_yt_dlp_json_typo"))
+
+_seam_real_subprocess = seam.original("subprocess")
+_seam_subprocess = seam.partial_module(_seam_real_subprocess, Popen=lambda *a, **k: None)
+check("SEAM6 a stand-in keeps every name the suite did not ask it to replace",
+      _seam_subprocess.run is _seam_real_subprocess.run
+      and _seam_subprocess.DEVNULL is _seam_real_subprocess.DEVNULL
+      and _seam_subprocess.PIPE is _seam_real_subprocess.PIPE
+      and _seam_subprocess.Popen is not _seam_real_subprocess.Popen)
+seam.patch("subprocess", _seam_subprocess)
+check("SEAM7 a replacement reaches across the package boundary, not just the entry point",
+      all(getattr(m, "subprocess") is _seam_subprocess for m in seam.owners("subprocess"))
+      and "yt_msd.audio.probe" in seam.owned_by("subprocess"),
+      seam.owned_by("subprocess"))
+seam.restore("subprocess")
+check("SEAM8 and the code that was never meant to be faked has the real thing back",
+      all(getattr(m, "subprocess") is _seam_real_subprocess for m in seam.owners("subprocess")))
+
+_seam_moved = seam.owners("measure_loudness")
+check("SEAM9 a moved name is held by its module and by every re-export, all the same object",
+      mod in _seam_moved and len(_seam_moved) >= 2
+      and len({getattr(m, "measure_loudness") for m in _seam_moved}) == 1,
+      seam.owned_by("measure_loudness"))
+
+_seam_stray = {p.name: _entry_point_writes(p) for p in sorted(Path(HERE).glob("*.py"))}
+_seam_stray = {k: v for k, v in _seam_stray.items() if v}
+check("SEAM10 nothing left in this suite drives the program by writing into the entry point",
+      not _seam_stray, _seam_stray)
+
 print("=" * 72)
 print("A. module constants and stream resolution")
+
 check("A1 the prefetch trigger is 30 seconds before the end", mod.PREFETCH_SECONDS_BEFORE_END == 30)
 check("A2 the prefetch cache holds four resolved stream URLs at most", mod.PREFETCH_CACHE_LIMIT == 4, mod.PREFETCH_CACHE_LIMIT)
 check("A3 a prefetched stream URL is trusted for fifteen minutes", mod.PREFETCH_URL_MAX_AGE == 15 * 60, mod.PREFETCH_URL_MAX_AGE)
@@ -355,14 +453,15 @@ def fake_ytdlp_empty(args, timeout=None):
     return {"formats": []}
 
 
-mod.run_yt_dlp_json = fake_ytdlp_direct
+seam.patch("run_yt_dlp_json", fake_ytdlp_direct)
 _u, _ua = _REAL_RESOLVE("vidA")
 check("A11 a direct stream URL is used when yt-dlp offers one", _u == "https://example.test/direct", _u)
 check("A12 the user agent yt-dlp asked for is carried along", _ua == "ua-1", _ua)
-mod.run_yt_dlp_json = fake_ytdlp_formats
+seam.patch("run_yt_dlp_json", fake_ytdlp_formats)
 _u, _ = _REAL_RESOLVE("vidB")
 check("A13 an audio format is preferred over a video-only one", _u == "https://x/audio-only", _u)
-mod.run_yt_dlp_json = fake_ytdlp_empty
+seam.patch("run_yt_dlp_json", fake_ytdlp_empty)
+
 _raised = False
 try:
     _REAL_RESOLVE("vidC")
@@ -1953,8 +2052,10 @@ unpatch()
 #     the network.
 # ---------------------------------------------------------------------------
 print("AA. a superseded stream fetch is stopped")
-_REAL_SUBPROCESS = mod.subprocess
-_REAL_FIND_YTDLP = mod.find_yt_dlp_executable
+_REAL_SUBPROCESS = seam.original("subprocess")
+_REAL_FIND_YTDLP = seam.original("find_yt_dlp_executable")
+
+SPAWNED = []          # every stand-in process this suite has been asked to produce
 
 
 class FakeProc:
@@ -1982,33 +2083,24 @@ class FakeProc:
         return self.payload, ""
 
 
-class FakeStartupInfo:
-    def __init__(self):
-        self.dwFlags = 0
+def fake_popen(args, **kwargs):
+    proc = FakeProc()
+    proc.vid_id = next((str(a).split("v=")[-1] for a in args if "watch?v=" in str(a)), "")
+    SPAWNED.append(proc)
+    return proc
 
 
-class FakeSubprocess:
-    """Only the names run_yt_dlp_json uses, so this suite never creates a real process."""
-    DEVNULL = None
-    PIPE = -1
-    STARTUPINFO = FakeStartupInfo
-    STARTF_USESHOWWINDOW = 1
+# Only Popen is replaced, because Popen is the thing under test. Everything else a
+# subprocess module offers - run, DEVNULL, PIPE, STARTUPINFO, TimeoutExpired - stays
+# the genuine one. This matters more now than it did: the seam patches `subprocess`
+# in every module that imports it, including the audio helpers, which call
+# subprocess.run for real. A stand-in written for one yt-dlp function would break
+# them, and the breakage would show up as a check about something else entirely.
+FAKE_SUBPROCESS = seam.partial_module(_REAL_SUBPROCESS, Popen=fake_popen)
 
-    class TimeoutExpired(Exception):
-        pass
+seam.patch("subprocess", FAKE_SUBPROCESS)
+seam.patch("find_yt_dlp_executable", lambda: "fake-yt-dlp")
 
-    spawned = []
-
-    @staticmethod
-    def Popen(args, **kwargs):
-        proc = FakeProc()
-        proc.vid_id = next((str(a).split("v=")[-1] for a in args if "watch?v=" in str(a)), "")
-        FakeSubprocess.spawned.append(proc)
-        return proc
-
-
-mod.subprocess = FakeSubprocess
-mod.find_yt_dlp_executable = lambda: "fake-yt-dlp"
 
 
 def attempt_resolve(vid_id):
@@ -2018,21 +2110,21 @@ def attempt_resolve(vid_id):
         return ("raised", type(exc).__name__)
 
 
-FakeSubprocess.spawned.clear()
+SPAWNED.clear()
 aa_single = attempt_resolve("vidSolo")
 check("AA1 a stream resolution is registered while its yt-dlp is running",
-      aa_single[0] == "resolved" and FakeSubprocess.spawned[-1].registered_while_running == 1,
-      (aa_single, FakeSubprocess.spawned[-1].registered_while_running))
+      aa_single[0] == "resolved" and SPAWNED[-1].registered_while_running == 1,
+      (aa_single, SPAWNED[-1].registered_while_running))
 check("AA2 a resolution that has finished is not left in the registry",
       mod._stream_fetches == [], mod._stream_fetches)
 
-FakeSubprocess.spawned.clear()
+SPAWNED.clear()
 aa_threads = {}
 for _tag, _vid in (("kept", "vidKeep"), ("dropped", "vidDrop")):
     threading.Thread(target=lambda t=_tag, v=_vid: aa_threads.__setitem__(t, attempt_resolve(v)),
                      daemon=True).start()
 wait_for(lambda: len(mod._stream_fetches) == 2)
-by_vid = {p.vid_id: p for p in FakeSubprocess.spawned}
+by_vid = {p.vid_id: p for p in SPAWNED}
 aa_stopped = mod.cancel_stream_fetches(keep_vid_id="vidKeep")
 check("AA3 a resolution for a track that has been superseded is stopped",
       aa_stopped == 1 and by_vid["vidDrop"].kills == 1, (aa_stopped, by_vid["vidDrop"].kills))
@@ -2051,11 +2143,11 @@ check("AA7 the kept resolution finishes with the URL it was asked for",
 check("AA8 nothing is left registered once both resolutions are done",
       wait_for(lambda: mod._stream_fetches == []), mod._stream_fetches)
 
-FakeSubprocess.spawned.clear()
+SPAWNED.clear()
 mod.run_yt_dlp_json(["--flat-playlist", "--no-playlist", "ytsearch5:some artist"])
 check("AA9 an extraction run - a search - is not cancellable as a stream fetch is",
-      FakeSubprocess.spawned[-1].registered_while_running == 0 and mod._stream_fetches == [],
-      (FakeSubprocess.spawned[-1].registered_while_running, mod._stream_fetches))
+      SPAWNED[-1].registered_while_running == 0 and mod._stream_fetches == [],
+      (SPAWNED[-1].registered_while_running, mod._stream_fetches))
 check("AA10 the stopping is asked for in one place, and keeps one named track",
       _source.count("def cancel_stream_fetches(keep_vid_id=None):") == 1
       and _source.count("def _cancel_superseded_stream_fetches(self, keep_vid_id=None):") == 1)
@@ -2088,7 +2180,7 @@ def superseded_resolve(vid_id):
     raise mod.StreamFetchSupersededError("superseded by a newer pick")
 
 
-mod.resolve_stream_url = superseded_resolve
+seam.patch("resolve_stream_url", superseded_resolve)
 app._renew_loaded_stream(force=True)
 check("AA14 a reload of the track on the player is held as in flight while it runs",
       app._stream_refetching is True, app._stream_refetching)
@@ -2125,8 +2217,8 @@ check("AA22 every track is reported as working when yt-dlp is handed it, not aft
 check("AA23 a press with nothing queued says so instead of looking like a slow start",
       '"Nothing in the queue to download."' in _source)
 
-mod.subprocess = _REAL_SUBPROCESS
-mod.find_yt_dlp_executable = _REAL_FIND_YTDLP
+seam.restore("subprocess")
+seam.restore("find_yt_dlp_executable")
 
 # ---------------------------------------------------------------------------
 # AB. The channel name a search row shows, and the search that asks again when
@@ -2209,7 +2301,7 @@ def use_search_answers(payloads):
     _ab_calls.clear()
     del _ab_answer[:]
     _ab_answer.extend(payloads)
-    mod.run_yt_dlp_json = _ab_fake_search
+    seam.patch("run_yt_dlp_json", _ab_fake_search)
     return _ab_calls
 
 
@@ -2255,7 +2347,7 @@ _ab_calls = use_search_answers([{"entries": [None, {"title": "entry with no id"}
 _ab_res = mod.run_yt_dlp_text_search("strange answer")
 check("AB21 an entry without an id is dropped, and that is not read as a nameless answer",
       _ab_res == [] and len(_ab_calls) == 1, (_ab_res, _ab_calls))
-mod.run_yt_dlp_json = _REAL_YTDLP_JSON
+seam.restore("run_yt_dlp_json")
 
 
 def _ab_retry_gives_up(args, **kwargs):
@@ -2266,12 +2358,12 @@ def _ab_retry_gives_up(args, **kwargs):
 
 
 _ab_calls.clear()
-mod.run_yt_dlp_json = _ab_retry_gives_up
+seam.patch("run_yt_dlp_json", _ab_retry_gives_up)
 _ab_res = mod.run_yt_dlp_text_search("lofi hip hop radio", status_cb=_ab_seen.append)
 check("AB26 a retry that gives up does not lose the search", len(_ab_res) == 15, len(_ab_res))
 check("AB27 and it stops asking instead of throwing away the results it has",
       len(_ab_calls) == 2, len(_ab_calls))
-mod.run_yt_dlp_json = _REAL_YTDLP_JSON
+seam.restore("run_yt_dlp_json")
 
 _ab_timeouts = []
 
@@ -2281,18 +2373,18 @@ def _ab_record_timeout(args, **kwargs):
     return _ab_nameless if len(_ab_timeouts) == 1 else _ab_named
 
 
-mod.run_yt_dlp_json = _ab_record_timeout
+seam.patch("run_yt_dlp_json", _ab_record_timeout)
 _ab_res = mod.run_yt_dlp_text_search("lofi hip hop radio")
 check("AB28 the search itself is still waited on for the full extraction timeout",
       _ab_timeouts[0] == mod.YTDLP_EXTRACT_TIMEOUT, _ab_timeouts)
 check("AB29 a bonus attempt is cut off sooner than the search itself",
       _ab_timeouts[1] == mod.SEARCH_RETRY_TIMEOUT, _ab_timeouts)
 _ab_timeouts.clear()
-mod.run_yt_dlp_json = lambda args, **kw: (_ab_timeouts.append(kw.get("timeout")), _ab_named)[1]
+seam.patch("run_yt_dlp_json", lambda args, **kw: (_ab_timeouts.append(kw.get("timeout")), _ab_named)[1])
 mod.run_yt_dlp_text_search("aura and2ble")
 check("AB30 an answer that names channels is asked once, on the search's own timeout",
       _ab_timeouts == [mod.YTDLP_EXTRACT_TIMEOUT], _ab_timeouts)
-mod.run_yt_dlp_json = _REAL_YTDLP_JSON
+seam.restore("run_yt_dlp_json")
 
 _ab_search_window = _source[_source.index("def perform_search"):]
 _ab_text_branch = _ab_search_window[_ab_search_window.index("                else:"):][:300]
@@ -2366,9 +2458,8 @@ class _HarnessPointer:
         return self.at
 
 
-_ac_real_qcursor = mod.QCursor
 _pointer = _HarnessPointer(mod.QPoint(-1, -1))   # a point no row of this window can ever be at
-mod.QCursor = _pointer
+seam.patch("QCursor", _pointer)
 
 _ac_host = mod.MainApp.__new__(mod.MainApp)
 _ac_host.accent_color_name = "Blue"
@@ -2507,7 +2598,7 @@ check("AC15 throwing the list away throws the row holding the button away with i
 check("AC16 and not one row of the window is left showing a play button",
       not any(_ac_button(t) for t in _ac_window.findChildren(mod.ThumbnailWidget)))
 
-mod.QCursor = _ac_real_qcursor                      # the pointer the app reads is the real one again
+seam.restore("QCursor")                           # the pointer the app reads is the real one again
 
 
 # The wiring those checks ran through, checked in the source the checks are reading.
@@ -2611,6 +2702,62 @@ check("AD8 the slider still spans 0-150, so the honest top is the top the listen
 check("AD9 the saved volume is applied the same way at start-up as on every slider move",
       _source.count("self.vlc_player.audio_set_volume(self.volume_val)") == 1
       and _source.count("self.vlc_player.audio_set_volume(val)") == 1)
+
+
+print("=" * 72)
+print("AE. the playback clocks are numbers the program itself holds")
+
+# A constant that only the harness reads is a number the tests agree with and the player does not,
+# which is exactly what a wave that moves a constant can leave behind. So each of these two is
+# patched through the seam and the player's own decision is watched, rather than the value read
+# back off the entry point.
+RESOLVE_CALLS.clear()
+patch_resolve()
+seam.patch("PREFETCH_SECONDS_BEFORE_END", 0)
+app = make_app(index=0, vid="vid0")
+app.vlc_player = FakePlayer(mod.vlc.State.Playing, ms=80000, length=100000)  # 20 s left
+app.update_player_ui()
+time.sleep(0.35)
+check("AE1 with the read-ahead trigger moved to zero seconds, the player stops reading ahead - the decision is made with the number the program holds",
+      RESOLVE_CALLS == [], RESOLVE_CALLS)
+seam.restore("PREFETCH_SECONDS_BEFORE_END")
+RESOLVE_CALLS.clear()
+app = make_app(index=0, vid="vid0")
+app.vlc_player = FakePlayer(mod.vlc.State.Playing, ms=80000, length=100000)  # the same 20 s left
+app.update_player_ui()
+check("AE2 and the same track is read ahead again as soon as the program's own number is back",
+      wait_for(lambda: "vid1" in RESOLVE_CALLS), RESOLVE_CALLS)
+unpatch()
+
+_STALL_AS_THE_PROGRAM_HAS = mod.STREAM_STALL_SECONDS
+RESOLVE_CALLS.clear()
+patch_resolve()
+app = stream_app(age=0.0, moved=13.0, renew_age=1.0)   # a position still for thirteen seconds
+app.update_player_ui()
+check("AE3 a position that has stood still for thirteen seconds is convicted under the program's own eight-second rule",
+      app._stream_dead is True and RESOLVE_CALLS == [], (app._stream_dead, RESOLVE_CALLS))
+seam.patch("STREAM_STALL_SECONDS", 60)
+RESOLVE_CALLS.clear()
+app = stream_app(age=0.0, moved=13.0, renew_age=1.0)   # the same track, the same thirteen seconds
+app.update_player_ui()
+check("AE4 the same track is left alone when that threshold is moved to sixty seconds - the watchdog asks the program, not the suite",
+      app._stream_dead is False and RESOLVE_CALLS == [], (app._stream_dead, RESOLVE_CALLS))
+seam.restore("STREAM_STALL_SECONDS")
+app = stream_app(age=0.0, moved=13.0, renew_age=1.0)
+app.update_player_ui()
+check("AE5 the eight-second rule is back and convicts it again",
+      mod.STREAM_STALL_SECONDS == _STALL_AS_THE_PROGRAM_HAS and app._stream_dead is True,
+      (mod.STREAM_STALL_SECONDS, app._stream_dead))
+unpatch()
+
+_playback_numbers = ("PREFETCH_SECONDS_BEFORE_END", "PREFETCH_URL_MAX_AGE", "PREFETCH_CACHE_LIMIT",
+                     "STREAM_STALL_SECONDS", "STREAM_RESUME_GRACE", "STREAM_URL_MAX_AGE",
+                     "STREAM_REFETCH_LIMIT", "STREAM_RENEW_COOLDOWN", "STREAM_END_SLACK_MS",
+                     "STREAM_SEEK_RESTORE_TIMEOUT")
+_number_holders = {_name: seam.owners(_name) for _name in _playback_numbers}
+check("AE6 every one of these numbers is a single object wherever it is held, whichever module ends up holding it",
+      all(len({getattr(_m, _name) for _m in _holders}) == 1 for _name, _holders in _number_holders.items()),
+      {_name: seam.owned_by(_name) for _name, _holders in _number_holders.items()})
 
 
 print(f"{CHECKS - len(FAILS)} / {CHECKS} checks passed")

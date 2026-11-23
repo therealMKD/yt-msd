@@ -11,16 +11,52 @@ from PySide6.QtGui import QIcon
 
 # ============================================================
 # APPLICATION ICON (title bar, taskbar, system tray)
-# icon-256x256.ico sits next to this file in the source tree and is bundled into
+# icon-256x256.ico sits next to the program in the source tree and is bundled into
 # the compiled exe, which unpacks it into its own application folder at startup.
 # ============================================================
 
+def program_file():
+    """The file this program was started as: the .pyw in the source tree, the exe once installed.
+
+    Deliberately not `__file__`. Since the split, the code that asks lives under yt_msd/, and its
+    own `__file__` is a module inside the package rather than the program - which is what made the
+    startup registry entry point at yt_msd/sync/startup.py, a file that starts nothing.
+
+    Returns "" when the process has no file it was started from at all.
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.abspath(sys.executable)
+    entry = getattr(sys.modules.get("__main__"), "__file__", None)
+    if not entry and sys.argv:
+        entry = sys.argv[0]
+    if not entry:
+        return ""
+    return os.path.abspath(entry)
+
+
+
+def program_folder():
+    """The folder the program itself was started from.
+
+    gui_config.json, icon-256x256.ico, a bundled yt-dlp.exe and yt-msd-crash.log all live beside
+    the file the program was started as - the .pyw in the source tree, the exe once installed. It
+    is the folder of `program_file()`, for the same reason: a folder taken from the asking
+    module's own `__file__` names a folder inside the package instead of the one the program sits
+    in.
+
+    Returns "" when the process has no file it was started from at all.
+    """
+    started_as = program_file()
+    return os.path.dirname(started_as) if started_as else ""
+
+
+
 def _app_icon_path():
-    """Absolute path to icon-256x256.ico: inside the packaged app when frozen, next to this file otherwise."""
+    """Absolute path to icon-256x256.ico: inside the packaged app when frozen, next to the program otherwise."""
     if getattr(sys, "frozen", False):
         base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.executable)))
     else:
-        base = os.path.dirname(os.path.abspath(__file__))
+        base = program_folder()
     return os.path.join(base, "icon-256x256.ico")
 
 
