@@ -15,17 +15,17 @@ From `GUI Source Code`:
 ```powershell
 python "GUI Test Suite\probe_playback.py"      # 424 playback / search / search-row / seam checks. No visible window, no network, no library writes.
 python "GUI Test Suite\probe_sync.py"          # 120 sync-chain checks. Loopback sockets only, fixture folders only, no LAN broadcast and no removable device.
-python "GUI Test Suite\probe_windows.py"       # 114 window checks: the settings window, the three chain builders, the sync manager, the tray bubble, the three update windows, the rename window, and the two promises made to the machine - which file Windows starts, which yt-dlp is looked for.
+python "GUI Test Suite\probe_windows.py"       # 119 window checks: the settings window, the three chain builders, the sync manager, the tray bubble, the three update windows, the rename window, the two promises made to the machine - which file Windows starts, which yt-dlp is looked for - and what MainApp is assembled from since wave 6.
 python "GUI Test Suite\probe_shell.py"         # 75 single-instance and crash-reporting checks. The crash log these checks write lands in their own fixture folder, never in the log a user reads.
 python "GUI Test Suite\probe_export.py"        # 70 export-package checks. Fixture folders only; every archive built is read back and deleted.
-python "GUI Test Suite\probe_local_pane.py"    # 15 local-folder-pane checks: how a folder is filled in chunks, and whose number decides each chunk's size.
+python "GUI Test Suite\probe_local_pane.py"    # 16 local-folder-pane checks: how a folder is filled in chunks, whose number decides each chunk's size, and which module builds the app that fills it.
 python "GUI Test Suite\check_glyphs.py"        # 14 icon-caption checks. Paints into bitmaps, never shows a window, writes captions.png.
 python "GUI Test Suite\probe_tuning_seam.py"   # 14 checks that the settings seam carries across module boundaries.
 python "GUI Test Suite\measure_changeover.py"  # optional dev tool: where the time at a real track change goes. Touches the network.
 ```
 
 Every regression script prints one line per check and a final `N / N checks passed`, and exits 1 when
-anything fails, so they are safe to chain. Those eight are the gate - 846 checks - and they are what a
+anything fails, so they are safe to chain. Those eight are the gate - 852 checks - and they are what a
 wave is measured against before it is accepted. `probe_playback.py` is the one to run after any edit to
 the `.pyw` or to `yt_msd/`; `probe_sync.py` is the one to run after anything in the sync chains - the
 TAG.yaml marker, the socket protocol, either end of a chain, or the removable-media worker;
@@ -42,9 +42,45 @@ stays in `yt-msd-gui.pyw` on purpose - it is the last large piece the compiled b
 Python), a class split across modules runs exactly as the one class does, and the time in this
 program goes to VLC, ffmpeg and the network rather than to attribute lookup. So there is no wave
 left to run: `python .test_harness/refactor/splitlib.py analyze` reports `LEFT IN THE .pyw BY
-DECISION : 1` with the reason and `BLOCKS THE PLAN STILL OWES : 0`, and `check_wave` refuses any
-wave that lists `MainApp` until `LEFT_BY_DECISION["MainApp"]` is deleted from `waves.py` - which is
-the edit that reopens the question, if the file ever outgrows being read as one piece.
+DECISION : 1` with the reason, `BLOCKS THE PLAN STILL OWES : 0` and `... of them over 150 lines : 0`,
+and `check_wave` refuses any wave that lists `MainApp` until `LEFT_BY_DECISION["MainApp"]` is deleted
+from `waves.py` - which is the edit that reopens the question, if the class ever outgrows being read
+as one piece.
+
+Wave 5h was the last one and it moved nothing: it removed 117 names the entry point imported back
+from the package that nothing reads - not the file that imports them, not `mod.<name>` in the suite,
+not a string the suite contains - together with the thirteen wave banners that still promised a
+final wave, taking `yt-msd-gui.pyw` from 6,995 lines to 6,882. `.test_harness/refactor/prune_reexports.py`
+does it and `.test_harness/refactor/splitlib.py analyze` reports `... of which nothing reads
+anywhere : 0`, so a wave that moves code out and leaves its import behind shows up as a number
+rather than quietly adding to the file. Names the suite reaches are kept on purpose: a good third of
+what remains in the import layer exists so a check can find it.
+
+Wave 6 is listed in `LIFTS` in that same file rather than in `WAVES`, because it moved methods and not
+blocks: `MainApp` stayed, and the five methods that had outgrown a screenful went into modules it now
+inherits - `yt_msd.ui.bootstrap` (`__init__`), `yt_msd.ui.layout` (`setup_ui`), `yt_msd.ui.stylesheet`
+(`apply_theme`), `yt_msd.ui.settings_reset` (`reset_to_defaults`) and `yt_msd.ytdlp.batch`
+(`start_batch_download`, whose nested `_run_batch` and `download_single` went with it). 1,618 lines,
+cut and pasted at the same indentation, which is why `verify.py` still reports not one changed line in
+any of them. `.test_harness/refactor/lift_methods.py` writes those modules and refuses a method whose
+out-edges still point at the entry point. `yt-msd-gui.pyw` went from 6,882 lines to 5,252, and the
+longest thing left in it is 132 lines.
+
+Three checks moved with it, and the one that complained loudest was the one that was right. `WN-G9`
+refuses a module under `yt_msd` that reads its own `__file__` for a location, and the constructor had
+done exactly that to decide where `gui_config.json` lives - after the move it would have been
+`yt_msd/ui/`, so it reads `program_folder()` now. `Z41` and `LP9`/`LP9b` were text windows pinned to a
+place in the `.pyw`, so they now ask the same questions of the whole program. The wave also left 18
+imports nothing read behind, which `analyze` reported and `prune_reexports.py` removed.
+
+Five checks were added rather than re-pointed. `WN-H1`-`WN-H5` ask the question the rest of the suite
+is structurally unable to ask: every other check drives `MainApp`'s methods as unbound functions on
+hand-made stand-ins, so a shadowed method, a duplicated one or a base in the wrong place would have
+left all 847 of them green. They assert that the five mixins are inherited ahead of `QMainWindow`,
+that each lifted method resolves to the mixin that owns it, that none of the five is redefined in
+`MainApp` on top of the mixin that holds it, that the constructor resolves to `BootstrapMixin` rather
+than to the Qt one behind it, and that the signals `MainApp` wires its threads to are still declared
+on the class itself.
 
 ## What is in here
 

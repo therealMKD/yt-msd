@@ -188,12 +188,24 @@ check("LP8 move the floor to four and the same expensive folder gets four rows -
 seam.restore("LOCAL_RENDER_CHUNK_MIN_ROWS")
 
 # The row height a screenful is measured against is the guess in the same group, and the one place
-# it is used is where a MainApp is built.
-_source_lines = [line.strip() for line in open(TMP_PY, encoding="utf-8")]
-_seeded = [line for line in _source_lines
-           if line == "self._local_render_row_height = LOCAL_RENDER_ROW_HEIGHT_GUESS"]
+# it is used is where a MainApp is built. Wave 6 moved that construction into
+# yt_msd/ui/bootstrap.py, so this reads the whole program rather than the entry point alone and
+# asks the same two questions of it: the seed is written exactly once, wherever the program now
+# keeps it, and it is the constructor MainApp now inherits that writes it.
+_program_text = [(os.path.relpath(TMP_PY, HERE), open(TMP_PY, encoding="utf-8").read())]
+for _root, _dirs, _files in os.walk(os.path.join(SRC_DIR, "yt_msd")):
+    for _name in sorted(_files):
+        if _name.endswith(".py"):
+            _path = os.path.join(_root, _name)
+            _program_text.append((os.path.relpath(_path, SRC_DIR),
+                                  open(_path, encoding="utf-8").read()))
+_seed_line = "self._local_render_row_height = LOCAL_RENDER_ROW_HEIGHT_GUESS"
+_seeded = [(where, number + 1) for where, text in _program_text
+           for number, line in enumerate(text.splitlines()) if line.strip() == _seed_line]
 check("LP9 the guess a screenful is measured against is seeded where MainApp is built, exactly once",
       len(_seeded) == 1, _seeded)
+check("LP9b and it is the bootstrap mixin MainApp inherits that builds it, since wave 6",
+      len(_seeded) == 1 and _seeded[0][0] == os.path.join("yt_msd", "ui", "bootstrap.py"), _seeded)
 
 # The height the pane is given is known before its rows are painted: 4000 rows at the guessed pitch.
 app = pane_app(pane_height=300, items=4000)

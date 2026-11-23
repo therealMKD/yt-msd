@@ -23,6 +23,11 @@ LOST	CUSTOM_NORM_CMD = self.main_app.custom_norm_cmd if state else ""
 LOST	CUSTOM_NORM_CMD = text
 LOST	MAX_WORKERS = args.norm_threads
 LOST	MAX_WORKERS = max(1, _available_threads // 2)
+LOST	QComboBox, QCheckBox, QSlider, QScrollArea,
+LOST	QHBoxLayout, QLabel, QPushButton, QLineEdit,
+LOST	QSizePolicy, QStyle, QToolTip, QStyleOption, QSpinBox, QProgressBar, QInputDialog)
+LOST	QSplitter, QSplitterHandle, QFileDialog, QMessageBox, QDialog,
+LOST	QSystemTrayIcon, QMenu, QFrame, QGridLayout,
 LOST	SILENCE_PAD_DUR = 2.0
 LOST	SILENCE_PAD_DUR = args.silence_pad
 LOST	SILENCE_PAD_DUR = float(self.silence_pad_dur)
@@ -38,7 +43,15 @@ LOST	SILENCE_TRIM = state
 LOST	_effective_norm_cmd = (custom_norm_cmd or CUSTOM_NORM_CMD or "").strip()
 LOST	base = os.path.dirname(os.path.abspath(__file__))
 LOST	base_dir = os.path.dirname(os.path.abspath(__file__))
+LOST	class MainApp(QMainWindow):
+LOST	else:
 LOST	folders.append(os.path.dirname(os.path.abspath(__file__)))
+LOST	from PySide6.QtCore import QObject, Signal
+LOST	from PySide6.QtCore import Qt, Signal, QTimer, Slot, QPoint, QRect, QMargins, QThread, QEvent, QObject, QByteArray
+LOST	from PySide6.QtGui import QIcon, QPixmap, QImage, QAction, QColor, QPalette, QPainter, QPainterPath, QBrush, QFont, QDrag, QFontMetrics, QCursor
+LOST	from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+LOST	from concurrent.futures import as_completed  # a plain re-export, already resolved at import
+LOST	from typing import Dict, List, Optional, Tuple, Callable, Union
 LOST	global CUSTOM_NORM_CMD
 LOST	global CUSTOM_NORM_CMD
 LOST	global SILENCE_PAD_DUR
@@ -48,6 +61,7 @@ LOST	global SILENCE_TRIM, SILENCE_PAD_DUR, CUSTOM_NORM_CMD
 LOST	global SILENCE_TRIM, SILENCE_PAD_DUR, CUSTOM_NORM_CMD
 LOST	global SILENCE_TRIM, SILENCE_PAD_DUR, CUSTOM_NORM_CMD
 LOST	if SILENCE_TRIM and orig_duration is not None and new_duration is not None:
+LOST	if getattr(sys, 'frozen', False):
 LOST	if include_pad and SILENCE_PAD_DUR > 0:
 LOST	if self.use_custom_norm_cmd and self.custom_norm_cmd.strip():
 LOST	new_duration = _get_audio_duration(filepath) if SILENCE_TRIM else None
@@ -58,6 +72,8 @@ LOST	print(f"{Colors.BOLD}Using {MAX_WORKERS} CPU Threads for Processing{Colors.
 LOST	print(f"{Colors.DIM}Silence trim: {'ON' if SILENCE_TRIM else 'OFF'} | End pad: {SILENCE_PAD_DUR}s | Loudnorm: {CUSTOM_NORM_CMD or 'built-in whole-track gain'}{Colors.END}\n")
 LOST	print(f"{Colors.GREEN}Starting static volume adjustment on {len(files)} files with {MAX_WORKERS} worker threads...{Colors.END}")
 LOST	script_path = os.path.abspath(__file__)
+LOST	self.config_dir = os.path.dirname(os.path.abspath(__file__))
+LOST	self.config_dir = os.path.dirname(os.path.abspath(sys.executable))
 LOST	trim_on = SILENCE_TRIM if include_silence_trim is None else include_silence_trim
 LOST	with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
 NEW	"""
@@ -71,14 +87,21 @@ NEW	"""The four normalization settings the ffmpeg chain is built from, in one pl
 NEW	"""The yt-dlp half of the yt-msd GUI package: installing it, updating it, and driving it."""
 NEW	1. silence trim    - _silence_trim_filters(), gated by the TUNING.silence_trim setting
 NEW	3. end-of-file pad - apad, gated by TUNING.silence_pad_dur
+NEW	BatchDownloadMixin,
 NEW	DEFAULT_CUSTOM_NORM_CMD = ""  # Optional override of ONLY the loudnorm part of the ffmpeg -af chain
 NEW	DEFAULT_MAX_WORKERS = max(1, _available_threads // 2)
 NEW	DEFAULT_SILENCE_PAD_DUR = 2.0
 NEW	DEFAULT_SILENCE_TRIM = True  # Trim leading/trailing silence; independent of the loudnorm override
 NEW	Deliberately not `__file__`. Since the split, the code that asks lives under yt_msd/, and its
 NEW	FileSystemEventHandler = None
+NEW	LayoutMixin,
 NEW	Observer = None
+NEW	QFileDialog, QMessageBox, QDialog, QSystemTrayIcon, QMenu, QStyle)
+NEW	QMainWindow):
+NEW	QPushButton, QLineEdit, QComboBox, QCheckBox, QScrollArea,
 NEW	Returns "" when the process has no file it was started from at all.
+NEW	SettingsResetMixin,
+NEW	StylesheetMixin,
 NEW	TUNING = Tuning()
 NEW	TUNING.custom_norm_cmd = args.custom_norm_cmd
 NEW	TUNING.custom_norm_cmd = self.main_app.custom_norm_cmd if state else ""
@@ -93,6 +116,12 @@ NEW	TUNING.silence_trim = state
 NEW	_effective_norm_cmd = (custom_norm_cmd or TUNING.custom_norm_cmd or "").strip()
 NEW	base = program_folder()
 NEW	base_dir = program_folder()
+NEW	class BatchDownloadMixin:
+NEW	class BootstrapMixin:
+NEW	class LayoutMixin:
+NEW	class MainApp(BootstrapMixin,
+NEW	class SettingsResetMixin:
+NEW	class StylesheetMixin:
 NEW	class Tuning:
 NEW	def __init__(self):
 NEW	def from_settings(self, silence_trim, silence_pad_dur, use_custom_norm_cmd, custom_norm_cmd):
@@ -127,6 +156,7 @@ NEW	return os.path.abspath(entry)
 NEW	return os.path.abspath(sys.executable)
 NEW	return os.path.dirname(started_as) if started_as else ""
 NEW	script_path = program_file()
+NEW	self.config_dir = program_folder()
 NEW	self.custom_norm_cmd = DEFAULT_CUSTOM_NORM_CMD
 NEW	self.custom_norm_cmd = override if (use_custom_norm_cmd and override) else ""
 NEW	self.max_workers = DEFAULT_MAX_WORKERS

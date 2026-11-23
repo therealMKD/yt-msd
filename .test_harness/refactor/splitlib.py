@@ -217,6 +217,65 @@ def wave_names(wave):
     return out
 
 
+def lifted_methods():
+    """{method name: (wave, dotted module, mixin class)} for the methods wave 6 lifted out.
+
+    Read separately from plan_map() on purpose: a lifted method is not a name the entry point can
+    import back, so it must never enter the plan that build_import_block() and check_wave() reason
+    over as though it were. lift_methods.py is the tool that consults this.
+    """
+    sys.path.insert(0, HERE)
+    import waves
+    out = {}
+    for wave, groups in getattr(waves, "LIFTS", {}).items():
+        for dotted, mixin, names in groups:
+            for name in names:
+                out[name] = (wave, dotted, mixin)
+    return out
+
+
+def method_sizes():
+    """[(lines, Class.method)] for every method written in the entry point, longest first."""
+    text = read_pyw()
+    tree = ast.parse(text)
+    found = []
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for sub in node.body:
+            if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                found.append((sub.end_lineno - sub.lineno + 1, "%s.%s" % (node.name, sub.name)))
+    found.sort(reverse=True)
+    return found
+
+
+METHOD_LINE_LIMIT = 150      # the wave-6 rule: no method in the entry point runs longer than this
+
+
+def report_methods():
+    """The wave-6 promise, kept as a number: nothing over 150 lines is left in the entry point.
+
+    Wave 5h did the same thing for the import layer for the same reason. A rule that is only
+    written down in a comment is a rule that quietly expires the first time someone adds a long
+    method; a count printed by analyze() is one that shows up on a screen.
+    """
+    lifted = lifted_methods()
+    sizes = method_sizes()
+    over = [s for s in sizes if s[0] > METHOD_LINE_LIMIT]
+    print("\nMETHODS LIFTED OUT OF THE CLASS (wave 6)")
+    for name, (wave, dotted, mixin) in sorted(lifted.items(), key=lambda kv: kv[1][1]):
+        print("  %-24s wave %-3s -> %-28s %s" % (name, wave, dotted, mixin))
+    if sizes:
+        print("METHODS LEFT IN THE ENTRY POINT          : %d, longest %d lines (%s)"
+              % (len(sizes), sizes[0][0], sizes[0][1]))
+    else:
+        print("METHODS LEFT IN THE ENTRY POINT          : 0")
+    print("  ... of them over %d lines              : %d" % (METHOD_LINE_LIMIT, len(over)))
+    for lines, name in over:
+        print("    TOO LONG  %5d lines  %s  (lift it: add it to waves.py LIFTS and run lift_methods.py)"
+              % (lines, name))
+
+
 def analyze(wave=None):
     if wave and cross_module_globals(wave):
         print("\nCROSS-MODULE `global` HAZARDS in wave '%s':" % wave)
@@ -268,6 +327,13 @@ def analyze(wave=None):
         print("  %-10s %5d-%-6d %s" % (b["kind"], b["start"], b["end"], ", ".join(b["names"])))
     if not uncovered:
         print("Nothing outstanding: every top-level block is moved above or closed out above.")
+    layer = import_layer_status()
+    unread = sorted(k for k, v in layer.items() if not v)
+    print("\nNAMES THE ENTRY POINT BINDS FROM IMPORTS : %d" % len(layer))
+    print("  ... of which nothing reads anywhere    : %d" % len(unread))
+    for name in unread:
+        print("    DEAD IMPORT  %s" % name)
+    report_methods()
 
 
 # ---------------------------------------------------------------- checks
@@ -374,6 +440,64 @@ def harness_exemptions(wave):
     sys.path.insert(0, HERE)
     import waves
     return getattr(waves, "HARNESS_EXEMPT", {}).get(wave, {})
+
+
+def suite_strings():
+    """Every string literal written anywhere in the GUI Test Suite.
+
+    harness_seam.patch(mod, "name") and getattr(mod, "name") reach a name by text rather than by
+    syntax, so a name that is only ever mentioned that way is still load-bearing: deleting the
+    import that provides it does not turn a check red, it turns it into a check that passes while
+    testing nothing.
+    """
+    found = set()
+    if not os.path.isdir(HARNESS_DIR):
+        return found
+    for name in sorted(os.listdir(HARNESS_DIR)):
+        if not name.endswith(".py"):
+            continue
+        path = os.path.join(HARNESS_DIR, name)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                tree = ast.parse(fh.read(), filename=path)
+        except (SyntaxError, OSError):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                found.add(node.value)
+    return found
+
+
+def import_layer_status():
+    """{binding: why it is still in the entry point} for every name it binds from an import.
+
+    Three things can earn a name its place: the entry point reads it, the suite reaches it as
+    mod.<name>, or the suite names it in a string. A binding that earns none of those is dead
+    text in the file - wave 5h's prune_reexports.py removes exactly those, and analyze() reports
+    the count so it cannot creep back after a later wave moves code out and leaves the import.
+    """
+    text, tree, _blocks = parse_blocks()
+    used, stored = set(), set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            (used if isinstance(node.ctx, ast.Load) else stored).add(node.id)
+    assigned, read = harness_couplings()
+    named = suite_strings()
+    out = {}
+    for node in tree.body:
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        for a in node.names:
+            binding = a.asname or a.name.split(".")[0]
+            if binding in used or binding in stored:
+                out[binding] = "read here"
+            elif binding in assigned or binding in read:
+                out[binding] = "suite reaches mod.%s" % binding
+            elif binding in named:
+                out[binding] = "suite names it in a string"
+            else:
+                out[binding] = ""
+    return out
 
 
 def left_by_decision():

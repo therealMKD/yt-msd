@@ -24,18 +24,19 @@
 # PySide6 version of yt-msd
 # Programmed with Qwen, if you don't like it, don't use it.
 # This file is the entry point only. The program is the yt_msd package beside it; it stopped
-# being one file in 3.5, and the parts moved out a wave at a time with the GUI Test Suite
-# green after every single wave.
+# being one file in 3.5, and the parts moved out a wave at a time with the GUI Test Suite green
+# after every single wave. What is left here is MainApp and the entry block - MainApp stays, on the
+# reasons recorded in LEFT_BY_DECISION (.test_harness/refactor/waves.py), and the five methods that
+# had outgrown a screenful went into the mixin modules it now inherits. Nothing written in this
+# file runs longer than 150 lines; splitlib.py analyze() is what keeps that number at zero.
 
 import os
-import re
 import sys
 import json
 import threading
 import tempfile
 import subprocess
 import zipfile
-import shutil
 from pathlib import Path
 # ThreadPoolExecutor is not defined in concurrent.futures - Python 3.15 hands it over with
 # a "lazy from" (concurrent/futures/__init__.py: lazy from .thread import ThreadPoolExecutor),
@@ -46,10 +47,8 @@ from pathlib import Path
 # "TypeError: 'lazy_import' object is not callable" that fired on every local-library metadata
 # pass. Importing from the module that really defines the class skips the lazy re-export.
 from concurrent.futures.thread import ThreadPoolExecutor
-from concurrent.futures import as_completed  # a plain re-export, already resolved at import
-# These names moved out of this file during the 3.5 modularisation (wave 1) and are
-# re-exported here so the entry point keeps every name it has always had while the
-# split proceeds. The final wave replaces this with the package's own entry point.
+# Wave 1: moved into yt_msd.constants and imported back because this file or the GUI Test Suite
+# still reads them by name. Wave 5h checked the group and dropped whatever nothing read.
 from yt_msd.constants import (
     APP_VERSION,
     AUDIO_EXTENSIONS,
@@ -67,17 +66,14 @@ from yt_msd.constants import (
     STOP_AFTER_ONCE,
     STOP_AFTER_STATE_NAMES,
     STOP_AFTER_TOOLTIPS,
-    TAGGABLE_EXTENSIONS,
     UPDATE_MODE_INSTALLER,
     UPDATE_MODE_REPLACE,
     UPDATE_MODE_SWAP,
     UPDATE_REPO,
 )
 from yt_msd.deps import (
-    FileSystemEventHandler,
     Observer,
     _VLC_MODULE_AVAILABLE,
-    _WATCHDOG_AVAILABLE,
     vlc,
     winreg,
 )
@@ -88,36 +84,18 @@ from yt_msd import deps as _deps_mod
 if hasattr(_deps_mod, '_VLC_IMPORT_ERROR'):
     _VLC_IMPORT_ERROR = _deps_mod._VLC_IMPORT_ERROR
 from yt_msd.paths import (
-    _app_icon_path,
     app_icon,
     is_packaged_build,
-)
-from yt_msd.util.console import (
-    Colors,
-    _print_lock,
-    _safe_print,
-)
-from yt_msd.util.text import (
-    _is_romanized,
-    _sanitize_filename,
-    _split_artist_title,
-    _title_match_key,
-    _title_matches_filename,
-    clean_youtube_title,
 )
 from yt_msd.util.timefmt import (
     _format_audio_duration,
 )
 from yt_msd.util.version import (
     _extract_version_number,
-    _release_asset_file,
     _version_is_newer,
     select_release_asset,
 )
 from yt_msd.util.yaml import (
-    _yaml_dump_list,
-    _yaml_scalar_parse,
-    _yaml_scalar_repr,
     yaml_dump,
     yaml_load,
 )
@@ -126,46 +104,26 @@ import urllib.request
 import urllib.parse
 import html
 import io
-import shlex
 import time
 import random
-import socket
-import struct
-import hashlib
-import traceback
-from typing import Dict, List, Optional, Tuple, Callable, Union
+from typing import List, Tuple
 from PIL import Image
 
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                               QHBoxLayout, QLabel, QPushButton, QLineEdit, 
-                               QComboBox, QCheckBox, QSlider, QScrollArea, 
-                               QSplitter, QSplitterHandle, QFileDialog, QMessageBox, QDialog,
-                               QSystemTrayIcon, QMenu, QFrame, QGridLayout,
-                               QSizePolicy, QStyle, QToolTip, QStyleOption, QSpinBox, QProgressBar, QInputDialog)
-from PySide6.QtCore import Qt, Signal, QTimer, Slot, QPoint, QRect, QMargins, QThread, QEvent, QObject, QByteArray
-from PySide6.QtGui import QIcon, QPixmap, QImage, QAction, QColor, QPalette, QPainter, QPainterPath, QBrush, QFont, QDrag, QFontMetrics, QCursor
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+                               QPushButton, QLineEdit, QComboBox, QCheckBox, QScrollArea,
+                               QFileDialog, QMessageBox, QDialog, QSystemTrayIcon, QMenu, QStyle)
+from PySide6.QtCore import Qt, Signal, QTimer, QPoint, QObject, QByteArray
+from PySide6.QtGui import QIcon, QPixmap, QColor, QPainter, QCursor
 from PySide6.QtCore import QMimeData, QUrl
-from PySide6.QtNetwork import QLocalServer, QLocalSocket
+from PySide6.QtNetwork import QLocalServer
 
-# The loudness numbers and the four settings the ffmpeg -af chain is built from now live in
-# the package. The fixed numbers are imported directly; the settings a user changes are
-# reached through one object so a write cannot miss a reader.
-from yt_msd.audio.tuning import (
-    _available_threads,
-    TARGET_LUFS,
-    TRUE_PEAK,
-    LOUDNESS_RANGE,
-    BITRATE,
-    SILENCE_THRESHOLD,
-    SILENCE_DURATION,
-    SILENCE_KEEP,
-)
+# The loudness numbers and the settings the ffmpeg -af chain is built from live in the package,
+# reached through one object so a settings write cannot miss a reader. Wave 5h stopped importing
+# the fixed numbers into this file: nothing in it reads them.
 from yt_msd.audio.tuning import TUNING
-# These names moved out of this file during the 3.5 modularisation (wave 2c) and are
-# re-exported here so the entry point keeps every name it has always had while the
-# split proceeds. The final wave replaces this with the package's own entry point.
+# Wave 2c: moved into yt_msd.audio.localmeta and imported back because this file or the GUI Test
+# Suite still reads them by name. Wave 5h checked the group and dropped whatever nothing read.
 from yt_msd.audio.localmeta import (
-    _LOCAL_META_CACHE_CAP,
     _ffprobe_audio_meta,
     _local_display_name,
     _local_meta_cache,
@@ -173,55 +131,32 @@ from yt_msd.audio.localmeta import (
     _read_local_audio_meta,
 )
 from yt_msd.audio.normalize import (
-    _silence_trim_filters,
     build_af_chain,
-    normalize_file,
-    run_loudness_normalization,
 )
 from yt_msd.audio.probe import (
-    _ffmpeg_binary,
-    _ffprobe_binary,
-    _get_audio_duration,
-    _probe_format_block,
     check_ffmpeg_available,
     measure_loudness,
 )
 from yt_msd.audio.renamer import (
-    _print_renamer_banner,
-    _select_renamer_folder,
-    clean_and_tag_files,
     run_integrated_renamer_cli,
 )
 from yt_msd.audio.tags import (
-    COMM,
-    EasyID3,
-    EasyMP4,
-    ID3,
-    ID3NoHeaderError,
-    MutagenFile,
-    _add_placeholder_tag,
-    _remove_placeholder_tag,
     read_metadata_tags,
     write_metadata_tags,
 )
-# These names moved out of this file during the 3.5 modularisation (wave 3) and are
-# re-exported here so the entry point keeps every name it has always had while the
-# split proceeds. The final wave replaces this with the package's own entry point.
+# Wave 3: moved into yt_msd.ytdlp.install and imported back because this file or the GUI Test
+# Suite still reads them by name. Wave 5h checked the group and dropped whatever nothing read.
 from yt_msd.ytdlp.install import (
     YTDLP_EXTRACT_TIMEOUT,
-    YTDLP_GITHUB_REPO,
-    YTDLP_INSTALL_TIMEOUT,
     YTDLP_UPDATE_CHECK_INTERVAL,
     YTDLP_WINGET_ID,
     YtDlpMissingError,
     _yt_dlp_lookup_paths,
-    find_winget_executable,
     latest_yt_dlp_release,
     run_winget,
 )
-# These names moved out of this file during the 3.5 modularisation (wave 5f) and are
-# re-exported here so the entry point keeps every name it has always had while the
-# split proceeds. The final wave replaces this with the package's own entry point.
+# Wave 5f: moved into yt_msd.playback.prefetch and imported back because this file or the GUI
+# Test Suite still reads them by name. Wave 5h checked the group and dropped whatever nothing read.
 from yt_msd.playback.prefetch import (
     PREFETCH_CACHE_LIMIT,
     PREFETCH_SECONDS_BEFORE_END,
@@ -236,82 +171,41 @@ from yt_msd.playback.stream import (
     STREAM_STALL_SECONDS,
     STREAM_URL_MAX_AGE,
 )
-# These names moved out of this file during the 3.5 modularisation (wave 3b) and are
-# re-exported here so the entry point keeps every name it has always had while the
-# split proceeds. The final wave replaces this with the package's own entry point.
-from yt_msd.ytdlp.download import (
-    DOWNLOAD_ITEM_ATTEMPTS,
-    _PERMANENT_DOWNLOAD_ERROR_MARKERS,
-    _YTDLP_FINAL_PATH_PATTERNS,
-    _YTDLP_STAGED_PATH_PATTERNS,
-    _clean_reported_path,
-    _is_permanent_download_error,
-    _match_reported_path,
-    run_yt_dlp_download,
-)
+# Wave 3b: moved into yt_msd.ytdlp.download and imported back because this file or the GUI Test
+# Suite still reads them by name. Wave 5h checked the group and dropped whatever nothing read.
 from yt_msd.ytdlp.runner import (
     SEARCH_CHANNEL_RETRIES,
     SEARCH_RETRY_TIMEOUT,
     StreamFetchSupersededError,
-    _stream_fetch_owner,
     _stream_fetches,
-    _stream_fetches_lock,
-    _ytdlp_exe_cache,
-    _ytdlp_exe_cache_lock,
-    begin_stream_fetch,
     cancel_stream_fetches,
-    end_stream_fetch,
     entry_channel_name,
     find_yt_dlp_executable,
     get_yt_dlp_version,
-    note_stream_fetch_process,
     resolve_stream_url,
     run_yt_dlp_json,
     run_yt_dlp_text_search,
     stream_cli_args,
-    stream_fetch_vid_for_this_thread,
-    stream_fetch_was_superseded,
 )
-# These names moved out of this file during the 3.5 modularisation (wave 2b) and are
-# re-exported here so the entry point keeps every name it has always had while the
-# split proceeds. The final wave replaces this with the package's own entry point.
-from yt_msd.subproc import (
-    _child_utf8_env,
-    _hidden_window_kwargs,
-)
-# These names moved out of this file during the 3.5 modularisation (wave 5) and are
-# re-exported here so the entry point keeps every name it has always had while the
-# split proceeds. The final wave replaces this with the package's own entry point.
+# Wave 2b moved into yt_msd.subproc, and wave 5h removed that import from this file entirely:
+# neither the entry point nor the GUI Test Suite reaches those names any more.
+# Wave 5: moved into yt_msd.ui.theme and imported back because this file or the GUI Test Suite
+# still reads them by name. Wave 5h checked the group and dropped whatever nothing read.
 from yt_msd.ui.theme import (
     THEME_COLORS,
     get_accent_color,
-    get_system_accent_color,
-    get_system_appearance_mode,
 )
 from yt_msd.ui.widgets import (
-    ClickableSlider,
     DoubleClickButton,
     DraggableQueueWidget,
-    THUMB_BOX_COLORS,
-    THUMB_BOX_H,
-    THUMB_BOX_INSET,
-    THUMB_BOX_PAUSED,
-    THUMB_BOX_PLAIN,
-    THUMB_BOX_PLAYING,
-    THUMB_BOX_RADIUS,
-    THUMB_BOX_W,
     THUMB_HOVER_RECHECK_MS,
-    THUMB_IMG_RADIUS,
-    THUMB_TILE_H,
-    THUMB_TILE_W,
     ThumbnailWidget,
     _ElideTextFilter,
     cover_thumbnail,
     pil_to_qpixmap,
 )
-# These names moved out of this file during the 3.5 modularisation (wave 5g) and are
-# re-exported here so the entry point keeps every name it has always had while the
-# split proceeds. The final wave replaces this with the package's own entry point.
+# Wave 5g: moved into yt_msd.ui.render and imported back because this file or the GUI Test Suite
+# still reads them by name. Wave 5h checked the group and dropped whatever nothing read.
 from yt_msd.ui.render import (
     LOCAL_RENDER_CHUNK_BUDGET_S,
     LOCAL_RENDER_CHUNK_MAX_ROWS,
@@ -319,11 +213,9 @@ from yt_msd.ui.render import (
     LOCAL_RENDER_FIRST_CHUNK_ROWS,
     LOCAL_RENDER_ROW_HEIGHT_GUESS,
 )
-# These names moved out of this file during the 3.5 modularisation (wave 4) and are
-# re-exported here so the entry point keeps every name it has always had while the
-# split proceeds. The final wave replaces this with the package's own entry point.
+# Wave 4: moved into yt_msd.sync.client and imported back because this file or the GUI Test Suite
+# still reads them by name. Wave 5h checked the group and dropped whatever nothing read.
 from yt_msd.sync.client import (
-    ClientSyncThread,
     SyncClientWorker,
 )
 from yt_msd.sync.config import (
@@ -333,9 +225,7 @@ from yt_msd.sync.config import (
     is_client_chain_paused,
 )
 from yt_msd.sync.discovery import (
-    UDPBeaconBroadcaster,
     discover_host_on_lan,
-    discover_hosts_on_lan,
     send_lan_update_notification,
 )
 from yt_msd.sync.host import (
@@ -343,19 +233,10 @@ from yt_msd.sync.host import (
     SyncHostServer,
 )
 from yt_msd.sync.lan import (
-    SYNC_CHUNK_SIZE,
-    SYNC_PORT_END,
-    SYNC_PORT_START,
-    SYNC_SOCKET_TIMEOUT,
-    UDP_BEACON_PORT,
-    _CACHED_LOCAL_IP,
-    _CACHED_LOCAL_IP_TIME,
-    get_broadcast_addresses,
     get_current_wifi_ssid,
     get_local_ip,
 )
 from yt_msd.sync.removable import (
-    RemovableInitThread,
     RemovableSyncThread,
     SyncRemovableWorker,
 )
@@ -365,8 +246,6 @@ from yt_msd.sync.startup import (
 )
 from yt_msd.sync.tags import (
     SYNC_RETROGRADE_GRACE_SECONDS,
-    SYNC_TAG_FILENAME,
-    SYNC_TAG_TIME_FORMATS,
     drive_last_synced_timestamp,
     find_tagged_sync_folders_on_drive,
     format_sync_timestamp,
@@ -376,8 +255,6 @@ from yt_msd.sync.tags import (
     write_sync_tag_file,
 )
 from yt_msd.sync.transfer import (
-    _DRIVE_IO_LOCKS,
-    _DRIVE_IO_LOCKS_GUARD,
     _recv_all,
     compute_file_sha256,
     filter_audio_files,
@@ -388,18 +265,15 @@ from yt_msd.sync.transfer import (
     send_json_msg,
     stream_file_to_socket,
 )
-# These names moved out of this file during the 3.5 modularisation (wave 5c) and are
-# re-exported here so the entry point keeps every name it has always had while the
-# split proceeds. The final wave replaces this with the package's own entry point.
+# Wave 5c: moved into yt_msd.sync.dialogs and imported back because this file or the GUI Test
+# Suite still reads them by name. Wave 5h checked the group and dropped whatever nothing read.
 from yt_msd.sync.dialogs import (
     ConnectClientChainDialog,
-    ConnectRemovableMediaDialog,
     CreateHostChainDialog,
     SyncManagerDialog,
 )
-# These names moved out of this file during the 3.5 modularisation (wave 5b) and are
-# re-exported here so the entry point keeps every name it has always had while the
-# split proceeds. The final wave replaces this with the package's own entry point.
+# Wave 5b: moved into yt_msd.export and imported back because this file or the GUI Test Suite
+# still reads them by name. Wave 5h checked the group and dropped whatever nothing read.
 from yt_msd.export import (
     EXPORT_CONFIG_ENTRY,
     EXPORT_FORMAT_VERSION,
@@ -419,9 +293,8 @@ from yt_msd.export import (
     unique_music_archive_name,
     zip_folder_into,
 )
-# These names moved out of this file during the 3.5 modularisation (wave 5d) and are
-# re-exported here so the entry point keeps every name it has always had while the
-# split proceeds. The final wave replaces this with the package's own entry point.
+# Wave 5d: moved into yt_msd.ui.dialogs and imported back because this file or the GUI Test Suite
+# still reads them by name. Wave 5h checked the group and dropped whatever nothing read.
 from yt_msd.ui.dialogs import (
     MetadataRenameDialog,
     PlaylistDialog,
@@ -432,7 +305,20 @@ from yt_msd.ui.dialogs import (
     YtDlpUpdateDialog,
 )
 
-class MainApp(QMainWindow):
+# Wave 6: every method below 150 lines stayed with the class. These five did not, and
+# each now lives in a module of its own that MainApp inherits below. Listed in the
+# order they are read in this file, which is not the order they run in.
+from yt_msd.ui.bootstrap import BootstrapMixin
+from yt_msd.ui.layout import LayoutMixin
+from yt_msd.ui.stylesheet import StylesheetMixin
+from yt_msd.ui.settings_reset import SettingsResetMixin
+from yt_msd.ytdlp.batch import BatchDownloadMixin
+class MainApp(BootstrapMixin,
+           LayoutMixin,
+           StylesheetMixin,
+           SettingsResetMixin,
+           BatchDownloadMixin,
+           QMainWindow):
     status_signal = Signal(str, bool, str)
     search_results_signal = Signal(list, bool)
     search_failed_signal = Signal()
@@ -455,349 +341,6 @@ class MainApp(QMainWindow):
     ytdlp_update_signal = Signal(str, str)  # installed yt-dlp version, newest yt-dlp version
     ytdlp_version_signal = Signal(str)  # yt-dlp version found by a bg thread, shown on the GUI thread
     stream_refreshed_signal = Signal(bool, str)  # (re-resolved ok, track title) from the stream-refresh thread
-
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("yt-msd | YouTube Media Downloader")
-        # Started by the MusicBee plugin (it passes --from-musicbee, see
-        # MusicBee Plugin/Plugin.cs): open compact, and come back at whatever size
-        # and position it was last closed at. Started normally, nothing changes.
-        self.launched_by_host = "--from-musicbee" in sys.argv
-        if self.launched_by_host:
-            self.resize(1100, 700)
-        else:
-            self.resize(1804, 935)
-        
-        # State Arrays
-        self.search_results = []
-        self.queue_items = []
-        self.local_folders = []
-        self.recent_folders = []
-        self.recent_playlists = []
-        # Local file editor state: File Explorer style multi-selection.
-        self.local_selected_paths = set()
-        self.local_rows = []
-        self.local_row_by_path = {}
-        self.local_btns = []
-        # Every folder switch gets its own id. Rows produced by a scan of a folder that
-        # has already been replaced are dropped by it instead of landing on the folder
-        # that is on screen now.
-        self._local_render_id = 0
-        # The listing of the folder currently filling the pane, less the rows that have
-        # already been drawn, plus what the last chunk cost the GUI thread. A fill that is
-        # still running is abandoned by the next folder switch.
-        self._local_render_pending = None
-        self._local_render_pending_id = 0
-        self._local_render_pending_path = None
-        self._local_render_step = 0
-        self._local_render_chunk_end = None
-        self._local_render_chunk_cost = 0.0
-        self._local_render_chunk_rows = 0
-        self._local_render_row_cost = 0.0
-        self._local_render_row_height = LOCAL_RENDER_ROW_HEIGHT_GUESS
-        # How many rows the folder on screen is going to have, and the height already handed to
-        # the pane for them. See _reserve_local_extent.
-        self._local_render_total_rows = 0
-        self._local_render_extent_height = 0
-        # Chunk N+1 is queued on a zero timer, which Qt runs after it has already laid out
-        # and polished chunk N - the reason a folder fills in instead of arriving at once.
-        self._local_render_timer = QTimer()
-        self._local_render_timer.setSingleShot(True)
-        self._local_render_timer.timeout.connect(self._fill_local_chunk)
-        self.local_selection_anchor = None
-        self.current_local_file_path = ""
-        self.splitter_sizes = [300, 800, 300]
-        # Qt's own serialisation of the window frame, kept only for windows that
-        # were opened from MusicBee. See _apply_host_window_geometry.
-        self.host_window_geometry = ""
-        self.thumbnail_cache = {}
-        self.thumbnail_cache_size = 0
-        
-        # Config Map
-        self.format_var = "mp3"
-        self.bitrate_var = "192"
-        self.download_path = ""
-        self.local_current_path = ""
-        self.appearance_mode = "Dark" 
-        self.accent_color_name = "Blue"
-        self.volume_val = 100
-        self.use_custom_args = False
-        self.custom_args = ""
-        self.minimize_to_tray = False
-        self.save_place = False
-        self.last_session = {}
-        self.last_search = ""
-        self.run_renamer = False
-        self.renamer_path = ""
-        self.run_custom_script = False
-        self.custom_script_path = ""
-        self._last_downloaded_files = []
-        self.normalization_mode = "ask"  # "on" | "off" | "ask"
-        self.auto_rename = False
-        self.silence_pad_dur = 2.0
-        self.silence_trim = True
-        self.use_custom_norm_cmd = False
-        self.custom_norm_cmd = ""
-        self.download_threads = 3
-        self.normalization_threads = max(1, os.cpu_count() // 2)
-        self.local_rescan_interval = 60  # minutes (default 1 hour)
-        self.disable_update_checks = False  # True once the user opts out of update notifications
-        self._update_check_running = False  # guards against overlapping network update checks
-        self._downloaded_update_tag = None  # tag already downloaded this session (avoid re-prompting)
-        self.ytdlp_version = ""  # version the system yt-dlp reported, "" until it is known
-        self.disable_ytdlp_updates = False  # True once the user opts out of yt-dlp update prompts
-        self.ytdlp_last_update_check = 0.0  # epoch seconds of the last yt-dlp version check
-        self._ytdlp_update_check_running = False  # guards against overlapping yt-dlp checks
-        self.local_rescan_timer = QTimer(self)
-        self.local_rescan_timer.timeout.connect(self._auto_rescan_local_folder)
-        
-        # Player Flags
-        self.is_playing = False
-        self.is_downloading = False
-        self.cancel_download = False
-        self.current_video_id = None
-        self.current_playing_title = ""
-        self.playback_index = -1
-        # The row currently carrying the playing/paused colour: (pane, key, state), or None.
-        # Compared against on every player tick so the colour moves only when it has to.
-        self._playback_box = None
-        # Which thumbnail row is holding its play button, and the timer that keeps asking the
-        # pointer whether that row is still the one it is on. The timer only runs while a row is
-        # holding the button, so nothing is polled while nobody is pointing at the list - see
-        # THUMB_HOVER_RECHECK_MS and _recheck_thumb_hover.
-        self._hover_tile = None
-        self._thumb_hover_timer = QTimer(self)
-        self._thumb_hover_timer.setInterval(THUMB_HOVER_RECHECK_MS)
-        self._thumb_hover_timer.timeout.connect(self._recheck_thumb_hover)
-        self.is_shuffled = False
-        self.shuffle_history = []
-        self.shuffle_order = []
-        # "Stop after current": off / once / always, cycled by the player-bar button
-        # and the tray entry (see the prefetch and stop-after block near play_result).
-        # "always" is kept in gui_config.json and read back by load_config() so the next
-        # window opens still stopping after every track; "once" is never restored, because
-        # the track it was armed for does not exist in a new session.
-        self.stop_after_current = STOP_AFTER_OFF
-        # Which track an automatic "once" belongs to. A new search arms one for the
-        # stream that is playing (see _arm_stop_after_for_new_search), and this id is
-        # what lets that arming be forgotten again when a different track starts.
-        # None means the armed state, if there is one, is the user's own.
-        self._search_stop_after_track = None
-        # Streams resolved seconds ahead of time: video id -> (url, user agent, epoch).
-        # Written only by the prefetch thread, read once by the play path; the lock is
-        # what keeps those two from tripping over the same dictionary.
-        self._prefetched_streams = {}
-        self._prefetch_lock = threading.Lock()
-        self._prefetch_busy = set()     # video ids currently being resolved
-        self._prefetch_decision = None  # (video id, next index, next video) decided ahead
-        self._prefetch_trigger_key = None  # the track the decision was made for
-        # The stream the player is actually loaded with: (video id, url, user agent, how old
-        # that URL already was when it was resolved). This is what a dead stream is re-resolved
-        # from, and it is None while a local file is playing or nothing has been played - a
-        # file on disk is not a link with an expiry, so every question in the stream-liveness
-        # block (see the block before "Stop after current") starts by asking whether this is set.
-        # The rest is the watchdog for it: the last position libVLC reported and the moment it
-        # last moved, whether the stream has been noticed dead, whether it is being re-resolved
-        # right now, how many times this track has already reloaded itself, whether anybody has
-        # ever heard this media advancing, and a position the user asked for that has to wait
-        # until the fresh media answers.
-        self._loaded_stream = None
-        self._loaded_stream_at = None
-        self._stream_seen_ms = -1
-        self._stream_moved_at = None
-        # Whether the media on the player is one the listener stopped and has not yet been heard
-        # advancing again. While it is true the stall clock does not run, and the track gets
-        # STREAM_RESUME_GRACE once it is playing again instead of the ordinary STREAM_STALL_SECONDS
-        # verdict. See _watch_stream_liveness.
-        self._stream_resuming = False
-        self._stream_dead = False
-        # Only a stream that has been heard advancing can count as having gone idle, which is the
-        # only case where the age of its URL is on its own a reason to re-resolve it. A track the
-        # session restore preloads at start up starts here as False and stays that way until
-        # somebody plays it. See _stream_needs_renew.
-        self._stream_listened = False
-        self._stream_refetching = False
-        self._stream_refetch_attempts = 0
-        self._stream_renew_started_at = None
-        self._pending_stream_seek_frac = None
-        self._pending_stream_seek_ms = None
-        self._pending_stream_pause = False
-        self._pending_stream_seek_at = None
-        # A track that ran to its end and was left on the player rather than advanced. libVLC is
-        # done with that media: it answers neither a scrub nor a resume any more, which is why
-        # dragging the bar back after a track finished did nothing at all. While this is set the
-        # play button is a replay button and a scrub is a replay to the place the bar was put,
-        # both through _replay_finished_track. Armed by _hold_finished_track, and cleared by
-        # _note_loaded_stream - that is, by any new media reaching the player.
-        self._finished_track = False
-        # The "stop after current" state the hold happened under, remembered so that replaying
-        # the track a "once" was spent on re-arms it: hearing that track again should not end
-        # with the player moving on to a track nobody picked. See _replay_finished_track.
-        self._finished_track_armed_under = STOP_AFTER_OFF
-        # True between a replay asking for fresh media and that media arriving. It is what tells a
-        # failed re-fetch apart from a failed self-heal: only the first has been promised the track
-        # from its top, so only the first puts the replay button back. See _on_stream_refreshed.
-        self._replay_in_flight = False
-        self.is_muted = False
-        self.active_downloads = {}
-        self.active_downloads_lock = threading.Lock()
-        # yt-dlp subprocess handles so cancel_batch_download can kill them
-        # immediately instead of waiting for a readline() to return a line.
-        self._active_ytdlp_procs = []
-        self._active_ytdlp_procs_lock = threading.Lock()
-        self.sync_manager_dialog = None
-        self.last_wifi_ssid = get_current_wifi_ssid()
-        # Persistent sync thread registry - lives at MainApp level so it survives dialog close/reopen
-        self.sync_threads = {}  # chain_id -> QThread
-        self.sync_progress_state = {}  # chain_id -> {'status': str, 'progress': str}
-        # Runtime-only registry of currently connected removable drives (not persisted)
-        self.active_removable_drives: dict = {}  # folder_path_str -> rc dict
-        # Cached answers about the filesystem. Only the background probe thread
-        # ever touches a drive; the GUI reads these instead, so a slow USB stick
-        # or MP3 player can never stall the interface.
-        self.known_connected_drives: set = set()  # drive roots seen by the last probe
-        self.mount_state: dict = {}  # folder_path_str -> bool (mounted?)
-        self.chain_track_counts: dict = {}  # chain_id -> audio file count
-        self._drive_probe_lock = threading.Lock()
-        self._drive_probe_busy = False
-        self._drive_probe_pending = False
-        # Only one import or export at a time: both do heavy filesystem work.
-        self._export_import_busy = False
-        # Guards the cached drive/chain state above: the probe thread reads it,
-        # the GUI thread writes it.
-        self._runtime_state_lock = threading.RLock()
-        
-        if getattr(sys, 'frozen', False):
-            self.config_dir = os.path.dirname(os.path.abspath(sys.executable))
-        else:
-            self.config_dir = os.path.dirname(os.path.abspath(__file__))
-            
-        self.config_path = os.path.join(self.config_dir, "gui_config.json")
-        self.load_config()
-
-        # Apply the normalization settings from the loaded config immediately
-        TUNING.from_settings(self.silence_trim, self.silence_pad_dur,
-                             self.use_custom_norm_cmd, self.custom_norm_cmd)
-
-        # Placeholder so UI code can check readiness before VLC is initialized
-        self.vlc_instance = None
-        self.vlc_player = None
-        self._vlc_ready = False
-
-        self.setup_ui()
-        self.apply_theme()
-
-        self.status_signal.connect(self._on_status_update)
-        self.search_results_signal.connect(self._on_search_results)
-        self.search_failed_signal.connect(self._on_search_failed)
-        self.playback_started_signal.connect(self._on_playback_started)
-        self.stream_refreshed_signal.connect(self._on_stream_refreshed)
-        self.queue_update_signal.connect(self._refresh_queue_display)
-        self.queue_status_changed_signal.connect(self._on_queue_status_changed)
-        self.thumbnails_loaded_signal.connect(self._on_thumbnail_loaded)
-        self.dl_progress_signal.connect(lambda txt: self.dl_progress_label.setText(txt))
-        self.renamer_finished_signal.connect(self._on_renamer_finished)
-        self.host_activity_signal.connect(self._on_host_activity)
-        self._probe_results_signal.connect(self._apply_probe_results)
-        self.local_list_refresh_signal.connect(self._refresh_local_list_async)
-        self._local_listing_signal.connect(self._on_local_listing)
-        self.update_available_signal.connect(self._show_update_dialog)
-        self.update_downloaded_signal.connect(self._prompt_swap_dialog)
-        self.missing_deps_signal.connect(self._show_missing_dependencies)
-        self.import_finished_signal.connect(self._apply_import_results)
-        self.import_failed_signal.connect(self._on_import_failed)
-        self.ytdlp_missing_signal.connect(self._show_ytdlp_missing_dialog)
-        self.ytdlp_update_signal.connect(self._show_ytdlp_update_dialog)
-        self.ytdlp_version_signal.connect(self._apply_ytdlp_version)
-
-        self.player_timer = QTimer(self)
-        self.player_timer.timeout.connect(self.update_player_ui)
-        self.player_timer.start(16)
-
-        self.setup_tray()
-        self._update_local_rescan_timer()
-
-        # Wi-Fi network change monitor timer (checks every 15s)
-        self.wifi_monitor_timer = QTimer(self)
-        self.wifi_monitor_timer.timeout.connect(self._check_wifi_network_change)
-        self.wifi_monitor_timer.start(15000)
-
-        # Removable drive auto-detect timer (checks every 3s for plugged drives with TAG.yaml).
-        # The very first probe is deferred: enumerating drives at startup would
-        # stat every root on the UI thread, including a slow player that happens
-        # to be plugged in.
-        self.drive_monitor_timer = QTimer(self)
-        self.drive_monitor_timer.timeout.connect(self._check_removable_drives_change)
-        self.drive_monitor_timer.start(3000)
-        QTimer.singleShot(600, self._check_removable_drives_change)
-
-        # Startup dependency validation runs inside the VLC init thread below,
-        # so it never blocks the UI thread while the window is appearing.
-
-        # Update check on startup (runs again with every local-folder rescan)
-        QTimer.singleShot(1500, self._check_for_updates)
-
-        # Initialize VLC in a background thread (plugin scanning can take seconds)
-        threading.Thread(target=self._init_vlc_background, daemon=True).start()
-
-        # yt-dlp lives outside the executable: find it, and install it with winget
-        # on the first run. This stays in a background thread so the window still
-        # appears exactly as fast as before.
-        threading.Thread(target=self._ensure_yt_dlp_background, daemon=True).start()
-
-        # Defer local folder load until after the window is shown
-        if self.local_current_path:
-            QTimer.singleShot(0, lambda: self.load_local_folder(self.local_current_path))
-
-        if getattr(self, 'save_place', False) and hasattr(self, 'session_data'):
-            sd = self.session_data
-            if sd.get('current_video_id') == "local" and sd.get('local_current_path'):
-                idx = sd.get('local_playback_index', -1)
-                # The folder opened above has only just started streaming its rows, so
-                # the track to resume on is remembered here and looked up by
-                # _finish_local_render, which runs when that list is actually complete.
-                # The folder it belongs to is remembered with it, because a folder that
-                # cannot be opened - or one the user switches away from before the rows
-                # land - must not have a track of another folder resumed in it.
-                self._pending_local_restore_index = idx
-                self._pending_local_restore_path = sd.get('local_current_path')
-
-        # --- Local Network Sync Chains Subsystem ---
-        self.sync_config_manager = SyncConfigManager(self.config_dir)
-        self.sync_host_server = SyncHostServer(
-            lambda: self.sync_config_manager.hosted_chains,
-            on_client_activity_cb=self.host_activity_signal.emit
-        )
-        self.udp_beacon = UDPBeaconBroadcaster(
-            lambda: self.sync_config_manager.hosted_chains,
-            lambda: self.sync_host_server.active_port,
-            on_chain_updated_cb=self._on_lan_chain_updated
-        )
-        self.host_watcher = HostFolderWatcher(self._on_hosted_folder_changed)
-
-        # Client Auto-Sync Periodic Timer
-        self.sync_timer = QTimer(self)
-        self.sync_timer.timeout.connect(self._auto_sync_client_chains)
-
-        # Start host server, UDP beacon, folder watchers, and client check on a background thread
-        def _deferred_sync_startup():
-            def _bg_init():
-                try:
-                    self.sync_host_server.start()
-                    self.udp_beacon.start()
-                    self.refresh_sync_watchers()
-                except Exception:
-                    pass
-            threading.Thread(target=_bg_init, daemon=True).start()
-            self._update_sync_timer()
-            QTimer.singleShot(2500, self._auto_sync_client_chains)
-
-        QTimer.singleShot(150, _deferred_sync_startup)
-
-        if self.launched_by_host:
-            self._apply_host_window_geometry()
-
-        QApplication.instance().installEventFilter(self)
 
     def _on_host_activity(self, sync_code: str, client_ip: str, activity: str):
         """Called when a client connects or pulls files from our hosted sync chain."""
@@ -1690,7 +1233,6 @@ class MainApp(QMainWindow):
         if missing:
             self.missing_deps_signal.emit("<br><br>".join(missing))
 
-
     def load_config(self):
         default_dl = os.path.join(os.path.expanduser("~"), "Downloads")
         try:
@@ -2159,198 +1701,6 @@ class MainApp(QMainWindow):
         except Exception:
             pass
 
-    def reset_to_defaults(self):
-        if os.path.exists(self.config_path):
-            try: os.remove(self.config_path)
-            except: pass
-        
-        # Reset variables
-        self.appearance_mode = "Dark"
-        self.accent_color_name = "Blue"
-        self.volume_val = 100
-        self.save_place = False
-        self.use_custom_args = False
-        self.custom_args = ""
-        self.last_search = ""
-        self.minimize_to_tray = False
-        self.run_renamer = False
-        self.renamer_path = ""
-        self.run_custom_script = False
-        self.custom_script_path = ""
-        self._last_downloaded_files = []
-        self.normalization_mode = "ask"
-        self.auto_rename = False
-        self.silence_pad_dur = 2.0
-        self.silence_trim = True
-        self.use_custom_norm_cmd = False
-        self.custom_norm_cmd = ""
-        self.disable_update_checks = False
-        self.disable_ytdlp_updates = False
-        # These two opt-outs live on MainApp only, never in the settings list save_config() writes
-        # from scratch, so without this they survived a "factory reset": save_config() writes
-        # whatever the attributes hold and load_config() reads it back on the next launch, so the
-        # user stayed opted out of app-update and yt-dlp-update prompts through a reset that claimed
-        # to put everything back to default.
-        TUNING.reset()
-        # The renamer half is a second copy of this program launched in a console, and it reads
-        # the tuning settings above rather than the MainApp attributes. Resetting only the
-        # attributes left every renamer this window launched running with the pre-reset trim /
-        # pad / override until the app was restarted. load_config() and _apply_imported_config()
-        # push the settings for the same reason; a reset has to do it too.
-        self.download_threads = 3
-        self.normalization_threads = max(1, os.cpu_count() // 2)
-        self.local_rescan_interval = 60
-        # Everything else gui_config.json stores. The file is deleted at the top of this method, but
-        # save_config() at the bottom writes a fresh one out of whatever these attributes and widgets
-        # hold, so anything not cleared here was straight back in the file the reset had just removed.
-        # These are the parts a user would call "my recent data": the download folders and the
-        # destination the top bar shows, the local folders and the folder open in the tree pane, the
-        # playlist history, the format and bitrate the two top-bar combos are set to, the metadata tick
-        # on the local pane, and the window geometry kept for MusicBee launches. session_data needs
-        # nothing: save_config() rebuilds it from the live window on every save, and load_config() only
-        # reads it back when "save place" is on, which this reset turns off. ytdlp_last_update_check is
-        # cleared as well so the next launch behaves like a first run and looks for a newer yt-dlp
-        # instead of trusting a timestamp left over from before the reset.
-        default_dl = os.path.join(os.path.expanduser("~"), "Downloads")
-        self.format_var = "mp3"
-        self.bitrate_var = "192"
-        self.recent_folders = [default_dl]
-        self.download_path = default_dl
-        self.local_folders = []
-        self.local_current_path = ""
-        self.recent_playlists = []
-        self.show_local_metadata = False
-        self.host_window_geometry = ""
-        self.ytdlp_last_update_check = 0.0
-        # "Stop after current" is now in the list save_config() writes, so leaving the attribute as
-        # it was would have put an "always" straight back into the file this reset had just removed -
-        # the same way the two update opt-outs survived the reset before they were cleared here. The
-        # search arming goes with it, and apply_theme() below repaints the button through
-        # _update_stop_after_ui().
-        self.stop_after_current = STOP_AFTER_OFF
-        self._search_stop_after_track = None
-        # ...and the widgets that display those values, because save_config() reads the format, the
-        # bitrate and the download folder straight off them. Left where they were, they would put the
-        # old values back into the new file on the next save. Signals are blocked so no handler runs
-        # against a value that has already been changed underneath it.
-        if hasattr(self, 'format_combo'):
-            self.format_combo.blockSignals(True)
-            self.format_combo.setCurrentText(self.format_var)
-            self.format_combo.blockSignals(False)
-        if hasattr(self, 'bitrate_combo'):
-            self.bitrate_combo.blockSignals(True)
-            self.bitrate_combo.setCurrentText(self.bitrate_var)
-            self.bitrate_combo.blockSignals(False)
-        if hasattr(self, 'path_combo'):
-            self.path_combo.blockSignals(True)
-            self.path_combo.clear()
-            self.path_combo.addItems([str(folder) for folder in self.recent_folders])
-            self.path_combo.setCurrentText(self.download_path)
-            self.path_combo.blockSignals(False)
-        if hasattr(self, 'local_meta_cb'):
-            self.local_meta_cb.blockSignals(True)
-            self.local_meta_cb.setChecked(False)
-            self.local_meta_cb.blockSignals(False)
-        if hasattr(self, 'local_path_combo'):
-            # Rebuilds the address bar from the now-empty recent list without firing
-            # load_local_folder, which would try to scan a folder this reset has just forgotten.
-            self.set_local_explorer_address("")
-        # local_current_path is empty, so the scan returns None and the pane is cleared instead of
-        # continuing to list the files of a folder that is no longer set anywhere.
-        self.refresh_local_list()
-        if hasattr(self, 'local_rescan_timer'):
-            self._update_local_rescan_timer()
-        if hasattr(self, 'run_renamer_cb'):
-            self.run_renamer_cb.blockSignals(True)
-            self.run_renamer_cb.setChecked(False)
-            self.run_renamer_cb.blockSignals(False)
-        self.splitter_sizes = [300, 800, 300]
-        
-        # Apply changes
-        self.apply_theme()
-        # The old form of this read self.splitter, which MainApp never creates: the two real
-        # splitters are main_splitter (local pane | everything else) and content_splitter
-        # (results | queue), and save_config() stores three sizes by reading both of them. The
-        # hasattr() was therefore always false, so the panel widths survived the reset and were
-        # written straight back into the new file. Same split the startup code applies.
-        if hasattr(self, 'main_splitter') and hasattr(self, 'content_splitter'):
-            self.main_splitter.setSizes([self.splitter_sizes[0], self.splitter_sizes[1] + self.splitter_sizes[2]])
-            self.content_splitter.setSizes([self.splitter_sizes[1], self.splitter_sizes[2]])
-            # Clear what each splitter kept as the user's own arrangement, or the next double-click
-            # on a handle restores the pre-reset widths instead of the default pair.
-            for splitter in (self.main_splitter, self.content_splitter):
-                splitter._last_custom_sizes = []
-        if hasattr(self, 'vol_slider'):
-            self.vol_slider.setValue(100)
-        # The Settings dialog is cached on MainApp and reused, and it reads the MainApp attributes
-        # only when it is first built. Resetting without dropping it left the very dialog the user
-        # just clicked "reset" in showing the old tick marks and the old pad value - and the next
-        # toggle would have written those stale values straight back. _apply_imported_config()
-        # throws the cached dialog away for the same reason; do the same here. The caller closes
-        # this dialog right after the reset, so closing it from here is safe.
-        settings_dialog = getattr(self, 'settings_dialog', None)
-        if settings_dialog is not None:
-            try:
-                settings_dialog.close()
-            except Exception:
-                pass
-            self.settings_dialog = None
-        # Sync chains and sync settings live in the same file this method deletes, but
-        # SyncConfigManager holds live copies of all three - hosted_chains, client_chains and
-        # settings - and the Sync dialog, the export dialog and the removable-drive path all read
-        # that manager rather than the file. Clearing only the file therefore left every chain in
-        # memory, and the next save() - on close, or from any chain operation - wrote them back into
-        # a brand-new file, so no chain was ever actually removed. That write-back is worth keeping
-        # for the case where the file is deleted by hand while the app is running: the manager still
-        # re-creates it on exit. It must not survive an explicit reset, so the manager is emptied
-        # here too.
-        # A mirror sync works on the drive it is copying to for its whole run. Stopping the chains
-        # first while one is mid-flight would leave it adding and deleting files against a chain
-        # definition that no longer exists, so the threads are asked to stop before the chains go.
-        for thread in list(getattr(self, 'sync_threads', {}).values()):
-            try:
-                thread.requestInterruption()
-                thread.quit()
-                thread.wait(1000)
-            except Exception:
-                pass
-        sync_threads = getattr(self, 'sync_threads', None)
-        if sync_threads is not None:
-            sync_threads.clear()  # in place again: SyncManagerDialog aliases this same dict
-        # The per-chain "Syncing... / [3/40] (7%)" lines the cards show are keyed by chain id.
-        # Left behind they describe chains this reset has just removed, and a card for a new chain
-        # with the same sync code would inherit the old progress text.
-        progress_state = getattr(self, 'sync_progress_state', None)
-        if progress_state is not None:
-            progress_state.clear()
-        sync_manager = getattr(self, 'sync_config_manager', None)
-        if sync_manager is not None:
-            # Emptied in place. The open Sync dialog keeps references to these very objects, so
-            # rebinding them to new lists would leave that window showing chains that are gone.
-            sync_manager.hosted_chains.clear()
-            sync_manager.client_chains.clear()
-            sync_manager.settings.clear()
-            sync_manager.settings.update(DEFAULT_SYNC_SETTINGS)
-        watcher = getattr(self, 'host_watcher', None)
-        if watcher is not None:
-            try:
-                watcher.stop_all()
-            except Exception:
-                pass
-        if hasattr(self, 'sync_timer'):
-            # Re-arms the client auto-sync timer on the default interval. With no client chains the
-            # callback returns immediately, but it should not keep running on an interval the user
-            # picked before the reset.
-            self._update_sync_timer()
-        sync_dialog = getattr(self, 'sync_manager_dialog', None)
-        if sync_dialog is not None:
-            try:
-                sync_dialog.refresh_cards(force=True)
-            except Exception:
-                pass
-        self.save_config()
-        self._on_status_update("Settings, recent data and sync chains reset to defaults.", False, "#3B8ED0")
-
     # ── EXPORT / IMPORT PACKAGES ──────────────────────────────────────────────
     def start_export(self, options: dict):
         """Build the .zip package on a worker thread: copying music or reading a
@@ -2688,339 +2038,6 @@ class MainApp(QMainWindow):
         # has been restored, so the scan sees the imported files too.
         return touched_local and os.path.isdir(self.local_current_path or "")
 
-    def setup_ui(self):
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        
-        # Main Layout (Horizontal)
-        self.main_layout = QHBoxLayout(central_widget)
-        self.main_layout.setContentsMargins(10, 10, 10, 10)
-        self.main_layout.setSpacing(0)
-        
-        # Splitter Logic
-        class ResetHandle(QSplitterHandle):
-            _last_click = 0
-            def mousePressEvent(self, e):
-                now = time.time()
-                if now - ResetHandle._last_click < 0.35:
-                    sp = self.splitter()
-                    if sp.orientation() == Qt.Horizontal:
-                        current_sizes = sp.sizes()
-                        is_main = (sp == getattr(self.window(), 'main_splitter', None))
-                        target_idx = 0 if is_main else 1
-                        
-                        if current_sizes[target_idx] > 0:
-                            sp._last_custom_sizes = current_sizes
-                            if is_main:
-                                sp.setSizes([0, sum(current_sizes)])
-                            else:
-                                sp.setSizes([sum(current_sizes), 0])
-                        else:
-                            if hasattr(sp, '_last_custom_sizes') and sp._last_custom_sizes and sp._last_custom_sizes[target_idx] > 0:
-                                sp.setSizes(sp._last_custom_sizes)
-                            else:
-                                if is_main:
-                                    sp.setSizes([300, max(0, sum(current_sizes)-300)])
-                                else:
-                                    sp.setSizes([max(0, sum(current_sizes)-300), 300])
-                    e.accept(); return
-                ResetHandle._last_click = now
-                super().mousePressEvent(e)
-
-        class ResetSplitter(QSplitter):
-            def createHandle(self):
-                return ResetHandle(self.orientation(), self)
-
-        # Main Splitter (Horizontal: Local | Content)
-        self.main_splitter = ResetSplitter(Qt.Horizontal)
-        self.main_layout.addWidget(self.main_splitter, 1)
-        
-        self._setup_local_pane()
-        
-        # Right Content Area
-        self.right_content = QWidget()
-        self.right_layout = QVBoxLayout(self.right_content)
-        self.right_layout.setContentsMargins(5, 0, 0, 0)
-        self.right_layout.setSpacing(5)
-        self.main_splitter.addWidget(self.right_content)
-        
-        # Content Splitter (Horizontal: Results | Queue)
-        self.content_splitter = ResetSplitter(Qt.Horizontal)
-        self.right_layout.addWidget(self.content_splitter, 1)
-        
-        self._setup_results_pane()
-        self._setup_queue_pane()
-        
-        # Initial Sizes
-        sz = getattr(self, 'splitter_sizes', [300, 800, 300])
-        if len(sz) == 3:
-            self.main_splitter.setSizes([sz[0], sz[1] + sz[2]])
-            self.content_splitter.setSizes([sz[1], sz[2]])
-        else:
-            self.main_splitter.setSizes([300, 1340])
-            self.content_splitter.setSizes([1000, 300])
-
-        # Where the two dividers sit is the user's choice, and nothing else. Every pane on the
-        # right of the local column gets an ignored horizontal size policy, which stops a pane
-        # from asking the splitter for width when its own contents grow - a longer "Playing:" or
-        # "Found N results" line, a download progress line naming five tracks, the queue label
-        # counting a thousand items, the first vertical scrollbar eating 16px of the results
-        # pane. Left as they were, each of those raised the pane's minimum width and QSplitter
-        # answered by moving the divider, so a search moved the local column out from under the
-        # user and the right pane was pushed past the edge of the window. With the policy ignored
-        # the panes keep whatever width they were given and the layout inside them absorbs the
-        # change instead: too much text is clipped by its own pane rather than shoveled into the
-        # neighbour's. The columns still resize with the window; only dragging a handle,
-        # double-clicking one, or toggling the local pane can move a divider now.
-        for _fixed_pane in (self.right_content,
-                            self.content_splitter.widget(0), self.content_splitter.widget(1)):
-            _pane_policy = _fixed_pane.sizePolicy()
-            _pane_policy.setHorizontalPolicy(QSizePolicy.Ignored)
-            _fixed_pane.setSizePolicy(_pane_policy)
-
-        # Controls UI
-        controls_frame = QFrame()
-        c_layout = QVBoxLayout(controls_frame)
-        c_layout.setContentsMargins(5, 5, 5, 5)
-        c_layout.setSpacing(5)
-        self.right_layout.addWidget(controls_frame)
-        
-        search_r = QHBoxLayout()
-        self.toggle_pane_btn = QPushButton("\uE8A0")
-        self.toggle_pane_btn.setObjectName("topIconBtn")
-        self.toggle_pane_btn.setFixedSize(36, 30)
-        self.toggle_pane_btn.setToolTip("Toggle File Browser")
-        self.toggle_pane_btn.clicked.connect(self.toggle_local_pane)
-        search_r.addWidget(self.toggle_pane_btn)
-        
-        self.search_entry = QLineEdit()
-        self.search_entry.setPlaceholderText("Search YouTube or Paste a Video Link")
-        self.search_entry.returnPressed.connect(self.perform_search)
-        self.search_btn = QPushButton("Search")
-        self.search_btn.setToolTip("Search YouTube for songs or playlists")
-        self.search_btn.clicked.connect(self.perform_search)
-        self.playlist_btn = QPushButton("\uE142")
-        self.playlist_btn.setObjectName("topIconBtn")
-        self.playlist_btn.setFixedSize(36, 30)
-        self.playlist_btn.setToolTip("Recent Playlists")
-        self.playlist_btn.clicked.connect(self.open_playlist_dialog)
-        
-        search_r.addWidget(self.search_entry, 1)
-        search_r.addWidget(self.search_btn)
-        search_r.addWidget(self.playlist_btn)
-        settings_btn = QPushButton("\uE713")
-        settings_btn.setObjectName("topIconBtn")
-        settings_btn.setFixedSize(36, 30)
-        settings_btn.setToolTip("Settings")
-        settings_btn.clicked.connect(self.open_settings_dialog)
-        search_r.addWidget(settings_btn)
-        c_layout.addLayout(search_r)
-        
-        set_r = QHBoxLayout()
-        set_r.addWidget(QLabel("Format:"))
-        self.format_combo = QComboBox()
-        self.format_combo.addItems(list(DOWNLOAD_FORMATS))
-        self.format_combo.setCurrentText(self.format_var)
-        self.format_combo.currentTextChanged.connect(self.save_config)
-        set_r.addWidget(self.format_combo)
-        
-        set_r.addWidget(QLabel("Bitrate:"))
-        self.bitrate_combo = QComboBox()
-        self.bitrate_combo.addItems(["128", "192", "256", "320"])
-        self.bitrate_combo.setCurrentText(self.bitrate_var)
-        self.bitrate_combo.currentTextChanged.connect(self.save_config)
-        set_r.addWidget(self.bitrate_combo)
-        
-        set_r.addWidget(QLabel("Save to:"))
-        
-        self.open_folder_btn = QPushButton("\uE8DA")
-        self.open_folder_btn.setObjectName("topIconBtn")
-        self.open_folder_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 16px; padding: 0px;")
-        self.open_folder_btn.setFixedSize(36, 30)
-        self.open_folder_btn.setToolTip("Open Folder in File Explorer")
-        self.open_folder_btn.clicked.connect(self.open_current_download_folder)
-        set_r.addWidget(self.open_folder_btn)
-        
-        self.path_combo = QComboBox()
-        self.path_combo.addItems(self.recent_folders)
-        if self.download_path not in self.recent_folders:
-            self.path_combo.addItem(self.download_path)
-        self.path_combo.setCurrentText(self.download_path)
-        self.path_combo.currentTextChanged.connect(self.on_path_changed)
-        set_r.addWidget(self.path_combo, 1)
-        
-        self.browse_btn = QPushButton("\uE8B7")
-        self.browse_btn.setObjectName("topIconBtn")
-        self.browse_btn.setStyleSheet("font-family: 'Segoe MDL2 Assets'; font-size: 16px; padding: 0px;")
-        self.browse_btn.setFixedSize(36, 30)
-        self.browse_btn.setToolTip("Browse destination folder")
-        self.browse_btn.clicked.connect(self.browse_folder)
-        set_r.addWidget(self.browse_btn)
-        set_r.addSpacing(6)
-        c_layout.addLayout(set_r)
-        
-        option_r = QHBoxLayout()
-        self.run_renamer_cb = QCheckBox("Run MP3 Renamer after download")
-        self.run_renamer_cb.setChecked(self.run_renamer)
-        self.run_renamer_cb.toggled.connect(self.on_run_renamer_toggled)
-        option_r.addWidget(self.run_renamer_cb)
-        option_r.addStretch()
-        c_layout.addLayout(option_r)
-        
-        status_bar = QHBoxLayout()
-        self.playing_label = QLabel("")
-        self.playing_label.setTextFormat(Qt.PlainText)
-        self.playing_label.setStyleSheet("font-size: 11px; margin-top: -2px;")
-        self.status_label = QLabel("Ready")
-        self.status_label.setTextFormat(Qt.PlainText)
-        self.status_label.setStyleSheet("font-size: 11px; margin-top: -2px;")
-        self.dl_progress_label = QLabel("")
-        self.dl_progress_label.setTextFormat(Qt.PlainText)
-        self.dl_progress_label.setStyleSheet("font-size: 11px; margin-top: -2px; color: #888;")
-        self.dl_progress_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        
-        status_bar.addWidget(self.playing_label)
-        status_bar.addWidget(self.status_label)
-        status_bar.addStretch()
-        status_bar.addWidget(self.dl_progress_label)
-        c_layout.addLayout(status_bar)
-
-        # Bottom Player
-        player_frame = QFrame()
-        p_layout = QVBoxLayout(player_frame)
-        p_layout.setContentsMargins(8, 4, 8, 4)
-        p_layout.setSpacing(0)
-        self.right_layout.addWidget(player_frame)
-        
-        class VolLabel(QLabel):
-            def mouseDoubleClickEvent(self, e):
-                win = self.window()
-                if hasattr(win, 'vol_slider'):
-                    win.vol_slider.setValue(100)
-                e.accept()
-
-        c = QHBoxLayout()
-        c.addWidget(VolLabel("Volume"))
-        
-        class VolSlider(QSlider):
-            def mouseDoubleClickEvent(self, e):
-                self.setValue(100)
-                e.accept()
-                
-        self.vol_slider = VolSlider(Qt.Horizontal)
-        self.vol_slider.setObjectName("volSlider")
-        _init_state = "red" if self.volume_val > 115 else ("orange" if self.volume_val > 100 else "normal")
-        self.vol_slider.setProperty("volume_state", _init_state)
-        self.vol_slider.setRange(0, 150); self.vol_slider.setValue(self.volume_val)
-        self.vol_slider.setFixedWidth(100)
-        self.vol_slider.valueChanged.connect(self.on_volume_changed)
-        c.addWidget(self.vol_slider)
-        
-        self.vol_pct = VolLabel(f"{self.volume_val}%")
-        self.vol_pct.setFixedWidth(50)
-        if self.volume_val > 115:
-            self.vol_pct.setStyleSheet("color: #E31E24; font-weight: bold;")
-        elif self.volume_val > 100:
-            self.vol_pct.setStyleSheet("color: #FF8C00; font-weight: bold;")
-        c.addWidget(self.vol_pct)
-        
-        c.addStretch(1)
-        _btn_ss = "background: transparent; color: white; font-family: 'Segoe MDL2 Assets'; font-size: 14px; border-radius: 4px; padding: 2px 4px;"
-        _btn_ss_hover = "background: transparent; color: white; font-family: 'Segoe MDL2 Assets'; font-size: 14px; border-radius: 4px; padding: 2px 4px;" + " /* hover set via stylesheet */"
-        
-        self.prev_btn = QPushButton("\uE892")
-        self.prev_btn.setObjectName("playerBtn")
-        self.prev_btn.setFixedSize(36, 36)
-        self.prev_btn.setToolTip("Previous track")
-        self.prev_btn.clicked.connect(self.play_previous)
-        c.addWidget(self.prev_btn)
-        
-        self.play_btn = QPushButton("\uE768")
-        self.play_btn.setObjectName("playerPlayBtn")
-        self.play_btn.setFixedSize(44, 44)
-        self.play_btn.setToolTip("Play / Pause")
-        self.play_btn.clicked.connect(self.toggle_playback)
-        c.addWidget(self.play_btn)
-        
-        self.next_btn = QPushButton("\uE893")
-        self.next_btn.setObjectName("playerBtn")
-        self.next_btn.setFixedSize(36, 36)
-        self.next_btn.setToolTip("Next track")
-        self.next_btn.clicked.connect(self.play_next)
-        c.addWidget(self.next_btn)
-
-        self.shuffle_btn = QPushButton("\uE8B1")
-        self.shuffle_btn.setObjectName("playerBtn")
-        self.shuffle_btn.setFixedSize(36, 36)
-        self.shuffle_btn.setToolTip("Shuffle Playback (Toggle)")
-        self.shuffle_btn.clicked.connect(self.toggle_shuffle)
-        c.addWidget(self.shuffle_btn)
-
-        # Stop After Current: one button, three states (off -> once -> always).
-        # U+25A0 BLACK SQUARE rather than a Segoe MDL2 Assets private-use codepoint:
-        # the previous caption (U+E76A "Replay") is not in this machine's MDL2 font, so
-        # Qt fell back to the .notdef glyph and the button drew an empty box. U+25A0 is a
-        # normal text glyph that Segoe MDL2 Assets (the family the #stopAfterBtn rule
-        # asks for), Segoe UI and the fallback fonts all have, so it paints as a filled
-        # square whichever font the rule resolves to.
-        #
-        # 24 rather than the 36 the neighbouring controls use, measured rather than guessed:
-        # this caption's ink is 10x9 px at the 20px the rule asks for, so a 36px box was a wide
-        # coloured field with the square a speck in the middle of it. 24 leaves ~7px of colour on
-        # every side, which is the margin the other controls give their own glyphs. The
-        # #stopAfterBtn rule also carries 6px of bottom padding for the same reason: the ink sits
-        # low in its own line box (17px of colour above it, 10px below at 36px), and without that
-        # padding the square looks parked at the bottom of whatever box draws it.
-        self.stop_after_btn = QPushButton("\u25A0")
-        self.stop_after_btn.setObjectName("stopAfterBtn")
-        self.stop_after_btn.setFixedSize(24, 24)
-        self.stop_after_btn.setProperty("stop_after_state", STOP_AFTER_STATE_NAMES[self.stop_after_current])
-        self.stop_after_btn.setToolTip(STOP_AFTER_TOOLTIPS[self.stop_after_current])
-        self.stop_after_btn.clicked.connect(self.cycle_stop_after_current)
-        c.addWidget(self.stop_after_btn)
-        c.addStretch(1)
-        
-        self.time_label = QLabel("0:00 / 0:00")
-        self.time_label.setStyleSheet("font-size: 11px;")
-        c.addWidget(self.time_label)
-        p_layout.addLayout(c)
-        
-        self.progress_slider = ClickableSlider(Qt.Horizontal)
-        self.progress_slider.setFixedHeight(20)
-        self.progress_slider.setRange(0, 10000)
-        self.progress_slider.sliderMoved.connect(self.on_seek)
-        p_layout.addWidget(self.progress_slider)
-
-        # Restore last search
-        if getattr(self, 'last_search', ''):
-            self.search_entry.setText(self.last_search)
-        
-        # Restore session
-        if self.save_place and hasattr(self, 'session_data'):
-            sd = self.session_data
-            if sd.get('search_results'):
-                self._on_search_results(sd['search_results'], False, reset_view=False)
-                self.playback_index = sd.get('playback_index', -1)
-            
-            # Restore playback state if item exists
-            v_id = sd.get('current_video_id')
-            if v_id and v_id != "local":
-                # Find the video object in results if possible
-                results = sd.get('search_results', [])
-                idx = sd.get('playback_index', -1)
-                if 0 <= idx < len(results):
-                    video = results[idx]
-                    self.play_result(video, paused_at_start=True)
-
-        # Re-search in background to update cache
-        if getattr(self, 'last_search', ''):
-            is_pl = False
-            for p in self.recent_playlists:
-                if isinstance(p, dict) and p.get("url") == self.last_search: is_pl = True; break
-                elif p == self.last_search: is_pl = True; break
-            self.perform_search(is_playlist=is_pl, keep_fetch_vid_id=v_id)
-
-
     def toggle_local_pane(self):
         sizes = self.main_splitter.sizes()
         if sizes[0] > 0:
@@ -3167,324 +2184,6 @@ class MainApp(QMainWindow):
                     item = self.queue_items.pop(src_idx)
                     self.queue_items.insert(dst_idx, item)
                     self.queue_update_signal.emit()
-
-    def apply_theme(self):
-        mode = self.appearance_mode
-        if mode == "System": mode = get_system_appearance_mode()
-        
-        accent = get_accent_color(self.accent_color_name)
-        
-        r = int(accent[1:3], 16)
-        g = int(accent[3:5], 16)
-        b = int(accent[5:7], 16)
-        brightness = (r * 299 + g * 587 + b * 114) / 1000
-        accent_fg = "#000000" if brightness > 150 else "#ffffff"
-        
-        # Write checkmark SVG to a temp file
-        checkmark_svg = f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="{accent_fg}" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>'
-        if not hasattr(self, '_checkmark_svg_path') or not os.path.exists(self._checkmark_svg_path):
-            tmp = tempfile.NamedTemporaryFile(suffix='.svg', delete=False, mode='w', encoding='utf-8')
-            tmp.write(checkmark_svg)
-            tmp.close()
-            self._checkmark_svg_path = tmp.name.replace('\\', '/')
-        else:
-            with open(self._checkmark_svg_path, 'w', encoding='utf-8') as f:
-                f.write(checkmark_svg)
-        checkmark_path = self._checkmark_svg_path
-        
-        # Write downarrow SVG to a temp file
-        downarrow_svg = f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="{accent_fg}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>'
-        if not hasattr(self, '_downarrow_svg_path') or not os.path.exists(self._downarrow_svg_path):
-            tmp = tempfile.NamedTemporaryFile(suffix='.svg', delete=False, mode='w', encoding='utf-8')
-            tmp.write(downarrow_svg)
-            tmp.close()
-            self._downarrow_svg_path = tmp.name.replace('\\', '/')
-        else:
-            with open(self._downarrow_svg_path, 'w', encoding='utf-8') as f:
-                f.write(downarrow_svg)
-        downarrow_path = self._downarrow_svg_path
-        
-        if mode == "Light":
-            bg = "#f3f3f3"
-            fg = "#1a1a1a"
-            frame_bg = "#ffffff"
-            input_bg = "#e8e8e8"
-            input_border = "#ccc"
-            scroll_bg = "#ffffff"
-            splitter_handle = "#ddd"
-            slider_bg = "#ddd"
-            hover_bg = "#000000"
-            hover_fg = "#ffffff"
-            queue_item_bg = "#e8e8e8"
-            queue_item_bg_finished = "#ffffff"
-            btn_hover = "rgba(0, 0, 0, 0.1)"
-            if self.accent_color_name == "White" or accent.upper() == "#FFFFFF":
-                main_btn_border = "1px solid #ccc"
-            else:
-                main_btn_border = "none"
-        else:
-            bg = "#1e1e1e"
-            fg = "#ffffff"
-            frame_bg = "#2a2a2a"
-            input_bg = "#333333"
-            input_border = "#555"
-            scroll_bg = "#1a1a1a"
-            splitter_handle = "#333333"
-            slider_bg = "#333"
-            hover_bg = "#dddddd"
-            hover_fg = "#1a1a1a"
-            queue_item_bg = "#333333"
-            queue_item_bg_finished = "#1a1a1a"
-            btn_hover = "rgba(255, 255, 255, 0.1)"
-            main_btn_border = "none"
-
-        secondary_fg = "#777777" if mode == "Light" else "#999999"
-
-        # Canonical tooltip style. Applied to the whole application (see below) so
-        # every window — the main window and all dialogs — shows identical tooltips
-        # with the same font size and appearance as the playback controls.
-        tooltip_css = (
-            "QToolTip {"
-            f" background-color: {frame_bg};"
-            f" color: {fg};"
-            f" border: 1px solid {input_border};"
-            " padding: 2px 6px;"
-            " border-radius: 4px;"
-            " font-family: 'Segoe UI';"
-            " font-size: 10px;"
-            " font-weight: normal;"
-            " show-delay: 4000ms;"
-            " }"
-        )
-
-        full_css = """
-            QMainWindow, QDialog {{ background-color: {bg}; }}
-            QWidget {{ color: {fg}; font-family: 'Segoe UI'; font-size: 13px; }}
-            QWidget#scrollContent, DraggableQueueWidget#scrollContent {{ background-color: {scroll_bg}; }}
-            QWidget#queueItemPending {{ background-color: {queue_item_bg}; border-radius: 4px; margin-bottom: 2px; }}
-            QWidget#queueItemFinished {{ background-color: {queue_item_bg_finished}; border-radius: 4px; margin-bottom: 2px; }}
-            QLabel {{ color: {fg}; }}
-            QLabel#durationLabel {{ color: {secondary_fg}; font-size: 11px; background: transparent; border: none; }}
-            QLabel#channelLabel {{ color: {secondary_fg}; font-size: 11px; background: transparent; border: none; }}
-            QPushButton {{ 
-                background-color: {accent}; 
-                color: {accent_fg}; border: {main_btn_border}; padding: 6px 12px; border-radius: 4px; font-weight: bold;
-            }}
-            QPushButton:hover {{ background-color: {hover_bg}; color: {hover_fg}; }}
-            QPushButton:disabled {{ background-color: #555555; color: #888888; }}
-            QLineEdit {{ 
-                background-color: {input_bg}; color: {fg}; border: 1px solid {input_border}; padding: 6px; border-radius: 4px;
-            }}
-            QComboBox {{ 
-                background-color: {input_bg}; color: {fg}; border: 1px solid {input_border}; padding: 6px; border-radius: 4px;
-            }}
-            QComboBox::drop-down {{
-                subcontrol-origin: padding;
-                subcontrol-position: top right;
-                width: 24px;
-                border-left: 1px solid {input_border};
-                background-color: {accent};
-                border-top-right-radius: 3px;
-                border-bottom-right-radius: 3px;
-            }}
-            QComboBox::down-arrow {{
-                image: url("{downarrow_path}");
-                width: 16px; height: 16px;
-            }}
-            QComboBox QAbstractItemView {{
-                background-color: {input_bg};
-                color: {fg};
-                selection-background-color: {accent};
-                selection-color: {accent_fg};
-                border: 1px solid {input_border};
-            }}
-            QScrollArea {{ border: none; background-color: {scroll_bg}; border-radius: 6px;}}
-            QFrame {{ background-color: {frame_bg}; border-radius: 6px; padding: 5px;}}
-            QSplitter::handle {{ background-color: {splitter_handle}; width: 6px; margin: 0px 2px; }}
-            QSlider::groove:horizontal {{ border: none; height: 4px; background: {slider_bg}; border-radius: 2px; }}
-            QSlider::sub-page:horizontal {{ background: {accent}; border-radius: 2px; }}
-            QSlider::handle:horizontal {{ background: {accent}; width: 16px; height: 16px; margin-top: -6px; margin-bottom: -6px; border-radius: 8px; }}
-            QSlider#volSlider[volume_state="normal"]::sub-page:horizontal {{ background: {accent}; }}
-            QSlider#volSlider[volume_state="normal"]::handle:horizontal {{ background: {accent}; }}
-            QSlider#volSlider[volume_state="orange"]::sub-page:horizontal {{ background: #FF8C00; }}
-            QSlider#volSlider[volume_state="orange"]::handle:horizontal {{ background: #FF8C00; }}
-            QSlider#volSlider[volume_state="red"]::sub-page:horizontal {{ background: #E31E24; }}
-            QSlider#volSlider[volume_state="red"]::handle:horizontal {{ background: #E31E24; }}
-            QSlider#volSlider::sub-page:horizontal {{ border-radius: 1px; }}
-            
-            QCheckBox {{ color: {fg}; spacing: 8px; }}
-            QCheckBox::indicator {{ width: 16px; height: 16px; border: 1px solid {accent}; border-radius: 3px; background: {frame_bg}; }}
-            QCheckBox::indicator:checked {{ background: {accent}; image: url("{checkmark_path}"); }}
-            
-            QPushButton#transparentBtn {{
-                background-color: transparent;
-                color: {fg};
-                font-weight: normal;
-                border-radius: 0px;
-                padding: 4px;
-                text-align: left;
-            }}
-            QPushButton#transparentBtn:hover {{
-                background-color: {btn_hover};
-            }}
-            QWidget#localRow {{
-                background-color: transparent;
-                border-radius: 4px;
-            }}
-            QWidget#localRow[selected="true"] {{
-                background-color: {accent};
-            }}
-            /* The row that is the track the player is holding wears the colour of that
-               state - green while it runs, orange while it is held - and it is written
-               after the selection rule so that a row which is both selected and playing
-               says the thing the listener is looking at the folder list to find out. */
-            QWidget#localRow[play_state="playing"] {{
-                background-color: {THUMB_BOX_PLAYING};
-            }}
-            QWidget#localRow[play_state="paused"] {{
-                background-color: {THUMB_BOX_PAUSED};
-            }}
-            /* A green and an orange row both carry saturated colour behind the text, so
-               the text on them is fixed rather than left to the theme's own foreground,
-               which is chosen to sit on the dark panes and not on these. */
-            QWidget#localRow[play_state="playing"] QPushButton#transparentBtn,
-            QWidget#localRow[play_state="paused"] QPushButton#transparentBtn,
-            QWidget#localRow[play_state="playing"] QLabel#durationLabel,
-            QWidget#localRow[play_state="paused"] QLabel#durationLabel {{
-                color: #1a1a1a;
-                font-weight: bold;
-            }}
-            QPushButton#transparentBtn[selected="true"] {{
-                background-color: transparent;
-                color: {accent_fg};
-            }}
-            QPushButton#transparentBtn[selected="true"]:hover {{
-                background-color: {btn_hover};
-            }}
-            QLabel#durationLabel[selected="true"] {{ color: {accent_fg}; }}
-            /* The duration sits just off the right edge of a local row. Saying it once
-               here instead of styling every row separately keeps the row build cheap,
-               and it is scoped to the local pane, where that 6px gap was designed. */
-            QWidget#localRow QLabel#durationLabel {{ padding-right: 6px; }}
-            QMenu#localContextMenu {{
-                background-color: {frame_bg};
-                color: {fg};
-                border: 1px solid {input_border};
-                border-radius: 4px;
-                padding: 4px;
-            }}
-            QMenu#localContextMenu::item {{
-                padding: 6px 28px 6px 12px;
-                border-radius: 3px;
-            }}
-            QMenu#localContextMenu::item:selected {{
-                background-color: {accent};
-                color: {accent_fg};
-            }}
-            QMenu#localContextMenu::item:disabled {{ color: {secondary_fg}; }}
-            QMenu#localContextMenu::separator {{
-                height: 1px;
-                background: {input_border};
-                margin: 4px 6px;
-            }}
-            QPushButton#iconBtn {{
-                background-color: transparent;
-                color: {fg};
-                font-weight: normal;
-                padding: 0px;
-            }}
-            QPushButton#topIconBtn {{
-                background-color: transparent;
-                color: {fg};
-                font-family: 'Segoe MDL2 Assets';
-                font-size: 15px;
-                font-weight: normal;
-                border: 1px solid {input_border};
-                border-radius: 4px;
-                padding: 0px;
-            }}
-            QPushButton#topIconBtn:hover {{
-                background-color: {btn_hover};
-            }}
-            QPushButton#playerBtn {{
-                background-color: transparent;
-                color: {fg};
-                font-family: 'Segoe MDL2 Assets';
-                font-size: 20px;
-                font-weight: normal;
-                border-radius: 6px;
-                padding: 0px;
-            }}
-            QPushButton#playerBtn:hover {{
-                background-color: {btn_hover};
-            }}
-            QPushButton#playerBtn[active="true"] {{
-                background-color: {accent};
-                color: {accent_fg};
-                font-weight: bold;
-            }}
-            QPushButton#playerBtn[active="true"]:hover {{
-                background-color: {hover_bg};
-                color: {hover_fg};
-            }}
-            QPushButton#playerPlayBtn {{
-                background-color: transparent;
-                color: {fg};
-                font-family: 'Segoe MDL2 Assets';
-                font-size: 30px;
-                font-weight: normal;
-                border-radius: 8px;
-                padding: 0px;
-            }}
-            QPushButton#playerPlayBtn:hover {{
-                background-color: {btn_hover};
-            }}
-            QPushButton#stopAfterBtn {{
-                background-color: transparent;
-                color: {secondary_fg};
-                font-family: 'Segoe MDL2 Assets';
-                font-size: 20px;
-                font-weight: normal;
-                border-radius: 6px;
-                padding: 0px 0px 6px 0px;
-            }}
-            QPushButton#stopAfterBtn:hover {{
-                background-color: {btn_hover};
-                color: {fg};
-            }}
-            QPushButton#stopAfterBtn[stop_after_state="once"] {{
-                background-color: {accent};
-                color: {accent_fg};
-                font-weight: bold;
-            }}
-            QPushButton#stopAfterBtn[stop_after_state="always"] {{
-                background-color: #E31E24;
-                color: white;
-                font-weight: bold;
-            }}
-            {tooltip_css}
-        """.format(
-            bg=bg, fg=fg, frame_bg=frame_bg, input_bg=input_bg, input_border=input_border,
-            scroll_bg=scroll_bg, splitter_handle=splitter_handle, slider_bg=slider_bg,
-            hover_bg=hover_bg, hover_fg=hover_fg, accent=accent, accent_fg=accent_fg,
-            queue_item_bg=queue_item_bg, queue_item_bg_finished=queue_item_bg_finished,
-            btn_hover=btn_hover, checkmark_path=checkmark_path, downarrow_path=downarrow_path,
-            main_btn_border=main_btn_border, secondary_fg=secondary_fg,
-            # The colours a row wears when it is the track the player is holding, shared with
-            # the thumbnail box of a search row so both panes say the same thing in the same
-            # green and the same orange.
-            THUMB_BOX_PLAYING=THUMB_BOX_PLAYING, THUMB_BOX_PAUSED=THUMB_BOX_PAUSED,
-            tooltip_css=tooltip_css
-        )
-        # Apply the theme at the widget level (as in 2.3). A single
-        # self.setStyleSheet re-polishes only this window's subtree; routing it
-        # through QApplication.setStyleSheet instead re-polishes every widget in
-        # every top-level window, which is what made theme switching laggy. The
-        # tooltip rules are embedded in full_css above and propagate to child
-        # dialogs through this stylesheet, so no app-level call is required.
-        self.setStyleSheet(full_css)
-        self.update_shuffle_btn_style()
-        self._update_stop_after_ui()
 
     # --- Local Folder Logic ---
     def set_local_explorer_address(self, path: str = "", add_to_recent: bool = False):
@@ -3929,7 +2628,6 @@ class MainApp(QMainWindow):
         from the cache while the folder was scanned is not touched at all, and each row
         that does need reading is written back on its own instead of the whole list being
         rebuilt around it."""
-        from PySide6.QtCore import QObject, Signal
 
         class MetaWorker(QObject):
             meta_done = Signal(object, object, object)
@@ -5030,444 +3728,6 @@ class MainApp(QMainWindow):
                 except Exception:
                     pass
 
-    def start_batch_download(self):
-        if self.is_downloading: return
-        pending = [q for q in self.queue_items if q['status'] == "Pending"]
-        if not pending:
-            # Said out loud on purpose: a press that changed nothing used to look exactly like
-            # a download that was taking its time to start.
-            self._on_status_update("Nothing in the queue to download.", False, "#FF8C00")
-            return
-
-        self.is_downloading = True
-        self.cancel_download = False
-        self._batch_total_count = len(pending)
-        self.dl_btn.setEnabled(False)
-        self.dl_btn.setText("Downloading...")
-        self.cancel_btn.setText("Cancel")
-        self.cancel_btn.setEnabled(True)
-        self.cancel_btn.setVisible(True)
-        # Everything read from a widget is read here, on the GUI thread. Qt
-        # objects belong to the thread that created them, and reading the
-        # settings once also stops a mid-batch change of format, bitrate or
-        # folder from splitting one queue across two different targets.
-        folder = self.path_combo.currentText()
-        target_format = self.format_combo.currentText().lower()
-        audio_quality = str(self.bitrate_combo.currentText())
-        ffmpeg_location = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable)) if getattr(sys, 'frozen', False) else None
-        extra_args = shlex.split(self.custom_args) if (getattr(self, 'use_custom_args', False) and getattr(self, 'custom_args', '')) else []
-
-        def bg_download():
-            try:
-                _run_batch()
-            except Exception as e:
-                # Nothing here may end a batch without a final status line:
-                # that line is what re-enables the Download button, so one
-                # unhandled error used to leave the queue stuck on
-                # "Downloading..." with the rest of the list never attempted.
-                print(f"Batch download error: {e}")
-                self.status_signal.emit(f"Batch complete (stopped early: {e}).", False, "#E31E24")
-
-        def _run_batch():
-            from concurrent.futures.thread import ThreadPoolExecutor  # see the note at the top
-
-            with self.active_downloads_lock:
-                self.active_downloads.clear()
-
-            threads_count = max(1, int(getattr(self, 'download_threads', 3)))
-            self._dl_finished_count = 0
-            downloaded_filepaths = []
-            downloaded_lock = threading.Lock()
-            # id(queue item) -> the file that item produced. Kept out of the
-            # queue dicts so the verification pass can check each track on its
-            # own instead of guessing from counts.
-            produced_files = {}
-            # Two queue entries can be different videos that share a title, and
-            # yt-dlp names its output after the title. Left alone, two threads
-            # write the same .part file at the same moment and one of them
-            # fails or writes garbage - which is why the skipping used to get
-            # worse with every extra thread. Same-title tracks are downloaded
-            # one at a time instead.
-            title_locks = {}
-            title_locks_guard = threading.Lock()
-            start_slot_guard = threading.Lock()
-            start_slot = [0]
-            # Lightweight counter for the progress prefix. Incremented once per
-            # download completion (inside download_single) instead of rescanning
-            # all queue_items on every yt-dlp progress line.
-            finished_counter = [0]
-            finished_counter_guard = threading.Lock()
-
-            def title_lock_for(title):
-                key = _title_match_key(title) or title
-                with title_locks_guard:
-                    lock = title_locks.get(key)
-                    if lock is None:
-                        lock = threading.Lock()
-                        title_locks[key] = lock
-                    return lock
-
-            def reset_start_slots():
-                with start_slot_guard:
-                    start_slot[0] = 0
-
-            def take_start_slot():
-                with start_slot_guard:
-                    slot = start_slot[0]
-                    start_slot[0] += 1
-                return slot
-
-            def repaint(q):
-                """Repaint one queue row, looking up where that item is now.
-
-                The index a worker was handed goes stale the moment the queue is
-                reordered or something is taken out of it, and painting the wrong
-                row is part of how a finished track kept showing as pending.
-                """
-                for i, item in enumerate(getattr(self, 'queue_items', [])):
-                    if item is q:
-                        self.queue_status_changed_signal.emit(i)
-                        return
-
-            def find_downloaded_file(title, not_before=0.0):
-                """Find the file a successful yt-dlp run left behind, by its title."""
-                try:
-                    entries = list(os.scandir(folder))
-                except OSError:
-                    return None
-                best = None
-                for entry in entries:
-                    try:
-                        if not entry.is_file():
-                            continue
-                        if not _title_matches_filename(title, entry.name):
-                            continue
-                        info = entry.stat()
-                    except OSError:
-                        continue
-                    if info.st_size <= 1024 or info.st_mtime < not_before - 5:
-                        continue
-                    if best is None or info.st_mtime > best[1]:
-                        best = (entry.path, info.st_mtime)
-                return best[0] if best else None
-
-            def download_single(item):
-                _, q = item
-                vid_id = q['video'].get('id', '')
-                if not vid_id: return
-                title = q['video'].get('title', '') or ''
-                q.pop('permanent_failure', None)
-                if getattr(self, 'cancel_download', False):
-                    q['status'] = "Pending"
-                    repaint(q)
-                    return
-                q['status'] = "Downloading"
-                repaint(q)
-
-                # The options the Python API used, written as yt-dlp CLI flags.
-                cli_args = [
-                    "--newline",
-                    "--format", "bestaudio/best",
-                    "--extract-audio",
-                    "--audio-format", target_format,
-                    "--audio-quality", audio_quality,
-                    "--retries", "15",
-                    "--fragment-retries", "15",
-                    "--file-access-retries", "10",
-                    "--output", f"{folder}/%(title)s.%(ext)s",
-                ]
-                if ffmpeg_location:
-                    cli_args.extend(["--ffmpeg-location", ffmpeg_location])
-                if extra_args:
-                    # Appended last, so the advanced field wins over the GUI picks
-                    # exactly like the Settings dialog says it should.
-                    cli_args.extend(extra_args)
-                # The track itself: yt-dlp takes URLs positionally, so it goes
-                # after every option. Without it yt-dlp exits with
-                # "You must provide at least one URL" and nothing downloads.
-                cli_args.append(f"https://www.youtube.com/watch?v={vid_id}")
-
-                # Stagger the first starts of a pass. Every thread asking
-                # YouTube for a stream in the same instant is what gets the
-                # requests throttled, and a throttled request is what used to
-                # come back as a song that "skipped".
-                #
-                # Only the first max_workers items start simultaneously and
-                # need staggering. Items beyond that wait for a previous
-                # download to finish (~20-30s), which is already a far larger
-                # gap than any stagger we could add — an extra 2s sleep on
-                # those items was pure dead time.
-                slot = take_start_slot()
-                if 0 < slot < max_workers:
-                    time.sleep(0.4 * slot)
-
-                # Say this track has been asked for, now. yt-dlp still has to reach YouTube and
-                # find the stream before a single byte arrives - a few seconds on a good day,
-                # longer when a track has to be retried - and every line the status bar showed
-                # until then came from that resolution. A batch that had already started looked
-                # like it had not started at all, so the queue is reported as working from the
-                # moment each thread hands its track to yt-dlp.
-                self._dl_progress_percent(vid_id, "0%")
-
-                downloaded_file = None
-                failure = None
-                with title_lock_for(title):
-                    for attempt in range(1, DOWNLOAD_ITEM_ATTEMPTS + 1):
-                        if getattr(self, 'cancel_download', False):
-                            break
-                        attempt_started = time.time()
-                        failure = None
-                        try:
-                            def _register_proc(p, _self=self):
-                                with _self._active_ytdlp_procs_lock:
-                                    _self._active_ytdlp_procs.append(p)
-
-                            def _unregister_proc(p, _self=self):
-                                with _self._active_ytdlp_procs_lock:
-                                    try:
-                                        _self._active_ytdlp_procs.remove(p)
-                                    except ValueError:
-                                        pass
-
-                            downloaded_file = None
-                            _proc_ref = [None]  # so unregister can find it after
-
-                            def _proc_and_track(p, _reg=_register_proc, _ref=_proc_ref):
-                                _reg(p)
-                                _ref[0] = p
-
-                            try:
-                                downloaded_file = run_yt_dlp_download(
-                                    cli_args,
-                                    progress_cb=lambda pct: self._dl_progress_percent(vid_id, pct),
-                                    cancelled_cb=lambda: getattr(self, 'cancel_download', False),
-                                    proc_cb=_proc_and_track,
-                                )
-                            finally:
-                                if _proc_ref[0] is not None:
-                                    _unregister_proc(_proc_ref[0])
-                            # run_yt_dlp_download raises for anything that truly
-                            # failed, so getting here means the track is on
-                            # disk. Only its name is uncertain.
-                            if not downloaded_file or not os.path.isfile(downloaded_file):
-                                downloaded_file = find_downloaded_file(title, attempt_started)
-                            break
-                        except Exception as e:
-                            failure = str(e)
-                            downloaded_file = None
-                            print(f"Download attempt {attempt}/{DOWNLOAD_ITEM_ATTEMPTS} failed for {vid_id}: {failure}")
-                            if getattr(self, 'cancel_download', False):
-                                break
-                            if _is_permanent_download_error(failure):
-                                # The video itself is gone, so a later pass of
-                                # the queue would only fail it all over again.
-                                q['permanent_failure'] = True
-                                break
-                            if attempt < DOWNLOAD_ITEM_ATTEMPTS:
-                                time.sleep(min(1.5 * attempt, 5.0))
-
-                with self.active_downloads_lock:
-                    if vid_id in self.active_downloads:
-                        del self.active_downloads[vid_id]
-
-                # A clean yt-dlp exit means the track downloaded, even when no
-                # usable path came out of its output. Treating "no path" as a
-                # failure is what turned finished downloads into skipped songs.
-                if failure is None:
-                    if downloaded_file:
-                        _add_placeholder_tag(downloaded_file)
-                        with downloaded_lock:
-                            downloaded_filepaths.append(downloaded_file)
-                        produced_files[id(q)] = downloaded_file
-                    q['status'] = "Finished"
-                    with finished_counter_guard:
-                        finished_counter[0] += 1
-                    self._dl_finished_count = finished_counter[0]
-                else:
-                    q['status'] = "Pending"
-
-                if getattr(self, 'cancel_download', False):
-                    q['status'] = "Pending"
-                repaint(q)
-
-                with finished_counter_guard:
-                    finished_cnt = finished_counter[0]
-                total_cnt = getattr(self, '_batch_total_count', len(getattr(self, 'queue_items', [])))
-                prog_prefix = f"({finished_cnt}/{total_cnt}) " if total_cnt > 0 else ""
-                with self.active_downloads_lock:
-                    if self.active_downloads:
-                        vals = list(self.active_downloads.values())
-                        if len(vals) > 5:
-                            self.dl_progress_signal.emit(f"{prog_prefix}Downloading: {', '.join(vals[:5])} (+{len(vals)-5} more)")
-                        else:
-                            self.dl_progress_signal.emit(f"{prog_prefix}Downloading: {', '.join(vals)}")
-                    else:
-                        self.dl_progress_signal.emit(f"{prog_prefix}Processing...")
-
-            max_passes = 4
-            for pass_num in range(1, max_passes + 1):
-                # Always check UP (from top / index 0) for undownloaded tracks before checking down
-                pending_items = sorted(
-                    [(idx, q) for idx, q in enumerate(self.queue_items)
-                     if q['status'] == "Pending" and not q.get('permanent_failure')],
-                    key=lambda x: x[0]
-                )
-                if not pending_items or getattr(self, 'cancel_download', False):
-                    break
-
-                if pass_num > 1:
-                    self.status_signal.emit(
-                        f"Re-checking queue (Pass {pass_num}: retrying {len(pending_items)} pending downloads)...",
-                        False, "#FF8C00"
-                    )
-                    time.sleep(min(1.0 * pass_num, 4.0))
-
-                max_workers = min(threads_count, len(pending_items))
-                reset_start_slots()
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = []
-                    for item in pending_items:
-                        if getattr(self, 'cancel_download', False):
-                            break
-                        futures.append(executor.submit(download_single, item))
-                    for fut in futures:
-                        try:
-                            fut.result()
-                        except Exception as e:
-                            # One track blowing up must not take the rest of the
-                            # queue down with it.
-                            print(f"Unexpected error while downloading: {e}")
-
-            # --- Verification Pass with Placeholder Tag & Title Matching ---
-            if not getattr(self, 'cancel_download', False):
-                # Check every finished track against the file it actually
-                # produced. The old check compared a file count against a queue
-                # count and matched raw titles against sanitized filenames, so
-                # any title holding a ':' or a '/' looked missing and was
-                # downloaded all over again for no reason.
-                #
-                # Build a single file-entry list once (one scandir) instead of
-                # re-scanning the folder for each finished item that needs a
-                # lookup. This is the difference between N × folder-scan syscalls
-                # and 1 scan + N in-memory matches.
-                _verify_entries = None  # lazily built: [(match_key, path, mtime)]
-
-                def _ensure_verify_entries():
-                    nonlocal _verify_entries
-                    if _verify_entries is not None:
-                        return _verify_entries
-                    try:
-                        raw = list(os.scandir(folder))
-                    except OSError:
-                        _verify_entries = []
-                        return _verify_entries
-                    entries = []
-                    for entry in raw:
-                        try:
-                            if not entry.is_file():
-                                continue
-                            info = entry.stat()
-                            if info.st_size <= 1024:
-                                continue
-                            mk = _title_match_key(os.path.splitext(entry.name)[0])
-                            if mk:
-                                entries.append((mk, entry.path, info.st_mtime))
-                        except OSError:
-                            continue
-                    _verify_entries = entries
-                    return _verify_entries
-
-                def _find_from_verify_entries(title, not_before=0.0):
-                    """Match a title against the pre-scanned folder entries."""
-                    wanted = _title_match_key(title)
-                    if not wanted:
-                        return None
-                    best = None
-                    for mk, path, mtime in _ensure_verify_entries():
-                        if mtime < not_before - 5:
-                            continue
-                        if mk == wanted or (len(wanted) >= 12 and mk.startswith(wanted)) or (len(mk) >= 12 and wanted.startswith(mk)):
-                            if best is None or mtime > best[1]:
-                                best = (path, mtime)
-                    return best[0] if best else None
-
-                missing_items = []
-                for idx, q in enumerate(list(self.queue_items)):
-                    if q['status'] != "Finished":
-                        continue
-                    path = produced_files.get(id(q))
-                    if path and os.path.isfile(path) and os.path.getsize(path) > 1024:
-                        continue
-                    path = _find_from_verify_entries(q['video'].get('title', ''))
-                    if path:
-                        produced_files[id(q)] = path
-                        continue
-                    q['status'] = "Pending"
-                    missing_items.append((idx, q))
-                    repaint(q)
-
-                if missing_items:
-                    missing_items.sort(key=lambda x: x[0])
-                    self.status_signal.emit(
-                        f"Verification: {len(missing_items)} files missing on disk. Redownloading missing tracks...",
-                        False, "#FF8C00"
-                    )
-                    # Sync the lightweight counter with reality: verification
-                    # reset some items back to Pending, so the counter is now
-                    # inflated by however many were demoted.
-                    with finished_counter_guard:
-                        finished_counter[0] -= len(missing_items)
-                        self._dl_finished_count = finished_counter[0]
-                    reset_start_slots()
-                    with ThreadPoolExecutor(max_workers=min(threads_count, len(missing_items))) as executor:
-                        futures = [executor.submit(download_single, item) for item in missing_items]
-                        for fut in futures:
-                            try:
-                                fut.result()
-                            except Exception as e:
-                                print(f"Unexpected error while redownloading: {e}")
-
-                # Strip placeholder verification tag from all confirmed files
-                for f in list(dict.fromkeys(downloaded_filepaths + list(produced_files.values()))):
-                    if os.path.exists(f):
-                        _remove_placeholder_tag(f)
-
-            self._last_downloaded_files = list(dict.fromkeys(
-                downloaded_filepaths + [p for p in produced_files.values() if p]
-            ))
-
-            if getattr(self, 'cancel_download', False):
-                self.status_signal.emit("Download cancelled.", False, "#E31E24")
-            else:
-                remaining = [q for q in self.queue_items if q['status'] == "Pending"]
-                if remaining:
-                    unavailable = len([q for q in remaining if q.get('permanent_failure')])
-                    if unavailable:
-                        self.status_signal.emit(
-                            f"Batch completed ({len(remaining)} failed, {unavailable} unavailable).",
-                            False, "#FF8C00"
-                        )
-                    else:
-                        self.status_signal.emit(f"Batch completed ({len(remaining)} failed).", False, "#FF8C00")
-                else:
-                    self.status_signal.emit("Batch complete!", False, "#1abd33")
-
-        # The button already reads "Downloading..." and the first queue rows have flipped, but
-        # the first thing the status bar could say about the work itself used to come from yt-dlp
-        # reporting a percentage - seconds after this, once an in-flight track had been resolved
-        # and had bytes moving. Nothing in between looked like a start, so the batch announces
-        # itself here, on the GUI thread, in the same click that asked for it.
-        self.dl_progress_signal.emit(f"(0/{self._batch_total_count}) Starting "
-                                     f"{self._batch_total_count} download"
-                                     f"{'s' if self._batch_total_count != 1 else ''}...")
-
-        threading.Thread(target=bg_download, daemon=True).start()
-        # Config save deferred until after the download thread is launched:
-        # the thread already has its own captured settings, so this write
-        # (which serialises search_results) overlapping with yt-dlp startup
-        # means it no longer delays the first download attempt.
-        self.save_config()
-        
     def _on_batch_complete(self):
         self.is_downloading = False
         self.cancel_download = False
@@ -6940,13 +5200,11 @@ class MainApp(QMainWindow):
                 self.thumbnail_cache_size += len(data)
                 self.thumbnails_loaded_signal.emit(vid_id, qpixmap)
         except: pass
-# These names moved out of this file during the 3.5 modularisation (wave 5e) and are
-# re-exported here so the entry point keeps every name it has always had while the
-# split proceeds. The final wave replaces this with the package's own entry point.
+# Wave 5e: moved into yt_msd.crash and imported back because this file or the GUI Test Suite
+# still reads them by name. Wave 5h checked the group and dropped whatever nothing read.
 from yt_msd.crash import (
     CRASH_LOG_MAX,
     CRASH_LOG_NAME,
-    CrashReporter,
     MAX_CRASH_DIALOGS_PER_MINUTE,
     _crash_state,
     crash_dialog_allowed,
@@ -6973,7 +5231,6 @@ from yt_msd.instance import (
     ask_running_instance_to_show,
     take_single_instance_name,
 )
-
 
 if __name__ == "__main__":
     # "--console" means "this copy needs somewhere to print errors". For the installed

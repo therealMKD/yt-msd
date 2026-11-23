@@ -998,6 +998,39 @@ _still_patched = [name for name in ("is_run_on_startup_enabled", "set_run_on_sta
 check("WN-F8 nothing this suite patched is left patched for the next suite to run against",
       _still_patched == [], _still_patched)
 
+print("=" * 72)
+print("WN-H. what MainApp is assembled from, since wave 6 lifted five of its methods out")
+
+# Wave 6 moved five methods into modules MainApp now inherits. Nothing else in this suite would
+# notice if that wiring were wrong: the checks drive MainApp's methods as unbound functions on
+# stand-ins, so a shadowed method, a duplicated one or a base in the wrong place would leave every
+# one of them green. These ask the wiring question directly, without building a window - MainApp's
+# constructor starts VLC, watchers and LAN services, which is more than a class composition needs.
+_lifted = {"__init__": "BootstrapMixin", "setup_ui": "LayoutMixin", "apply_theme": "StylesheetMixin",
+           "reset_to_defaults": "SettingsResetMixin", "start_batch_download": "BatchDownloadMixin"}
+_bases = [c.__name__ for c in mod.MainApp.__mro__]
+_present = [o for o in _lifted.values() if o in _bases]
+check("WN-H1 MainApp inherits the five modules wave 6 lifted into, with QMainWindow last",
+      len(_present) == 5
+      and _bases.index("QMainWindow") > max((_bases.index(o) for o in _present), default=-1),
+      _bases[:8])
+check("WN-H2 every lifted method is still reachable through MainApp, from the mixin it moved to",
+      all(getattr(mod.MainApp, name).__qualname__.split(".")[0] == owner
+          for name, owner in _lifted.items()),
+      {name: getattr(mod.MainApp, name).__qualname__ for name, owner in _lifted.items()})
+_redefined = [name for name in _lifted if name in vars(mod.MainApp)]
+check("WN-H3 and none of the five is left defined in MainApp on top of the mixin that owns it",
+      _redefined == [], _redefined)
+_holders = {name: [c.__name__ for c in mod.MainApp.__mro__ if name in vars(c)] for name in _lifted}
+check("WN-H4 no lifted name is held by two of the wave-6 mixins, and the constructor resolves to "
+      "BootstrapMixin ahead of the Qt one behind it",
+      all(len([c for c in where if c in _lifted.values()]) == 1 for where in _holders.values())
+      and _holders["__init__"][0] == "BootstrapMixin", _holders)
+_signals = {n: type(getattr(mod.MainApp, n)).__name__
+            for n in ("status_signal", "search_results_signal", "stream_refreshed_signal")}
+check("WN-H5 the signals MainApp wires its worker threads to are still declared on the class itself",
+      all("Signal" in t for t in _signals.values()), _signals)
+
 shutil.rmtree(FIXTURE_ROOT, ignore_errors=True)
 check("WN-F9 every folder this suite wrote is gone again", not FIXTURE_ROOT.exists())
 

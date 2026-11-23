@@ -1947,7 +1947,12 @@ _hold_block = _source[_source.index("def _hold_finished_track"):][:1600]
 check("Z40 anything arriving on the player ends the hold, and arming a hold ends any replay still marked in flight",
       "self._finished_track = False" in _note_block and "self._replay_in_flight = False" in _note_block
       and "self._replay_in_flight = False" in _hold_block)
-_init_block = _source[_source.index("self._pending_stream_seek_at = None"):][:1400]
+# "With the rest of the player state" means inside the same constructor, so the window this check
+# reads is the constructor itself - from the `def` above the anchor to the `def` below it - rather
+# than a fixed run of characters after one assignment. Wave 6 moved the constructor into
+# yt_msd/ui/bootstrap.py, where what follows that assignment is not what followed it in the .pyw.
+_init_at = _source.index("self._pending_stream_seek_at = None")
+_init_block = _source[_source.rindex("\n    def ", 0, _init_at):_source.index("\n    def ", _init_at)]
 check("Z41 and the hold state is initialised with the rest of the player state",
       "self._finished_track = False" in _init_block and "self._replay_in_flight = False" in _init_block)
 check("Z42 the three captions are named constants in one block, one place sets that button, and nothing else captions it",

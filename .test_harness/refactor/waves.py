@@ -9,10 +9,11 @@
 # wave when an out-edge points at the .pyw.
 #
 # Order matters: leaves first (no Qt, no app state), then the external-process layer,
-# then sync, then the widgets and dialogs, then the app-level helpers. The plan runs to 5g
-# and stops there: MainApp stays in the entry point, recorded in LEFT_BY_DECISION below,
-# reported by analyze() as left by decision, and refused by check_wave() if a later wave
-# tries to move it anyway.
+# then sync, then the widgets and dialogs, then the app-level helpers. WAVES runs to 5g and stops
+# there: MainApp stays in the entry point, recorded in LEFT_BY_DECISION below, reported by
+# analyze() as left by decision, and refused by check_wave() if a later wave tries to move it
+# anyway. LIFTS below runs to 6, and it is a different kind of move: the class stays exactly where
+# this decision puts it, and five of its methods do not.
 
 # Names a wave may move even though the GUI Test Suite writes mod.<name> against the entry
 # point (see splitlib.harness_couplings). Every entry needs the reason and the harness change
@@ -28,13 +29,46 @@ HARNESS_EXEMPT = {
 # wave written past it.
 LEFT_BY_DECISION = {
     "MainApp": (
-        "Kept in yt-msd-gui.pyw as the single class it already is (lines 412-6920, 230 methods). "
+        "Kept in yt-msd-gui.pyw as one class - 4,887 lines and 183 methods since wave 6 lifted the "
+        "five methods that had outgrown a screenful into the mixin modules the class now inherits. "
         "It is the last large piece the compiled build holds: build_gui_cython.py compiles the "
-        "entry point into one .pyd while yt_msd travels as plain Python, so moving it out costs "
-        "the player, the window and every handler their compilation and buys nothing at run time - "
-        "a class split across modules runs exactly as the one class does. Reopen only if the file "
-        "grows past being reviewable as a whole, and then as one move-whole wave, not a carving."
+        "entry point into one .pyd while yt_msd travels as plain Python, so moving the class itself "
+        "out costs the player, the window and every handler their compilation and buys nothing at "
+        "run time. What had stopped it being reviewable was not the class but those five methods, "
+        "and wave 6 removed that instead of the class: nothing written in the entry point now runs "
+        "longer than 150 lines, and analyze() keeps that count at zero. Reopen the rest of it only "
+        "as one move-whole wave, not a carving."
     ),
+}
+
+# Methods the class no longer holds, and the module each one went to:
+#
+#   LIFTS[wave] = [(dotted module, mixin class MainApp now inherits, [method names])]
+#
+# WAVES moves top-level blocks; LIFTS moves methods out of the one block WAVES closed out. They
+# are kept apart on purpose: a lifted method is not a name the entry point can import back, so it
+# must not appear in the wave plan that build_import_block() and check_wave() reason over.
+#
+# The rule is the 150-line one, and it is a rule about reviewability rather than about the split:
+# a method you cannot read in one screen is a method nobody reviews. Five methods met it, and no
+# method left in MainApp does - the longest now runs 132 lines - so analyze() reports the longest
+# method left in the entry point the same way it reports dead imports: a number that has to stay
+# at zero.
+#
+# Each lands as a mixin rather than as a function taking the app, for one reason: it is the only
+# shape in which the move is a cut-and-paste. The body is dedented one level and otherwise untouched
+# - `self` still means the window, a zero-argument `super()` still resolves, and the signals,
+# attributes and Qt wiring that the class already relies on are untouched because the method is
+# still written inside a class. A plain function would have needed every `self.` in 1,618 lines
+# re-pointed at a parameter, and every one of those a human checking.
+LIFTS = {
+    "6": [
+        ("yt_msd.ui.bootstrap", "BootstrapMixin", ["__init__"]),
+        ("yt_msd.ui.layout", "LayoutMixin", ["setup_ui"]),
+        ("yt_msd.ui.stylesheet", "StylesheetMixin", ["apply_theme"]),
+        ("yt_msd.ui.settings_reset", "SettingsResetMixin", ["reset_to_defaults"]),
+        ("yt_msd.ytdlp.batch", "BatchDownloadMixin", ["start_batch_download"]),
+    ],
 }
 
 WAVES = {
@@ -452,32 +486,63 @@ WAVES = {
         ]),
     ],
 
-    # The plan ends here. What remains in the entry point is MainApp (lines 412-6920, 230 methods)
-    # and the 487 lines of imports and entry-block glue around it. It is deliberately not listed as
-    # a wave: the decision is that it stays, recorded in LEFT_BY_DECISION at the top of this file,
-    # where analyze() reports it as left by decision and check_wave() refuses a wave that lists it.
+    # Wave 5h moved nothing; it removed text. The .pyw had imported back every name a wave moved
+    # out, on the promise that the entry point and the suite keep reaching names by name. With the
+    # split closed, 117 of those 354 bindings were read by nobody - not by the file that imported
+    # them, not as mod.<name> in the suite's syntax, and not in any string the suite contains
+    # (harness_seam.patch(mod, "name") and getattr(mod, "name") reach a name by text, and a name
+    # only ever mentioned that way is still load-bearing). prune_reexports.py removes exactly that
+    # set and nothing else: it keeps each statement's own layout, never touches a comment, and is a
+    # no-op when re-run. It also re-homed the thirteen wave banners, every one of which still
+    # promised a final wave that is not coming. 6,995 lines became 6,882.
     #
-    # Measured against the rule this file exists to enforce, MainApp could move today: it reads 163
-    # names, 114 of them builtins or already in a moved module and every one of the other 49 an
-    # import, so check_wave finds no out-edge still pointing at the .pyw; it contains no `global`
-    # statement - and neither does anything else in the entry point now - so cross_module_globals
-    # has nothing to refuse; and no check in the suite writes mod.MainApp.
+    # The rule is permanent rather than a one-off sweep: splitlib.import_layer_status() labels every
+    # binding the entry point creates from an import as read-here, suite-mod, suite-string or
+    # unread; analyze() prints the count; and that is the same function the prune reads. A later
+    # wave that moves code out and leaves the import behind shows up as a number on a screen.
+    #
+    # WAVES ends here. What remains in the entry point is MainApp - 4,887 lines, 183 methods, the
+    # longest 132 lines - and the 365 lines of imports and entry-block glue around it. The class is
+    # deliberately not listed as a wave: the decision is that it stays, recorded in LEFT_BY_DECISION
+    # at the top of this file, where analyze() reports it as left by decision and check_wave()
+    # refuses a wave that lists it.
+    #
+    # Wave 6, in LIFTS above, is the move this comment could only imagine doing whole. It did not
+    # need to: what had outgrown reviewability was five methods, not the class. 1,618 lines went into
+    # five modules the class inherits, every body cut and pasted at the same indent so verify.py
+    # still finds no changed line in any of them, and no method left in the entry point runs over 150
+    # lines - a number analyze() prints, for the same reason it prints dead imports.
+    #
+    # What it cost, said plainly. Those 1,618 lines are no longer compiled: the .pyd holds 5,252
+    # lines against yt_msd's 9,646. And three checks had to be re-aimed because they named a place
+    # rather than a behaviour. Two were text windows pinned to a location - probe_playback's Z41, and
+    # probe_local_pane's LP9, which is LP9 and LP9b now. The third found a defect: probe_windows' G9
+    # refuses a module under yt_msd that reads its own __file__ for a location, and the moved
+    # constructor did exactly that to decide where gui_config.json lives. It reads program_folder()
+    # now, the answer wave 5e established for the crash log and the window icon. Wave 6 also left 18
+    # imports nothing read behind, which analyze() reported and prune_reexports.py removed.
+    #
+    # Measured against the rule this file exists to enforce, the class itself could still move today:
+    # every name it reads is an import or already sits in a moved module, so check_wave finds no
+    # out-edge still pointing at the .pyw; it holds no `global` statement - and neither does anything
+    # else in the entry point - so cross_module_globals has nothing to refuse; and no check in the
+    # suite writes mod.MainApp.
     #
     # What decides it is the build. The shipped program is one compiled module plus a plain-Python
     # package: build_gui_cython.py writes GUI Source Code/yt_msd_gui.pyx as the .pyw's text byte for
     # byte, build_gui_exe.py compiles that single module with MSVC into yt_msd_gui.pyd, and
     # PyInstaller carries yt_msd as ordinary Python in the archive. Whatever leaves the entry point
-    # stops being compiled, and MainApp is the last large piece that still is - about 6,500 of the
-    # 7,000 lines the compiled module holds, against the 7,916 lines already sitting in yt_msd.
-    # Carving it into several modules moves the same code and more, and a class split across modules
-    # runs exactly as the one class does: where the time goes is VLC, ffmpeg and the network, not
-    # attribute lookup. A further split would be tidier and no faster.
+    # stops being compiled, and MainApp is the last large piece that still is - 4,887 of the 5,252
+    # lines the compiled module holds. Carving the class itself into several modules moves the same
+    # code and more, and a class split across modules runs exactly as the one class does: where the
+    # time goes is VLC, ffmpeg and the network, not attribute lookup. A further split would be tidier
+    # and no faster.
     #
-    # The deal, then: one file, compiled, for as long as it reads as one piece. If it outgrows that,
-    # the way back is a single move-whole wave - MainApp into one module, the .pyw down to its imports
-    # and the entry block - with the suite's 25 source-text anchors re-pointed as a change of their
-    # own (probe_playback's `W` section and `AD6`-`AD9`, and the few in probe_local_pane, probe_shell,
-    # probe_export, probe_sync and probe_windows). Deleting LEFT_BY_DECISION["MainApp"] is the edit
-    # that reopens it; the guard is there so it is reopened on purpose.
+    # The deal, then: one class, compiled, for as long as it reads as one piece - and a method that
+    # stops fitting on a screen lifts out on wave 6's rule the moment it stops fitting. If the class
+    # itself ever outgrows that, the way back is a single move-whole wave - MainApp into one module,
+    # the .pyw down to its imports and the entry block - with the suite's source-text anchors
+    # re-pointed as a change of their own. Deleting LEFT_BY_DECISION["MainApp"] is the edit that
+    # reopens it; the guard is there so it is reopened on purpose.
 
 }
