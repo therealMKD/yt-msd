@@ -1,8 +1,9 @@
 # Open Source Software under the Apache License, Version 2.0
 # PySide6 version of yt-msd
 # Programmed with Qwen, if you don't like it, don't use it.
-# Yeah it's all one file, what are you going to do about it?
-# Modular file systems are for sane people
+# This file is the entry point only. The program is the yt_msd package beside it; it stopped
+# being one file in 3.5, and the parts moved out a wave at a time with the GUI Test Suite
+# green after every single wave.
 
 import os
 import re
@@ -24,22 +25,85 @@ from pathlib import Path
 # pass. Importing from the module that really defines the class skips the lazy re-export.
 from concurrent.futures.thread import ThreadPoolExecutor
 from concurrent.futures import as_completed  # a plain re-export, already resolved at import
-try:
-    import winreg
-except ImportError:
-    winreg = None
+# These names moved out of this file during the 3.5 modularisation (wave 1) and are
+# re-exported here so the entry point keeps every name it has always had while the
+# split proceeds. The final wave replaces this with the package's own entry point.
+from yt_msd.constants import (
+    APP_VERSION,
+    AUDIO_EXTENSIONS,
+    DEFAULT_DOWNLOAD_FORMAT,
+    DOWNLOAD_FORMATS,
+    INSTALLER_ASSET,
+    MUTAGEN_TAGGABLE_EXTENSIONS,
+    PAUSE_GLYPH,
+    PLAY_GLYPH,
+    REPLAY_GLYPH,
+    SOURCE_ASSET,
+    STOP_AFTER_ALWAYS,
+    STOP_AFTER_LABELS,
+    STOP_AFTER_OFF,
+    STOP_AFTER_ONCE,
+    STOP_AFTER_STATE_NAMES,
+    STOP_AFTER_TOOLTIPS,
+    TAGGABLE_EXTENSIONS,
+    UPDATE_MODE_INSTALLER,
+    UPDATE_MODE_REPLACE,
+    UPDATE_MODE_SWAP,
+    UPDATE_REPO,
+)
+from yt_msd.deps import (
+    FileSystemEventHandler,
+    Observer,
+    _VLC_MODULE_AVAILABLE,
+    _WATCHDOG_AVAILABLE,
+    vlc,
+    winreg,
+)
+from yt_msd import deps as _deps_mod
+# _VLC_IMPORT_ERROR only ever exists on a machine where the guarded import above failed,
+# and the program reads it with getattr(..., default) for exactly that
+# reason, so it is forwarded the same way rather than demanded here.
+if hasattr(_deps_mod, '_VLC_IMPORT_ERROR'):
+    _VLC_IMPORT_ERROR = _deps_mod._VLC_IMPORT_ERROR
+from yt_msd.paths import (
+    _app_icon_path,
+    app_icon,
+    is_packaged_build,
+)
+from yt_msd.util.console import (
+    Colors,
+    _print_lock,
+    _safe_print,
+)
+from yt_msd.util.text import (
+    _is_romanized,
+    _sanitize_filename,
+    _split_artist_title,
+    _title_match_key,
+    _title_matches_filename,
+    clean_youtube_title,
+)
+from yt_msd.util.timefmt import (
+    _format_audio_duration,
+)
+from yt_msd.util.version import (
+    _extract_version_number,
+    _release_asset_file,
+    _version_is_newer,
+    select_release_asset,
+)
+from yt_msd.util.yaml import (
+    _yaml_dump_list,
+    _yaml_scalar_parse,
+    _yaml_scalar_repr,
+    yaml_dump,
+    yaml_load,
+)
 import webbrowser
 import urllib.request
 import urllib.parse
 import html
 import io
-try:
-    import vlc
-    _VLC_MODULE_AVAILABLE = True
-except Exception as e:
-    vlc = None
-    _VLC_MODULE_AVAILABLE = False
-    _VLC_IMPORT_ERROR = str(e)
 import shlex
 import time
 import random
@@ -49,13 +113,6 @@ import hashlib
 import traceback
 from typing import Dict, List, Optional, Tuple, Callable, Union
 from PIL import Image
-
-try:
-    from watchdog.observers import Observer
-    from watchdog.events import FileSystemEventHandler
-    _WATCHDOG_AVAILABLE = True
-except ImportError:
-    _WATCHDOG_AVAILABLE = False
 
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QHBoxLayout, QLabel, QPushButton, QLineEdit, 
@@ -68,744 +125,78 @@ from PySide6.QtGui import QIcon, QPixmap, QImage, QAction, QColor, QPalette, QPa
 from PySide6.QtCore import QMimeData, QUrl
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
-# ============================================================
-# APPLICATION ICON (title bar, taskbar, system tray)
-# icon-256x256.ico sits next to this file in the source tree and is bundled into
-# the compiled exe, which unpacks it into its own application folder at startup.
-# ============================================================
-
-def _app_icon_path():
-    """Absolute path to icon-256x256.ico: inside the packaged app when frozen, next to this file otherwise."""
-    if getattr(sys, "frozen", False):
-        base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.executable)))
-    else:
-        base = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base, "icon-256x256.ico")
-
-
-def app_icon():
-    """The application icon, or None when icon-256x256.ico is missing or unreadable."""
-    path = _app_icon_path()
-    if os.path.isfile(path):
-        icon = QIcon(path)
-        if not icon.isNull():
-            return icon
-    return None
-
-# ============================================================
-# INTEGRATED MP3 RENAMER, TAGGER & LOUDNESS NORMALIZER
-# (Ported from mp3renamer5000.py — interactive CLI mode & algorithms)
-# ============================================================
-
-class Colors:
-    HEADER = '\033[95m'
-    BLUE = '\033[94m'
-    CYAN = '\033[96m'
-    GREEN = '\033[92m'
-    YELLOW = '\033[93m'
-    RED = '\033[91m'
-    END = '\033[0m'
-    BOLD = '\033[1m'
-    DIM = '\033[90m'
-
-_print_lock = threading.Lock()
-
-def _safe_print(msg):
-    with _print_lock:
-        print(msg)
-
-_available_threads = os.cpu_count() or 4
-TARGET_LUFS = "-16"
-TRUE_PEAK = "-1.5"
-LOUDNESS_RANGE = "11"
-BITRATE = "320k"
-MAX_WORKERS = max(1, _available_threads // 2)
-SILENCE_PAD_DUR = 2.0
-SILENCE_TRIM = True  # Trim leading/trailing silence; independent of the loudnorm override
-# Built-in silence trimming values. Used verbatim for both the front pass and the
-# reversed back pass - a loudnorm override never changes them.
-SILENCE_THRESHOLD = "-60dB"
-SILENCE_DURATION = "0.5"
-SILENCE_KEEP = "0.5"
-CUSTOM_NORM_CMD = ""  # Optional override of ONLY the loudnorm part of the ffmpeg -af chain
-
-# Internal version number - the numeric part of the latest GitHub release tag.
-# (RELEASE-3.4 is tagged as "RELEASE-3.4" and read here as "3.4":
-# _extract_version_number() reduces both sides to their numbers before comparing
-# them, so a tag is still recognised as this version or as a newer one. The same
-# numbers are what build_gui_exe.py puts in the installer and in the version
-# resource of the exe, so the app, the setup program and the file's own
-# Properties dialog all report one version.)
-APP_VERSION = "3.4"
-
-# GitHub repository whose releases page is polled for newer versions.
-UPDATE_REPO = "therealMKD/yt-msd"
-
-# Which file of a release this copy of yt-msd downloads depends on how it is being
-# run: the packaged exe is updated with its setup program, a copy started from the
-# source is updated with the new source file written over the one being run.
-INSTALLER_ASSET = "yt-msd-setup.exe"   # what the packaged exe looks for on a release
-SOURCE_ASSET = "yt-msd-gui.pyw"        # what a copy started from the source looks for
-
-# How a downloaded update gets applied, reported to UpdateReadyDialog and used by
-# _launch_swap_helper:
-UPDATE_MODE_INSTALLER = "installer"  # run the downloaded setup program; this file is left alone
-UPDATE_MODE_REPLACE = "replace"      # the download was written over the file being run
-UPDATE_MODE_SWAP = "swap"            # keep both files, delete this one, launch the new one
-
-
-def is_packaged_build():
-    """True when yt-msd is running as the packaged exe, False when it is running the source file."""
-    return bool(getattr(sys, 'frozen', False))
-
-
-def _release_asset_file(asset):
-    """(file name, download url) of one GitHub release asset, or ("", "") if it is unusable."""
-    if not isinstance(asset, dict):
-        return "", ""
-    name = (asset.get("name") or "").strip()
-    url = (asset.get("browser_download_url") or "").strip()
-    return name, url
-
-
-def select_release_asset(assets, wanted_name):
-    """Choose which file of a release this build should download.
-
-    A release page lists its files in whatever order the uploads happened to land
-    in, so the first asset is not necessarily the one worth downloading. The wanted
-    file is looked up by name instead: an exact match wins, then (for the setup
-    program) any .exe named like a setup program, then any asset that simply shares
-    the wanted extension. Returns (file name, download url), or ("", "") when the
-    release carries nothing this kind of yt-msd can install.
-    """
-    wanted_name = (wanted_name or "").strip().lower()
-    wanted_ext = os.path.splitext(wanted_name)[1]
-    setup_like = None
-    same_ext = None
-    for asset in assets or []:
-        name, url = _release_asset_file(asset)
-        if not name or not url:
-            continue
-        lowered = name.lower()
-        if lowered == wanted_name:
-            return name, url
-        if not lowered.endswith(wanted_ext):
-            continue
-        if same_ext is None:
-            same_ext = (name, url)
-        if wanted_ext == ".exe" and "setup" in lowered and setup_like is None:
-            setup_like = (name, url)
-    return setup_like or same_ext or ("", "")
-
-
-# The packaged GUI has no console of its own, so the renamer is run by starting
-# a second copy of the same exe with --renamer (see run_mp3_renamer). The
-# launcher build_gui_exe.py puts inside the exe answers that flag by allocating a
-# console window for that copy before it runs the renamer CLI, which prints a
-# banner, uses colours and asks questions with input().
-
-
-def _extract_version_number(text):
-    """Isolate the full numeric version (including decimals) from a tag like 'RELEASE-3.0' -> (3, 0)."""
-    tokens = re.findall(r"\d+(?:\.\d+)*", text or "")
-    if not tokens:
-        return (0,)
-    # Prefer the token that looks most like a complete version (most dots, then longest).
-    token = max(tokens, key=lambda s: (s.count("."), len(s)))
-    parts = [int(p) for p in token.split(".") if p.isdigit()]
-    return tuple(parts) if parts else (0,)
-
-
-def _version_is_newer(latest, current):
-    """Return True if 'latest' is a greater version than 'current' (shorter tuple zero-padded)."""
-    n = max(len(latest), len(current))
-    latest = tuple(list(latest) + [0] * (n - len(latest)))
-    current = tuple(list(current) + [0] * (n - len(current)))
-    return latest > current
-
-from mutagen.easyid3 import EasyID3
-from mutagen.id3 import ID3, COMM, ID3NoHeaderError
-from mutagen.easymp4 import EasyMP4
-from mutagen import File as MutagenFile
-
-def _print_renamer_banner():
-    banner = rf"""{Colors.CYAN}{Colors.BOLD}                                                  
- _____ _____ ___    _____                           
-|     |  _  |_  |  | __  |___ ___ ___ _____ ___ ___ 
-| | | |   __|_  |  |    -| -_|   | .'|     | -_|  _|
-|_|_|_|__|  |___|  |__|__|___|_|_|__,|_|_|_|___|_|  
-{Colors.END}"""
-    print(banner)
-    print(f"{Colors.BOLD}Interactive MP3/M4A Renamer, Tagger & Loudness Normalizer{Colors.END}")
-    print(f"{Colors.BOLD}Available CPU Threads: {_available_threads}{Colors.END}\n")
-    print(f"{Colors.BOLD}Using {MAX_WORKERS} CPU Threads for Processing{Colors.END}\n")
-    print(f"{Colors.GREEN}[✓] Mutagen library active. Automatic metadata tagging is enabled.{Colors.END}\n")
-
-def _select_renamer_folder():
-    print(f"{Colors.BLUE}Please select the folder containing your audio files...{Colors.END}")
-    folder_path = ""
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-        root = tk.Tk()
-        root.withdraw()
-        root.focus_force()
-        folder_path = filedialog.askdirectory(title="Select Audio Folder (MP3/M4A)")
-        root.destroy()
-    except Exception:
-        pass
-    if not folder_path:
-        folder_path = input(f"{Colors.BOLD}Enter the folder path containing MP3/M4A files:{Colors.END}\n").strip()
-    if not folder_path:
-        print(f"{Colors.RED}No folder selected. Exiting.{Colors.END}")
-        sys.exit(0)
-    path = Path(folder_path)
-    if not path.exists() or not path.is_dir():
-        print(f"{Colors.RED}The folder '{folder_path}' does not exist or is not a directory.{Colors.END}")
-        sys.exit(1)
-    return path
-
-def _is_romanized(text):
-    return re.search(
-        r'[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af\u0400-\u04ff\u0370-\u03ff\u0600-\u06ff]',
-        text
-    ) is None
-
-def clean_youtube_title(filename):
-    title = filename
-    title = re.sub(r'[\u2010-\u2015—–‐‑‒―]+', '-', title)
-    title = re.sub(r'-+', '-', title)
-    title = re.sub(r'[｜│┃ǀ]+', '|', title)
-    title = title.replace('：', ':')
-    title = title.replace('’', "'").replace('‘', "'").replace('`', "'").replace('´', "'")
-    title = title.replace('“', '"').replace('”', '"')
-
-    MASK_HYPHEN = "\x00HYPHEN\x00"
-    MASK_PIPE   = "\x00PIPE\x00"
-    MASK_COLON  = "\x00COLON\x00"
-
-    def mask_separators_in_brackets(text):
-        result, depth, i = [], 0, 0
-        while i < len(text):
-            ch = text[i]
-            if ch in '([{':
-                depth += 1; result.append(ch); i += 1
-            elif ch in ')]}':
-                depth -= 1; result.append(ch); i += 1
-            elif depth > 0:
-                if text[i:i+3] == ' - ':
-                    result.append(MASK_HYPHEN); i += 3
-                elif text[i] == '|':
-                    result.append(MASK_PIPE); i += 1
-                elif text[i] == ':':
-                    result.append(MASK_COLON); i += 1
-                else:
-                    result.append(ch); i += 1
-            else:
-                result.append(ch); i += 1
-        return ''.join(result)
-
-    title = mask_separators_in_brackets(title)
-    title = re.sub(r'\s*:\s*', ' - ', title)
-
-    if "|" in title:
-        if "-" not in title:
-            title = title.replace("|", " - ")
-        else:
-            title = title.split("|")[0].rstrip()
-
-    title = re.sub(r'\s+-\s+', ' - ', title)
-
-    parts = title.split(" - ")
-    if len(parts) > 2:
-        title = " - ".join(parts[:2])
-
-    title = title.replace(MASK_HYPHEN, ' - ').replace(MASK_PIPE, '|').replace(MASK_COLON, ':')
-
-    if " - " in title:
-        parts = title.split(" - ", 1)
-        artist_part, title_part = parts[0].strip(), parts[1].strip()
-        if not _is_romanized(title_part):
-            m = re.search(r'[\(\[\{]([^\)\}\]]+)[\)\]\}]', title_part)
-            if m:
-                inside = m.group(1).strip()
-                if not _is_romanized(inside):
-                    title_part = inside
-        title = f"{artist_part} - {title_part}"
-    else:
-        if not _is_romanized(title):
-            m = re.search(r'[\(\[\{]([^\)\}\]]+)[\)\]\}]', title)
-            if m:
-                inside = m.group(1).strip()
-                if not _is_romanized(inside):
-                    title = inside
-
-    if " - " in title:
-        parts = title.split(" - ", 1)
-        artist_part = re.split(r'\s*&\s*|\s+[xX]\s+', parts[0].strip())[0].strip()
-        title = f"{artist_part} - {parts[1].strip()}"
-
-    def process_brackets(match):
-        inside = match.group(2)
-        if not _is_romanized(inside):
-            return inside
-        return ""
-
-    bracket_pair_pattern = r'(\(|\[|\{)([^\(\)\[\]\{\}]*)(\)|\]|\})'
-    old_title = ""
-    while old_title != title:
-        old_title = title
-        title = re.sub(bracket_pair_pattern, process_brackets, title)
-
-    title = re.sub(r'[\(\)\{\}\[\]]', '', title)
-    title = re.sub(r'\b(hd|version|original|official|4k|uhd|upgraded|upscaled|remastered|lyrics)\b', '', title, flags=re.IGNORECASE)
-    # Strip "feat/ft/featuring" credits only from the title side so an artist
-    # whose name begins with those letters (e.g. "FT Island") is not destroyed.
-    if " - " in title:
-        _feat_re = re.compile(r'\s*\b(ft|feat|featuring)\b\.?.*$', re.IGNORECASE)
-        _artist_part, _title_part = title.split(" - ", 1)
-        title = f"{_artist_part.strip()} - {_feat_re.split(_title_part)[0].strip()}"
-    else:
-        title = re.compile(r'\s*\b(ft|feat|featuring)\b\.?.*$', re.IGNORECASE).split(title)[0]
-    title = re.sub(r'#\S+', '', title)
-
-    # Quote handling:
-    # 1. Double quotes are never part of a contraction, so every double-quote character is
-    #    removed outright: ASCII " plus the unicode variants - curly U+201C/U+201D, low
-    #    double U+201E, reversed-9 high U+201F, guillemets U+00AB/U+00BB and the double
-    #    prime U+2033. No pairing and no adjacency rules are applied. This is what stops Bad
-    #    Lip Reading style titles (which wrap words in quotes) from leaving floating double
-    #    quotes behind in the filename.
-    title = re.sub(r'["\u201c\u201d\u201e\u201f\u00ab\u00bb\u2033]', '', title)
-
-    # 2. Mask interior word contractions (e.g. Don't, won't, it's, rock'n'roll)
-    MASK = "\x00APOS\x00"
-    title = re.sub(r"([a-zA-Z0-9])'([a-zA-Z0-9])", rf"\1{MASK}\2", title)
-
-    # 2b. Quoted-title pattern with no explicit artist separator.
-    #     When no " - " was detected anywhere but there is a balanced single-quote pair
-    #     (opening quote preceded by whitespace), treat it as "<artist> '<title>' <junk>":
-    #     everything before the quotes becomes the artist, the quoted text becomes the title,
-    #     the quotes are dropped and everything after the closing quote is stripped.
-    #     Common for Kpop uploads, e.g. "A2O Lite 'NEON' Official Video" -> "A2O Lite - NEON".
-    if " - " not in title:
-        m = re.match(r"^(.*?)\s+'([^']+)'.*$", title)
-        if m:
-            quoted_artist = m.group(1).strip()
-            quoted_title  = m.group(2).strip()
-            if quoted_artist and quoted_title:
-                title = f"{quoted_artist} - {quoted_title}"
-
-    # 3. Remove balanced single-quote pairs ('x')
-    old = None
-    while old != title:
-        old = title
-        title = re.sub(r"'([^']*)'", r'\1', title)
-
-    # 4. Remove any UNATTACHED single quotes (not touching any letters/numbers on either side)
-    title = re.sub(r"(?<![a-zA-Z0-9])'(?![a-zA-Z0-9])", "", title)
-
-    # 5. Restore masked interior contractions (e.g. Don't stays as Don't)
-    title = title.replace(MASK, "'")
-
-    try:
-        title = re.sub(r'[\U00010000-\U0010ffff\u2600-\u27bf]', '', title, flags=re.UNICODE)
-    except re.error:
-        pass
-
-    title = re.sub(r'\s+', ' ', title).strip()
-
-    if " - " in title:
-        parts = title.split(" - ", 1)
-        artist_part = parts[0].strip()
-        title_part = parts[1].strip()
-        if "," in artist_part:
-            artist_part = artist_part.split(",")[0].strip()
-        title = f"{artist_part} - {title_part}"
-    else:
-        title = re.sub(r'\s*-\s*$', '', title)
-        title = re.sub(r'^\s*-\s*', '', title)
-        title = title.strip()
-
-    invalid_chars = r'[\\/:*?<>|]'
-    title = re.sub(invalid_chars, '_', title)
-    title = re.sub(r'\s+', ' ', title).strip()
-
-    return title
-
-def read_metadata_tags(filepath):
-    suffix = filepath.suffix.lower()
-    try:
-        if suffix == ".mp3":
-            try:
-                tags = EasyID3(filepath)
-                artist = tags.get("artist", [None])[0] or tags.get("albumartist", [None])[0] or tags.get("performer", [None])[0]
-                title = tags.get("title", [None])[0]
-                return (str(artist).strip() if artist else None), (str(title).strip() if title else None)
-            except ID3NoHeaderError:
-                return None, None
-        elif suffix == ".m4a":
-            try:
-                tags = EasyMP4(filepath)
-                artist = tags.get("artist", [None])[0] or tags.get("albumartist", [None])[0]
-                title = tags.get("title", [None])[0]
-                return (str(artist).strip() if artist else None), (str(title).strip() if title else None)
-            except Exception:
-                return None, None
-    except Exception:
-        pass
-    return None, None
-
-def write_metadata_tags(filepath, artist, title):
-    suffix = filepath.suffix.lower()
-    try:
-        if suffix == ".mp3":
-            try:
-                tags = EasyID3(filepath)
-            except ID3NoHeaderError:
-                tags = EasyID3()
-                tags.save(filepath)
-                tags = EasyID3(filepath)
-            tags["artist"] = artist
-            tags["title"] = title
-            tags.save()
-            return True
-        elif suffix == ".m4a":
-            try:
-                tags = EasyMP4(filepath)
-            except Exception:
-                tags = EasyMP4(filepath)
-            tags["artist"] = artist
-            tags["title"] = title
-            tags.save()
-            return True
-    except Exception as e:
-        print(f"{Colors.RED}Error writing tags to {filepath.name}: {e}{Colors.END}")
-    return False
-
-def _add_placeholder_tag(filepath):
-    if not os.path.exists(filepath): return
-    ext = os.path.splitext(filepath)[1].lower()
-    try:
-        if ext == ".mp3":
-            try:
-                audio = ID3(filepath)
-            except ID3NoHeaderError:
-                audio = ID3()
-            audio.setall('COMM', [COMM(encoding=3, lang='eng', desc='ytmsd', text='YTMSD_PENDING_VERIFY')])
-            audio.save(filepath)
-        elif ext == ".m4a":
-            try:
-                tags = EasyMP4(filepath)
-                tags['comment'] = ['YTMSD_PENDING_VERIFY']
-                tags.save()
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-def _remove_placeholder_tag(filepath):
-    if not os.path.exists(filepath): return
-    ext = os.path.splitext(filepath)[1].lower()
-    try:
-        if ext == ".mp3":
-            audio = ID3(filepath)
-            comms = [c for c in audio.getall('COMM') if 'YTMSD_PENDING_VERIFY' not in str(c.text)]
-            audio.setall('COMM', comms)
-            audio.save(filepath)
-        elif ext == ".m4a":
-            tags = EasyMP4(filepath)
-            if 'comment' in tags:
-                tags['comment'] = [c for c in tags['comment'] if c != 'YTMSD_PENDING_VERIFY']
-                tags.save()
-    except Exception:
-        pass
-
-
-def clean_and_tag_files(folder_path, start_auto=False):
-    extensions = TAGGABLE_EXTENSIONS
-    files = sorted([f for f in folder_path.iterdir() if f.is_file() and f.suffix.lower() in extensions])
-    
-    if not files:
-        print(f"{Colors.YELLOW}No MP3 or M4A files found in this folder.{Colors.END}")
-        return 0, 0, 0, 0
-        
-    print(f"{Colors.GREEN}Found {len(files)} audio files for renaming.{Colors.END}\n")
-    
-    renamed_count = 0
-    tagged_count = 0
-    skipped_count = 0
-    already_formatted_count = 0
-    
-    def run_renaming_pass(file_list, is_manual_skipped_pass=False):
-        nonlocal renamed_count, tagged_count, skipped_count, already_formatted_count
-        
-        auto_mode = start_auto if not is_manual_skipped_pass else False
-        skipped_files = []
-        forced_redo_indices = set()
-        
-        idx = 1
-        while idx <= len(file_list):
-            file = file_list[idx - 1]
-            stem = file.stem
-            suffix = file.suffix.lower()
-            
-            current_suggestion = clean_youtube_title(stem)
-            existing_artist, existing_title = read_metadata_tags(file)
-            
-            filename_is_correct = (current_suggestion == stem and " - " in stem)
-            has_valid_tags = bool(existing_artist and existing_title)
-            
-            is_forced_redo = (idx in forced_redo_indices)
-            if is_forced_redo:
-                forced_redo_indices.remove(idx)
-            
-            # Skip renaming AND normalization if file already has both artist and title tags
-            if not is_manual_skipped_pass and not is_forced_redo and has_valid_tags:
-                print(f"{Colors.DIM}[{idx}/{len(file_list)}] {Colors.GREEN}✔ Already tagged (artist+title present), skipping: {Colors.END}{file.name}")
-                already_formatted_count += 1
-                idx += 1
-                continue
-            
-            is_manually_inputted = False
-            if auto_mode:
-                has_artist_sep = " - " in current_suggestion
-                artist_name = ""
-                title_name = ""
-                if has_artist_sep:
-                    parts = current_suggestion.split(" - ", 1)
-                    artist_name = parts[0].strip()
-                    title_name = parts[1].strip()
-                
-                if not has_artist_sep or not artist_name or not title_name:
-                    skipped_files.append(file)
-                    skipped_count += 1
-                    idx += 1
-                    continue
-                else:
-                    final_name = current_suggestion
-            else:
-                final_name = None
-                skip_file = False
-                go_prev = False
-                while True:
-                    print(f"{Colors.DIM}─" * 60)
-                    print(f"{Colors.BOLD}[{idx}/{len(file_list)}] File: {Colors.END}{file.name}")
-                    print(f"  {Colors.YELLOW}Original  :{Colors.END} {stem}")
-                    print(f"  {Colors.GREEN}Predicted :{Colors.END} {current_suggestion}")
-                    
-                    if has_valid_tags:
-                        print(f"  {Colors.CYAN}Tags found:{Colors.END} Artist='{existing_artist}', Title='{existing_title}'")
-                    else:
-                        print(f"  {Colors.DIM}Tags found: [None/Missing]{Colors.END}")
-                        
-                    has_artist_sep = " - " in current_suggestion
-                    artist_name = ""
-                    title_name = ""
-                    if has_artist_sep:
-                        parts = current_suggestion.split(" - ", 1)
-                        artist_name = parts[0].strip()
-                        title_name = parts[1].strip()
-                        
-                    if not has_artist_sep or not artist_name or not title_name:
-                        artist_prompt = (
-                            f"\n  {Colors.CYAN}No artist found.{Colors.END} Predicted title: {Colors.BOLD}{current_suggestion}{Colors.END}\n"
-                            f"  Type the {Colors.GREEN}artist name{Colors.END} to build '{Colors.BOLD}Artist - {current_suggestion}{Colors.END}',\n"
-                            f"  {Colors.YELLOW}'n'{Colors.END} to enter a full name manually, {Colors.YELLOW}'s'{Colors.END} to skip, {Colors.YELLOW}'prev'{Colors.END} to redo previous, or type {Colors.YELLOW}'AUTO'{Colors.END} to switch to auto-mode:\n  > "
-                        )
-                        user_input = input(artist_prompt).strip()
-                        
-                        if user_input.upper() == 'AUTO':
-                            auto_mode = True
-                            break
-                        elif user_input.lower() == 'prev':
-                            if idx > 1:
-                                go_prev = True
-                                forced_redo_indices.add(idx - 1)
-                            else:
-                                print(f"  {Colors.YELLOW}Already at the first file.{Colors.END}")
-                            break
-                        elif user_input.lower() == 's':
-                            print(f"  {Colors.YELLOW}Skipped.{Colors.END}\n")
-                            skipped_count += 1
-                            skipped_files.append(file)
-                            skip_file = True
-                            break
-                        elif user_input.lower() == 'n' or not user_input:
-                            prompt = f"\n  Type custom {Colors.BOLD}Artist - Title{Colors.END} name, or {Colors.YELLOW}'s'{Colors.END} to skip:\n  > "
-                            custom_input = input(prompt).strip()
-                            if custom_input.lower() == 's':
-                                print(f"  {Colors.YELLOW}Skipped.{Colors.END}\n")
-                                skipped_count += 1
-                                skipped_files.append(file)
-                                skip_file = True
-                                break
-                            elif custom_input.upper() == 'AUTO':
-                                auto_mode = True
-                                break
-                            elif custom_input:
-                                final_name = custom_input
-                                is_manually_inputted = True
-                                break
-                            else:
-                                print(f"  {Colors.YELLOW}Skipped.{Colors.END}\n")
-                                skipped_count += 1
-                                skipped_files.append(file)
-                                skip_file = True
-                                break
-                        else:
-                            final_name = f"{user_input} - {current_suggestion}"
-                            is_manually_inputted = True
-                            break
-                    else:
-                        prompt = f"\n  {Colors.BOLD}Accept predicted name?{Colors.END}\n  {Colors.CYAN}[ENTER]{Colors.END} to accept, type {Colors.GREEN}'f'{Colors.END} to flip Artist/Title, type a new {Colors.BOLD}Artist - Title{Colors.END}, {Colors.YELLOW}'s'{Colors.END} to skip, {Colors.YELLOW}'prev'{Colors.END} to redo previous, or {Colors.YELLOW}'AUTO'{Colors.END} to auto-process remaining:\n  > "
-                        user_input = input(prompt).strip()
-                        
-                        if user_input.upper() == 'AUTO':
-                            auto_mode = True
-                            break
-                        elif user_input.lower() == 'prev':
-                            if idx > 1:
-                                go_prev = True
-                                forced_redo_indices.add(idx - 1)
-                            else:
-                                print(f"  {Colors.YELLOW}Already at the first file.{Colors.END}")
-                            break
-                        elif user_input.lower() == 's':
-                            print(f"  {Colors.YELLOW}Skipped.{Colors.END}\n")
-                            skipped_count += 1
-                            skipped_files.append(file)
-                            skip_file = True
-                            break
-                        elif user_input.lower() == 'f':
-                            parts = current_suggestion.split(" - ", 1)
-                            flipped_name = f"{parts[1]} - {parts[0]}"
-                            current_suggestion = clean_youtube_title(flipped_name)
-                            print(f"  {Colors.CYAN}Flipped Layout Prediction to:{Colors.END} {current_suggestion}")
-                            continue
-                        else:
-                            if user_input:
-                                final_name = user_input
-                                is_manually_inputted = True
-                            else:
-                                final_name = current_suggestion
-                                is_manually_inputted = False
-                            break
-                
-                if auto_mode:
-                    continue
-                if go_prev:
-                    idx -= 1
-                    continue
-                if skip_file:
-                    idx += 1
-                    continue
-            
-            if not is_manually_inputted:
-                final_name = clean_youtube_title(final_name)
-            if not final_name:
-                print(f"  {Colors.RED}Invalid name. Skipped.{Colors.END}\n")
-                skipped_count += 1
-                skipped_files.append(file)
-                idx += 1
-                continue
-                
-            new_filename = f"{final_name}{suffix}"
-            new_filepath = folder_path / new_filename
-            
-            renamed = False
-            active_filepath = file
-            
-            if final_name != stem:
-                if new_filepath.exists():
-                    print(f"  {Colors.RED}Error: A file named '{new_filename}' already exists. Skipping rename.{Colors.END}\n")
-                    skipped_count += 1
-                    skipped_files.append(file)
-                    idx += 1
-                    continue
-                try:
-                    file.rename(new_filepath)
-                    print(f"  {Colors.GREEN}Renamed to:{Colors.END} {new_filename}")
-                    active_filepath = new_filepath
-                    file_list[idx - 1] = new_filepath
-                    renamed_count += 1
-                    renamed = True
-                except Exception as e:
-                    print(f"  {Colors.RED}Rename failed: {e}{Colors.END}\n")
-                    skipped_count += 1
-                    skipped_files.append(file)
-                    idx += 1
-                    continue
-            
-            # If this file was recorded as skipped earlier in the pass (e.g. its rename
-            # failed because of an illegal character in a manually entered name) but is
-            # now being handled successfully - typically because the user went back to it
-            # with 'prev' and gave it a valid name - drop it from the skipped list so it
-            # is not presented again in the end-of-pass review of skipped files.
-            while file in skipped_files:
-                skipped_files.remove(file)
-                skipped_count -= 1
-
-            artist, title = None, None
-            if " - " in final_name:
-                parts = final_name.split(" - ", 1)
-                artist = parts[0].strip()
-                title = parts[1].strip()
-                
-            if artist and title:
-                success = write_metadata_tags(active_filepath, artist, title)
-                if success:
-                    tagged_count += 1
-                    tag_status = "Renamed & Tagged" if renamed else "Tagged"
-                    print(f"  {Colors.GREEN}✔ {tag_status} successfully:{Colors.END} Artist='{artist}', Title='{title}'")
-                else:
-                    print(f"  {Colors.YELLOW}Renamed, but failed to write metadata tags.{Colors.END}")
-            else:
-                print(f"  {Colors.YELLOW}Could not parse 'Artist - Title' format. Skipping metadata tagging.{Colors.END}")
-                
-            print()
-            idx += 1
-            
-        return skipped_files
-    
-    skipped_files = run_renaming_pass(files, is_manual_skipped_pass=False)
-    
-    if skipped_files:
-        print(f"{Colors.DIM}─" * 60)
-        print(f"\n{Colors.BOLD}Auto-mode / Renaming Pass Complete.{Colors.END}")
-        print(f"There are {len(skipped_files)} files that were skipped or did not match the naming pattern.")
-        try:
-            choice = input(f"Do you want to manually go over the skipped ones? ({Colors.GREEN}y{Colors.END}/{Colors.RED}n{Colors.END}): ").strip().lower()
-            if choice in ('y', 'yes'):
-                skipped_count -= len(skipped_files)
-                run_renaming_pass(skipped_files, is_manual_skipped_pass=True)
-        except KeyboardInterrupt:
-            print(f"\n\n{Colors.RED}Process interrupted by user. Exiting.{Colors.END}")
-            sys.exit(0)
-            
-    return renamed_count, tagged_count, skipped_count, already_formatted_count
-
-def check_ffmpeg_available():
-    try:
-        subprocess.run([_ffmpeg_binary(), "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, check=True, **_hidden_window_kwargs())
-        return True
-    except Exception:
-        return False
-
-# ============================================================
-# SYSTEM yt-dlp: installed and updated with winget, never bundled in the exe
-# ============================================================
-# yt-dlp is updated almost weekly, so the packaged build does not carry its own
-# copy inside the executable. yt-dlp is a normal Windows program (winget id
-# "yt-dlp.yt-dlp") and yt-msd drives it through its command line instead of the
-# Python API. Whether a newer yt-dlp exists is answered by GitHub; installing and
-# updating it is done by winget, which is already part of Windows 10/11. No pip,
-# no bundled copy that goes stale, and nothing to rebuild when yt-dlp ships a fix.
-YTDLP_WINGET_ID = "yt-dlp.yt-dlp"
-YTDLP_GITHUB_REPO = "yt-dlp/yt-dlp"
-YTDLP_UPDATE_CHECK_INTERVAL = 7 * 24 * 60 * 60  # seconds between "is yt-dlp current?" checks
-YTDLP_INSTALL_TIMEOUT = 1200  # winget installs can be slow
-YTDLP_EXTRACT_TIMEOUT = 300  # search / stream-info extraction
+# The loudness numbers and the four settings the ffmpeg -af chain is built from now live in
+# the package. The fixed numbers are imported directly; the settings a user changes are
+# reached through one object so a write cannot miss a reader.
+from yt_msd.audio.tuning import (
+    _available_threads,
+    TARGET_LUFS,
+    TRUE_PEAK,
+    LOUDNESS_RANGE,
+    BITRATE,
+    SILENCE_THRESHOLD,
+    SILENCE_DURATION,
+    SILENCE_KEEP,
+)
+from yt_msd.audio.tuning import TUNING
+# These names moved out of this file during the 3.5 modularisation (wave 2c) and are
+# re-exported here so the entry point keeps every name it has always had while the
+# split proceeds. The final wave replaces this with the package's own entry point.
+from yt_msd.audio.localmeta import (
+    _LOCAL_META_CACHE_CAP,
+    _ffprobe_audio_meta,
+    _local_display_name,
+    _local_meta_cache,
+    _local_meta_cache_put,
+    _read_local_audio_meta,
+)
+from yt_msd.audio.normalize import (
+    _silence_trim_filters,
+    build_af_chain,
+    normalize_file,
+    run_loudness_normalization,
+)
+from yt_msd.audio.probe import (
+    _ffmpeg_binary,
+    _ffprobe_binary,
+    _get_audio_duration,
+    _probe_format_block,
+    check_ffmpeg_available,
+    measure_loudness,
+)
+from yt_msd.audio.renamer import (
+    _print_renamer_banner,
+    _select_renamer_folder,
+    clean_and_tag_files,
+    run_integrated_renamer_cli,
+)
+from yt_msd.audio.tags import (
+    COMM,
+    EasyID3,
+    EasyMP4,
+    ID3,
+    ID3NoHeaderError,
+    MutagenFile,
+    _add_placeholder_tag,
+    _remove_placeholder_tag,
+    read_metadata_tags,
+    write_metadata_tags,
+)
+# These names moved out of this file during the 3.5 modularisation (wave 3) and are
+# re-exported here so the entry point keeps every name it has always had while the
+# split proceeds. The final wave replaces this with the package's own entry point.
+from yt_msd.ytdlp import (
+    YTDLP_EXTRACT_TIMEOUT,
+    YTDLP_GITHUB_REPO,
+    YTDLP_INSTALL_TIMEOUT,
+    YTDLP_UPDATE_CHECK_INTERVAL,
+    YTDLP_WINGET_ID,
+    YtDlpMissingError,
+    _yt_dlp_lookup_paths,
+    find_winget_executable,
+    latest_yt_dlp_release,
+    run_winget,
+)
 
 # Playback reads ahead of the player. A stream URL takes a second or two to resolve
 # with yt-dlp, and that time used to land between two tracks - the player sat on an
@@ -852,85 +243,15 @@ STREAM_RENEW_COOLDOWN = 10        # seconds between two re-resolutions of the sa
 STREAM_END_SLACK_MS = 15000       # a stream that ended this far short of its length did not finish
 STREAM_SEEK_RESTORE_TIMEOUT = 12  # seconds a scrub or a restored position stays queued for fresh media
 
-# The captions the play button carries, and the one place they are set (_update_play_button).
-# Play and Pause are the codes that button has always used; Replay is the state the button
-# takes when the media on the player has run to its end and nothing was started after it - a
-# media libVLC can no longer seek, scrub or resume, so the only thing a press can mean is
-# "this track again, from the top". U+E72C rather than the published MDL2 chart's own "Replay"
-# (U+E76A) for the same reason the stop-after button avoids a private-use codepoint (see the
-# comment where that button is built): U+E76A has no glyph in this machine's copy of the font
-# and Qt would draw an empty box. U+E72C was drawn at the size the button uses and looked at
-# to confirm it reads as "start this again".
-PLAY_GLYPH = "\uE768"
-PAUSE_GLYPH = "\uE769"
-REPLAY_GLYPH = "\uE72C"
-
-# "Stop after current", cycled one state per click: off -> once -> always -> off.
-STOP_AFTER_OFF = 0     # playback advances to the next track when one ends, as it always did
-STOP_AFTER_ONCE = 1    # stop when the current track ends, then the state returns to off
-STOP_AFTER_ALWAYS = 2  # stop after every track until the button is clicked again
-STOP_AFTER_STATE_NAMES = {STOP_AFTER_OFF: "off", STOP_AFTER_ONCE: "once", STOP_AFTER_ALWAYS: "always"}
-STOP_AFTER_LABELS = {STOP_AFTER_OFF: "Off", STOP_AFTER_ONCE: "Once", STOP_AFTER_ALWAYS: "Always"}
-STOP_AFTER_TOOLTIPS = {
-    STOP_AFTER_OFF: "Stop After Current: Off - playback advances to the next track.\n"
-                    "Click once: stop after this track.",
-    STOP_AFTER_ONCE: "Stop After Current: Once - this track is the last one, then the button returns to Off.\n"
-                     "Click again: keep stopping after every track.",
-    STOP_AFTER_ALWAYS: "Stop After Current: Always - every track stops when it ends.\n"
-                       "Click once: turn it off.",
-}
-
 _ytdlp_exe_cache = None
 _ytdlp_exe_cache_lock = threading.Lock()
-
-
-class YtDlpMissingError(RuntimeError):
-    """Raised when yt-dlp is needed but no yt-dlp exists on this system."""
-
-
-def _hidden_window_kwargs():
-    """subprocess kwargs that stop helper programs from flashing a console window."""
-    if sys.platform != "win32":
-        return {}
-    startupinfo = subprocess.STARTUPINFO()
-    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-    return {"startupinfo": startupinfo, "creationflags": 0x08000000}
-
-
-def _child_utf8_env():
-    """Ask child programs for UTF-8 so titles and JSON survive non-ASCII text."""
-    env = dict(os.environ)
-    env["PYTHONIOENCODING"] = "utf-8"
-    return env
-
-
-def _yt_dlp_lookup_paths():
-    """Places to look for yt-dlp.exe before falling back to PATH.
-
-    The winget copy comes first on purpose: it is the copy yt-msd can keep up
-    to date. A copy placed next to the program, or one only reachable through
-    PATH, is still used when there is no winget copy.
-    """
-    candidates = []
-    local = os.environ.get("LOCALAPPDATA") or ""
-    if local:
-        candidates.append(os.path.join(local, "Microsoft", "WinGet", "Links", "yt-dlp.exe"))
-        packages = os.path.join(local, "Microsoft", "WinGet", "Packages")
-        if os.path.isdir(packages):
-            try:
-                for unpacked in Path(packages).glob("yt-dlp.yt-dlp*"):
-                    candidates.append(str(unpacked / "yt-dlp.exe"))
-            except Exception:
-                pass
-    try:
-        if getattr(sys, 'frozen', False):
-            base_dir = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(sys.executable)))
-        else:
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-        candidates.append(os.path.join(base_dir, "yt-dlp.exe"))
-    except Exception:
-        pass
-    return candidates
+# These names moved out of this file during the 3.5 modularisation (wave 2b) and are
+# re-exported here so the entry point keeps every name it has always had while the
+# split proceeds. The final wave replaces this with the package's own entry point.
+from yt_msd.subproc import (
+    _child_utf8_env,
+    _hidden_window_kwargs,
+)
 
 
 def find_yt_dlp_executable(refresh=False):
@@ -966,44 +287,6 @@ def get_yt_dlp_version(exe_path=None):
                                 timeout=30, env=_child_utf8_env(), **_hidden_window_kwargs())
         text = (result.stdout or "").strip()
         return text.splitlines()[0] if text else ""
-    except Exception:
-        return ""
-
-def find_winget_executable():
-    """winget.exe, the package manager that ships with Windows. None if absent."""
-    found = shutil.which("winget")
-    if found:
-        return found
-    local = os.environ.get("LOCALAPPDATA") or ""
-    if local:
-        candidate = os.path.join(local, "Microsoft", "WindowsApps", "winget.exe")
-        if os.path.isfile(candidate):
-            return candidate
-    return None
-
-
-def run_winget(args, timeout=YTDLP_INSTALL_TIMEOUT):
-    """Run winget with these arguments. Returns (returncode, output, error)."""
-    winget = find_winget_executable()
-    if not winget:
-        return None, "", "winget was not found on this system."
-    try:
-        result = subprocess.run([winget] + list(args), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, encoding="utf-8", errors="replace",
-                                timeout=timeout, **_hidden_window_kwargs())
-        return result.returncode, (result.stdout or ""), ""
-    except Exception as e:
-        return None, "", str(e)
-
-
-def latest_yt_dlp_release():
-    """Newest published yt-dlp release tag from GitHub ('' if it cannot be read)."""
-    try:
-        api_url = f"https://api.github.com/repos/{YTDLP_GITHUB_REPO}/releases/latest"
-        req = urllib.request.Request(api_url, headers={"User-Agent": "yt-msd-updater"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        return (data.get("tag_name") or "").strip()
     except Exception:
         return ""
 
@@ -1294,30 +577,6 @@ def _match_reported_path(line):
     return None, ''
 
 
-def _title_match_key(text):
-    """A loose key for matching a queue title against the file it produced.
-
-    yt-dlp rewrites every character a Windows filename cannot hold, so a title
-    with a ':' or a '/' in it never matches the file it was downloaded to.
-    Comparing only the letters and digits ignores those rewrites.
-    """
-    return re.sub(r'[^0-9a-z]+', '', (text or '').lower())
-
-
-def _title_matches_filename(title, filename):
-    """True when 'filename' is the file a download of 'title' would have written."""
-    wanted = _title_match_key(title)
-    on_disk = _title_match_key(os.path.splitext(os.path.basename(filename))[0])
-    if not wanted or not on_disk:
-        return False
-    if wanted == on_disk:
-        return True
-    # yt-dlp shortens titles past its own filename limit, so a long enough
-    # prefix of the right shape still counts.
-    shorter, longer = (wanted, on_disk) if len(wanted) < len(on_disk) else (on_disk, wanted)
-    return len(shorter) >= 12 and longer.startswith(shorter)
-
-
 def run_yt_dlp_download(args, progress_cb=None, cancelled_cb=None, proc_cb=None):
     """Run a real yt-dlp download and report its progress while it runs.
 
@@ -1409,387 +668,6 @@ def _is_permanent_download_error(message):
     text = (message or '').lower()
     return any(marker in text for marker in _PERMANENT_DOWNLOAD_ERROR_MARKERS)
 
-
-def measure_loudness(filepath):
-    command = [
-        _ffmpeg_binary(),
-        "-nostdin",
-        "-y",
-        "-i", str(filepath),
-        "-af", f"loudnorm=I={TARGET_LUFS}:TP={TRUE_PEAK}:print_format=json",
-        "-f", "null",
-        "-"
-    ]
-    try:
-        result = subprocess.run(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding='utf-8',
-            errors='ignore',
-            **_hidden_window_kwargs()
-        )
-        if result.returncode != 0:
-            return None, None, f"FFmpeg exited with code {result.returncode}"
-            
-        stderr_output = result.stderr
-        json_match = re.search(r'\{\s*"input_i".*?\}', stderr_output, re.DOTALL)
-        if json_match:
-            data = json.loads(json_match.group(0))
-            input_i = float(data.get("input_i", TARGET_LUFS))
-            input_tp = float(data.get("input_tp", TRUE_PEAK))
-            return input_i, input_tp, None
-        else:
-            return None, None, "Could not find loudnorm JSON block in FFmpeg output"
-    except Exception as e:
-        return None, None, str(e)
-
-def _ffprobe_binary():
-    """The ffprobe to run: the one bundled with the frozen exe when this program is
-    packaged, otherwise whatever is on PATH."""
-    if getattr(sys, 'frozen', False):
-        base_dir = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
-        bundled = os.path.join(base_dir, 'ffprobe.exe')
-        if os.path.exists(bundled):
-            return bundled
-    return 'ffprobe'
-
-
-def _ffmpeg_binary():
-    """The ffmpeg to run: the one bundled with the frozen exe when this program is
-    packaged, otherwise whatever is on PATH. yt-dlp is already pointed at that copy
-    with --ffmpeg-location, but the loudness and silence-trim passes call ffmpeg
-    directly and had no equivalent, so a packaged build that carries ffmpeg.exe and
-    does not have it on PATH reported ffmpeg as unavailable and never normalized or
-    trimmed anything."""
-    if getattr(sys, 'frozen', False):
-        base_dir = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
-        bundled = os.path.join(base_dir, 'ffmpeg.exe')
-        if os.path.exists(bundled):
-            return bundled
-    return 'ffmpeg'
-
-
-def _probe_format_block(filepath):
-    """Run ffprobe over one file and return the "format" block of its JSON output,
-    or None when ffprobe could not read it.
-
-    '-nostdin' is deliberately not used: this build of ffprobe treats it as an option
-    that takes a value, so every call that had it failed with "Failed to set value
-    '-v' for option 'nostdin'" and no duration was ever returned. Closing stdin with
-    DEVNULL, as this does, is what that switch was for."""
-    try:
-        cmd = [_ffprobe_binary(), "-v", "quiet", "-print_format", "json", "-show_format", str(filepath)]
-        result = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, encoding='utf-8', errors='ignore',
-                                **_hidden_window_kwargs())
-        if result.returncode == 0 and result.stdout:
-            data = json.loads(result.stdout)
-            return data.get('format') or None
-    except Exception:
-        pass
-    return None
-
-
-def _get_audio_duration(filepath):
-    """Return duration in seconds via ffprobe, or None on failure."""
-    fmt = _probe_format_block(filepath)
-    if not fmt:
-        return None
-    try:
-        return float(fmt.get('duration'))
-    except (TypeError, ValueError):
-        return None
-
-def _silence_trim_filters():
-    """
-    The built-in silence-trim filters, exactly as they have always been built:
-    one pass for the front of the track, then the same filter over a reversed
-    stream so the trailing silence is trimmed too, then reversed back.
-    """
-    single = (
-        f"silenceremove=start_periods=1:start_duration={SILENCE_DURATION}:"
-        f"start_threshold={SILENCE_THRESHOLD}:start_silence={SILENCE_KEEP}:stop_silence={SILENCE_KEEP}"
-    )
-    return f"{single},areverse,{single},areverse"
-
-
-def build_af_chain(loudnorm_filter=None, include_silence_trim=None, include_pad=True):
-    """
-    Assemble the ffmpeg -af chain from its three independent parts:
-
-      1. silence trim    - _silence_trim_filters(), gated by the SILENCE_TRIM setting
-      2. loudnorm        - the built-in whole-track gain, or the loudnorm/EQ override
-      3. end-of-file pad - apad, gated by SILENCE_PAD_DUR
-
-    A loudnorm override only replaces part 2. Silence trimming is never overridden
-    by it, and turning silence trimming off never touches the loudnorm part.
-    """
-    trim_on = SILENCE_TRIM if include_silence_trim is None else include_silence_trim
-    parts = []
-    if trim_on:
-        parts.append(_silence_trim_filters())
-    if loudnorm_filter:
-        parts.append(loudnorm_filter)
-    if include_pad and SILENCE_PAD_DUR > 0:
-        parts.append(f"apad=pad_dur={SILENCE_PAD_DUR}")
-    return ",".join(parts)
-
-
-def normalize_file(index, total, filepath, custom_norm_cmd=None):
-    suffix = filepath.suffix.lower()
-    artist, title = read_metadata_tags(filepath)
-
-    # Measure original duration only when silence-trim reporting needs it (saves a
-    # ffprobe subprocess per file when trimming is off).
-    orig_duration = _get_audio_duration(filepath) if SILENCE_TRIM else None
-    
-    input_i, input_tp, err = measure_loudness(filepath)
-    if err:
-        return False, filepath.name, f"Loudness measurement failed: {err}"
-        
-    target_lufs = float(TARGET_LUFS)
-    true_peak_limit = float(TRUE_PEAK)
-    
-    gain = target_lufs - input_i
-    max_gain = true_peak_limit - input_tp
-    final_gain = min(gain, max_gain)
-    
-    limit_str = " (Peak Limited)" if final_gain < gain else ""
-    _effective_norm_cmd = (custom_norm_cmd or CUSTOM_NORM_CMD or "").strip()
-    gain_line = (
-        f"  └─ Loudnorm/EQ override: {_effective_norm_cmd}" if _effective_norm_cmd
-        else f"  └─ Applying Whole-Track Gain: {final_gain:+.2f} dB{limit_str} (Target: {target_lufs} LUFS)"
-    )
-    _safe_print(
-        f"[{index}/{total}] {Colors.CYAN}Processing:{Colors.END} {filepath.name}...\n"
-        f"  ├─ Measured: {input_i:+.2f} LUFS | True Peak: {input_tp:+.2f} dB\n"
-        f"{gain_line}"
-    )
-    
-    try:
-        temp_fd, temp_path = tempfile.mkstemp(suffix=suffix)
-        os.close(temp_fd)
-    except Exception as e:
-        return False, filepath.name, f"Failed to create temp file: {e}"
-        
-    # The three parts of the chain are independent: silence trimming, the loudnorm
-    # filter and the end-of-file pad. A loudnorm override replaces ONLY the loudnorm
-    # filter and can never replace the silence trimming command.
-    loudnorm_filter = _effective_norm_cmd or f"volume={final_gain:.2f}dB"
-    af_chain = build_af_chain(loudnorm_filter)
-
-    command = [_ffmpeg_binary(), "-nostdin", "-y", "-i", str(filepath), "-af", af_chain]
-    
-    if suffix == ".mp3":
-        command += ["-codec:a", "libmp3lame", "-b:a", BITRATE]
-    elif suffix == ".m4a":
-        command += ["-codec:a", "aac", "-b:a", BITRATE]
-    else:
-        command += ["-b:a", BITRATE]
-        
-    command += ["-map_metadata", "0"]
-    if suffix == ".m4a":
-        command += ["-movflags", "+faststart"]
-        
-    command.append(temp_path)
-    
-    try:
-        result = subprocess.run(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            **_hidden_window_kwargs()
-        )
-    except Exception as e:
-        try: os.remove(temp_path)
-        except: pass
-        return False, filepath.name, f"FFmpeg execution failed: {e}"
-        
-    if result.returncode != 0:
-        try: os.remove(temp_path)
-        except: pass
-        return False, filepath.name, result.stderr
-        
-    try:
-        os.replace(temp_path, str(filepath))
-    except Exception as e:
-        return False, filepath.name, f"Failed to replace original file with temp: {e}"
-    
-    # Report silence removal stats (only meaningful when the trim filters ran)
-    new_duration = _get_audio_duration(filepath) if SILENCE_TRIM else None
-    if SILENCE_TRIM and orig_duration is not None and new_duration is not None:
-        total_removed = orig_duration - new_duration
-        pad_added = SILENCE_PAD_DUR if SILENCE_PAD_DUR > 0 else 0.0
-        net_removed = total_removed + pad_added  # silence removed before pad was added
-        front_est = net_removed / 2.0
-        back_est = net_removed / 2.0
-        _safe_print(
-            f"  {Colors.DIM}├─ Original duration: {orig_duration:.2f}s  →  New: {new_duration:.2f}s{Colors.END}\n"
-            f"  {Colors.DIM}└─ Silence removed: ~{front_est:.2f}s front, ~{back_est:.2f}s back (total: {net_removed:.2f}s){Colors.END}"
-        )
-        
-    if (artist or title):
-        write_metadata_tags(filepath, artist, title)
-        
-    return True, filepath.name, None
-
-
-def run_loudness_normalization(folder_path, skip_files=None):
-    print(f"\n{Colors.CYAN}{Colors.BOLD}========================================{Colors.END}")
-    print(f"{Colors.CYAN}{Colors.BOLD}=== TWO-PASS VOLUME ADJUSTMENT PASS ===={Colors.END}")
-    print(f"{Colors.CYAN}{Colors.BOLD}========================================{Colors.END}\n")
-    
-    if not check_ffmpeg_available():
-        print(f"{Colors.YELLOW}[!] FFmpeg was not found in your system's PATH.{Colors.END}")
-        print(f"{Colors.DIM}    Loudness normalization requires FFmpeg to process files.{Colors.END}")
-        print(f"{Colors.DIM}    Skipping volume adjustment pass.{Colors.END}\n")
-        return 0, 0
-        
-    extensions = TAGGABLE_EXTENSIONS
-    files = sorted([f for f in folder_path.iterdir() if f.is_file() and f.suffix.lower() in extensions])
-
-    # Filter out files that were already tagged before the renaming pass started
-    if skip_files:
-        pre_skip_count = len([f for f in files if f in skip_files])
-        files = [f for f in files if f not in skip_files]
-        if pre_skip_count:
-            print(f"{Colors.DIM}Skipping {pre_skip_count} already-tagged file(s) from normalization.{Colors.END}")
-
-    if not files:
-        print(f"{Colors.YELLOW}No MP3 or M4A files found to adjust.{Colors.END}\n")
-        return 0, 0
-        
-    print(f"{Colors.GREEN}Starting static volume adjustment on {len(files)} files with {MAX_WORKERS} worker threads...{Colors.END}")
-    print(f"{Colors.DIM}Settings: Target Loudness={TARGET_LUFS} LUFS | Max Peak={TRUE_PEAK} dB | Output Bitrate={BITRATE}{Colors.END}")
-    print(f"{Colors.DIM}Silence trim: {'ON' if SILENCE_TRIM else 'OFF'} | End pad: {SILENCE_PAD_DUR}s | Loudnorm: {CUSTOM_NORM_CMD or 'built-in whole-track gain'}{Colors.END}\n")
-    
-    completed = 0
-    failed = 0
-    
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = []
-        for idx, file in enumerate(files, 1):
-            futures.append(executor.submit(normalize_file, idx, len(files), file))
-            
-        for future in as_completed(futures):
-            success, filename, error = future.result()
-            if success:
-                completed += 1
-                _safe_print(f"  {Colors.GREEN}✔ Adjusted Volume:{Colors.END} {filename}\n")
-            else:
-                failed += 1
-                _safe_print(f"\n  {Colors.RED}✘ Failed to adjust volume {filename}:{Colors.END}")
-                _safe_print(f"{Colors.DIM}{error}{Colors.END}\n")
-                
-    print(f"\n{Colors.CYAN}{Colors.BOLD}Volume Adjustment Complete!{Colors.END}")
-    print(f"  {Colors.GREEN}Success: {completed}{Colors.END} | {Colors.RED}Failed: {failed}{Colors.END}\n")
-    return completed, failed
-
-def run_integrated_renamer_cli():
-    if sys.platform == "win32":
-        os.system("")
-        try:
-            import ctypes
-            kernel32 = ctypes.windll.kernel32
-            hStdin = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
-            mode = ctypes.c_uint32()
-            if kernel32.GetConsoleMode(hStdin, ctypes.byref(mode)):
-                new_mode = (mode.value & ~0x0040) | 0x0080  # Disable ENABLE_QUICK_EDIT_MODE, set ENABLE_EXTENDED_FLAGS
-                kernel32.SetConsoleMode(hStdin, new_mode)
-        except Exception:
-            pass
-        
-    import argparse
-    parser = argparse.ArgumentParser(description="Integrated MP3 Renamer 5000", add_help=False)
-    parser.add_argument('folder', nargs='?', default=None,
-                        help="Target folder path. If omitted or invalid, a prompt will appear.")
-    parser.add_argument('--norm', choices=['on', 'off', 'ask'], default='ask',
-                        help="Normalization: on=always run, off=always skip, ask=prompt (default)")
-    parser.add_argument('--auto', action='store_true',
-                        help="Auto-accept all rename predictions without user prompts")
-    parser.add_argument('--silence-pad', type=float, default=None,
-                        help="Seconds of silence to append at end of each normalized file")
-    parser.add_argument('--norm-threads', type=int, default=None,
-                        help="Worker threads for normalization pass")
-    parser.add_argument('--silence-trim', choices=['on', 'off'], default='on',
-                        help="Silence trimming: on=trim front and back (default), off=leave silence alone")
-    parser.add_argument('--custom-norm-cmd', default=None,
-                        help="Replace ONLY the loudnorm part of the ffmpeg -af chain (silence trim unaffected)")
-    args, _ = parser.parse_known_args()
-
-    global SILENCE_PAD_DUR, SILENCE_TRIM, MAX_WORKERS, CUSTOM_NORM_CMD
-    if args.silence_pad is not None:
-        SILENCE_PAD_DUR = args.silence_pad
-    SILENCE_TRIM = (args.silence_trim == 'on')
-    if args.custom_norm_cmd:
-        CUSTOM_NORM_CMD = args.custom_norm_cmd
-    if args.norm_threads is not None and args.norm_threads > 0:
-        MAX_WORKERS = args.norm_threads
-
-    norm_mode = args.norm
-    start_auto = args.auto
-
-    _print_renamer_banner()
-
-    if args.folder and Path(args.folder).is_dir():
-        folder = Path(args.folder)
-        print(f"{Colors.GREEN}[✓] Using folder: {folder}{Colors.END}\n")
-    else:
-        folder = _select_renamer_folder()
-
-    # Snapshot which files already have both artist+title tags BEFORE renaming writes new tags
-    _ext = TAGGABLE_EXTENSIONS
-    _pre_tagged = frozenset(
-        f for f in folder.iterdir()
-        if f.is_file() and f.suffix.lower() in _ext
-        and all(read_metadata_tags(f))
-    )
-    if _pre_tagged:
-        print(f"{Colors.DIM}Found {len(_pre_tagged)} already-tagged file(s) — will skip them in normalization/trim.{Colors.END}\n")
-
-    renamed_count, tagged_count, skipped_count, already_formatted_count = clean_and_tag_files(folder, start_auto=start_auto)
-
-    norm_completed, norm_failed = 0, 0
-
-    try:
-        if norm_mode == 'on':
-            norm_completed, norm_failed = run_loudness_normalization(folder, skip_files=_pre_tagged)
-        elif norm_mode == 'off':
-            print(f"\n{Colors.YELLOW}Skipping volume adjustment (disabled in settings).{Colors.END}\n")
-        else:
-            print(f"{Colors.BOLD}Normalization and Silence Trimming{Colors.END}")
-            choice = input(f"Do you want to run normalization and silence trimming? ({Colors.GREEN}y{Colors.END}/{Colors.RED}n{Colors.END}): ").strip().lower()
-            if choice in ('y', 'yes'):
-                norm_completed, norm_failed = run_loudness_normalization(folder, skip_files=_pre_tagged)
-            else:
-                print(f"\n{Colors.YELLOW}Skipping normalization and silence trim pass.{Colors.END}\n")
-    except KeyboardInterrupt:
-        print(f"\n\n{Colors.RED}Process interrupted by user. Exiting.{Colors.END}")
-        sys.exit(0)
-
-    print(f"\n{Colors.CYAN}{Colors.BOLD}{'═' * 50}{Colors.END}")
-    print(f"{Colors.CYAN}{Colors.BOLD}  SESSION SUMMARY{Colors.END}")
-    print(f"{Colors.CYAN}{Colors.BOLD}{'═' * 50}{Colors.END}")
-    print(f"  {Colors.GREEN}Already formatted / skipped:{Colors.END} {already_formatted_count}")
-    print(f"  {Colors.GREEN}Renamed:                    {Colors.END} {renamed_count}")
-    print(f"  {Colors.GREEN}Tagged:                     {Colors.END} {tagged_count}")
-    print(f"  {Colors.YELLOW}Skipped (user / no artist): {Colors.END} {skipped_count}")
-    if norm_completed or norm_failed:
-        print(f"  {Colors.GREEN}Volume-equalized:           {Colors.END} {norm_completed}  "
-              f"{Colors.RED}(failed: {norm_failed}){Colors.END}")
-    print(f"{Colors.CYAN}{Colors.BOLD}{'═' * 50}{Colors.END}")
-    print(f"\n{Colors.CYAN}{Colors.BOLD}All processes complete.{Colors.END}")
-
-    try:
-        input(f"\n{Colors.DIM}Press ENTER to exit...{Colors.END}")
-    except (KeyboardInterrupt, EOFError):
-        pass
-
 # ============================================================
 # Theme Mapping for custom colors
 THEME_COLORS = {
@@ -1803,50 +681,6 @@ THEME_COLORS = {
     "Grey": ("#808080", "#555555"),
     "White": ("#FFFFFF", "#E5E5E5")
 }
-
-# The formats the Format dropdown offers, and therefore the formats a download can
-# be saved as. The rule for this list is strict: a format is only allowed if the
-# tagger can write artist/title into it and read them back, because the player gets
-# everything it displays out of those two tags. Three formats used to be on this
-# list and are off it on purpose, each verified against mutagen:
-#   .aac  - a raw ADTS bitstream with no tag container of any kind.
-#   .wav  - RIFF/PCM. mutagen opens it but gives it no tag API at all, so the
-#           tagger has nowhere to put an artist or a title.
-#   .flac - taggable, but only through Vorbis comments, which is a different tag
-#           system from the ID3/MP4 path this tagger uses.
-# All three are still in AUDIO_EXTENSIONS below, so a file someone already downloaded
-# in one of them stays visible and playable - it can just no longer be produced. The
-# two that are left are the two the whole pipeline actually supports: MP3 (ID3v2) and
-# M4A (MP4 atoms). M4A is the same AAC codec, so no codec was ever lost, only the
-# containers that could not carry a tag.
-DOWNLOAD_FORMATS = ("mp3", "m4a")
-DEFAULT_DOWNLOAD_FORMAT = "mp3"
-
-# The same list as file suffixes, for the passes that walk a folder. Derived from
-# DOWNLOAD_FORMATS so that a format cannot be offered in the dropdown without also
-# being handled by the rename/tag/normalize/silence-trim passes, which is how aac,
-# flac and wav ended up downloadable-but-never-taggable in the first place.
-TAGGABLE_EXTENSIONS = {f".{fmt}" for fmt in DOWNLOAD_FORMATS}
-
-# Audio extensions the local file browser and the sync scan accept. This is wider
-# than DOWNLOAD_FORMATS on purpose: it also covers files that are already sitting in
-# someone's library, including .aac files downloaded by older versions of the app,
-# which should stay visible and playable even though they can no longer be produced.
-AUDIO_EXTENSIONS = {'.mp3', '.flac', '.wav', '.m4a', '.ogg', '.opus', '.aac', '.wma', '.mka', '.aiff', '.alac', '.ape', '.wv'}
-
-# The containers mutagen can read artist/title out of, measured against mutagen 1.48.1.
-# Everything else on AUDIO_EXTENSIONS is outside this set for a reason: .aac is a raw
-# ADTS bitstream with no tag container, .wav and .aiff open fine but mutagen gives them
-# no tag API, and .mka and .ape are formats mutagen will not open at all. Those keep
-# going to ffprobe for their tags, exactly as they did before.
-MUTAGEN_TAGGABLE_EXTENSIONS = {'.mp3', '.m4a', '.alac', '.flac', '.ogg', '.opus', '.wma', '.wv'}
-
-# Duration and tags for the local file list, cached for the whole session under a key
-# that describes what the file IS - (path, mtime_ns, size) - rather than what it is
-# called. A file that is edited, re-downloaded or replaced simply misses, and the
-# entries nobody is looking at any more are dropped once the cache reaches its cap.
-_LOCAL_META_CACHE_CAP = 6000
-_local_meta_cache = {}
 
 # The rows of a folder are filled in chunks, and every chunk hands the event loop back a
 # chance to lay the new rows out and paint them. The first chunk is deliberately about
@@ -1866,112 +700,6 @@ LOCAL_RENDER_ROW_HEIGHT_GUESS = 24.0
 LOCAL_RENDER_CHUNK_MIN_ROWS = 32
 LOCAL_RENDER_CHUNK_MAX_ROWS = 1024
 LOCAL_RENDER_CHUNK_BUDGET_S = 0.020
-
-# The pane is handed the height the finished folder is going to occupy as soon as its listing is
-# known, and it keeps that height until the fill is done. A row that has already been drawn is
-# therefore never moved while the rest of the folder is being built: the folder appears at the
-# size it is going to be, its scrollbar is right from the first frame, and every chunk after the
-# first lands in room that is already reserved instead of stretching the list under the user and
-# forcing everything already on screen to be laid out and painted over again. Chunked filling
-# without it is what makes a big folder look like it is inflating rather than arriving.
-
-
-def _format_audio_duration(seconds):
-    """The duration text a local row shows: H:MM:SS at an hour or more, M:SS under it."""
-    try:
-        d = float(seconds)
-    except (TypeError, ValueError):
-        return ""
-    if d <= 0:
-        return ""
-    if d >= 3600:
-        return f"{int(d // 3600)}:{int((d % 3600) // 60):02d}:{int(d % 60):02d}"
-    return f"{int(d // 60)}:{int(d % 60):02d}"
-
-
-def _local_display_name(filename, title, artist):
-    """The name a local row shows when "Show artist/title" is switched on: "Artist -
-    Title", the title on its own when there is no artist, and the filename when the
-    file is not tagged."""
-    if title:
-        return f"{artist} - {title}" if artist else title
-    return filename
-
-
-def _local_meta_cache_put(key, title, artist, duration, tags_resolved):
-    """Remember what was read for one file. Insertion order is the age order, so
-    trimming drops the oldest half rather than a random half."""
-    if len(_local_meta_cache) >= _LOCAL_META_CACHE_CAP:
-        for stale in list(_local_meta_cache)[:_LOCAL_META_CACHE_CAP // 2]:
-            del _local_meta_cache[stale]
-    _local_meta_cache[key] = (title, artist, duration, tags_resolved)
-
-
-def _read_local_audio_meta(path):
-    """Duration, and artist/title when the file has them, read in-process by mutagen.
-    Returns (title, artist, duration_seconds), or None when mutagen cannot open the
-    format at all - which is the signal to fall back to ffprobe for that file.
-
-    mutagen is already a dependency (it is the tagger) and it answers both questions
-    off the file header without starting a process: measured over 120 files it read
-    them in 0.04s against 7.66s for one ffprobe call each."""
-    try:
-        audio = MutagenFile(path, easy=True)
-    except Exception:
-        return None
-    if audio is None:
-        return None
-
-    duration = None
-    info = getattr(audio, 'info', None)
-    if info is not None:
-        try:
-            length = float(getattr(info, 'length', 0.0) or 0.0)
-            if length > 0:
-                duration = length
-        except (TypeError, ValueError):
-            duration = None
-
-    title = artist = None
-    tags = getattr(audio, 'tags', None)
-    if tags:
-        def _tag_value(*names):
-            # The key a title lives under depends on the tag system behind the
-            # container: the easy interface normalises ID3 and MP4 to 'title' and
-            # 'artist', Vorbis comments (flac, ogg, opus) already use those names,
-            # and ASF (wma) uses its own.
-            for name in names:
-                try:
-                    value = tags[name]
-                except Exception:
-                    continue
-                if isinstance(value, (list, tuple)):
-                    value = value[0] if len(value) else None
-                if value is None:
-                    continue
-                text = str(value).strip()
-                if text:
-                    return text
-            return None
-        title = _tag_value('title', 'Title', 'TITLE')
-        artist = _tag_value('artist', 'Artist', 'ARTIST', 'albumartist', 'Author', 'Writer')
-    return title, artist, duration
-
-
-def _ffprobe_audio_meta(path):
-    """The fallback for a file mutagen cannot open or measure: one ffprobe call,
-    giving back (title, artist, duration_seconds) with anything unreadable as None."""
-    fmt = _probe_format_block(path)
-    if not fmt:
-        return None, None, None
-    tags = fmt.get('tags') or {}
-    title = tags.get('title') or tags.get('TITLE')
-    artist = tags.get('artist') or tags.get('ARTIST')
-    try:
-        duration = float(fmt.get('duration'))
-    except (TypeError, ValueError):
-        duration = None
-    return title or None, artist or None, duration or None
 
 def get_system_accent_color():
     try:
@@ -5168,181 +3896,6 @@ SYNC_ONLY_CONFIG_KEYS = ("sync_settings", "hosted_chains", "client_chains")
 EXPORT_SKIP_DIRS = {"$recycle.bin", "system volume information", "__pycache__", ".git"}
 
 
-def _yaml_scalar_repr(value) -> str:
-    """Render a single scalar the way the export manifest writes it."""
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, float):
-        return repr(value)
-    if value is None:
-        return "null"
-    text = str(value)
-    needs_quotes = (
-        text == ""
-        or text != text.strip()
-        or any(ch in text for ch in ("#", "\n", "\r", '"', "'", "\\"))
-        or ": " in text
-        or text.endswith(":")
-        or text[0] in "-?&*!|>%@`{}[]"
-        or text.lower() in ("true", "false", "null", "yes", "no", "on", "off")
-    )
-    return json.dumps(text) if needs_quotes else text
-
-
-def yaml_dump(data, indent: int = 0) -> str:
-    """Serialize the small YAML subset used by export.yaml."""
-    pad = " " * indent
-    lines: List[str] = []
-    if not isinstance(data, dict):
-        return "\n".join(lines)
-    for key, value in data.items():
-        key = str(key)
-        if isinstance(value, dict):
-            if value:
-                lines.append(f"{pad}{key}:")
-                lines.append(yaml_dump(value, indent + 2))
-            else:
-                lines.append(f"{pad}{key}: {{}}")
-        elif isinstance(value, list):
-            if value:
-                lines.append(f"{pad}{key}:")
-                lines.append(_yaml_dump_list(value, indent + 2))
-            else:
-                lines.append(f"{pad}{key}: []")
-        else:
-            lines.append(f"{pad}{key}: {_yaml_scalar_repr(value)}")
-    return "\n".join(lines)
-
-
-def _yaml_dump_list(items: List, indent: int) -> str:
-    pad = " " * indent
-    lines: List[str] = []
-    for item in items:
-        if isinstance(item, dict):
-            if not item:
-                lines.append(f"{pad}- {{}}")
-            elif any(isinstance(value, (dict, list)) for value in item.values()):
-                lines.append(f"{pad}-")
-                lines.append(yaml_dump(item, indent + 2))
-            else:
-                pairs = list(item.items())
-                first_key, first_value = pairs[0]
-                lines.append(f"{pad}- {first_key}: {_yaml_scalar_repr(first_value)}")
-                for key, value in pairs[1:]:
-                    lines.append(f"{pad}  {key}: {_yaml_scalar_repr(value)}")
-        elif isinstance(item, list):
-            if item:
-                lines.append(f"{pad}-")
-                lines.append(_yaml_dump_list(item, indent + 2))
-            else:
-                lines.append(f"{pad}- []")
-        else:
-            lines.append(f"{pad}- {_yaml_scalar_repr(item)}")
-    return "\n".join(lines)
-
-
-def _yaml_scalar_parse(body: str):
-    """Inverse of _yaml_scalar_repr for the scalar shapes export.yaml uses."""
-    body = body.strip()
-    if body == "[]":
-        return []
-    if body == "{}":
-        return {}
-    if body.startswith('"'):
-        try:
-            return json.loads(body)
-        except Exception:
-            return body.strip('"')
-    lowered = body.lower()
-    if lowered in ("true", "yes", "on"):
-        return True
-    if lowered in ("false", "no", "off"):
-        return False
-    if lowered in ("null", "~", ""):
-        return None
-    if re.fullmatch(r"-?\d+", body):
-        return int(body)
-    if re.fullmatch(r"-?\d+\.\d+", body):
-        return float(body)
-    return body
-
-
-def yaml_load(text: str) -> dict:
-    """Parse export.yaml back into a dict (comments and blank lines are ignored)."""
-    lines: List[Tuple[int, str]] = []
-    for raw_line in text.splitlines():
-        stripped = raw_line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        lines.append((len(raw_line) - len(raw_line.lstrip(" ")), stripped))
-    if not lines:
-        return {}
-
-    pos = 0
-
-    def parse_mapping(indent: int) -> dict:
-        nonlocal pos
-        result: dict = {}
-        while pos < len(lines):
-            current_indent, content = lines[pos]
-            if current_indent < indent or content.startswith("-"):
-                break
-            if current_indent > indent:
-                pos += 1
-                continue
-            key, _, rest = content.partition(":")
-            key = key.strip().strip('"')
-            rest = rest.strip()
-            pos += 1
-            if rest:
-                result[key] = _yaml_scalar_parse(rest)
-                continue
-            if pos < len(lines) and lines[pos][0] > indent:
-                child_indent = lines[pos][0]
-                if lines[pos][1].startswith("-"):
-                    result[key] = parse_sequence(child_indent)
-                else:
-                    result[key] = parse_mapping(child_indent)
-            else:
-                result[key] = None
-        return result
-
-    def parse_sequence(indent: int) -> list:
-        nonlocal pos
-        result: list = []
-        while pos < len(lines):
-            current_indent, content = lines[pos]
-            if current_indent != indent or not content.startswith("-"):
-                break
-            body = content[1:].strip()
-            pos += 1
-            if not body:
-                if pos < len(lines) and lines[pos][0] > indent:
-                    child_indent = lines[pos][0]
-                    if lines[pos][1].startswith("-"):
-                        result.append(parse_sequence(child_indent))
-                    else:
-                        result.append(parse_mapping(child_indent))
-                else:
-                    result.append(None)
-            elif ":" in body and not body.startswith('"'):
-                key, _, rest = body.partition(":")
-                item = {key.strip(): _yaml_scalar_parse(rest) if rest.strip() else None}
-                if pos < len(lines) and lines[pos][0] > indent:
-                    item.update(parse_mapping(lines[pos][0]))
-                result.append(item)
-            else:
-                result.append(_yaml_scalar_parse(body))
-        return result
-
-    top_indent = lines[0][0]
-    if lines[0][1].startswith("-"):
-        return {"items": parse_sequence(top_indent)}
-    return parse_mapping(top_indent)
-
-
 def default_export_config() -> dict:
     """A fresh default GUI config, used when only sync chains are exported."""
     default_dl = os.path.join(os.path.expanduser("~"), "Downloads")
@@ -6219,8 +4772,7 @@ class SettingsDialog(QDialog):
             val = float(text)
             if val >= 0:
                 self.main_app.silence_pad_dur = val
-                global SILENCE_PAD_DUR
-                SILENCE_PAD_DUR = val
+                TUNING.silence_pad_dur = val
                 self.main_app.save_config()
         except ValueError:
             pass
@@ -6247,8 +4799,7 @@ class SettingsDialog(QDialog):
 
     def _toggle_silence_trim(self, state):
         self.main_app.silence_trim = state
-        global SILENCE_TRIM
-        SILENCE_TRIM = state
+        TUNING.silence_trim = state
         self.main_app.save_config()
 
     def _toggle_norm_cmd(self, state):
@@ -6256,15 +4807,13 @@ class SettingsDialog(QDialog):
         self.norm_cmd_edit.setEnabled(state)
         if state and not self.norm_cmd_edit.text().strip():
             self.norm_cmd_edit.setText(f"loudnorm=I={TARGET_LUFS}:TP={TRUE_PEAK}:LRA={LOUDNESS_RANGE}")
-        global CUSTOM_NORM_CMD
-        CUSTOM_NORM_CMD = self.main_app.custom_norm_cmd if state else ""
+        TUNING.custom_norm_cmd = self.main_app.custom_norm_cmd if state else ""
         self.main_app.save_config()
 
     def _update_norm_cmd(self, text):
         self.main_app.custom_norm_cmd = text
-        global CUSTOM_NORM_CMD
         if self.main_app.use_custom_norm_cmd:
-            CUSTOM_NORM_CMD = text
+            TUNING.custom_norm_cmd = text
         self.main_app.save_config()
 
     def _toggle_custom_script(self, state):
@@ -6676,21 +5225,6 @@ class YtDlpUpdateDialog(QDialog):
         self.reject()
 
 
-def _sanitize_filename(name: str) -> str:
-    """Strip characters that Windows filenames cannot contain."""
-    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name)
-    return re.sub(r'\s+', ' ', cleaned).strip(' .')
-
-
-def _split_artist_title(stem: str) -> Tuple[str, str]:
-    """Best-effort 'Artist - Title' split, used to pre-fill the renamer when a
-    file has no tags but is already named in that format."""
-    if " - " in stem:
-        artist, title = stem.split(" - ", 1)
-        return artist.strip(), title.strip()
-    return "", stem.strip()
-
-
 class MetadataRenameDialog(QDialog):
     """Metadata renamer used by the local file editor.
 
@@ -7100,12 +5634,9 @@ class MainApp(QMainWindow):
         self.config_path = os.path.join(self.config_dir, "gui_config.json")
         self.load_config()
 
-        # Apply the normalization globals from the loaded config immediately
-        global SILENCE_TRIM, SILENCE_PAD_DUR, CUSTOM_NORM_CMD
-        SILENCE_TRIM = bool(self.silence_trim)
-        SILENCE_PAD_DUR = float(self.silence_pad_dur)
-        if self.use_custom_norm_cmd and self.custom_norm_cmd.strip():
-            CUSTOM_NORM_CMD = self.custom_norm_cmd.strip()
+        # Apply the normalization settings from the loaded config immediately
+        TUNING.from_settings(self.silence_trim, self.silence_pad_dur,
+                             self.use_custom_norm_cmd, self.custom_norm_cmd)
 
         # Placeholder so UI code can check readiness before VLC is initialized
         self.vlc_instance = None
@@ -8619,15 +7150,12 @@ class MainApp(QMainWindow):
         # whatever the attributes hold and load_config() reads it back on the next launch, so the
         # user stayed opted out of app-update and yt-dlp-update prompts through a reset that claimed
         # to put everything back to default.
-        global SILENCE_TRIM, SILENCE_PAD_DUR, CUSTOM_NORM_CMD
-        SILENCE_TRIM = True
-        SILENCE_PAD_DUR = self.silence_pad_dur
-        CUSTOM_NORM_CMD = ""
-        # The renamer half is a second copy of this program launched in a console, and it reads the
-        # module globals above rather than the MainApp attributes. Resetting only the attributes left
-        # every renamer this window launched running with the pre-reset trim / pad / override until
-        # the app was restarted. load_config() and _apply_imported_config() push the globals for the
-        # same reason; a reset has to do it too.
+        TUNING.reset()
+        # The renamer half is a second copy of this program launched in a console, and it reads
+        # the tuning settings above rather than the MainApp attributes. Resetting only the
+        # attributes left every renamer this window launched running with the pre-reset trim /
+        # pad / override until the app was restarted. load_config() and _apply_imported_config()
+        # push the settings for the same reason; a reset has to do it too.
         self.download_threads = 3
         self.normalization_threads = max(1, os.cpu_count() // 2)
         self.local_rescan_interval = 60
@@ -9081,10 +7609,8 @@ class MainApp(QMainWindow):
             self.use_custom_norm_cmd = bool(cfg.get('use_custom_norm_cmd'))
         if 'custom_norm_cmd' in cfg:
             self.custom_norm_cmd = str(cfg.get('custom_norm_cmd') or "")
-        global SILENCE_TRIM, SILENCE_PAD_DUR, CUSTOM_NORM_CMD
-        SILENCE_TRIM = bool(self.silence_trim)
-        SILENCE_PAD_DUR = float(self.silence_pad_dur)
-        CUSTOM_NORM_CMD = self.custom_norm_cmd.strip() if (self.use_custom_norm_cmd and self.custom_norm_cmd.strip()) else ""
+        TUNING.from_settings(self.silence_trim, self.silence_pad_dur,
+                             self.use_custom_norm_cmd, self.custom_norm_cmd)
         if 'download_threads' in cfg:
             try:
                 self.download_threads = max(1, int(cfg.get('download_threads')))
