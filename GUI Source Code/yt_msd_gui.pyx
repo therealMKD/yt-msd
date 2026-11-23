@@ -13238,9 +13238,10 @@ class MainApp(QMainWindow):
     def on_volume_changed(self, val):
         self.volume_val = val
         if self.vlc_player:
-            # VLC uses 0-200 (100=normal). Map slider 0-100 → vlc 0-100, 101-150 → vlc 101-200
-            vlc_vol = val if val <= 100 else int(100 + (val - 100) * 2)
-            self.vlc_player.audio_set_volume(vlc_vol)
+            # libVLC's volume is a percentage of amplitude with 100 = 0 dB, so the number the slider
+            # shows is the number the player is told: 150 is 1.5x, about +3.5 dB. It used to be
+            # doubled onto 200, which made 150% on the label mean 2x (+6 dB) in the audio output.
+            self.vlc_player.audio_set_volume(val)
         if hasattr(self, 'vol_pct'):
             self.vol_pct.setText(f"{val}%")
             if val > 115:
