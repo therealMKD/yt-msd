@@ -11,13 +11,16 @@ import json
 import subprocess
 from yt_msd.audio.tuning import TARGET_LUFS, TRUE_PEAK
 from yt_msd.subproc import _hidden_window_kwargs
+from yt_msd.util import trace
 
 
 def check_ffmpeg_available():
     try:
+        trace.command("ffmpeg", [_ffmpeg_binary(), "-version"])
         subprocess.run([_ffmpeg_binary(), "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, check=True, **_hidden_window_kwargs())
         return True
     except Exception:
+        trace.result("no ffmpeg on this system, so no loudness or silence-trim pass can run")
         return False
 
 
@@ -32,6 +35,7 @@ def measure_loudness(filepath):
         "-f", "null",
         "-"
     ]
+    trace.command("ffmpeg", command)
     try:
         result = subprocess.run(
             command,
@@ -44,6 +48,8 @@ def measure_loudness(filepath):
             **_hidden_window_kwargs()
         )
         if result.returncode != 0:
+            trace.result("ffmpeg exited with code %d: %s"
+                         % (result.returncode, trace.tail(result.stderr)))
             return None, None, f"FFmpeg exited with code {result.returncode}"
             
         stderr_output = result.stderr
@@ -52,10 +58,13 @@ def measure_loudness(filepath):
             data = json.loads(json_match.group(0))
             input_i = float(data.get("input_i", TARGET_LUFS))
             input_tp = float(data.get("input_tp", TRUE_PEAK))
+            trace.result("measured %+.2f LUFS, true peak %+.2f dB" % (input_i, input_tp))
             return input_i, input_tp, None
         else:
+            trace.result("no loudnorm JSON block came back")
             return None, None, "Could not find loudnorm JSON block in FFmpeg output"
     except Exception as e:
+        trace.result("loudness measurement failed: %s" % e)
         return None, None, str(e)
 
 
@@ -97,6 +106,11 @@ def _probe_format_block(filepath):
     DEVNULL, as this does, is what that switch was for."""
     try:
         cmd = [_ffprobe_binary(), "-v", "quiet", "-print_format", "json", "-show_format", str(filepath)]
+        # Level 2 (--trace=all) only. This is called once per local file while a library folder is
+        # listed (yt_msd.audio.localmeta), so plain --trace would spend a thousand lines answering
+        # a question nobody asked. --trace=all is for when that question is the one in trouble.
+        if trace.tracing_all():
+            trace.command("ffprobe", cmd)
         result = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, encoding='utf-8', errors='ignore',
                                 **_hidden_window_kwargs())

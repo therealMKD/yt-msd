@@ -8,10 +8,12 @@ import os
 import re
 import sys
 import json
+import time
 import threading
 import subprocess
 import shutil
 from yt_msd.subproc import _child_utf8_env, _hidden_window_kwargs
+from yt_msd.util import trace
 from yt_msd.ytdlp.install import YTDLP_EXTRACT_TIMEOUT, YtDlpMissingError, _yt_dlp_lookup_paths
 
 
@@ -49,6 +51,9 @@ def get_yt_dlp_version(exe_path=None):
     exe = exe_path or find_yt_dlp_executable()
     if not exe:
         return ""
+    # Which yt-dlp this copy resolved to is the first thing a report about a failed extraction
+    # needs, and it is not something the caller can guess at: there are three places it looks.
+    trace.command("yt-dlp", [exe, "--version"])
     try:
         result = subprocess.run([exe, "--version"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL, encoding="utf-8", errors="replace",
@@ -165,6 +170,10 @@ def run_yt_dlp_json(args, timeout=YTDLP_EXTRACT_TIMEOUT):
     exe = find_yt_dlp_executable()
     if not exe:
         raise YtDlpMissingError("yt-dlp is not installed on this system")
+    started = time.monotonic()
+    # The whole command line, including which yt-dlp was resolved: this is the line a search or a
+    # stream resolution is decided by, and it is the thing a report is most useful with.
+    trace.command("yt-dlp", [exe] + list(args))
     # Popen rather than subprocess.run: a stream URL resolution is cancellable, and cancelling
     # needs the handle to the process while it runs (see cancel_stream_fetches).
     proc = subprocess.Popen([exe] + list(args), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -179,14 +188,53 @@ def run_yt_dlp_json(args, timeout=YTDLP_EXTRACT_TIMEOUT):
             proc.communicate()
         except Exception:
             pass
+        trace.result("no answer within %ds, killed" % timeout)
         raise
     if stream_fetch_was_superseded():
         # The kill came from in here, not from yt-dlp giving up on the track.
+        trace.result("stopped: a newer pick made this answer pointless (%.1fs)"
+                     % (time.monotonic() - started))
         raise StreamFetchSupersededError("Stream URL fetch superseded by a newer pick")
     if proc.returncode != 0:
         tail = [line for line in (result_stderr or "").splitlines() if line.strip()]
+        trace.result("failed: %s" % (tail[-1] if tail else "exit code %d" % proc.returncode))
         raise RuntimeError(tail[-1] if tail else f"yt-dlp exited with code {proc.returncode}")
-    return json.loads(result_stdout or "")
+    info = json.loads(result_stdout or "")
+    trace.result(_extracted_summary(info, time.monotonic() - started))
+    return info
+
+
+def _extracted_summary(info, seconds):
+    """One line saying what an extraction actually brought back.
+
+    Never the URL. For a stream request the answer is a signed googlevideo link - a kilobyte of
+    tokens with an expiry stamped on it - and trace output gets pasted into issue reports the way
+    yt-msd-crash.log is. What is worth pasting is which formats were offered, which one is at the
+    top of the list, how big it is and which host it comes from.
+    """
+    if not isinstance(info, dict):
+        return "nothing back (%.1fs)" % seconds
+    entries = info.get("entries")
+    if isinstance(entries, list):
+        named = sum(1 for e in entries if isinstance(e, dict) and entry_channel_name(e))
+        return "%d entries, %d of them naming a channel (%.1fs)" % (len(entries), named, seconds)
+    formats = info.get("formats") or []
+    title = info.get("title") or info.get("id") or "no title"
+    if not formats:
+        return "%s - no formats offered (%.1fs)" % (title, seconds)
+    chosen = formats[-1]
+    bitrate = chosen.get("abr") or chosen.get("tbr")
+    facts = ["%d formats" % len(formats),
+             str(chosen.get("ext") or "?"),
+             str(chosen.get("acodec") or "no audio"),
+             ("%sk" % bitrate) if bitrate else "?k"]
+    size = chosen.get("filesize") or chosen.get("filesize_approx")
+    if size:
+        facts.append("%.1f MB" % (size / 1048576.0))
+    host = trace.url_host(chosen.get("url") or "")
+    if host:
+        facts.append(host)
+    return "%s - %s (%.1fs)" % (title, " | ".join(facts), seconds)
 
 
 
@@ -306,7 +354,9 @@ def resolve_stream_url(vid_id):
         if not url and info['formats']:
             url = info['formats'][-1].get('url')
     if not url:
+        trace.result("no playable audio stream URL found")
         raise RuntimeError("No playable audio stream URL found")
     headers = info.get('http_headers', {}) if info else {}
     user_agent = headers.get('User-Agent', 'com.google.android.youtube/19.29.37 (Linux; U; Android 11)')
+    trace.result("the stream the player gets comes from %s" % (trace.url_host(url) or "an unnamed host"))
     return url, user_agent

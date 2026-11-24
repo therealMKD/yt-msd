@@ -11,6 +11,7 @@ from yt_msd.audio.normalize import run_loudness_normalization
 from yt_msd.audio.tags import read_metadata_tags, write_metadata_tags
 from yt_msd.audio.tuning import TUNING, _available_threads
 from yt_msd.constants import TAGGABLE_EXTENSIONS
+from yt_msd.util import trace
 from yt_msd.util.console import Colors
 from yt_msd.util.text import clean_youtube_title
 
@@ -333,6 +334,12 @@ def run_integrated_renamer_cli():
         except Exception:
             pass
         
+    # --trace / -v reach the renamer two ways: this copy was started with them, or the window
+    # re-ran this program with them (see run_mp3_renamer in the entry point). They come out before
+    # argparse so they are not mistaken for the folder argument, and they turn on the account of
+    # every ffmpeg and ffprobe command the normalization pass then builds.
+    sys.argv = trace.parse_flags(sys.argv)
+
     import argparse
     parser = argparse.ArgumentParser(description="Integrated MP3 Renamer 5000", add_help=False)
     parser.add_argument('folder', nargs='?', default=None,
@@ -358,6 +365,14 @@ def run_integrated_renamer_cli():
         TUNING.custom_norm_cmd = args.custom_norm_cmd
     if args.norm_threads is not None and args.norm_threads > 0:
         TUNING.max_workers = args.norm_threads
+
+    if trace.enabled():
+        # What the ffmpeg -af chain is about to be built from. Four settings, each of them a
+        # command-line switch or a Settings window field, and the reason a normalized file came
+        # out the way it did.
+        trace.note("renamer settings: silence trim %s, end pad %.1fs, %d worker threads, loudnorm %s"
+                   % ("on" if TUNING.silence_trim else "off", TUNING.silence_pad_dur,
+                      TUNING.max_workers, TUNING.custom_norm_cmd or "built-in whole-track gain"))
 
     norm_mode = args.norm
     start_auto = args.auto

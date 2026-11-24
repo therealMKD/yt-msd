@@ -14,6 +14,7 @@ from yt_msd.audio.tags import read_metadata_tags, write_metadata_tags
 from yt_msd.audio.tuning import BITRATE, SILENCE_DURATION, SILENCE_KEEP, SILENCE_THRESHOLD, TARGET_LUFS, TRUE_PEAK, TUNING
 from yt_msd.constants import TAGGABLE_EXTENSIONS
 from yt_msd.subproc import _hidden_window_kwargs
+from yt_msd.util import trace
 from yt_msd.util.console import Colors, _safe_print
 
 
@@ -111,6 +112,10 @@ def normalize_file(index, total, filepath, custom_norm_cmd=None):
         command += ["-movflags", "+faststart"]
         
     command.append(temp_path)
+    # The whole ffmpeg command, filters included. This is the line that answers "what did it
+    # actually do to my file" - the -af chain is built from four settings the user changed, and
+    # until now the only way to see the result was to read build_af_chain() and guess.
+    trace.command("ffmpeg", command)
     
     try:
         result = subprocess.run(
@@ -124,11 +129,14 @@ def normalize_file(index, total, filepath, custom_norm_cmd=None):
     except Exception as e:
         try: os.remove(temp_path)
         except: pass
+        trace.result("could not run ffmpeg: %s" % e)
         return False, filepath.name, f"FFmpeg execution failed: {e}"
         
     if result.returncode != 0:
         try: os.remove(temp_path)
         except: pass
+        trace.result("ffmpeg exited with code %d: %s"
+                     % (result.returncode, trace.tail(result.stderr)))
         return False, filepath.name, result.stderr
         
     try:

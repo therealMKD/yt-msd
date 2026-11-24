@@ -6,8 +6,10 @@
 # added.
 import os
 import re
+import time
 import subprocess
 from yt_msd.subproc import _child_utf8_env, _hidden_window_kwargs
+from yt_msd.util import trace
 from yt_msd.ytdlp.install import YtDlpMissingError
 from yt_msd.ytdlp.runner import find_yt_dlp_executable
 
@@ -82,6 +84,8 @@ def run_yt_dlp_download(args, progress_cb=None, cancelled_cb=None, proc_cb=None)
     exe = find_yt_dlp_executable()
     if not exe:
         raise YtDlpMissingError("yt-dlp is not installed on this system")
+    started = time.monotonic()
+    trace.command("yt-dlp", [exe] + list(args))
     # stderr is folded into stdout: two pipes would let ffmpeg's chatter fill a
     # full buffer and stall the download.
     proc = subprocess.Popen([exe] + list(args), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -111,6 +115,11 @@ def run_yt_dlp_download(args, progress_cb=None, cancelled_cb=None, proc_cb=None)
                 progress_cb(match.group(1))
         elif line.startswith("ERROR:"):
             errors.append(line)
+        if trace.enabled():
+            # The line has just been sorted for the progress bar; the echo reads that same sort the
+            # other way. A bare [download] percentage is the only kind worth thinning - everything
+            # else names something that happened, and there are few enough of those.
+            trace.child_line("yt-dlp", line, chatter=(kind is None and line.startswith("[download]")))
         if cancelled_cb and cancelled_cb():
             cancelled = True
             proc.kill()
@@ -124,15 +133,20 @@ def run_yt_dlp_download(args, progress_cb=None, cancelled_cb=None, proc_cb=None)
     except Exception:
         pass
     if cancelled:
+        trace.result("cancelled after %.1fs" % (time.monotonic() - started))
         raise RuntimeError("Download cancelled by user")
     if proc.returncode != 0:
+        trace.result("failed: %s" % (errors[-1] if errors else "exit code %d" % proc.returncode))
         raise RuntimeError(errors[-1] if errors else f"yt-dlp exited with code {proc.returncode}")
     # Return whichever path is really there: the converted file when there is
     # one, the plain download when the conversion message was never printed.
     # A half-parsed path is worse than no path at all.
     for candidate in (final_path, staged_path):
         if candidate and os.path.isfile(candidate):
+            trace.result("finished: %s (%.1fs)" % (candidate, time.monotonic() - started))
             return candidate
+    trace.result("finished without naming a file this version recognises (%.1fs)"
+                 % (time.monotonic() - started))
     return final_path or staged_path
 
 

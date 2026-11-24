@@ -99,6 +99,10 @@ from yt_msd.util.yaml import (
     yaml_dump,
     yaml_load,
 )
+# Not a move from this file: yt_msd.util.trace is new in 3.5, the running account of every other
+# program this one starts. It is silent unless --trace (or -v) was on the command line, and the
+# entry block below is where that flag is read.
+from yt_msd.util import trace
 import webbrowser
 import urllib.request
 import urllib.parse
@@ -1041,7 +1045,10 @@ class MainApp(BootstrapMixin,
         except Exception:
             return
         try:
-            # CREATE_NO_WINDOW (0x08000000) keeps the helper itself invisible.
+            # CREATE_NO_WINDOW (0x08000000) keeps the helper itself invisible. It is still worth
+            # naming on the trace: it is the thing that puts a new version where the old one was,
+            # and a swap that never happened otherwise looks identical to an update that failed.
+            trace.command("update swap", ["cmd.exe", "/c", swap_path])
             subprocess.Popen(["cmd.exe", "/c", swap_path], creationflags=0x08000000)
         except Exception:
             pass
@@ -3776,6 +3783,12 @@ class MainApp(BootstrapMixin,
         args.append(f'--silence-trim={"on" if self.silence_trim else "off"}')
         if self.use_custom_norm_cmd and self.custom_norm_cmd.strip():
             args.append(f'--custom-norm-cmd={self.custom_norm_cmd.strip()}')
+        if trace.enabled():
+            # The renamer runs as a second copy of this program, so the account of the ffmpeg it
+            # builds has to be asked for by that copy too - and it belongs in the renamer's own
+            # console window, which is the one the user is watching while files are rewritten.
+            args.append("--trace" if trace.get_level() == trace.WORK_LEVEL else "--trace=all")
+        trace.command("renamer", args)
 
         try:
             creationflags = 0x00000010 if sys.platform == "win32" else 0
@@ -3832,12 +3845,15 @@ class MainApp(BootstrapMixin,
             if ext in interp_map:
                 cmd = interp_map[ext] + [script] + payload
                 flags = 0x00000010 if sys.platform == "win32" else 0  # CREATE_NEW_CONSOLE
+                trace.command("script", cmd)
                 subprocess.Popen(cmd, cwd=cwd, creationflags=flags)
             elif ext == '.exe':
+                trace.command("script", [script] + payload)
                 subprocess.Popen([script] + payload, cwd=cwd)
             else:
                 # Unknown type: let Windows resolve it through its file associations.
                 quoted = ' '.join(f'"{a}"' for a in payload)
+                trace.command("script", [f'"{script}" {quoted}'.strip()])
                 subprocess.Popen(f'"{script}" {quoted}'.strip(), shell=True, cwd=cwd)
             self._on_status_update(f"Ran custom script: {os.path.basename(script)}", False, "#1abd33")
         except Exception as e:
@@ -5233,6 +5249,12 @@ from yt_msd.instance import (
 )
 
 if __name__ == "__main__":
+    # "--trace", "-v" and "--trace=all" turn on the running account of every other program this
+    # copy starts (yt_msd.util.trace). It is read here and dropped here for the same reason
+    # "--console" is: Qt is handed only the options it recognises. Packaged, the launcher also
+    # gives this copy a console when one of them is present, because a trace line nobody can read
+    # is just work thrown away.
+    sys.argv = trace.parse_flags(sys.argv)
     # "--console" means "this copy needs somewhere to print errors". For the installed
     # exe the launcher answers that by giving the copy a console (see attach_console
     # in the launcher); for the .pyw the terminal is already there. Either way the

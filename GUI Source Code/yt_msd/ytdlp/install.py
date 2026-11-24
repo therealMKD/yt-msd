@@ -18,6 +18,7 @@ import urllib.request
 import urllib.parse
 from yt_msd.subproc import _hidden_window_kwargs
 from yt_msd.paths import program_folder
+from yt_msd.util import trace
 
 
 # ============================================================
@@ -93,13 +94,17 @@ def run_winget(args, timeout=YTDLP_INSTALL_TIMEOUT):
     """Run winget with these arguments. Returns (returncode, output, error)."""
     winget = find_winget_executable()
     if not winget:
+        trace.result("no winget on this system, so yt-dlp cannot be installed or updated")
         return None, "", "winget was not found on this system."
+    trace.command("winget", [winget] + list(args))
     try:
         result = subprocess.run([winget] + list(args), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, encoding="utf-8", errors="replace",
                                 timeout=timeout, **_hidden_window_kwargs())
+        trace.result("exit %s: %s" % (result.returncode, trace.tail(result.stdout, 2)))
         return result.returncode, (result.stdout or ""), ""
     except Exception as e:
+        trace.result("winget did not run: %s" % e)
         return None, "", str(e)
 
 
