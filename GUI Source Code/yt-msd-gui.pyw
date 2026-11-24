@@ -145,6 +145,7 @@ from yt_msd.playback.prefetch import (
     PREFETCH_URL_MAX_AGE,
 )
 from yt_msd.playback.stream import (
+    STREAM_ADVANCE_SKIP_LIMIT,
     STREAM_END_SLACK_MS,
     STREAM_REFETCH_LIMIT,
     STREAM_RENEW_COOLDOWN,
@@ -323,6 +324,7 @@ class MainApp(BootstrapMixin,
     ytdlp_update_signal = Signal(str, str)  # installed yt-dlp version, newest yt-dlp version
     ytdlp_version_signal = Signal(str)  # yt-dlp version found by a bg thread, shown on the GUI thread
     stream_refreshed_signal = Signal(bool, str)  # (re-resolved ok, track title) from the stream-refresh thread
+    stream_fetch_failed_signal = Signal(str, bool)  # (video id, whether this was an automatic changeover) from bg_fetch
 
     def _on_host_activity(self, sync_code: str, client_ip: str, activity: str):
         """Called when a client connects or pulls files from our hosted sync chain."""
@@ -3985,14 +3987,17 @@ class MainApp(BootstrapMixin,
 
         Everything done here is cheap: one preview, one remembered decision, and the
         start of a thread. The yt-dlp call itself never runs on the GUI thread.
+
+        It is asked for whichever way the track got onto the player - a click, a Next, the
+        timer advancing on its own, a replay - and whatever "stop after current" is set to.
+        A listener who has armed a stop still presses Next afterwards, and that wait is the
+        whole reason this exists; one read-ahead is one yt-dlp run, and one it decided for a
+        track it then never plays costs the listener nothing they wait on.
         """
         if not getattr(self, 'search_results', None):
             return
-        # Local files need no resolving, and a track that will not be followed
-        # automatically needs nothing ready.
+        # Local files need no resolving: a file on disk is already there.
         if getattr(self, 'current_video_id', None) in (None, "", "local"):
-            return
-        if getattr(self, 'stop_after_current', STOP_AFTER_OFF):
             return
         current_id = self.current_video_id
         # One decision per track: the player timer fires every 16 ms and must not
@@ -4775,6 +4780,11 @@ class MainApp(BootstrapMixin,
         self._is_loading_stream = True
         self._has_played_current = False
         self._ended_trigger = True
+        # This track reads ahead for its own successor, whichever way it arrived. The trigger
+        # key left behind by the track it replaced is not an answer about this one, and a track
+        # started again by hand gets a look-ahead of its own rather than riding on a decision
+        # made for whatever was playing before it.
+        self._prefetch_trigger_key = None
         
         # update index
         self.playback_index = -1
@@ -4829,11 +4839,18 @@ class MainApp(BootstrapMixin,
                 if getattr(self, '_pending_fetch_id', None) == vid_id:
                     self._is_loading_stream = False
                 self.search_failed_signal.emit()
+                # Whether this was a changeover the player made on its own is what decides what
+                # happens next, and this is the only place that knows it: a track the listener
+                # picked is theirs to retry, a track the list walked into has no stream at all.
+                self.stream_fetch_failed_signal.emit(vid_id, bool(from_nav))
         threading.Thread(target=bg_fetch, daemon=True).start()
 
     def _on_playback_started(self, title, vid_id, paused_at_start=False):
         self.current_playing_title = title
         self.current_video_id = vid_id
+        # A track that started is a track with a stream, so whatever run of dead rows led here
+        # is over and the allowance for stepping past more of them is whole again.
+        self._stream_skip_streak = 0
         if paused_at_start:
             self.is_playing = False
             self._update_play_button()
@@ -4842,6 +4859,36 @@ class MainApp(BootstrapMixin,
             self.is_playing = True
             self._update_play_button()
             self._on_status_update(f"Playing: {title}", True, "gray")
+
+    def _on_stream_fetch_failed(self, vid_id, from_navigation):
+        """An automatic changeover into a row that has no stream steps past it.
+
+        bg_fetch could not resolve the track play_next() had just advanced to - a removed
+        upload, a row a search page lists that YouTube will not serve - and nothing else here
+        can notice that it happened. The media still on the player is the finished one, whose
+        Ended tick was already spent, and play_result() had just cleared the two flags that
+        branch waits on, so a list with one dead row in it used to stop walking there: no
+        advance, no read-ahead for anything after it, and a listener clicking every row that
+        followed. This is the GUI thread, so the one place auto-advance is allowed to happen -
+        play_next() - can be asked for once more. The allowance is small on purpose: a search
+        full of dead rows, or an internet that really is down, must not spend a whole list on
+        attempts, and the streak is paid back the moment a track starts.
+        """
+        if not from_navigation:
+            return  # a track the listener picked themselves is theirs to retry
+        if getattr(self, '_pending_fetch_id', None) != vid_id:
+            return  # a newer pick owns the player now
+        if not getattr(self, 'search_results', None):
+            return  # a single track opened by url has no list to walk on through
+        if int(getattr(self, 'stop_after_current', STOP_AFTER_OFF)):
+            return  # the listener asked the list to stop on that track
+        if int(getattr(self, '_stream_skip_streak', 0)) >= STREAM_ADVANCE_SKIP_LIMIT:
+            return
+        title = next((v.get('title') or 'that track' for v in self.search_results
+                      if v.get('id') == vid_id), 'that track')
+        self._stream_skip_streak = int(getattr(self, '_stream_skip_streak', 0)) + 1
+        self._on_status_update(f"Skipping {title} - no stream available.", False, "#E31E24")
+        self.play_next()
 
     def eventFilter(self, obj, event):
         if event.type() == event.Type.KeyPress:

@@ -189,6 +189,10 @@ class BootstrapMixin:
         self._stream_listened = False
         self._stream_refetching = False
         self._stream_refetch_attempts = 0
+        # How many automatic changeovers in a row have landed on a row with no stream. Each one
+        # steps past that row and says so; the allowance is whole again as soon as a track
+        # starts. See _on_stream_fetch_failed.
+        self._stream_skip_streak = 0
         self._stream_renew_started_at = None
         self._pending_stream_seek_frac = None
         self._pending_stream_seek_ms = None
@@ -268,6 +272,7 @@ class BootstrapMixin:
         self.search_failed_signal.connect(self._on_search_failed)
         self.playback_started_signal.connect(self._on_playback_started)
         self.stream_refreshed_signal.connect(self._on_stream_refreshed)
+        self.stream_fetch_failed_signal.connect(self._on_stream_fetch_failed)
         self.queue_update_signal.connect(self._refresh_queue_display)
         self.queue_status_changed_signal.connect(self._on_queue_status_changed)
         self.thumbnails_loaded_signal.connect(self._on_thumbnail_loaded)

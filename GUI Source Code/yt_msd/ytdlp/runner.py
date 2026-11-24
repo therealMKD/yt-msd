@@ -276,10 +276,124 @@ def entry_channel_name(video):
     return ""
 
 
+# A search page lists more than tracks. Among the fifteen rows yt-dlp hands back can be the
+# channel itself, a playlist, or a shelf of that channel's uploads, and a flat entry for one
+# of those looks like any other entry - id, title, url, the channel's own name - except that
+# its id is a channel id (UC…), a playlist id (PL… / UU…) or a radio id (RD…), its url is
+# /channel/…, /playlist?list=… or /videos, and it carries no duration. Those rows used to
+# reach the results list and read as a track that had gone missing: it has no duration to
+# show, playing it spends a yt-dlp run on watch?v=<channel id>, which answers "This video is
+# unavailable", and its "Open on YouTube" button opens the page YouTube says does not exist.
+# A row is kept only when it points at a watchable video. Rows of any other extractor are
+# kept exactly as they were - nothing here knows their id shapes and nothing used to judge them.
+_YOUTUBE_VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
+
+_YOUTUBE_WATCH_URL = re.compile(r"youtube\.com/(?:watch\?v=|shorts/|live/)[A-Za-z0-9_-]{11}")
+
+
+def flat_entry_is_video(entry):
+    """Whether a flat-playlist row points at a video this app can play and download.
+
+    Duration is deliberately not the test: a live stream is a video and has no duration, and
+    the sparse answer YouTube serves sometimes carries no duration for a real track either.
+    What tells the two kinds of row apart is the url the row points at, and - when the row
+    names no url worth reading - the shape of the id itself.
+    """
+    if not isinstance(entry, dict):
+        return False
+    vid_id = entry.get('id')
+    if not isinstance(vid_id, str) or not vid_id.strip():
+        return False
+    url = entry.get('url') if isinstance(entry.get('url'), str) else ""
+    ie_key = entry.get('ie_key') if isinstance(entry.get('ie_key'), str) else ""
+    if not ('youtube.com' in url or 'youtu.be' in url
+            or ie_key in ('Youtube', 'YoutubeTab', 'YoutubeMusic')):
+        return True
+    if _YOUTUBE_WATCH_URL.search(url):
+        # A mix or radio row carries the watch url of the track it is seeded with, and
+        # watch?v= with --no-playlist is that track - the row is worth keeping.
+        return True
+    return bool(_YOUTUBE_VIDEO_ID.fullmatch(vid_id))
+
+
+# A video shorter than this is not a track. It is what a search page hands back for a video
+# it cannot serve - a removed upload, an upload with no stream left - and in the results list
+# it is a row that plays as a click that does nothing and downloads as a failure.
+MIN_ROW_SECONDS = 1
+
+# The rows a typed-in search shows (ytsearch15:<query>), and how far down the same search is
+# read when some of those rows are refused: one extra search, asked only when rows were
+# actually dropped, so one row YouTube will not serve does not leave the window a row short.
+SEARCH_ROW_LIMIT = 15
+SEARCH_FILL_BATCH = 30
+
+
+def row_is_worth_showing(entry):
+    """Whether a row that is a video is long enough to be a track.
+
+    A row that names no duration is kept, because the two answers that carry none are the
+    two worth keeping: a live stream, which is a real track with no length, and the sparse
+    answer YouTube serves, which strips durations off ordinary tracks too.
+    """
+    if not isinstance(entry, dict):
+        return False
+    duration = entry.get('duration')
+    if duration is None:
+        return True
+    try:
+        return float(duration) >= MIN_ROW_SECONDS
+    except (TypeError, ValueError):
+        return True
+
+
+def search_rows(payload):
+    """The rows of one search answer that belong in the results list, in the order given."""
+    return [e for e in ((payload or {}).get('entries') or [])
+            if flat_entry_is_video(e) and row_is_worth_showing(e)]
+
+
+def rows_from_further_down(query, kept, status_cb=None):
+    """Fill a search's rows out of the rows below its own limit.
+
+    Asked only when the answer lost rows to `flat_entry_is_video` or `row_is_worth_showing`,
+    so a search that dropped a channel row still shows the fifteen rows a search usually
+    shows. It asks for the deeper half of a bigger search - rows 16 to 30 of
+    `ytsearch30:<query>` - because the rows already in hand are the better matches, and it
+    deduplicates by id, keeps the batch to the search's own limit, and is silent about a
+    deeper search that fails: the rows already in hand are the answer.
+    """
+    if len(kept) >= SEARCH_ROW_LIMIT:
+        return kept
+    if status_cb is not None:
+        status_cb("Searching... (replacing the results that cannot be played)")
+    seen = {e.get('id') for e in kept}
+    try:
+        info = run_yt_dlp_json(["--flat-playlist", "-J",
+                                "--playlist-items", f"16-{SEARCH_FILL_BATCH}",
+                                f"ytsearch{SEARCH_FILL_BATCH}:{query}"],
+                               timeout=SEARCH_RETRY_TIMEOUT)
+    except Exception:
+        return kept
+    for entry in search_rows(info):
+        if len(kept) >= SEARCH_ROW_LIMIT:
+            break
+        if entry.get('id') in seen:
+            continue
+        seen.add(entry.get('id'))
+        kept.append(entry)
+    return kept
+
 
 def run_yt_dlp_text_search(query, status_cb=None, retries=SEARCH_CHANNEL_RETRIES,
                            retry_timeout=SEARCH_RETRY_TIMEOUT):
     """The flat entries of a typed-in search, retried while no entry names a channel.
+
+    Rows that are not videos - the channel the search is named for, a playlist, a shelf of
+    uploads - are dropped here, in the one place a typed-in search's rows are read, and so is
+    a video under a second long, which is what a search page hands back for an upload YouTube
+    will not serve. Whatever the fifteen rows lose is replaced from further down the same
+    search (see `rows_from_further_down`), so the window is not left short by a row that
+    cannot play and cannot download.
 
     Retrying costs a search only in the case worth paying for: an answer where not one
     entry has an owner, which is the answer that strips a channel name and usually a
@@ -301,18 +415,18 @@ def run_yt_dlp_text_search(query, status_cb=None, retries=SEARCH_CHANNEL_RETRIES
             if attempt == 1:
                 raise
             break
-        entries = [e for e in ((info or {}).get('entries') or [])
-                   if isinstance(e, dict) and e.get('id')]
+        entries = search_rows(info)
         if not entries:
             return best or entries
         if any(entry_channel_name(entry) for entry in entries):
-            return entries
+            # Rows this file refused are replaced from further down the same search, so one
+            # row YouTube will not serve does not leave the window a row short.
+            return rows_from_further_down(query, entries, status_cb)
         if len(entries) > len(best):
             best = entries
         if attempt <= retries and status_cb is not None:
             status_cb("Searching... (results with no channels, asking again)")
-    return best
-
+    return rows_from_further_down(query, best, status_cb)
 
 
 def stream_cli_args():

@@ -72,11 +72,20 @@ def wait_for(predicate, timeout=5.0):
 
 
 class Sig:
+    """A Qt signal stand-in. `emit` records the call; a slot put in with `connect` is called
+    back the same way __init__ connects a real signal to its handler."""
+
     def __init__(self):
         self.calls = []
+        self.slots = []
+
+    def connect(self, slot):
+        self.slots.append(slot)
 
     def emit(self, *a):
         self.calls.append(a)
+        for slot in self.slots:
+            slot(*a)
 
 
 class FakeScrollBar:
@@ -291,6 +300,11 @@ def make_app(res=None, index=0, vid="vid0", shuffled=False, history=None, mode=0
     app.playback_started_signal = Sig()
     app.search_failed_signal = Sig()
     app.stream_refreshed_signal = Sig()
+    app.stream_fetch_failed_signal = Sig()
+    app._stream_skip_streak = 0
+    # __init__ connects stream_fetch_failed_signal to _on_stream_fetch_failed. A section that
+    # wants that step to actually happen - AH - connects it on its own fixture; the sections
+    # written before it only ask what bg_fetch emitted.
     # The stream-liveness watchdog state, as __init__ sets it. Nothing is loaded on a fresh
     # harness, which is also how the app starts.
     app._loaded_stream = None
@@ -317,12 +331,17 @@ RESOLVE_CALLS = []
 RESOLVE_HOLD = [0.0]      # seconds a fake resolve spends fetching, set per test
 
 
-def patch_resolve(url="https://example.test/prefetched", user_agent="probe-agent", fail=False):
+def patch_resolve(url="https://example.test/prefetched", user_agent="probe-agent", fail=False,
+                  fail_for=()):
+    """Fake `resolve_stream_url`. `fail` refuses every id; `fail_for` refuses only the ids
+    listed, which is how a list holding one row that has no stream is built."""
+    refused = set(fail_for or ())
+
     def fake_resolve(vid_id):
         if RESOLVE_HOLD[0]:
             time.sleep(RESOLVE_HOLD[0])
         RESOLVE_CALLS.append(vid_id)
-        if fail:
+        if fail or vid_id in refused:
             raise RuntimeError("simulated stream failure")
         return url, user_agent
     seam.patch("resolve_stream_url", fake_resolve)
@@ -519,8 +538,16 @@ RESOLVE_CALLS.clear()
 app_armed = make_app(mode=mod.STOP_AFTER_ONCE)
 for _ in range(5):
     app_armed._maybe_prefetch_next_track()
-check("C10 a track that will not be followed is not prefetched",
-      RESOLVE_CALLS == [] and app_armed._prefetch_decision is None, RESOLVE_CALLS)
+check("C10 a track armed to stop after is read ahead for anyway - a manual Next costs the same",
+      wait_for(lambda: "vid1" in RESOLVE_CALLS) and app_armed._prefetch_decision is not None,
+      RESOLVE_CALLS)
+RESOLVE_CALLS.clear()
+app_always = make_app(mode=mod.STOP_AFTER_ALWAYS)
+for _ in range(5):
+    app_always._maybe_prefetch_next_track()
+check("C16 the same on 'always': the read-ahead is never what stops the list",
+      wait_for(lambda: "vid1" in RESOLVE_CALLS) and app_always._prefetch_decision is not None,
+      RESOLVE_CALLS)
 RESOLVE_CALLS.clear()
 app_local2 = make_app()
 app_local2.current_video_id = "local"
@@ -585,6 +612,24 @@ check("E6 with nothing prefetched the track is resolved as it always was, and th
       wait_for(lambda: app2.vlc_instance.medias) and RESOLVE_CALLS == ["vid2"]
       and app2.vlc_instance.medias[0].url == "https://example.test/prefetched",
       (RESOLVE_CALLS, app2.vlc_instance.medias))
+RESOLVE_CALLS.clear()
+app3 = make_app(shadow_play=False)
+app3._prefetch_trigger_key = "vid0"              # the look-ahead has already answered for this track
+app3._maybe_prefetch_next_track()
+wait_for(lambda: "vid1" in RESOLVE_CALLS)
+app3.play_result(app3.search_results[0])         # ... and now the same track is started again
+wait_for(lambda: len(app3.playback_started_signal.calls) >= 1)
+RESOLVE_CALLS.clear()
+app3._maybe_prefetch_next_track()
+check("E10 a track started again reads ahead for its own successor instead of riding on the old decision",
+      wait_for(lambda: "vid1" in RESOLVE_CALLS), RESOLVE_CALLS)
+_play_src = open(SRC, encoding="utf-8").read()     # _source is built later in this file
+check("E11 that decision belongs to the track play_result started, whoever started it",
+      "self._prefetch_trigger_key = None"
+      in _play_src[_play_src.index("def play_result"):][:4000])
+check("E12 and the look-ahead asks for a track whatever 'stop after current' is set to",
+      "'stop_after_current', STOP_AFTER_OFF)" not in
+      _play_src[_play_src.index("def _maybe_prefetch_next_track"):][:1400])
 
 print("F. play_next plays the track that was readied")
 RESOLVE_CALLS.clear()
@@ -894,6 +939,48 @@ app_last.vlc_player = FakePlayer(mod.vlc.State.Playing, ms=95000, length=100000)
 app_last.update_player_ui()
 time.sleep(0.35)
 check("K9 the last track of a list prefetches nothing", RESOLVE_CALLS == [], RESOLVE_CALLS)
+
+# K10 to K14: the walk a listener who never touches the player actually takes. K1 to K9 each
+# ask about one track; this is a list gone through track by track, which is the case a report
+# of "the read-ahead only works for the first one" is about. Every tick here is the real
+# update_player_ui(), every changeover is the real play_next() into the real play_result(), and
+# the only fake is the player clock and the yt-dlp run.
+RESOLVE_CALLS.clear()
+app_walk = make_app(index=0, vid="vid0", shadow_play=False)
+_walk_reached = []
+_walk_keys = []
+for _step in (0, 1, 2):
+    # A fresh media for the track this step is about to play, as a changeover is, and the
+    # stream watchdog as it stands when nothing has been loaded yet.
+    app_walk.vlc_player = FakePlayer(mod.vlc.State.Playing, ms=95000, length=100000)
+    app_walk._loaded_stream = None
+    app_walk._stream_seen_ms = -1
+    app_walk._stream_dead = False
+    app_walk._has_played_current = True
+    app_walk._ended_trigger = False
+    app_walk.update_player_ui()                    # the tick twenty seconds from the end
+    _walk_keys.append(app_walk._prefetch_trigger_key)
+    wait_for(lambda: f"vid{len(_walk_reached) + 1}" in app_walk._prefetched_streams)
+    app_walk.vlc_player.state = mod.vlc.State.Ended
+    app_walk.vlc_player.ms = 100000
+    app_walk.update_player_ui()                    # the tick that finds the track finished
+    _expected = len(_walk_reached) + 1
+    wait_for(lambda: len(app_walk.playback_started_signal.calls) >= _expected)
+    _walk_reached.append(app_walk.playback_started_signal.calls[-1][1])
+    app_walk._on_playback_started(*app_walk.playback_started_signal.calls[-1])   # what __init__ connects
+check("K10 three tracks in a row each start the track the list says is next",
+      _walk_reached == ["vid1", "vid2", "vid3"], (_walk_reached, app_walk.playback_index))
+check("K11 and each of them was resolved once, by the read-ahead, before it was needed",
+      sorted(RESOLVE_CALLS) == ["vid1", "vid2", "vid3"], RESOLVE_CALLS)
+check("K12 the stream each changeover handed the player is the one resolved ahead of it",
+      len(app_walk.vlc_instance.medias) == 3
+      and all(m.url == "https://example.test/prefetched" for m in app_walk.vlc_instance.medias),
+      app_walk.vlc_instance.medias)
+check("K13 the look-ahead is keyed to the track on the player and moves with it down the list",
+      _walk_keys == ["vid0", "vid1", "vid2"] and app_walk.playback_index == 3,
+      (_walk_keys, app_walk.playback_index))
+check("K14 walking a list cannot grow the resolved-URL cache past its limit",
+      len(app_walk._prefetched_streams) <= mod.PREFETCH_CACHE_LIMIT, app_walk._prefetched_streams)
 unpatch()
 
 print("L. the tray menu entry, built for real")
@@ -1194,8 +1281,10 @@ RESOLVE_CALLS.clear()
 app.vlc_player = FakePlayer(mod.vlc.State.Playing, ms=80000, length=100000)  # 20 s left
 app.update_player_ui()
 time.sleep(0.3)
-check("N17 an armed track reads nothing ahead, so no stream resolution is wasted",
-      RESOLVE_CALLS == [], RESOLVE_CALLS)
+check("N17 an armed track is read ahead for too - a listener who armed a stop still presses Next",
+      wait_for(lambda: "vid1" in RESOLVE_CALLS) and app.stop_after_current == mod.STOP_AFTER_ONCE
+      and app._search_stop_after_track == "vid0",
+      (RESOLVE_CALLS, app.stop_after_current, app._search_stop_after_track))
 
 app = live_app(shadow_play=False)
 app._arm_stop_after_for_new_search()
@@ -2352,6 +2441,138 @@ _ab_calls = use_search_answers([{"entries": [None, {"title": "entry with no id"}
 _ab_res = mod.run_yt_dlp_text_search("strange answer")
 check("AB21 an entry without an id is dropped, and that is not read as a nameless answer",
       _ab_res == [] and len(_ab_calls) == 1, (_ab_res, _ab_calls))
+
+# AB31 to AB39: rows that are not videos at all. A search for a band's name answers with the
+# band's own channel among its fifteen rows - measured on a live search, that row is
+# id=UCV1YxS0AVPOrx_HDj9Pgt8Q, ie_key=YoutubeTab, duration=None, url=https://www.youtube.com/
+# channel/UCV1YxS0AVPOrx_HDj9Pgt8Q - and it used to be built as a track: no duration to show,
+# "This video is unavailable" when played, and an "Open on YouTube" button built as
+# watch?v=UCV1YxS0AVPOrx_HDj9Pgt8Q, which is not a page YouTube has. Duration is not the test
+# that keeps or drops a row, because a live stream is a video with no duration either.
+_ab_is_video = seam.original("flat_entry_is_video")
+_ab_channel_row = {"id": "UCV1YxS0AVPOrx_HDj9Pgt8Q", "title": "f5ve", "_type": "url",
+                   "ie_key": "YoutubeTab", "duration": None,
+                   "url": "https://www.youtube.com/channel/UCV1YxS0AVPOrx_HDj9Pgt8Q",
+                   "channel": "f5ve", "uploader": "f5ve", "uploader_id": "@f5ve_official"}
+_ab_uploads_row = {"id": "UU1YxS0AVPOrx_HDj9Pgt8Q", "title": "Uploads", "_type": "url",
+                   "ie_key": "YoutubeTab", "duration": None,
+                   "url": "https://www.youtube.com/channel/UCV1YxS0AVPOrx_HDj9Pgt8Q/videos"}
+_ab_playlist_row = {"id": "PLukcNB9L3w6mQh8VXOyE0gQ", "title": "f5ve - Abstract EP",
+                    "_type": "url", "ie_key": "YoutubeTab", "duration": None,
+                    "url": "https://www.youtube.com/playlist?list=PLukcNB9L3w6mQh8VXOyE0gQ",
+                    "channel": "f5ve"}
+_ab_radio_row = {"id": "RDMMWL8OwB0ElJg", "title": "f5ve - I Choose You - Topic",
+                 "_type": "url", "ie_key": "Youtube", "duration": 173,
+                 "url": "https://www.youtube.com/watch?v=WL8OwB0ElJg&list=RDMMWL8OwB0ElJg"}
+_ab_live_row = {"id": "jfKfPfyJRdk", "title": "lofi hip hop radio - beats to relax/study to",
+                "_type": "url", "ie_key": "Youtube", "duration": None,
+                "url": "https://www.youtube.com/watch?v=jfKfPfyJRdk", "channel": "Lofi Girl"}
+_ab_short_row = {"id": "aB3dEfGhIjK", "title": "f5ve - Magic Clock (short)", "_type": "url",
+                 "ie_key": "Youtube", "duration": 51,
+                 "url": "https://www.youtube.com/shorts/aB3dEfGhIjK", "channel": "f5ve"}
+_ab_sparse_row = {"id": "yKItFB_HPhE", "title": "OMG - NewJeans", "duration": None,
+                  "ie_key": "Youtube", "channel": None, "uploader": None}
+_ab_other_row = {"id": "123456789", "title": "a track on another site", "_type": "url",
+                 "ie_key": "Soundcloud", "duration": 210,
+                 "url": "https://soundcloud.com/someone/a-track-on-another-site"}
+check("AB31 the channel a search is named for is not a video row",
+      _ab_is_video(_ab_channel_row) is False, _ab_channel_row)
+check("AB32 nor is a channel's uploads shelf", _ab_is_video(_ab_uploads_row) is False)
+check("AB33 nor a playlist that came back among the tracks", _ab_is_video(_ab_playlist_row) is False)
+check("AB34 a radio row is kept: its url is a watch url of a real track",
+      _ab_is_video(_ab_radio_row) is True)
+check("AB35 a live stream is kept even though it has no duration",
+      _ab_is_video(_ab_live_row) is True)
+check("AB36 so is a short", _ab_is_video(_ab_short_row) is True)
+check("AB37 and so is the sparse answer's row, which names no url at all",
+      _ab_is_video(_ab_sparse_row) is True)
+check("AB38 another extractor's row is judged by nothing here",
+      _ab_is_video(_ab_other_row) is True)
+check("AB39 a row with no id is still not a row", _ab_is_video({"title": "no id"}) is False
+      and _ab_is_video(None) is False)
+
+_ab_mixed = {"entries": [_ab_channel_row,
+                         {"id": "WL8OwB0ElJg", "title": "f5ve - I Choose You", "duration": 173,
+                          "ie_key": "Youtube", "channel": "f5ve",
+                          "url": "https://www.youtube.com/watch?v=WL8OwB0ElJg"},
+                         _ab_live_row,
+                         {"id": "xRdIYnRVrSU", "title": "f5ve - Magic Clock", "duration": 154,
+                          "ie_key": "Youtube", "channel": "f5ve",
+                          "url": "https://www.youtube.com/watch?v=xRdIYnRVrSU"}]}
+_ab_calls = use_search_answers([_ab_mixed])
+_ab_res = mod.run_yt_dlp_text_search("F5ve")
+check("AB40 the channel row is out of the results the search hands the window",
+      [e.get('id') for e in _ab_res] == ["WL8OwB0ElJg", "jfKfPfyJRdk", "xRdIYnRVrSU"], _ab_res)
+check("AB41 dropping it is not read as a nameless answer - the search itself is asked once, and the"
+      " second run is the fill from further down",
+      len(_ab_calls) == 2 and _ab_calls[0][:3] == ["--flat-playlist", "-J", "ytsearch15:F5ve"]
+      and _ab_calls[1][2:4] == ["--playlist-items", "16-30"], _ab_calls)
+
+# AB44 to AB49: a row under a second long, and the rows that replace the ones refused.
+_ab_is_row = seam.original("row_is_worth_showing")
+check("AB44 a row under a second long is not a track",
+      _ab_is_row({"id": "aB3dEfGhIjK", "duration": 0.4}) is False
+      and _ab_is_row({"id": "aB3dEfGhIjK", "duration": 0}) is False)
+check("AB45 a row of exactly a second is, and so is a duration carried as text",
+      _ab_is_row({"id": "aB3dEfGhIjK", "duration": 1}) is True
+      and _ab_is_row({"id": "aB3dEfGhIjK", "duration": "184"}) is True)
+check("AB46 no duration at all is kept - a live row, and the sparse answer, are both real tracks",
+      _ab_is_row({"id": "jfKfPfyJRdk", "duration": None}) is True
+      and _ab_is_row({"id": "jfKfPfyJRdk"}) is True
+      and _ab_is_row({"id": "jfKfPfyJRdk", "duration": "not a number"}) is True)
+
+
+def _ab_video_rows(prefix, count, start=0):
+    """Rows shaped like the ones a search really answers: an eleven-character id and a watch url."""
+    def _vid(i):
+        return f"{prefix}{i}abcdefghij"[:11]
+    return [{"id": _vid(i), "title": f"{prefix} {i}", "duration": 180 + i,
+             "ie_key": "Youtube", "channel": f"Channel {i}",
+             "url": f"https://www.youtube.com/watch?v={_vid(i)}"}
+            for i in range(start, start + count)]
+
+
+_ab_seen = []
+_ab_calls = use_search_answers([{"entries": [_ab_channel_row] + _ab_video_rows("near", 14)},
+                                {"entries": _ab_video_rows("far", 20, start=15)}])
+_ab_res = mod.run_yt_dlp_text_search("and2ble aura", status_cb=_ab_seen.append)
+check("AB47 the rows a search loses are replaced from further down the same search",
+      len(_ab_res) == 15 and _ab_res[0]["title"] == "near 0" and _ab_res[-1]["title"] == "far 15",
+      [e.get('title') for e in _ab_res])
+check("AB48 the filling is bounded by the fifteen rows a search shows, and no row appears twice",
+      len(_ab_res) == 15 and len({e.get('id') for e in _ab_res}) == 15, len(_ab_res))
+check("AB49 the filling says what it is doing, and only happens when rows were actually dropped",
+      _ab_seen == ["Searching... (replacing the results that cannot be played)"], _ab_seen)
+_ab_seen = []
+_ab_calls = use_search_answers([{"entries": _ab_video_rows("full", 15)}])
+_ab_res = mod.run_yt_dlp_text_search("bo burnham inside", status_cb=_ab_seen.append)
+check("AB50 a search that filled its fifteen rows is not asked a second time",
+      len(_ab_calls) == 1 and len(_ab_res) == 15 and _ab_seen == [], (_ab_calls, _ab_res))
+
+
+def _ab_fill_gives_up(args, **kwargs):
+    _ab_calls.append(list(args))
+    if len(_ab_calls) == 1:
+        return {"entries": [_ab_channel_row] + _ab_video_rows("half", 14)}
+    raise RuntimeError("simulated yt-dlp giving up on the deeper half")
+
+
+_ab_calls.clear()
+_ab_seen = []
+seam.patch("run_yt_dlp_json", _ab_fill_gives_up)
+_ab_res = mod.run_yt_dlp_text_search("half of it playable", status_cb=_ab_seen.append)
+check("AB51 a deeper half that fails keeps the rows already in hand",
+      len(_ab_res) == 14 and len(_ab_calls) == 2, (len(_ab_res), len(_ab_calls)))
+seam.restore("run_yt_dlp_json")
+
+_ab_calls = use_search_answers([{"entries": [_ab_channel_row, _ab_playlist_row]}])
+_ab_res = mod.run_yt_dlp_text_search("f5ve official")
+check("AB42 a search that found only a channel and a playlist returns no rows",
+      _ab_res == [] and len(_ab_calls) == 1, (_ab_res, _ab_calls))
+check("AB43 the dropping happens in the search's own reader, not again in the window",
+      open(SRC, encoding="utf-8").read().count("flat_entry_is_video") == 0
+      and open(SRC, encoding="utf-8").read().count("row_is_worth_showing") == 0,
+      open(SRC, encoding="utf-8").read().count("flat_entry_is_video"))
 seam.restore("run_yt_dlp_json")
 
 
@@ -3168,6 +3389,132 @@ check("AG31 it is the caption's own 50 px again, and the double click that put t
       and "win.vol_slider.setValue(100)" in _volbox_src)
 
 QApplication.instance().removeEventFilter(_ag_filter)
+
+# ---------------------------------------------------------------------------
+# AH. A row in the results list that has no stream. bg_fetch can fail on a track the player
+#     walked into on its own - a removed upload, or a row a search page lists that YouTube will
+#     not serve - and when it does, nothing else in the app can notice: the media still on the
+#     player is the finished one whose Ended tick was already spent, and play_result() has just
+#     cleared the two flags that branch waits on. These checks run the real play_result, the
+#     real bg_fetch and the real handler, with only the yt-dlp run and the player clock faked.
+#     A real Qt connection hands a failure raised on a worker thread to the GUI thread; the Sig
+#     stand-in calls the slot back directly, which is the sequence and thread count here.
+# ---------------------------------------------------------------------------
+print("=" * 72)
+print("AH. a row in the list that has no stream")
+
+RESOLVE_HOLD[0] = 0.0
+
+
+def app_that_walks(mode=mod.STOP_AFTER_OFF, index=0, vid="vid0", fail_for=()):
+    """A list being walked with no hand on the player, wired as __init__ wires it."""
+    patch_resolve(fail_for=fail_for)
+    app = make_app(index=index, vid=vid, mode=mode, shadow_play=False)
+    app._search_stop_after_track = None
+    app._is_loading_stream = False
+    app._finished_track = False
+    app._replay_in_flight = False
+    app.playback_started_signal.connect(app._on_playback_started)
+    app.stream_fetch_failed_signal.connect(app._on_stream_fetch_failed)
+    return app
+
+
+RESOLVE_CALLS.clear()
+app_ah = app_that_walks(fail_for={"vid1"})
+app_ah.play_result(app_ah.search_results[0])
+wait_for(lambda: len(app_ah.playback_started_signal.calls) >= 1)
+RESOLVE_CALLS.clear()
+app_ah.play_next()                        # the changeover the player timer makes on its own
+wait_for(lambda: len(app_ah.playback_started_signal.calls) >= 2)
+check("AH1 one row with no stream does not stop the list - the track after it starts",
+      [c[1] for c in app_ah.playback_started_signal.calls] == ["vid0", "vid2"],
+      app_ah.playback_started_signal.calls)
+check("AH2 the dead row is tried once and no more", RESOLVE_CALLS == ["vid1", "vid2"], RESOLVE_CALLS)
+check("AH3 the listener is told which row was skipped",
+      any(text.startswith("Skipping Track 1") for text, _p, _c in app_ah.status_messages),
+      app_ah.status_messages)
+check("AH4 skipping does not rearrange the list the listener is looking at - the walk is by index",
+      [v.get('id') for v in app_ah.search_results] == ["vid0", "vid1", "vid2", "vid3", "vid4"]
+      and app_ah.playback_index == 2, (app_ah.search_results, app_ah.playback_index))
+check("AH5 a track that does start pays the skipping allowance back",
+      app_ah._stream_skip_streak == 0, app_ah._stream_skip_streak)
+
+RESOLVE_CALLS.clear()
+app_ah2 = app_that_walks(fail_for={"vid1"})
+app_ah2.play_result(app_ah2.search_results[1])   # the listener clicked that row themselves
+wait_for(lambda: app_ah2.search_failed_signal.calls)
+time.sleep(0.3)
+check("AH6 a track the listener picked is theirs to retry - nothing plays behind their click",
+      app_ah2.playback_started_signal.calls == [] and app_ah2._stream_skip_streak == 0
+      and app_ah2.playback_index == 1,
+      (app_ah2.playback_started_signal.calls, app_ah2._stream_skip_streak, app_ah2.playback_index))
+
+
+RESOLVE_CALLS.clear()
+app_ah3 = app_that_walks(fail_for={"vid1", "vid2", "vid3", "vid4"})
+app_ah3.play_result(app_ah3.search_results[0])
+wait_for(lambda: len(app_ah3.playback_started_signal.calls) >= 1)
+RESOLVE_CALLS.clear()
+app_ah3.play_next()
+time.sleep(1.2)
+check("AH7 a list with nothing playable in it is tried a bounded number of times, then waits",
+      [c[1] for c in app_ah3.playback_started_signal.calls] == ["vid0"]
+      and app_ah3._stream_skip_streak == mod.STREAM_ADVANCE_SKIP_LIMIT
+      and len(RESOLVE_CALLS) == mod.STREAM_ADVANCE_SKIP_LIMIT + 1,
+      (app_ah3.playback_started_signal.calls, app_ah3._stream_skip_streak, RESOLVE_CALLS))
+
+RESOLVE_CALLS.clear()
+app_ah4 = app_that_walks(mode=mod.STOP_AFTER_ALWAYS, fail_for={"vid1"})
+app_ah4.play_result(app_ah4.search_results[0])
+wait_for(lambda: len(app_ah4.playback_started_signal.calls) >= 1)
+RESOLVE_CALLS.clear()
+app_ah4.play_next()
+time.sleep(0.4)
+check("AH8 an armed 'stop after current' is not walked past - the listener asked it to stop there",
+      RESOLVE_CALLS == ["vid1"] and app_ah4._stream_skip_streak == 0
+      and app_ah4.playback_index == 1, (RESOLVE_CALLS, app_ah4._stream_skip_streak))
+
+RESOLVE_CALLS.clear()
+app_ah5 = app_that_walks()
+app_ah5.play_result(app_ah5.search_results[0])
+wait_for(lambda: len(app_ah5.playback_started_signal.calls) >= 1)
+RESOLVE_CALLS.clear()
+app_ah5._pending_fetch_id = "vid8"               # a newer pick owns the player now
+app_ah5.stream_fetch_failed_signal.emit("vid1", True)
+time.sleep(0.3)
+check("AH9 a failure the window has already moved on from starts nothing",
+      RESOLVE_CALLS == [] and app_ah5._stream_skip_streak == 0,
+      (RESOLVE_CALLS, app_ah5._stream_skip_streak))
+app_ah5.search_results = []                      # a single track opened by url has no list
+app_ah5.stream_fetch_failed_signal.emit("vid1", True)
+check("AH10 and neither does it when there is no list to walk on through",
+      RESOLVE_CALLS == [] and app_ah5._stream_skip_streak == 0,
+      (RESOLVE_CALLS, app_ah5._stream_skip_streak))
+app_ah5.search_results = results()
+app_ah5._pending_fetch_id = "vid1"
+app_ah5.stream_fetch_failed_signal.emit("vid1", False)   # a track the listener picked
+check("AH11 the same failure raised by a manual pick starts nothing either",
+      RESOLVE_CALLS == [] and app_ah5._stream_skip_streak == 0,
+      (RESOLVE_CALLS, app_ah5._stream_skip_streak))
+
+_ah_fetch = _source[_source.index("def bg_fetch"):][:3000]
+_ah_handler = _source[_source.index("def _on_stream_fetch_failed"):][:2400]
+check("AH12 bg_fetch reports a failed resolution to that handler, saying whether the player made the pick",
+      "self.stream_fetch_failed_signal.emit(vid_id, bool(from_nav))" in _ah_fetch
+      and "stream_fetch_failed_signal = Signal(str, bool)" in _source)
+check("AH13 it is connected where every other signal is connected",
+      "self.stream_fetch_failed_signal.connect(self._on_stream_fetch_failed)"
+      in open(os.path.join(os.path.dirname(SRC), "yt_msd", "ui", "bootstrap.py"),
+              encoding="utf-8").read())
+check("AH14 the allowance is a constant the program holds, not a number only the harness reads",
+      "STREAM_ADVANCE_SKIP_LIMIT = 3"
+      in open(os.path.join(os.path.dirname(SRC), "yt_msd", "playback", "stream.py"),
+              encoding="utf-8").read()
+      and "STREAM_ADVANCE_SKIP_LIMIT" in _ah_handler)
+check("AH15 a started track clears the allowance, so a later dead row gets the same three tries",
+      "self._stream_skip_streak = 0"
+      in _source[_source.index("def _on_playback_started"):][:900])
+unpatch()
 
 
 print(f"{CHECKS - len(FAILS)} / {CHECKS} checks passed")

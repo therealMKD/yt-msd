@@ -44,3 +44,5 @@ STREAM_RENEW_COOLDOWN = 10        # seconds between two re-resolutions of the sa
 STREAM_END_SLACK_MS = 15000       # a stream that ended this far short of its length did not finish
 
 STREAM_SEEK_RESTORE_TIMEOUT = 12  # seconds a scrub or a restored position stays queued for fresh media
+
+STREAM_ADVANCE_SKIP_LIMIT = 3     # automatic changeovers to try past rows that have no stream before the player stops trying
