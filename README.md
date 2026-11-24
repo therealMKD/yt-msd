@@ -24,7 +24,7 @@ I don't want to deal with spotify's ads (Or pay for premium), and youtube playli
 > The 3.5 update is currently in progress! I will most likely be finishing it in a few weeks, but I'm in no hurry since I hope for my winget package to pass before the update. That most likely won't happen due to Microsoft apparently giving zero craps about winget, but we can always hope. This update will have a decent amount of fixes, but also some notable new features. Here is the current roadmap:
 >
 > - **No more python version!**\
->   Having a python version IS kind of nice, but the project is now 14,000 lines long, and an entire app in a single file is NOT best practice. 3.5 will modularize the program, and hopefully improve performance. That means that a single python file will not exist anymore, and the exe version will be the only version going forward. My apologies to anyone using the python version.
+>   Having a python version IS kind of nice, but the project is now 14,000 lines long, and an entire app in a single file is NOT best practice. 3.5 modularizes the program, and in current testing, decently improves performance. That means that a single python file will not exist anymore, and the exe version will be the only version going forward. My apologies to anyone using the python version.
 > - **New renaming features:**\
 >   3.5 will have an automated check on filenames as they are downloaded. It will run the same checks the renamer does, and will append the channel name to a title that doesn't have an artist. This will be a big timesaver if you're downloading songs from the artist's channel, as most will just be the song title, nothing else.
 > - **New Sync features:**\
