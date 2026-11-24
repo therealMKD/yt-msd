@@ -7,7 +7,7 @@
 > [!WARNING]
 > This program was created with the help of AI, specifically Qwen3.8-Flash-Next (Strata). If you have a problem with this, don't use the program. Release versions have been extensively bug tested, and this is NOT an "AI slop" program. This is first and foremost a personal program, and I do not have the time to learn Python just to download my playlist from Youtube.
 > 
-> If you want to contribute to this project, you're welcome to use an AI model, HOWEVER, you **MUST** have a disclaimer in the pull request, along with a detailed explanation of your change, to prove to me you understand it.
+> If you want to contribute to this project, you're welcome to use an AI model, HOWEVER, you **MUST** have a disclaimer in the pull request, along with a detailed explanation of your change, to prove to me you understand it. Your PR MUST be human written. Any AI written PRs, regardless of the work quality, will be closed.
 
 ## What is this, and what does it do?
 
