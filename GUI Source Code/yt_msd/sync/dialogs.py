@@ -10,13 +10,15 @@ import threading
 from pathlib import Path
 import time
 import socket
-from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QComboBox, QScrollArea, QFileDialog, QMessageBox, QDialog, QMenu, QFrame, QSpinBox, QInputDialog
+from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QComboBox, QScrollArea, QFileDialog, QMessageBox, QDialog, QMenu, QFrame, QSpinBox, QInputDialog, QCheckBox, QListWidget, QListWidgetItem
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont
 from yt_msd.sync.client import ClientSyncThread, deletions_were_declined, make_delete_confirm_cb
-from yt_msd.sync.config import DEFAULT_DELETE_CONFIRM_LIMIT, DELETE_CONFIRM_LIMIT_MAX, SyncConfigManager, delete_confirm_limit, is_client_chain_paused
-from yt_msd.sync.discovery import send_lan_update_notification
-from yt_msd.sync.lan import get_current_wifi_ssid, get_local_ip
+from yt_msd.sync.config import (DEFAULT_DELETE_CONFIRM_LIMIT, DEFAULT_HOST_CHAIN_VISIBLE,
+                                DELETE_CONFIRM_LIMIT_MAX, SyncConfigManager, delete_confirm_limit,
+                                host_chain_is_visible, is_client_chain_paused)
+from yt_msd.sync.discovery import HostScanThread, send_lan_update_notification
+from yt_msd.sync.lan import SYNC_PORT_START, get_current_wifi_ssid, get_local_ip
 from yt_msd.sync.removable import RemovableInitThread
 from yt_msd.sync.tags import SYNC_TAG_FILENAME, make_removable_chain_id
 from yt_msd.sync.transfer import filter_audio_files
@@ -30,7 +32,7 @@ class CreateHostChainDialog(QDialog):
         self.parent_window = parent_window
         self.config_manager = config_manager
         self.setWindowTitle("Create Sync Chain (Host)")
-        self.setFixedSize(520, 360)
+        self.setFixedSize(520, 410)
         self.setWindowFlags(self.windowFlags() | Qt.Tool)
 
         layout = QVBoxLayout(self)
@@ -84,6 +86,15 @@ class CreateHostChainDialog(QDialog):
         options_h.addStretch()
         layout.addLayout(options_h)
 
+        # Whether this chain tells the network it exists. Visible is the default, for the same reason
+        # it is the default for a chain saved by an older build: a hosted chain's code has been
+        # broadcast on the LAN by the beacon since 3.0, so a chain nobody can find is a change in
+        # behaviour the user did not ask for - and a chain nobody can find is a chain nobody joins.
+        self.visible_check = QCheckBox("Visible chain - clients on my network can find it without the code")
+        self.visible_check.setChecked(DEFAULT_HOST_CHAIN_VISIBLE)
+        self.visible_check.setToolTip("Unset means this chain names itself in nothing and answers no search. A client can still sync it, but only one that was already given the 4-digit sync code.")
+        layout.addWidget(self.visible_check)
+
         layout.addStretch()
 
         btn_h = QHBoxLayout()
@@ -132,7 +143,8 @@ class CreateHostChainDialog(QDialog):
             QMessageBox.warning(self, "Invalid Code", "Sync code must be a 4-digit number (e.g. 1002).")
             return
 
-        self.config_manager.add_hosted_chain(name, folder, code, notify_delay_mins=delay)
+        self.config_manager.add_hosted_chain(name, folder, code, notify_delay_mins=delay,
+                                             visible=self.visible_check.isChecked())
         self.accept()
 
 
@@ -144,7 +156,7 @@ class ConnectClientChainDialog(QDialog):
         self.parent_window = parent_window
         self.config_manager = config_manager
         self.setWindowTitle("Connect to Sync Chain (Client)")
-        self.setFixedSize(520, 430)
+        self.setFixedSize(520, 640)
         self.setWindowFlags(self.windowFlags() | Qt.Tool)
 
         layout = QVBoxLayout(self)
@@ -165,11 +177,35 @@ class ConnectClientChainDialog(QDialog):
         self.ip_edit.setPlaceholderText("e.g. 192.168.1.50")
         layout.addWidget(self.ip_edit)
 
+        # ... or none of the above. A search asks this machine's own networks whether anything on
+        # them is hosting a chain, which is the whole point of it: the address is the part nobody
+        # knows off by heart, and a visible chain hands over its code with its name.
+        scan_row = QHBoxLayout()
+        self.scan_btn = QPushButton("Find Hosts On My Network")
+        self.scan_btn.setFixedWidth(185)
+        self.scan_btn.setToolTip("Search this network for yt-msd hosts. A visible chain is named with its code, so nothing has to be typed. A private chain answers only if its code is typed here first.")
+        scan_row.addWidget(self.scan_btn)
+        self.scan_status = QLabel("Nothing searched yet.")
+        self.scan_status.setStyleSheet("color: #888; font-size: 11px;")
+        scan_row.addWidget(self.scan_status, 1)
+        layout.addLayout(scan_row)
+
         layout.addWidget(QLabel("4-Digit Sync Code:"))
         self.code_edit = QLineEdit()
         self.code_edit.setPlaceholderText("e.g. 1002")
         self.code_edit.setFixedWidth(100)
         layout.addWidget(self.code_edit)
+
+        self.host_list_label = QLabel("Hosts found:")
+        self.host_list_label.setStyleSheet("color: #3B8ED0; font-size: 11px;")
+        self.host_list_label.setVisible(False)
+        layout.addWidget(self.host_list_label)
+        self.host_list = QListWidget()
+        self.host_list.setMaximumHeight(112)
+        self.host_list.setVisible(False)
+        self.host_list.setToolTip("Pick one and its address, its code and its chain name go in. A private chain only answers a search that already named its code.")
+        self.host_list.currentItemChanged.connect(self._apply_scan_choice)
+        layout.addWidget(self.host_list)
 
         layout.addWidget(QLabel("Local Base Folder where files should be synced:"))
         folder_h = QHBoxLayout()
@@ -233,6 +269,111 @@ class ConnectClientChainDialog(QDialog):
         btn_h.addWidget(connect_btn)
         layout.addLayout(btn_h)
 
+        # The search this window can start, and what it found. A host takes the first free port from
+        # 63350 upwards, so the port a chain was found answering on has to be kept: a chain joined
+        # to a host sitting on 63351 that was saved with 63350 would be looking for it on a port
+        # nothing is listening on. `_scanned_ip` is what ties that port to the address it came from,
+        # so an address typed in afterwards is not quietly given someone else's port.
+        self._scan_thread = None
+        self._scan_results = []
+        self._scanned_port = SYNC_PORT_START
+        self._scanned_ip = ''
+        self.scan_btn.clicked.connect(self._start_scan)
+
+    def _start_scan(self):
+        """Search this machine's networks for hosts, on its own thread, off the GUI thread."""
+        self._stop_scan()
+        self._scan_results = []
+        self.host_list.clear()
+        self.host_list.setVisible(False)
+        self.host_list_label.setVisible(False)
+        self.scan_btn.setEnabled(False)
+        self.scan_btn.setText("Searching...")
+        self.scan_status.setStyleSheet("color: #888; font-size: 11px;")
+        self.scan_status.setText("Asking this network where a chain is being hosted...")
+        # The code typed here travels with the search, because that is how a private chain is found:
+        # it answers a search that already named it, and nothing else.
+        thread = HostScanThread(requested_code=self.code_edit.text().strip(), parent=self)
+        thread.host_found.connect(self._on_scan_host)
+        thread.scan_finished.connect(self._on_scan_done)
+        self._scan_thread = thread
+        thread.start()
+
+    def _stop_scan(self):
+        """Let go of a search still running, and wait for it to notice.
+
+        The thread is parented to this window and a QThread destroyed while running takes the
+        program with it, so a window that is closing - by Connect, by Cancel, or by its close box -
+        asks the search to stop first. The scan checks for that between addresses, so this is a
+        short wait and not a wait for the whole budget.
+        """
+        thread = self._scan_thread
+        if thread is None:
+            return
+        self._scan_thread = None
+        try:
+            thread.requestInterruption()
+            thread.wait(3000)
+        except RuntimeError:
+            pass
+
+    def accept(self):
+        self._stop_scan()
+        super().accept()
+
+    def reject(self):
+        self._stop_scan()
+        super().reject()
+
+    def _scan_line(self, entry: dict) -> str:
+        """How one found host is written on the list."""
+        if not entry.get('sync_code'):
+            # The machine answered but would not name a chain: a yt-msd from before a search could
+            # be answered. It will still take a client that authenticates, so what it gives is the
+            # address, and the code is the part the user has to bring.
+            return f"{entry['ip']}:{entry['port']}  -  yt-msd host (older version) - type its sync code"
+        found_as = "visible" if entry.get('visible') else "private"
+        return f"{entry['ip']}:{entry['port']}  -  {entry['chain_name']}  (code {entry['sync_code']}, {found_as})"
+
+    def _on_scan_host(self, entry: dict):
+        item = QListWidgetItem(self._scan_line(entry))
+        item.setData(Qt.UserRole, entry)
+        self.host_list.addItem(item)
+        self._scan_results.append(entry)
+        self.host_list.setVisible(True)
+        self.host_list_label.setVisible(True)
+        # The first host found is picked on its own. The point of a search is that nothing has to be
+        # chosen, and a second host on the list is the rare case rather than the one to design for.
+        if len(self._scan_results) == 1:
+            self.host_list.setCurrentItem(item)
+
+    def _on_scan_done(self, count: int, how: str):
+        self.scan_btn.setEnabled(True)
+        self.scan_btn.setText("Find Hosts On My Network")
+        if count:
+            self.scan_status.setStyleSheet("color: #1abd33; font-size: 11px;")
+            self.scan_status.setText(f"{count} host(s) found ({how}).")
+        else:
+            self.scan_status.setStyleSheet("color: #FF8C00; font-size: 11px;")
+            self.scan_status.setText("No host found. Is yt-msd running on the other PC, and is its chain Visible?")
+
+    def _apply_scan_choice(self, current, previous=None):
+        """Put a picked host into the boxes a chain is made from."""
+        entry = current.data(Qt.UserRole) if current is not None else None
+        if not isinstance(entry, dict):
+            return
+        self.ip_edit.setText(entry['ip'])
+        self._scanned_ip = entry['ip']
+        self._scanned_port = int(entry['port'])
+        if entry.get('sync_code'):
+            self.code_edit.setText(entry['sync_code'])
+        if entry.get('chain_name') and not self.playlist_name_edit.text().strip():
+            self.playlist_name_edit.setText(entry['chain_name'])
+        self.scan_status.setStyleSheet("color: #1abd33; font-size: 11px;")
+        self.scan_status.setText(f"Picked {entry['ip']}:{entry['port']}" +
+                                 (f", code {entry['sync_code']}" if entry.get('sync_code')
+                                  else " - type this host's sync code"))
+
     def _browse_base_folder(self):
         f = QFileDialog.getExistingDirectory(self, "Select Base Music Directory", self.folder_edit.text() or "")
         if f:
@@ -270,11 +411,17 @@ class ConnectClientChainDialog(QDialog):
             return
 
         full_dest_path = str(Path(base_folder) / subfolder)
+        # The port travels with the chain because a host takes the first free port from 63350 upward:
+        # a chain found answering on 63351 has to be looked for there and not on the port its name
+        # suggests. Only the port belonging to the address being saved is used, so an address typed
+        # in after a search is not given the port of the address the search picked.
+        host_port = (self._scanned_port if self._scanned_ip == ip else SYNC_PORT_START)
         self.config_manager.add_client_chain(
             name=subfolder,
             folder_path=full_dest_path,
             sync_code=code,
             host_ip=ip,
+            host_port=host_port,
             deletion_mode=del_mode,
             delete_confirm_limit=self.delete_limit_spin.value()
         )
@@ -683,7 +830,7 @@ class SyncManagerDialog(QDialog):
         counts = getattr(self.parent_app, 'chain_track_counts', {}) or {}
         hosted = tuple(
             (hc.get('id'), hc.get('name'), str(hc.get('sync_code', '')), hc.get('folder_path'),
-             counts.get(hc.get('id')))
+             counts.get(hc.get('id')), host_chain_is_visible(hc))
             for hc in self.config_manager.hosted_chains
         )
         clients = tuple(
@@ -807,7 +954,22 @@ class SyncManagerDialog(QDialog):
         code_lbl = QLabel(f"Sync Code: <b style='color: #FF8C00;'>{hc.get('sync_code')}</b>")
         header.addWidget(code_lbl)
 
+        # Whether this chain tells the network it exists. It is asked once when the chain is made and
+        # changed here afterwards, because a chain saved before the choice existed has to be made
+        # private without deleting and re-making it.
+        is_visible = host_chain_is_visible(hc)
+        vis_badge = QLabel("Visible" if is_visible else "Private")
+        vis_badge.setStyleSheet("background: " + ("#1abd33" if is_visible else "#FF8C00") +
+                                "; color: white; padding: 2px 6px; border-radius: 3px; font-weight: bold; font-size: 10px;")
+        header.addWidget(vis_badge)
+
         header.addStretch()
+
+        vis_btn = QPushButton("Make Private" if is_visible else "Make Visible")
+        vis_btn.setFixedWidth(110)
+        vis_btn.setToolTip("A visible chain names itself to any client searching this network, code included. A private one answers no search at all, and only a client that was already given the code can find it.")
+        vis_btn.clicked.connect(lambda chk=False, cid=hc.get('id'), want=not is_visible: self._set_chain_visibility(cid, want))
+        header.addWidget(vis_btn)
 
         copy_code_btn = QPushButton("Copy Code")
         copy_code_btn.setFixedWidth(105)
@@ -825,6 +987,13 @@ class SyncManagerDialog(QDialog):
         header.addWidget(del_btn)
 
         l.addLayout(header)
+
+        vis_hint = QLabel("Any yt-msd on this network can find this chain by name and connect with its code."
+                          if is_visible else
+                          "This chain names itself in nothing and answers no search: only a client already holding the code can reach it.")
+        vis_hint.setWordWrap(True)
+        vis_hint.setStyleSheet("color: #888; font-size: 11px;")
+        l.addWidget(vis_hint)
 
         folder_str = hc.get('folder_path', '')
         # Track counts come from the background probe's cache: counting files
@@ -1154,6 +1323,18 @@ class SyncManagerDialog(QDialog):
             if hasattr(self.parent_app, 'refresh_sync_watchers'):
                 self.parent_app.refresh_sync_watchers()
             self.refresh_cards(force=True)
+
+    def _set_chain_visibility(self, chain_id: str, visible: bool):
+        """Flip a hosted chain between findable and unfindable, on its card and in the config.
+
+        Nothing else has to be re-armed to make it take effect: the beacon and a host's answer to a
+        search both re-read the chains every time they run, so the next advertisement and the next
+        search already see the change. The card is rebuilt straight away because the badge and the
+        button on it are the answer, and a card that still said the old thing after a click would
+        read as a click that did nothing.
+        """
+        self.config_manager.set_host_chain_visibility(chain_id, visible)
+        self.refresh_cards(force=True)
 
     def _update_delete_limit(self, chain_id: str, value):
         """Store the number of files a chain may delete before it asks, and stop there.

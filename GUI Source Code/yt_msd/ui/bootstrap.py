@@ -282,6 +282,7 @@ class BootstrapMixin:
         self.stream_refreshed_signal.connect(self._on_stream_refreshed)
         self.stream_fetch_failed_signal.connect(self._on_stream_fetch_failed)
         self.sync_confirm_signal.connect(self._on_sync_confirm)
+        self.chain_visibility_signal.connect(self._on_chain_visibility_notice)
         self.queue_update_signal.connect(self._refresh_queue_display)
         self.queue_status_changed_signal.connect(self._on_queue_status_changed)
         self.thumbnails_loaded_signal.connect(self._on_thumbnail_loaded)
@@ -380,6 +381,10 @@ class BootstrapMixin:
                     pass
             threading.Thread(target=_bg_init, daemon=True).start()
             self._update_sync_timer()
+            # A chain saved by 3.0-3.4 has no visibility setting, and this is where that is noticed:
+            # late enough that the main window is up to hold the box, and before a client on the
+            # network has had the chance to find such a chain and surprise the user with it instead.
+            QTimer.singleShot(1800, self._notify_legacy_visible_chains)
             QTimer.singleShot(2500, self._auto_sync_client_chains)
 
         QTimer.singleShot(150, _deferred_sync_startup)

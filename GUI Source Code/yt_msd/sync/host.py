@@ -12,8 +12,41 @@ from typing import Dict, List, Optional, Callable
 from yt_msd.audio.tags import read_metadata_tags
 from yt_msd.constants import AUDIO_EXTENSIONS
 from yt_msd.deps import FileSystemEventHandler, Observer, _WATCHDOG_AVAILABLE
-from yt_msd.sync.lan import SYNC_PORT_END, SYNC_PORT_START, SYNC_SOCKET_TIMEOUT
+from yt_msd.sync.config import host_chain_is_visible
+from yt_msd.sync.lan import DISCOVERY_APP_NAME, SYNC_PORT_END, SYNC_PORT_START, SYNC_SOCKET_TIMEOUT
 from yt_msd.sync.transfer import compute_file_sha256, filter_audio_files, recv_json_msg, send_json_msg, stream_file_to_socket
+
+
+def hello_reply(hosted_chains: List[dict], requested_code: str = '', active_port: int = 0) -> dict:
+    """What a host says about itself to a client that asks before it authenticates.
+
+    This is the answer a network search reads, so it is the only thing the program says about a
+    chain to somebody it has not verified. A visible chain is named freely, code and all - which
+    is what "visible" means, and what lets a client join it without being given an address and a
+    number to type. A private chain is named to no untargeted search at all, and answers only one
+    that already put its code on the request: the code is what that client would have to know to
+    sync anyway, and naming it back is what turns "I was told a code" into "here is the machine it
+    belongs to". The hosted folder's path is deliberately not in the answer - a search is a
+    stranger, and it stays a stranger until an AUTH succeeds.
+    """
+    wanted = str(requested_code or '').strip()
+    named: List[dict] = []
+    for chain in hosted_chains:
+        code = str(chain.get('sync_code', '')).strip()
+        if not code or (wanted and wanted != code):
+            continue
+        visible = host_chain_is_visible(chain)
+        if not visible and not wanted:
+            continue
+        named.append({'sync_code': code,
+                      'name': chain.get('name', 'Audio Playlist'),
+                      'visible': visible})
+    if not named:
+        return {'status': 'ERROR',
+                'reason': f'Sync code {wanted} not found on host' if wanted
+                else 'This host advertises no sync chain'}
+    return {'status': 'OK', 'app': DISCOVERY_APP_NAME, 'host_name': socket.gethostname(),
+            'port': int(active_port or 0), 'chains': named}
 
 
 
@@ -165,8 +198,21 @@ class SyncHostServer:
     def _handle_client(self, sock: socket.socket, client_ip: str):
         try:
             sock.settimeout(SYNC_SOCKET_TIMEOUT)
-            auth_msg = recv_json_msg(sock)
-            if not auth_msg or auth_msg.get('cmd') != 'AUTH':
+            first_msg = recv_json_msg(sock)
+            if not first_msg:
+                return
+
+            if first_msg.get('cmd') == 'HELLO':
+                # Somebody searching the network rather than a client: one answer, and then the
+                # connection is done with. It is deliberately not reported as chain activity - a
+                # search touches every host on the LAN, and a host card that flashed for each one
+                # would be reporting something that is not true.
+                send_json_msg(sock, hello_reply(self.get_hosted_chains_cb(),
+                                                first_msg.get('sync_code', ''), self.active_port))
+                return
+
+            auth_msg = first_msg
+            if auth_msg.get('cmd') != 'AUTH':
                 send_json_msg(sock, {'status': 'ERROR', 'reason': 'Expected AUTH command'})
                 return
 

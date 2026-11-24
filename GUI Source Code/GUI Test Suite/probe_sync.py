@@ -1,14 +1,17 @@
 """The sync-chain regression harness.
 
-Sections SY-A..SY-M cover the sync half of `GUI Source Code/yt-msd-gui.pyw`: the TAG.yaml marker
+Sections SY-A..SY-N cover the sync half of `GUI Source Code/yt-msd-gui.pyw`: the TAG.yaml marker
 a chain leaves on removable media and what comes back when it is read, the two forms `last_synced`
 takes (an epoch in the chain dict, a wall-clock string in TAG.yaml) and the clock grace between
 them, the drive scan that looks for tagged folders, sync-chain persistence inside the shared
 gui_config.json, the length-prefixed socket protocol both ends of a chain speak, the host server's
 answers to a client, the client worker's decisions about what to download and what to delete, the
 number of files a client chain may delete before it has to ask the user and what keeping the host
-interested during that question looks like, the removable-media worker and the failsafe that stops a
-newer drive from being rolled back to an older copy, and the hosted folder watcher's debounce.
+interested during that question looks like, what a host is willing to say about a chain to somebody
+who has not authenticated - which chains a beacon, a probe answer and a `HELLO` name, and what a
+search across this machine's own networks makes of each answer - the removable-media worker and the
+failsafe that stops a newer drive from being rolled back to an older copy, and the hosted folder
+watcher's debounce.
 
 Recipe (AI Readme section 20): same as probe_playback - the `.pyw` is copied to a throwaway `.py`
 in this folder's `copy/` and imported, and the functions are driven directly. Every replacement
@@ -17,8 +20,11 @@ goes through harness_seam.py, never by writing into the entry point.
 This suite does two things probe_playback does not, and both are bounded:
 
   - it opens sockets, but only on 127.0.0.1 - a listening socket bound to loopback, and connected
-    pairs. No LAN address is bound, nothing is broadcast, and LAN discovery itself is patched out
-    through the seam so no check can put a probe packet on the network.
+    pairs. No LAN address is bound and nothing is broadcast. LAN discovery is patched out through
+    the seam so no check can put a packet on the network; the one check that drives the real search
+    (SY-N36) lifts that patch for the length of the call and puts it straight back, and the search
+    it runs is handed the addresses and ports written out in this file, with `adapter_addresses`
+    stood in for, so what it searches is a loopback fixture and not this machine's network.
   - it writes files, but only fixture folders under `copy/sync_fixture/`, rebuilt at the start of
     every run and deleted again at the end. No check touches a real removable device, the app's
     own config folder, the music library, or the Windows startup registry.
@@ -1095,6 +1101,305 @@ check("SY-M18 the keepalive is on a schedule the host's own patience allows, so 
       0 < mod.SYNC_CONFIRM_PING_INTERVAL < 30.0, mod.SYNC_CONFIRM_PING_INTERVAL)
 
 # ===========================================================================
+# SY-N: what a host says to a search, and what a search makes of the answer
+# ===========================================================================
+# A chain's visibility is a decision about who may be told the chain exists, so what is proved here
+# is the answering rather than the windows: which chains a host names to a stranger, which it answers
+# only when its code is named back, and what a search across this machine's own networks does with
+# each answer. Same bounds as the rest of this suite - loopback sockets on port 0 only, and the
+# address lists a search is asked to probe are written out here instead of read off the machine, so
+# no check puts a packet on the LAN.
+host_chain_is_visible = seam.original("host_chain_is_visible")
+advertised_chains = seam.original("advertised_chains")
+probe_replies = seam.original("probe_replies")
+hello_reply = seam.original("hello_reply")
+HostScanner = seam.original("HostScanner")
+DISCOVERY_APP = seam.original("DISCOVERY_APP_NAME")
+
+VIS_CFG_PATH = str(fixture("config visibility"))
+VIS_CFG = mod.SyncConfigManager(VIS_CFG_PATH)
+NEW_HOST_CHAIN = VIS_CFG.add_hosted_chain("Front Room", str(fixture("visible master")), "2468")
+check("SY-N1 a chain made by this build carries its own visibility, so nobody has to guess at it afterwards",
+      NEW_HOST_CHAIN["visible"] is True
+      and mod.SyncConfigManager(VIS_CFG_PATH).hosted_chains[0]["visible"] is True,
+      mod.SyncConfigManager(VIS_CFG_PATH).hosted_chains)
+VIS_CFG.set_host_chain_visibility("hc_2468", False)
+check("SY-N2 and the toggle writes a real decision into the config rather than removing the question",
+      mod.SyncConfigManager(VIS_CFG_PATH).hosted_chains[0]["visible"] is False,
+      mod.SyncConfigManager(VIS_CFG_PATH).hosted_chains)
+
+check("SY-N3 a chain saved by 3.0-3.4 carries no such key and reads as visible, because visible is what it already was",
+      host_chain_is_visible({"sync_code": "1234", "name": "Made by 3.2"}) is True
+      and host_chain_is_visible({}) is True, host_chain_is_visible({}))
+check("SY-N4 a written False is private, and so is anything a hand-edited config spells out as no",
+      host_chain_is_visible({"visible": False}) is False
+      and host_chain_is_visible({"visible": "false"}) is False
+      and host_chain_is_visible({"visible": "0"}) is False
+      and host_chain_is_visible({"visible": "off"}) is False
+      and host_chain_is_visible({"visible": ""}) is False
+      and host_chain_is_visible({"visible": True}) is True
+      and host_chain_is_visible({"visible": "yes"}) is True,
+      [host_chain_is_visible({"visible": raw}) for raw in (False, "false", "0", "off", "", True, "yes")])
+
+MIXED_CHAINS = [{"sync_code": "1111", "name": "Open"},
+                {"sync_code": "2222", "name": "Study", "visible": False},
+                {"sync_code": "3333", "name": "Made by 3.4"}]
+
+check("SY-N5 the beacon names only the visible chains, and it names their codes in the same breath",
+      [c["sync_code"] for c in advertised_chains(MIXED_CHAINS)] == ["1111", "3333"],
+      advertised_chains(MIXED_CHAINS))
+check("SY-N6 a hosted chain with no code in it is named in nothing at all",
+      advertised_chains([{"name": "no code"}, {"sync_code": "", "name": "empty code"}]) == [],
+      advertised_chains([{"name": "no code"}, {"sync_code": "", "name": "empty code"}]))
+check("SY-N7 asked in the general over UDP, a host answers with its visible chains only",
+      [r["sync_code"] for r in probe_replies(MIXED_CHAINS, 63350)] == ["1111", "3333"],
+      probe_replies(MIXED_CHAINS, 63350))
+check("SY-N8 asked by code, a private chain answers - a client holding the code could sync it anyway",
+      len(probe_replies(MIXED_CHAINS, 63350, "2222")) == 1
+      and probe_replies(MIXED_CHAINS, 63350, "2222")[0]["chain_name"] == "Study"
+      and probe_replies(MIXED_CHAINS, 63350, "2222")[0]["visible"] is False,
+      probe_replies(MIXED_CHAINS, 63350, "2222"))
+check("SY-N9 and a code it does not host gets no answer, private or otherwise",
+      probe_replies(MIXED_CHAINS, 63350, "9999") == [], probe_replies(MIXED_CHAINS, 63350, "9999"))
+
+_search_answer = hello_reply(MIXED_CHAINS, '', 63351)
+check("SY-N10 the answer a search reads names the visible chains, says what app it is, and says which port it is answering on",
+      _search_answer["status"] == "OK" and _search_answer["app"] == DISCOVERY_APP
+      and _search_answer["port"] == 63351
+      and [c["sync_code"] for c in _search_answer["chains"]] == ["1111", "3333"],
+      _search_answer)
+check("SY-N11 the hosted folder's own path is not in an answer handed to somebody who has not authenticated",
+      all("folder_path" not in chain for chain in _search_answer["chains"]), _search_answer["chains"])
+check("SY-N12 a host whose only chains are private advertises nothing rather than a yes naming nobody",
+      hello_reply([{"sync_code": "2222", "name": "Study", "visible": False}])
+      == {"status": "ERROR", "reason": "This host advertises no sync chain"},
+      hello_reply([{"sync_code": "2222", "name": "Study", "visible": False}]))
+check("SY-N13 a private chain answers a search that named its code, and says it is private while answering",
+      hello_reply(MIXED_CHAINS, "2222")["chains"] == [{"sync_code": "2222", "name": "Study", "visible": False}],
+      hello_reply(MIXED_CHAINS, "2222"))
+check("SY-N14 a private chain is not named alongside someone else's code either - naming one chain is not naming them all",
+      hello_reply(MIXED_CHAINS, "1111")["chains"] == [{"sync_code": "1111", "name": "Open", "visible": True}],
+      hello_reply(MIXED_CHAINS, "1111"))
+
+
+def _round_with(server, requests, expecting):
+    """The same drive SY-G uses - the host's own handler over a connected loopback pair."""
+    client, server_side = _loopback_pair()
+    worker = threading.Thread(target=lambda: server._handle_client(server_side, "127.0.0.1"), daemon=True)
+    worker.start()
+    for message in requests:
+        mod.send_json_msg(client, message)
+    answers = [mod.recv_json_msg(client, timeout=8.0) for _ in range(expecting)]
+    client.close()
+    worker.join(8)
+    try:
+        server_side.close()
+    except Exception:
+        pass
+    return answers, worker
+
+
+SEARCH_CHAINS = [{"sync_code": "5301", "name": "Front Room", "folder_path": str(HOST_CHAIN_FOLDER)},
+                 {"sync_code": "5302", "name": "Study", "visible": False, "folder_path": str(HOST_CHAIN_FOLDER)}]
+SEARCH_SEEN = []
+SEARCH_SERVER = mod.SyncHostServer(lambda: SEARCH_CHAINS,
+                                   on_client_activity_cb=lambda code, ip, note: SEARCH_SEEN.append((code, note)))
+SEARCH_SERVER._running = True
+
+answers, _ = _round_with(SEARCH_SERVER, [{"cmd": "HELLO", "sync_code": ""}], 1)
+check("SY-N15 a host answers a search without authenticating it, and a chain saved without a visibility key is in the answer",
+      answers[0].get("status") == "OK" and [c["sync_code"] for c in answers[0]["chains"]] == ["5301"],
+      answers)
+check("SY-N16 the private chain is kept out of that answer, and answers on its own once its code is named",
+      all(c["sync_code"] != "5302" for c in answers[0]["chains"])
+      and _round_with(SEARCH_SERVER, [{"cmd": "HELLO", "sync_code": "5302"}], 1)[0][0]["chains"]
+      == [{"sync_code": "5302", "name": "Study", "visible": False}], answers)
+check("SY-N17 a search is not a client: nothing about it reaches the chain's activity reporting",
+      SEARCH_SEEN == [], SEARCH_SEEN)
+
+_client, _server_side = _loopback_pair()
+_search_worker = threading.Thread(target=lambda: SEARCH_SERVER._handle_client(_server_side, "127.0.0.1"),
+                                  daemon=True)
+_search_worker.start()
+mod.send_json_msg(_client, {"cmd": "HELLO", "sync_code": ""})
+_hello_answer = mod.recv_json_msg(_client, timeout=8.0)
+_search_worker.join(4)
+_handler_closed_up = not _search_worker.is_alive()
+try:
+    mod.send_json_msg(_client, {"cmd": "AUTH", "sync_code": "5301"})
+    _after_search = mod.recv_json_msg(_client, timeout=2.0)
+except Exception:
+    _after_search = None
+_client.close()
+_search_worker.join(8)
+check("SY-N18 and a search is answered and then done with - finding out a host is there is not being let into its chains",
+      _hello_answer.get("status") == "OK" and _handler_closed_up and _after_search is None,
+      (_hello_answer, _handler_closed_up, _after_search))
+
+ANSWER_NOTHING = object()
+
+
+def _search_fixture(chains, answering=None, delay=0.0):
+    """One machine answering one search, on loopback, on a port nothing else is using.
+
+    `answering` stands in for an answer the current host would not give - which is how a yt-msd from
+    before a search could be answered, and how a machine that is not yt-msd at all, are put in front
+    of a search. `delay` is how long it takes to reply, which is the only way a budget gets tested.
+    """
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    asked = []
+
+    def _serve():
+        try:
+            conn, _addr = listener.accept()
+        except OSError:
+            return
+        finally:
+            listener.close()
+        try:
+            request = mod.recv_json_msg(conn, timeout=8.0)
+            asked.append(request)
+            if delay:
+                time.sleep(delay)
+            if answering is ANSWER_NOTHING:
+                return
+            mod.send_json_msg(conn, answering if answering is not None else
+                              hello_reply(chains, str((request or {}).get("sync_code", "")), port))
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    threading.Thread(target=_serve, daemon=True).start()
+    return port, asked
+
+
+def _search(chains=MIXED_CHAINS, requested_code="", answering=None, delay=0.0, budget=8.0,
+            connect_timeout=1.5, extra_targets=(), extra_ports=(), should_stop=None, on_found=None):
+    """Stand one machine up on loopback, search it, and hand back what the search made of it."""
+    port, asked = _search_fixture(chains, answering=answering, delay=delay)
+    scanner = HostScanner(requested_code=requested_code,
+                          targets=["127.0.0.1", *extra_targets],
+                          ports=[port, *extra_ports],
+                          connect_timeout=connect_timeout, budget=budget)
+    return scanner.run(on_found=on_found, should_stop=should_stop), scanner, port, asked
+
+
+found, scanner, found_port, asked = _search()
+check("SY-N19 a search finds the visible chains on an address it was given, naming the port each one answered on",
+      [(e["ip"], e["port"], e["sync_code"], e["chain_name"]) for e in found]
+      == [("127.0.0.1", found_port, "1111", "Open"), ("127.0.0.1", found_port, "3333", "Made by 3.4")], found)
+check("SY-N20 the private chain is not among what a search that named no code found",
+      all(e["sync_code"] != "2222" for e in found), found)
+check("SY-N21 a search asks in the open, and names no code when nobody gave it one",
+      asked == [{"cmd": "HELLO", "sync_code": ""}], asked)
+
+named, _, _, asked_named = _search(requested_code="2222")
+check("SY-N22 a private chain answers a search that named its code, and the search reports it as private",
+      len(named) == 1 and named[0]["sync_code"] == "2222" and named[0]["visible"] is False
+      and asked_named[0]["sync_code"] == "2222", (named, asked_named))
+
+older, _, older_port, _ = _search(answering={"status": "ERROR", "reason": "Expected AUTH command"})
+check("SY-N23 a yt-msd from before a search could be answered is still found as a host, with no chain invented for it",
+      len(older) == 1 and older[0]["port"] == older_port and older[0]["sync_code"] == ""
+      and older[0]["advertised"] is False, older)
+
+older_named, _, _, _ = _search(requested_code="5301",
+                               answering={"status": "ERROR", "reason": "Expected AUTH command"})
+check("SY-N24 and there the search hands back the code the user already had, because the address was the missing half",
+      len(older_named) == 1 and older_named[0]["sync_code"] == "5301", older_named)
+
+_not_hosts = []
+for _reply in (ANSWER_NOTHING, {"status": "OK"}, {"status": "OK", "chains": []},
+               {"hello": "not this program"}, {"status": "ERROR", "reason": "Something else entirely"}):
+    _found_there, _, _, _ = _search(answering=_reply)
+    _not_hosts.append(_found_there)
+check("SY-N25 a machine with a port open that is not this program is not reported as a host at all",
+      all(entries == [] for entries in _not_hosts), _not_hosts)
+
+_broadcast_calls = []
+seam.patch("get_broadcast_addresses", lambda: _broadcast_calls.append("broadcast") or [])
+_without_broadcast, _, _, _ = _search()
+seam.restore("get_broadcast_addresses")
+check("SY-N26 a search sends no broadcast packet - it asks each address directly, which is the path a working sync already proved",
+      _broadcast_calls == [] and len(_without_broadcast) == 2, (_broadcast_calls, _without_broadcast))
+
+_clock = time.time()
+_slow, _slow_scanner, _, _ = _search(delay=2.5, budget=0.4, connect_timeout=2.0)
+_spent = time.time() - _clock
+check("SY-N27 a search is bounded by its own budget and not by how many addresses it was handed",
+      _slow == [] and _slow_scanner.timed_out and _spent < 2.0, (_spent, _slow_scanner.timed_out))
+
+_stopped, _stop_scanner, _, _ = _search(should_stop=lambda: True, budget=8.0)
+check("SY-N28 a search stops when it is told to, and stops spending its budget at the same moment",
+      _stopped == [] and _stop_scanner.stopped_early and _stop_scanner.searched == 0,
+      (_stopped, _stop_scanner.stopped_early, _stop_scanner.searched))
+
+_live = []
+_hit, _hit_scanner, _, _ = _search(requested_code="1111", extra_targets=("127.0.0.2",),
+                                   extra_ports=(_closed_port(),),
+                                   on_found=lambda entry: _live.append(entry["sync_code"]))
+check("SY-N29 a search told which code it wanted stops at the first machine answering it, and reports each host as it is found rather than at the end",
+      len(_hit) == 1 and _hit_scanner.searched == 2 and _live == ["1111"],
+      (_hit, _hit_scanner.searched, _live))
+
+seam.patch("adapter_addresses", lambda: ["192.168.1.50", "10.0.0.9", "192.168.1.77"])
+_scope_bases, _scope_own = seam.original("local_scan_scope")()
+check("SY-N30 the networks a search covers are the network of every adapter this machine answers on, not one guess about where a packet would leave",
+      _scope_bases == ["192.168.1", "10.0.0"] and _scope_own == ["192.168.1.50", "10.0.0.9", "192.168.1.77"],
+      (_scope_bases, _scope_own))
+_scope_targets = seam.original("subnet_targets")(_scope_bases, exclude=_scope_own)
+check("SY-N31 every host number in those networks is asked - .1 through .254 - and this machine is never asked about itself",
+      _scope_targets[0] == "192.168.1.1" and _scope_targets[-1] == "10.0.0.254"
+      and len(_scope_targets) == 505 and "192.168.1.50" not in _scope_targets
+      and "10.0.0.9" not in _scope_targets, (len(_scope_targets), _scope_targets[:2]))
+seam.patch("SCAN_MAX_NETWORKS", 1)
+check("SY-N32 a machine with adapters on several networks searches the number of networks it is bounded to",
+      seam.original("local_scan_scope")()[0] == ["192.168.1"], seam.original("local_scan_scope")()[0])
+seam.restore("SCAN_MAX_NETWORKS")
+seam.patch("SCAN_MAX_TARGETS", 300)
+check("SY-N33 and the addresses a search will ask is capped, so an unusual network is not asked sixty thousand questions",
+      len(seam.original("subnet_targets")(_scope_bases)) == 300,
+      len(seam.original("subnet_targets")(_scope_bases)))
+seam.restore("SCAN_MAX_TARGETS")
+_default_targets, _default_ports = HostScanner().scope()
+check("SY-N34 a search handed nothing to ask about reads this machine's own networks, on the ports a host listens on",
+      _default_targets[0] == "192.168.1.1"
+      and _default_ports == list(range(seam.original("SYNC_PORT_START"), seam.original("SYNC_PORT_END") + 1)),
+      (_default_targets[:2], _default_ports[:2]))
+seam.restore("adapter_addresses")
+
+seam.patch("get_local_ip", lambda: "127.0.0.1")
+_own_addresses = seam.original("adapter_addresses")()
+seam.restore("get_local_ip")
+check("SY-N35 the address list a search reads off this machine never includes the loopback address, whichever adapter it came from",
+      "127.0.0.1" not in _own_addresses, _own_addresses)
+
+seam.patch("adapter_addresses", lambda: ["192.168.1.50"])
+seam.patch("subnet_targets", lambda bases, exclude=None: ["127.0.0.1"])
+_fallback_port, _ = _search_fixture(MIXED_CHAINS)
+seam.patch("SYNC_PORT_START", _fallback_port)
+seam.patch("SYNC_PORT_END", _fallback_port)
+# The standing patch this suite keeps over `discover_host_on_lan` - so no check can put a probe on
+# the LAN - is lifted for this one check and put straight back: it is the only check that drives the
+# real lookup, and it drives it against a loopback port written out here.
+seam.restore("discover_host_on_lan")
+_fallback = mod.discover_host_on_lan("3333", timeout=4.0)
+seam.patch("discover_host_on_lan", _no_host_on_lan)
+seam.restore("SYNC_PORT_START")
+seam.restore("SYNC_PORT_END")
+seam.restore("subnet_targets")
+seam.restore("adapter_addresses")
+check("SY-N36 the search a client falls back to when the address it remembers stopped answering is this same search, and still hands back the (ip, port, name) that client reads",
+      _fallback == ("127.0.0.1", _fallback_port, "Made by 3.4"), _fallback)
+
+# ===========================================================================
 # SY-L: the seam this suite reaches the program through
 # ===========================================================================
 _real_discovery = seam.original("discover_host_on_lan")
@@ -1117,7 +1422,11 @@ check("SY-L3 every sync name this suite drives is a module-level name the seam c
                                          "SyncHostServer", "SyncRemovableWorker",
                                          "HostFolderWatcher", "get_drive_io_lock",
                                          "delete_confirm_limit", "make_delete_confirm_cb",
-                                         "deletions_were_declined", "_HostKeepalive")))
+                                         "deletions_were_declined", "_HostKeepalive",
+                                         "host_chain_is_visible", "hello_reply",
+                                         "advertised_chains", "probe_replies", "HostScanner",
+                                         "adapter_addresses", "local_scan_scope",
+                                         "subnet_targets")))
 try:
     seam.patch("sync_chain_that_is_not_in_the_program", lambda: None)
     _refused_unowned = False

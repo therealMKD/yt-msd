@@ -35,10 +35,26 @@ def is_client_chain_paused(cc: dict) -> tuple[bool, int]:
 _CONFIG_WRITE_LOCK = threading.Lock()
 
 
+# Whether a hosted chain announces itself to the network. A visible chain is named in the host's
+# discovery answers, together with its sync code, so a client finds it and never types anything. A
+# private chain is named in nothing and answers no untargeted search at all - it only replies to a
+# client that already put its code on the request.
+DEFAULT_HOST_CHAIN_VISIBLE = True
+
+# Chains saved before this option existed carry no key for it. They read as visible because that
+# is what they already were: a hosted chain's code has been broadcast on the LAN by the beacon in
+# every build since 3.0, so a chain that could be found before this setting existed must not
+# quietly become unfindable after it. MainApp says so once, in a box on the main window
+# (_notify_legacy_visible_chains), because a privacy setting that arrives by upgrade has to be
+# pointed out rather than assumed. The key below is what remembers that it has.
+VISIBILITY_NOTICE_SETTING = 'chains_visibility_notice_shown'
+
+
 # The sync settings a fresh install gets. Named here rather than written inline so that
 # MainApp.reset_to_defaults() can hand back exactly these defaults instead of guessing at
 # a copy of the literal.
-DEFAULT_SYNC_SETTINGS = {"auto_sync_interval_mins": 30, "firewall_prompted": False}
+DEFAULT_SYNC_SETTINGS = {"auto_sync_interval_mins": 30, "firewall_prompted": False,
+                         VISIBILITY_NOTICE_SETTING: False}
 
 
 # How many files a client chain is allowed to delete on its own before it has to ask the user
@@ -55,6 +71,22 @@ DELETE_CONFIRM_LIMIT_MAX = 999999
 # parked and its host connection is being kept warm while it waits (see _HostKeepalive), so this
 # only exists so a question nobody answers cannot hold a chain open forever.
 SYNC_CONFIRM_WAIT_LIMIT = 30 * 60
+
+
+def host_chain_is_visible(chain_config: dict) -> bool:
+    """Whether this hosted chain may be named to anyone searching the network.
+
+    Read with a fallback rather than required, for the reason `delete_confirm_limit()` reads the
+    same way: chains written by 3.0-3.4 have no such key, a hand-edited config can hold anything,
+    and a value that reads as neither True nor False must not decide this on its own. Text is what
+    a hand-edited file holds, so "false", "0", "no" and "off" are all taken as private.
+    """
+    raw = chain_config.get('visible')
+    if raw is None:
+        return DEFAULT_HOST_CHAIN_VISIBLE
+    if isinstance(raw, str):
+        return raw.strip().lower() not in ('false', '0', 'no', 'off', '')
+    return bool(raw)
 
 
 def delete_confirm_limit(chain_config: dict) -> int:
@@ -159,7 +191,8 @@ class SyncConfigManager:
                 return code
         return "1000"
 
-    def add_hosted_chain(self, name: str, folder_path: str, sync_code: Optional[str] = None, notify_delay_mins: int = 5) -> dict:
+    def add_hosted_chain(self, name: str, folder_path: str, sync_code: Optional[str] = None, notify_delay_mins: int = 5,
+                         visible: bool = DEFAULT_HOST_CHAIN_VISIBLE) -> dict:
         code = sync_code or self.generate_unique_sync_code()
         chain = {
             'id': f'hc_{code}',
@@ -167,6 +200,10 @@ class SyncConfigManager:
             'name': name,
             'folder_path': folder_path,
             'notify_delay_mins': notify_delay_mins,
+            # Written every time, even when it is the default, so a chain created by this build is
+            # never mistaken for one created before the option existed - which is the difference
+            # between telling the user about it and leaving them to find out from a client.
+            'visible': bool(visible),
             'created_at': time.time(),
             'last_synced': 0,
             'status': 'Active'
@@ -174,6 +211,19 @@ class SyncConfigManager:
         self.hosted_chains.append(chain)
         self.save()
         return chain
+
+    def set_host_chain_visibility(self, chain_id: str, visible: bool):
+        """Make a hosted chain findable by anyone on the LAN, or answer nobody but its code.
+
+        Written as a real True/False rather than as a deletion: the key's absence is what marks a
+        chain as predating the option, and a chain the user has just decided about has been decided
+        about.
+        """
+        for c in self.hosted_chains:
+            if c.get('id') == chain_id:
+                c['visible'] = bool(visible)
+                break
+        self.save()
 
     def add_client_chain(self, name: str, folder_path: str, sync_code: str, host_ip: str,
                          host_port: int = 63350, deletion_mode: str = 'mirror', bound_wifi_ssid: str = '',

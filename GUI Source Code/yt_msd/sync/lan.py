@@ -32,6 +32,24 @@ SYNC_CONFIRM_PING_INTERVAL = 10.0
 
 SYNC_CHUNK_SIZE = 1024 * 1024
 
+# What a host calls itself when a client asks it "are you a yt-msd, and what are you hosting?"
+# before authenticating. The answer is what makes a scan able to tell a sync host from whatever
+# else happens to have a port open on a machine down the hall. See HELLO in yt_msd.sync.host.
+DISCOVERY_APP_NAME = 'yt-msd'
+
+# A LAN search is a TCP handshake to every address on this machine's own networks, on the ports
+# the host server listens on. TCP rather than a UDP broadcast because it is the one path a sync
+# has already proved works on the network it runs on: broadcast traffic is dropped by most access
+# points, and Windows authorises the program for the TCP ports it listens on and not for a
+# broadcast port it only ever sends from. The numbers are the whole budget of one search - long
+# enough to cross a /24 twice, short enough that a search that finds nothing finishes.
+SCAN_CONNECT_TIMEOUT = 0.35
+SCAN_READ_TIMEOUT = 1.5
+SCAN_MAX_CONCURRENCY = 128
+SCAN_BUDGET_SECONDS = 14.0
+SCAN_MAX_NETWORKS = 4
+SCAN_MAX_TARGETS = 1024
+
 
 
 def get_current_wifi_ssid() -> Optional[str]:

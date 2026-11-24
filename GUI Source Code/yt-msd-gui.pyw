@@ -209,6 +209,7 @@ from yt_msd.sync.config import (
     DEFAULT_SYNC_SETTINGS,
     DELETE_CONFIRM_LIMIT_MAX,
     SYNC_CONFIRM_WAIT_LIMIT,
+    VISIBILITY_NOTICE_SETTING,
     SyncConfigManager,
     _CONFIG_WRITE_LOCK,
     delete_confirm_limit,
@@ -334,6 +335,7 @@ class MainApp(BootstrapMixin,
     stream_refreshed_signal = Signal(bool, str)  # (re-resolved ok, track title) from the stream-refresh thread
     stream_fetch_failed_signal = Signal(str, bool)  # (video id, whether this was an automatic changeover) from bg_fetch
     sync_confirm_signal = Signal(str, str, str)  # (request id, window title, question) from a sync worker - parked until _on_sync_confirm answers
+    chain_visibility_signal = Signal(str, str)  # (title, body) naming the hosted chains that are visible on the network - a box on the main window, from the startup check
 
     def _on_host_activity(self, sync_code: str, client_ip: str, activity: str):
         """Called when a client connects or pulls files from our hosted sync chain."""
@@ -874,6 +876,57 @@ class MainApp(BootstrapMixin,
             proceed = False
         waiter["answer"] = proceed
         waiter["event"].set()
+
+    def _notify_legacy_visible_chains(self):
+        """Tell the user, once, that the chains already saved on this PC are visible on the network.
+
+        Visibility is a new setting in this build, and every chain written by 3.0, 3.1, 3.2, 3.3 or
+        3.4 predates it. Those chains read as visible because that is what they already were - a
+        hosted chain's code has been broadcast on the LAN by the beacon in every one of those builds,
+        so a chain that could be found before this build must not quietly become unfindable after it.
+        But a privacy setting that arrives by an upgrade is not something a user can be assumed to
+        have agreed to, so the first launch that finds such a chain says so, names them, and points
+        at the button that changes it. The flag is written before the box is opened rather than after
+        it is closed: this is a notice and not a question, and it is given once per machine.
+        """
+        manager = getattr(self, 'sync_config_manager', None)
+        if manager is None:
+            return
+        if manager.settings.get(VISIBILITY_NOTICE_SETTING):
+            return
+        legacy = [hc for hc in manager.hosted_chains if hc.get('sync_code') and 'visible' not in hc]
+        if not legacy:
+            return
+        manager.settings[VISIBILITY_NOTICE_SETTING] = True
+        manager.save()
+        listed = "\n".join(f"  •  {hc.get('name', 'Audio Playlist')} (code {hc.get('sync_code')})"
+                           for hc in legacy)
+        body = (
+            "This version can keep a hosted sync chain private. The chains already saved on this "
+            "computer are visible, which is what they have always been: any yt-msd on your local "
+            "network can find them by name and connect using the code below.\n\n"
+            f"{listed}\n\n"
+            "To keep one to yourself, open Sync Chains and press \"Make Private\" on its card. A "
+            "private chain names itself in nothing and answers no search - it can still be synced, "
+            "but only by a client that was already given its 4-digit sync code. Chains you create "
+            "from now on are asked about as they are made."
+        )
+        self.chain_visibility_signal.emit("Sync chains are visible on your network", body)
+
+    def _on_chain_visibility_notice(self, title: str, body: str):
+        """Main-thread slot for the notice above: a box on the main window, in the same shape as the
+        one a sync asks before it deletes - parented to the Sync Chains window when that is open, and
+        to the main window when it is not."""
+        parent = None
+        try:
+            if self.sync_manager_dialog is not None and self.sync_manager_dialog.isVisible():
+                parent = self.sync_manager_dialog
+        except RuntimeError:
+            parent = None
+        try:
+            QMessageBox.information(parent, title, body)
+        except Exception:
+            pass
 
     def open_sync_manager(self, parent_dialog=None):
         """Opens or brings the Sync Chains Manager to the foreground directly with Main < Settings < Sync stacking."""

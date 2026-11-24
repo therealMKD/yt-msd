@@ -1,10 +1,13 @@
 """The windows regression harness.
 
-Sections WN-A..WN-G cover the windows half of `GUI Source Code/yt-msd-gui.pyw`: the settings window
+Sections WN-A..WN-J cover the windows half of `GUI Source Code/yt-msd-gui.pyw`: the settings window
 and where each of its controls writes, the three windows that build a sync chain (host, client,
 removable drive), the sync manager that lists and pauses and removes them, the playlist picker, the
-tray progress bubble, the three update windows, the rename-from-metadata window, and the two things
-the program promises the machine - which file Windows is told to start, and which yt-dlp it looks for.
+tray progress bubble, the three update windows, the rename-from-metadata window, the two things
+the program promises the machine - which file Windows is told to start, and which yt-dlp it looks for
+- the question a sync asks before it deletes more than its chain allows, and the window that searches
+the network for a host along with the once-only notice a Host is given about chains that were already
+visible when this choice existed.
 
 Recipe (AI Readme section 20): the `.pyw` is copied to a throwaway `.py` in this folder's `copy/` and
 imported, and the windows are driven directly against a stand-in for the main window they are opened
@@ -39,6 +42,7 @@ import time
 from pathlib import Path
 
 from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QWidget
+from PySide6.QtCore import QThread
 
 HERE = os.path.dirname(os.path.abspath(__file__))              # .../GUI Source Code/GUI Test Suite
 SRC = os.path.join(os.path.dirname(HERE), "yt-msd-gui.pyw")    # the master copy, one folder up
@@ -197,6 +201,7 @@ class _Answers:
     answer_yes = True
     asked = []
     warned = []
+    told = []
     Yes = 1
     No = 0
     Critical = 16
@@ -212,12 +217,19 @@ class _Answers:
     def warning(cls, parent, title, text, *args, **kwargs):
         cls.warned.append((title, text))
 
+    @classmethod
+    def information(cls, parent, title, text, *args, **kwargs):
+        # A notice rather than a question: the window it is on is recorded too, because where a box
+        # opens is part of what a notice is supposed to do.
+        cls.told.append((parent, title, text))
+
 
 def answering(answer_yes, drive):
     """Run `drive`, with confirmations answered `answer_yes` and warnings recorded."""
     _Answers.answer_yes = answer_yes
     _Answers.asked.clear()
     _Answers.warned.clear()
+    _Answers.told.clear()
     seam.patch("QMessageBox", _Answers)
     try:
         return drive()
@@ -477,6 +489,23 @@ answering(True, lambda: _GUARD_DLG._connect_chain())
 check("WN-B17 the number typed into that box is the number the chain is saved with",
       CM.client_chains[-1]["delete_confirm_limit"] == 4, CM.client_chains[-1])
 
+_vis_dlg = mod.CreateHostChainDialog(None, CM)
+check("WN-B18 a hosted chain being made is asked whether it tells the network it exists, and Visible is what it is offered",
+      _vis_dlg.visible_check.isChecked() and _vis_dlg.visible_check.text().startswith("Visible"),
+      (_vis_dlg.visible_check.text(), _vis_dlg.visible_check.isChecked()))
+_vis_dlg.name_edit.setText("Study Mix")
+_vis_dlg.folder_edit.setText(str(HOST_FOLDER))
+_vis_dlg._update_file_count(str(HOST_FOLDER))
+_vis_dlg.visible_check.setChecked(False)
+answering(True, lambda: _vis_dlg._create_chain())
+check("WN-B19 and unchecking it saves a chain that says, in the config file, that it is private",
+      CM.hosted_chains[-1]["name"] == "Study Mix" and CM.hosted_chains[-1]["visible"] is False
+      and mod.SyncConfigManager(str(CHAINS_CFG)).hosted_chains[-1]["visible"] is False,
+      CM.hosted_chains[-1])
+check("WN-B20 a chain made without touching that box is saved as visible, which is what every chain this program made before it existed already was",
+      mod.SyncConfigManager(str(CHAINS_CFG)).hosted_chains[0]["visible"] is True,
+      mod.SyncConfigManager(str(CHAINS_CFG)).hosted_chains)
+
 # ===========================================================================
 # WN-C: the window that runs the chains
 # ===========================================================================
@@ -688,6 +717,52 @@ check("WN-C25 a chain saved by a build that had no such number gets the box anyw
       _OLD_SPIN is not None and _OLD_SPIN.value() == mod.DEFAULT_DELETE_CONFIRM_LIMIT, _OLD_SPIN)
 _OLD_DLG.accept()
 
+_VIS_CFG = fixture("hosted visibility")
+_VIS_CM = mod.SyncConfigManager(str(_VIS_CFG))
+_OPEN_CHAIN = _VIS_CM.add_hosted_chain("Open Mix", str(HOST_FOLDER), "4510")
+_SHUT_CHAIN = _VIS_CM.add_hosted_chain("Study Mix", str(HOST_FOLDER), "4511", visible=False)
+seam.patch("get_local_ip", lambda: "192.0.2.11")
+seam.patch("get_current_wifi_ssid", lambda: "patched network")
+_vis_app = AppStandIn(sync_config_manager=_VIS_CM)
+_VIS_DLG = QuietSyncDialog(_vis_app)
+check("WN-C26 a hosted chain's card says out loud whether a search can find it, and offers the other answer as a button",
+      any(text == "Visible" for text in _texts(_card_for(_VIS_DLG, _OPEN_CHAIN["id"])))
+      and any(text == "Make Private" for text in _button_texts(_card_for(_VIS_DLG, _OPEN_CHAIN["id"])))
+      and any(text == "Private" for text in _texts(_card_for(_VIS_DLG, _SHUT_CHAIN["id"])))
+      and any(text == "Make Visible" for text in _button_texts(_card_for(_VIS_DLG, _SHUT_CHAIN["id"]))),
+      (_button_texts(_card_for(_VIS_DLG, _OPEN_CHAIN["id"])),
+       _texts(_card_for(_VIS_DLG, _SHUT_CHAIN["id"]))))
+_make_private = [btn for btn in _card_for(_VIS_DLG, _OPEN_CHAIN["id"]).findChildren(QPushButton)
+                 if btn.text() == "Make Private"]
+_make_private[0].click()
+check("WN-C27 pressing Make Private writes the decision into the chain and rebuilds the card so it now says Private",
+      mod.SyncConfigManager(str(_VIS_CFG)).hosted_chains[0]["visible"] is False
+      and any(text == "Private" for text in _texts(_card_for(_VIS_DLG, _OPEN_CHAIN["id"])))
+      and any(text == "Make Visible" for text in _button_texts(_card_for(_VIS_DLG, _OPEN_CHAIN["id"]))),
+      (_button_texts(_card_for(_VIS_DLG, _OPEN_CHAIN["id"])),
+       mod.SyncConfigManager(str(_VIS_CFG)).hosted_chains))
+check("WN-C28 and it asks nobody to re-arm the watchers while doing it, because a host answers a search by re-reading its chains",
+      _vis_app.called("refresh_sync_watchers") == 0, _vis_app.calls)
+_make_private = [btn for btn in _card_for(_VIS_DLG, _SHUT_CHAIN["id"]).findChildren(QPushButton)
+                 if btn.text() == "Make Visible"]
+_make_private[0].click()
+check("WN-C29 and the other way round works too, so a chain is not committed to the first answer given it",
+      mod.SyncConfigManager(str(_VIS_CFG)).hosted_chains[1]["visible"] is True
+      and any(text == "Visible" for text in _texts(_card_for(_VIS_DLG, _SHUT_CHAIN["id"]))),
+      mod.SyncConfigManager(str(_VIS_CFG)).hosted_chains)
+_VIS_DLG.accept()
+_LEGACY_CFG = fixture("hosted chain saved before visibility")
+(_LEGACY_CFG / "gui_config.json").write_text(json.dumps({"hosted_chains": [
+    {"id": "hc_2580", "sync_code": "2580", "name": "Made by 3.2", "folder_path": str(HOST_FOLDER),
+     "notify_delay_mins": 5, "created_at": 0, "last_synced": 0, "status": "Active"}]}), encoding="utf-8")
+_legacy_dlg = QuietSyncDialog(AppStandIn(sync_config_manager=mod.SyncConfigManager(str(_LEGACY_CFG))))
+check("WN-C30 a hosted chain saved by a build that had no such choice shows as Visible, because visible is what it already was",
+      any(text == "Visible" for text in _texts(_card_for(_legacy_dlg, "hc_2580")))
+      and any(text == "Make Private" for text in _button_texts(_card_for(_legacy_dlg, "hc_2580"))),
+      (_texts(_card_for(_legacy_dlg, "hc_2580")), _button_texts(_card_for(_legacy_dlg, "hc_2580"))))
+_legacy_dlg.accept()
+seam.restore("get_local_ip")
+seam.restore("get_current_wifi_ssid")
 
 # ===========================================================================
 # WN-D: the smaller windows
@@ -1175,6 +1250,217 @@ check("WN-I9 the gate is a signal MainApp declares and a pair of methods it owns
       "Signal" in type(getattr(mod.MainApp, "sync_confirm_signal")).__name__
       and "ask_sync_confirm" in dir(mod.MainApp) and "_on_sync_confirm" in dir(mod.MainApp),
       type(getattr(mod.MainApp, "sync_confirm_signal")).__name__)
+
+# ===========================================================================
+# WN-J: finding a host without being told where it is
+# ===========================================================================
+# What a host answers a search, and what a scan makes of that answer, is proved in probe_sync (SY-N),
+# where loopback sockets stand in for the network. What is proved here is the window that hands the
+# job over and then uses what comes back: the boxes it fills in, the port it remembers, the thread it
+# will not let outlive it, and the once-only notice a Host is given about chains that were already
+# visible before this choice existed.
+_scan_dlg = mod.ConnectClientChainDialog(None, CM)
+check("WN-J1 joining a chain is offered a search of the network as well as an address to type",
+      _scan_dlg.scan_btn.text() == "Find Hosts On My Network"
+      and not _scan_dlg.host_list.isVisibleTo(_scan_dlg)
+      and not _scan_dlg.host_list_label.isVisibleTo(_scan_dlg),
+      (_scan_dlg.scan_btn.text(), _scan_dlg.host_list.isVisibleTo(_scan_dlg)))
+_scan_dlg._on_scan_host({"ip": "192.168.1.50", "port": 63351, "sync_code": "4821",
+                         "chain_name": "Rock Classics", "visible": True, "host_name": "KITCHEN",
+                         "advertised": True})
+check("WN-J2 a host the search found goes on the list, and the first one found is picked without being asked for",
+      _scan_dlg.host_list.count() == 1 and _scan_dlg.host_list.isVisibleTo(_scan_dlg)
+      and _scan_dlg.host_list.currentItem() is _scan_dlg.host_list.item(0)
+      and "192.168.1.50:63351" in _scan_dlg.host_list.item(0).text(),
+      _scan_dlg.host_list.item(0).text())
+check("WN-J3 and picking a host puts its address, its code and its chain name into the boxes a chain is made from",
+      _scan_dlg.ip_edit.text() == "192.168.1.50" and _scan_dlg.code_edit.text() == "4821"
+      and _scan_dlg.playlist_name_edit.text() == "Rock Classics",
+      (_scan_dlg.ip_edit.text(), _scan_dlg.code_edit.text(), _scan_dlg.playlist_name_edit.text()))
+_scan_dlg._on_scan_host({"ip": "192.168.1.77", "port": 63350, "sync_code": "7788",
+                         "chain_name": "Study", "visible": False, "host_name": "STUDY",
+                         "advertised": True})
+check("WN-J4 a private chain says it is private on the list, so what was found is not mistaken for what is open",
+      "private" in _scan_dlg.host_list.item(1).text(), _scan_dlg.host_list.item(1).text())
+_scan_dlg._on_scan_host({"ip": "192.168.1.9", "port": 63350, "sync_code": "", "chain_name": "",
+                         "visible": True, "host_name": "OLD-PC", "advertised": False})
+check("WN-J5 a host that will not name its chains is listed as the host it is, with the code left to the user",
+      "older version" in _scan_dlg.host_list.item(2).text()
+      and "type its sync code" in _scan_dlg.host_list.item(2).text(),
+      _scan_dlg.host_list.item(2).text())
+_scan_dlg.host_list.setCurrentRow(1)
+check("WN-J6 picking a different host takes the boxes back and fills them in again",
+      _scan_dlg.ip_edit.text() == "192.168.1.77" and _scan_dlg.code_edit.text() == "7788",
+      (_scan_dlg.ip_edit.text(), _scan_dlg.code_edit.text()))
+_scan_dlg.host_list.setCurrentRow(0)
+_scan_dlg.folder_edit.setText(str(CLIENT_BASE))
+_scan_dlg.playlist_name_edit.setText("Found Mix")
+answering(True, lambda: _scan_dlg._connect_chain())
+check("WN-J7 the port a host was found answering on is saved with the chain, because a host takes the first free port and 63351 is not 63350",
+      CM.client_chains[-1]["host_port"] == 63351
+      and CM.client_chains[-1]["last_known_host_ip"] == "192.168.1.50", CM.client_chains[-1])
+_scan_dlg.ip_edit.setText("192.0.2.88")
+_scan_dlg.playlist_name_edit.setText("Typed In")
+answering(True, lambda: _scan_dlg._connect_chain())
+check("WN-J8 and an address typed in afterwards is not quietly given the port of the address the search picked",
+      CM.client_chains[-1]["host_port"] == seam.original("SYNC_PORT_START")
+      and CM.client_chains[-1]["last_known_host_ip"] == "192.0.2.88", CM.client_chains[-1])
+_scan_dlg.reject()
+
+
+class _ConnectedSignal:
+    """A signal a window can connect to, that records what was connected rather than emitting."""
+
+    def __init__(self):
+        self.handlers = []
+
+    def connect(self, handler):
+        self.handlers.append(handler)
+
+
+class _ScanStub:
+    """A HostScanThread that does not search, so the window's handling of it can be watched.
+
+    Letting the real one run here would put a search for real hosts onto this machine's network,
+    which is the one thing this suite keeps out of the suite. What is watched instead is that the
+    window hands the job over, says it is doing it, and stops it before the window goes away.
+    """
+
+    def __init__(self, requested_code='', parent=None):
+        self.requested_code = str(requested_code)
+        self.parent = parent
+        self.started = False
+        self.interrupted = False
+        self.waited_for = None
+        self.host_found = _ConnectedSignal()
+        self.scan_finished = _ConnectedSignal()
+
+    def start(self):
+        self.started = True
+
+    def requestInterruption(self):
+        self.interrupted = True
+
+    def wait(self, milliseconds):
+        self.waited_for = milliseconds
+
+
+check("WN-J9 the search is a thread of its own, so searching the network cannot hold the window still",
+      issubclass(seam.original("HostScanThread"), QThread), seam.original("HostScanThread"))
+seam.patch("HostScanThread", _ScanStub)
+_thread_dlg = mod.ConnectClientChainDialog(None, CM)
+_thread_dlg.code_edit.setText("4821")
+_thread_dlg._start_scan()
+_running_scan = _thread_dlg._scan_thread
+check("WN-J10 pressing the search hands the job to that thread, carrying the code already typed so a private chain answers it",
+      isinstance(_running_scan, _ScanStub) and _running_scan.started
+      and _running_scan.requested_code == "4821", _running_scan.requested_code)
+check("WN-J11 and the window says it is searching, and will not start a second search while the first is going",
+      not _thread_dlg.scan_btn.isEnabled() and "Searching" in _thread_dlg.scan_btn.text(),
+      (_thread_dlg.scan_btn.text(), _thread_dlg.scan_btn.isEnabled()))
+_thread_dlg.reject()
+check("WN-J12 closing the window stops a search still running and waits for it, because a thread that outlives its window takes the program with it",
+      _thread_dlg._scan_thread is None and _running_scan.interrupted and _running_scan.waited_for == 3000,
+      (_running_scan.interrupted, _running_scan.waited_for))
+_thread_dlg._on_scan_done(0, "finished")
+check("WN-J13 a search that found nothing says what to check, rather than leaving an empty list and a silent window",
+      "No host found" in _thread_dlg.scan_status.text()
+      and "Visible" in _thread_dlg.scan_status.text(), _thread_dlg.scan_status.text())
+_thread_dlg._on_scan_done(2, "finished")
+check("WN-J14 and the button is ready to be pressed again afterwards either way",
+      _thread_dlg.scan_btn.isEnabled() and "2 host" in _thread_dlg.scan_status.text(),
+      (_thread_dlg.scan_btn.text(), _thread_dlg.scan_status.text()))
+seam.restore("HostScanThread")
+check("WN-J15 the search this section stood in for is back with the program",
+      not seam.is_patched("HostScanThread")
+      and "yt_msd.sync.discovery" in seam.owned_by("HostScanThread"),
+      seam.owned_by("HostScanThread"))
+
+
+class _NoticeManager:
+    """The sync config the startup notice reads and writes, with no config file behind it."""
+
+    def __init__(self, hosted_chains, settings=None):
+        self.hosted_chains = hosted_chains
+        self.settings = settings if settings is not None else dict(mod.DEFAULT_SYNC_SETTINGS)
+        self.saves = 0
+
+    def save(self):
+        self.saves += 1
+
+
+class _EmittedSignal:
+    def __init__(self):
+        self.emitted = []
+
+    def emit(self, title, body):
+        self.emitted.append((title, body))
+
+
+class _NoticeApp:
+    """Both halves of the startup notice, taken from MainApp with no main window behind them."""
+
+    _notify_legacy_visible_chains = mod.MainApp._notify_legacy_visible_chains
+    _on_chain_visibility_notice = mod.MainApp._on_chain_visibility_notice
+
+    def __init__(self, manager):
+        self.sync_config_manager = manager
+        self.sync_manager_dialog = None
+        self.chain_visibility_signal = _EmittedSignal()
+        self.emitted = self.chain_visibility_signal.emitted
+
+
+_legacy_manager = _NoticeManager([{"id": "hc_2580", "sync_code": "2580", "name": "Made by 3.2"},
+                                  {"id": "hc_1111", "sync_code": "1111", "name": "Made by 3.5",
+                                   "visible": True}])
+_notice_app = _NoticeApp(_legacy_manager)
+_notice_app._notify_legacy_visible_chains()
+check("WN-J16 a Host still holding chains saved before this choice existed is told about them, by name and by code",
+      len(_notice_app.emitted) == 1 and "Made by 3.2" in _notice_app.emitted[0][1]
+      and "2580" in _notice_app.emitted[0][1] and "Made by 3.5" not in _notice_app.emitted[0][1],
+      _notice_app.emitted)
+check("WN-J17 the notice says where the choice is, because a privacy setting nobody can find is not one",
+      "Make Private" in _notice_app.emitted[0][1], _notice_app.emitted[0][1])
+check("WN-J18 and it is marked as given and saved before it is opened, so it is a notice and not something read every launch",
+      _legacy_manager.settings[mod.VISIBILITY_NOTICE_SETTING] is True and _legacy_manager.saves == 1,
+      (_legacy_manager.settings, _legacy_manager.saves))
+_notice_app._notify_legacy_visible_chains()
+check("WN-J19 the next launch is silent", len(_notice_app.emitted) == 1 and _legacy_manager.saves == 1,
+      _legacy_manager.saves)
+_new_manager = _NoticeManager([{"id": "hc_9090", "sync_code": "9090", "name": "Made by 3.5",
+                                "visible": False}])
+_new_app = _NoticeApp(_new_manager)
+_new_app._notify_legacy_visible_chains()
+check("WN-J20 a machine whose chains all carry the choice is told nothing, and nothing is written for it",
+      _new_app.emitted == [] and _new_manager.saves == 0, (_new_app.emitted, _new_manager.saves))
+_no_chains_app = _NoticeApp(_NoticeManager([]))
+_no_chains_app._notify_legacy_visible_chains()
+check("WN-J21 and a machine hosting nothing is told nothing either", _no_chains_app.emitted == [],
+      _no_chains_app.emitted)
+answering(True, lambda: _notice_app._on_chain_visibility_notice("a title", "a body"))
+check("WN-J22 the notice is opened as a box on the main window, and not as a question the user has to answer",
+      len(_Answers.told) == 1 and _Answers.told[0][0] is None and _Answers.told[0][2] == "a body"
+      and _Answers.asked == [], (_Answers.told, _Answers.asked))
+_open_dialog = QWidget()
+_open_dialog.show()
+_dialog_app = _NoticeApp(_NoticeManager([]))
+_dialog_app.sync_manager_dialog = _open_dialog
+answering(True, lambda: _dialog_app._on_chain_visibility_notice("a title", "a body"))
+check("WN-J23 and it opens on the Sync Chains window when that window is already open, because that is where the button it names is",
+      _Answers.told[0][0] is _open_dialog, _Answers.told)
+_open_dialog.hide()
+check("WN-J24 the notice is a signal MainApp declares and a pair of methods it owns, so the startup check has somewhere to put it",
+      "Signal" in type(getattr(mod.MainApp, "chain_visibility_signal")).__name__
+      and "_notify_legacy_visible_chains" in dir(mod.MainApp)
+      and "_on_chain_visibility_notice" in dir(mod.MainApp),
+      type(getattr(mod.MainApp, "chain_visibility_signal")).__name__)
+_bootstrap_attrs = {node.attr for node in ast.walk(ast.parse(
+    (Path(SRC_DIR) / "yt_msd" / "ui" / "bootstrap.py").read_text(encoding="utf-8")))
+    if isinstance(node, ast.Attribute)}
+check("WN-J25 and it is wired where the sync subsystem is built: the signal is connected, and the check is scheduled",
+      "_on_chain_visibility_notice" in _bootstrap_attrs
+      and "_notify_legacy_visible_chains" in _bootstrap_attrs,
+      sorted(name for name in _bootstrap_attrs if "visibility" in name))
 
 shutil.rmtree(FIXTURE_ROOT, ignore_errors=True)
 check("WN-F9 every folder this suite wrote is gone again", not FIXTURE_ROOT.exists())
