@@ -1186,8 +1186,20 @@ class MainApp(BootstrapMixin,
             vlc_error = getattr(sys.modules[__name__], '_VLC_IMPORT_ERROR', 'python-vlc not available')
         else:
             try:
+                # This is the part of starting the program that a pick made right after launch has
+                # to queue behind: libVLC reads its own plugins - 363 files, 139 MB, beside the
+                # program in the compiled build - before it can hold media. Three launches of this
+                # build, timed by the line below: 0.29 s when those files had been read recently,
+                # 10.5 s a minute after a rebuild had rewritten every one of them, and over 20 s on
+                # the launch straight after it. Whatever is being waited for, play_result() and
+                # _on_local_click() hold the pick until this finishes - the line below is what makes
+                # that wait measurable on someone's machine instead of guessed at from a report.
+                _vlc_started_at = time.monotonic()
                 instance = vlc.Instance('--quiet', '--no-video')
                 player = instance.media_player_new() if instance else None
+                if trace.enabled():
+                    trace.note("libVLC ready after %.2f s of plugin scanning"
+                               % (time.monotonic() - _vlc_started_at))
                 # Switch to main-thread ownership safely
                 self.vlc_instance = instance
                 self.vlc_player = player
@@ -1217,6 +1229,8 @@ class MainApp(BootstrapMixin,
             )
         if missing:
             self.missing_deps_signal.emit("<br><br>".join(missing))
+        if vlc_error and trace.enabled():
+            trace.note("libVLC did not start: %s" % vlc_error)
 
     def load_config(self):
         default_dl = os.path.join(os.path.expanduser("~"), "Downloads")
@@ -2733,8 +2747,10 @@ class MainApp(BootstrapMixin,
         else:
             # If VLC is still initializing in background, retry after a short delay
             if not getattr(self, '_vlc_ready', False):
+                self._note_waiting_for_player()
                 QTimer.singleShot(200, lambda: self._on_local_click(item, paused_at_start, from_nav))
                 return
+            self._vlc_ready_waits = 0   # as in play_result: a pick that got through ends the count
             if self.vlc_instance is None or self.vlc_player is None:
                 self._on_status_update("Playback unavailable: VLC Media Player is not installed.", False, "#E31E24")
                 return
@@ -4708,11 +4724,31 @@ class MainApp(BootstrapMixin,
         if getattr(self, 'stop_after_current', STOP_AFTER_OFF) == STOP_AFTER_ONCE:
             self.set_stop_after_current(STOP_AFTER_OFF)
 
+    def _note_waiting_for_player(self):
+        """Say so when a pick is being held because the player is still being started.
+
+        play_result() and _on_local_click() both re-try a pick every 200 ms while the background
+        thread in __init__ finishes setting libVLC up. The pick is never lost - it runs the moment
+        the player exists - but until this was added nothing on screen changed while it waited, so
+        a pick made during a slow launch read as a click that did nothing. One line when the waiting
+        starts and then one every five seconds: enough that the pause is explained, not enough to
+        repeat itself. --trace gets the same lines, which is how the length of that wait is measured
+        on someone else's machine instead of estimated from a report.
+        """
+        waits = getattr(self, '_vlc_ready_waits', 0) + 1
+        self._vlc_ready_waits = waits
+        if waits == 1 or waits % 25 == 0:        # once, then every five seconds of retries
+            self._on_status_update("Starting the player - one moment...", False, "#3B8ED0")
+            if trace.enabled():
+                trace.note("holding the pick: libVLC still starting (%.1f s so far)" % (waits * 0.2))
+
     def play_result(self, video, paused_at_start=False, from_nav=False):
         # If VLC is still initializing in background, defer and retry
         if not getattr(self, '_vlc_ready', False):
+            self._note_waiting_for_player()
             QTimer.singleShot(200, lambda: self.play_result(video, paused_at_start, from_nav))
             return
+        self._vlc_ready_waits = 0   # this pick got through; a later wait starts its counting again
         if self.vlc_instance is None or self.vlc_player is None:
             self._on_status_update("Playback unavailable: VLC Media Player is not installed.", False, "#E31E24")
             return

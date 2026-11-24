@@ -256,6 +256,9 @@ class BootstrapMixin:
         self.vlc_instance = None
         self.vlc_player = None
         self._vlc_ready = False
+        # How many 200 ms retries one pick has waited for the thread below. Only used to thin what
+        # the window says while it waits - see _note_waiting_for_player.
+        self._vlc_ready_waits = 0
 
         self.setup_ui()
         self.apply_theme()

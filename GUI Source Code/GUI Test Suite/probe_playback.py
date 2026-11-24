@@ -2772,6 +2772,79 @@ check("AE6 every one of these numbers is a single object wherever it is held, wh
       {_name: seam.owned_by(_name) for _name, _holders in _number_holders.items()})
 
 
+print("AF. a track picked while the player is still starting is held, and says so")
+patch_resolve()
+RESOLVE_CALLS.clear()
+app = make_app(index=0, vid="vid0", shadow_play=False)
+app._vlc_ready = False                       # exactly how the window starts: the thread has not finished
+app.play_result(app.search_results[2])
+check("AF1 nothing is fetched and nothing is handed to VLC while libVLC is still being started",
+      RESOLVE_CALLS == [] and not app.vlc_instance.medias, (RESOLVE_CALLS, app.vlc_instance.medias))
+check("AF2 the hold is announced - the difference between a wait and a dead click",
+      any("Starting the player" in text for text, _p, _c in app.status_messages), app.status_messages)
+check("AF3 announced once, not once per 200 ms retry", len(app.status_messages) == 1, app.status_messages)
+for _ in range(23):
+    app._note_waiting_for_player()
+check("AF4 four and a half seconds of retries adds nothing", len(app.status_messages) == 1, app.status_messages)
+app._note_waiting_for_player()               # the 25th retry: five seconds of waiting
+check("AF5 and it is said again on the five-second mark", len(app.status_messages) == 2, app.status_messages)
+check("AF6 the retries are counted on the window, so they can be thinned this way",
+      app._vlc_ready_waits == 25, app._vlc_ready_waits)
+app._vlc_ready = True
+app.play_result(app.search_results[2])
+check("AF7 the pick that was held runs as soon as the player exists",
+      wait_for(lambda: app.vlc_instance.medias) and RESOLVE_CALLS == ["vid2"],
+      (RESOLVE_CALLS, app.vlc_instance.medias))
+check("AF8 the counting restarts, so a later wait would announce itself too",
+      app._vlc_ready_waits == 0, app._vlc_ready_waits)
+RESOLVE_CALLS.clear()
+app_nowait = make_app(shadow_play=False)
+app_nowait.play_result(app_nowait.search_results[1])
+check("AF9 a pick made after the player was ready says nothing about waiting",
+      RESOLVE_CALLS == ["vid1"]
+      and not any("Starting the player" in text for text, _p, _c in app_nowait.status_messages),
+      (RESOLVE_CALLS, app_nowait.status_messages))
+
+
+class _CapturedStdout:
+    """sys.stdout for two checks: what --trace would have printed for this wait."""
+    def __init__(self):
+        self.text = ""
+
+    def write(self, text):
+        self.text += text
+        return len(text)
+
+    def flush(self):
+        pass
+
+
+_trace_level_as_it_was = mod.trace.get_level()
+_stdout_as_it_was, sys.stdout = sys.stdout, _CapturedStdout()
+mod.trace.set_level(1)
+app_traced = make_app(shadow_play=False)
+app_traced._vlc_ready = False
+app_traced._note_waiting_for_player()
+mod.trace.set_level(0)
+app_traced._note_waiting_for_player()        # the same wait again, with --trace off
+_captured_wait = sys.stdout.text
+sys.stdout = _stdout_as_it_was
+mod.trace.set_level(_trace_level_as_it_was)
+check("AF10 --trace records the pick it is holding and for how long",
+      "holding the pick" in _captured_wait and "s so far" in _captured_wait, _captured_wait)
+check("AF11 with the trace off the same wait prints not one character",
+      _captured_wait.count("holding the pick") == 1, _captured_wait)
+check("AF12 both ways of picking a track - a search row and a local file - hold it the same way",
+      _source.count("self._note_waiting_for_player()") == 2,
+      _source.count("self._note_waiting_for_player()"))
+check("AF13 the player's own startup is timed where it happens, and only asks for the line when tracing",
+      "trace.note(\"libVLC ready after" in _source
+      and "_vlc_started_at = time.monotonic()" in _source)
+check("AF14 and the wait is measured from the retry, not from a guess about how long VLC takes",
+      "trace.note(\"holding the pick" in _source)
+unpatch()
+
+
 print(f"{CHECKS - len(FAILS)} / {CHECKS} checks passed")
 if FAILS:
     print("FAILED: " + "; ".join(FAILS))

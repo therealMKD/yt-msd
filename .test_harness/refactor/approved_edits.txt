@@ -85,6 +85,7 @@ NEW	"""One argument as it would have to be written in a terminal to mean the sam
 NEW	"""One line a helper program printed. chatter=True is the thinning-eligible kind."""
 NEW	"""One line saying what an extraction actually brought back.
 NEW	"""Read --trace / -v / --trace=all out of a command line and set the level.
+NEW	"""Say so when a pick is being held because the player is still being started.
 NEW	"""Set the level directly. The suite uses this to restore the gate after changing it."""
 NEW	"""Take the settings MainApp holds. This is the one place that decides when a custom
 NEW	"""The audio half of the yt-msd GUI package: tuning, tagging, probing, normalizing, renaming."""
@@ -102,6 +103,7 @@ NEW	"""scheme://host of a URL and nothing else from it - see WHAT NEVER APPEARS 
 NEW	"all": ALL_LEVEL}.get(wanted, max(level, WORK_LEVEL))
 NEW	% ("on" if TUNING.silence_trim else "off", TUNING.silence_pad_dur,
 NEW	% (result.returncode, trace.tail(result.stderr)))
+NEW	% (time.monotonic() - _vlc_started_at))
 NEW	% (time.monotonic() - started))
 NEW	("%sk" % bitrate) if bitrate else "?k"]
 NEW	1. silence trim    - _silence_trim_filters(), gated by the TUNING.silence_trim setting
@@ -148,10 +150,12 @@ NEW	_level[0] = level
 NEW	_lock = threading.Lock()        # background threads ask for lines at the same moment
 NEW	_progress_at = [0.0]            # when progress chatter was last echoed
 NEW	_progress_at[0] = now
+NEW	_vlc_started_at = time.monotonic()
 NEW	_write("      -> %s" % text)
 NEW	_write("      | %s" % line)
 NEW	_write("  %s" % text)
 NEW	_write(line)
+NEW	a pick made during a slow launch read as a click that did nothing. One line when the waiting
 NEW	and the line is what it looks like to run it.
 NEW	args.append("--trace" if trace.get_level() == trace.WORK_LEVEL else "--trace=all")
 NEW	base = program_folder()
@@ -168,6 +172,7 @@ NEW	class Tuning:
 NEW	def __init__(self):
 NEW	def _emit(prefix, tokens):
 NEW	def _extracted_summary(info, seconds):
+NEW	def _note_waiting_for_player(self):
 NEW	def _quoted(arg):
 NEW	def _sink():
 NEW	def _write(text):
@@ -227,6 +232,8 @@ NEW	if stream is None or not hasattr(stream, "write"):
 NEW	if stream is None:
 NEW	if trace.enabled():
 NEW	if trace.tracing_all():
+NEW	if vlc_error and trace.enabled():
+NEW	if waits == 1 or waits % 25 == 0:        # once, then every five seconds of retries
 NEW	in.
 NEW	indent = " " * (len(prefix) + 1)
 NEW	info = json.loads(result_stdout or "")
@@ -245,6 +252,7 @@ NEW	module's own `__file__` names a folder inside the package instead of the one
 NEW	named = sum(1 for e in entries if isinstance(e, dict) and entry_channel_name(e))
 NEW	new_duration = _get_audio_duration(filepath) if TUNING.silence_trim else None
 NEW	now = time.monotonic()
+NEW	on someone else's machine instead of estimated from a report.
 NEW	one token and is never broken in half, and no token is dropped. The wrapping is presentation,
 NEW	orig_duration = _get_audio_duration(filepath) if TUNING.silence_trim else None
 NEW	override = (custom_norm_cmd or "").strip()
@@ -253,9 +261,11 @@ NEW	own `__file__` is a module inside the package rather than the program - whic
 NEW	pad_added = TUNING.silence_pad_dur if TUNING.silence_pad_dur > 0 else 0.0
 NEW	parts.append(f"apad=pad_dur={TUNING.silence_pad_dur}")
 NEW	pass
+NEW	play_result() and _on_local_click() both re-try a pick every 200 ms while the background
 NEW	print(f"{Colors.BOLD}Using {TUNING.max_workers} CPU Threads for Processing{Colors.END}\n")
 NEW	print(f"{Colors.DIM}Silence trim: {'ON' if TUNING.silence_trim else 'OFF'} | End pad: {TUNING.silence_pad_dur}s | Loudnorm: {TUNING.custom_norm_cmd or 'built-in whole-track gain'}{Colors.END}\n")
 NEW	print(f"{Colors.GREEN}Starting static volume adjustment on {len(files)} files with {TUNING.max_workers} worker threads...{Colors.END}")
+NEW	repeat itself. --trace gets the same lines, which is how the length of that wait is measured
 NEW	return
 NEW	return " | ".join(lines[-limit:]) if lines else ""
 NEW	return ""
@@ -277,6 +287,12 @@ NEW	return os.path.abspath(sys.executable)
 NEW	return os.path.dirname(started_as) if started_as else ""
 NEW	return stream
 NEW	script_path = program_file()
+NEW	self._note_waiting_for_player()
+NEW	self._on_status_update("Starting the player - one moment...", False, "#3B8ED0")
+NEW	self._vlc_ready_waits = 0
+NEW	self._vlc_ready_waits = 0   # as in play_result: a pick that got through ends the count
+NEW	self._vlc_ready_waits = 0   # this pick got through; a later wait starts its counting again
+NEW	self._vlc_ready_waits = waits
 NEW	self.config_dir = program_folder()
 NEW	self.custom_norm_cmd = DEFAULT_CUSTOM_NORM_CMD
 NEW	self.custom_norm_cmd = override if (use_custom_norm_cmd and override) else ""
@@ -289,6 +305,7 @@ NEW	self.use_custom_norm_cmd, self.custom_norm_cmd)
 NEW	size = chosen.get("filesize") or chosen.get("filesize_approx")
 NEW	started = time.monotonic()
 NEW	started_as = program_file()
+NEW	starts and then one every five seconds: enough that the pause is explained, not enough to
 NEW	startup registry entry point at yt_msd/sync/startup.py, a file that starts nothing.
 NEW	str(chosen.get("acodec") or "no audio"),
 NEW	str(chosen.get("ext") or "?"),
@@ -300,7 +317,9 @@ NEW	stream.write(text.encode("ascii", "replace").decode("ascii") + "\n")
 NEW	sys.argv = trace.parse_flags(sys.argv)
 NEW	text = str(arg)
 NEW	the file the program was started as - the .pyw in the source tree, the exe once installed. It
+NEW	the player exists - but until this was added nothing on screen changed while it waited, so
 NEW	the renamer's argparse. Called from the entry block and from the renamer's own entry, which
+NEW	thread in __init__ finishes setting libVLC up. The pick is never lost - it runs the moment
 NEW	title = info.get("title") or info.get("id") or "no title"
 NEW	together are every way a copy of this program starts.
 NEW	tokens with an expiry stamped on it - and trace output gets pasted into issue reports the way
@@ -317,6 +336,9 @@ NEW	trace.command("update swap", ["cmd.exe", "/c", swap_path])
 NEW	trace.command("winget", [winget] + list(args))
 NEW	trace.command("yt-dlp", [exe, "--version"])
 NEW	trace.command("yt-dlp", [exe] + list(args))
+NEW	trace.note("holding the pick: libVLC still starting (%.1f s so far)" % (waits * 0.2))
+NEW	trace.note("libVLC did not start: %s" % vlc_error)
+NEW	trace.note("libVLC ready after %.2f s of plugin scanning"
 NEW	trace.note("renamer settings: silence trim %s, end pad %.1fs, %d worker threads, loudnorm %s"
 NEW	trace.result("cancelled after %.1fs" % (time.monotonic() - started))
 NEW	trace.result("could not run ffmpeg: %s" % e)
@@ -339,6 +361,7 @@ NEW	trace.result("winget did not run: %s" % e)
 NEW	trace.result(_extracted_summary(info, time.monotonic() - started))
 NEW	trim_on = TUNING.silence_trim if include_silence_trim is None else include_silence_trim
 NEW	try:
+NEW	waits = getattr(self, '_vlc_ready_waits', 0) + 1
 NEW	wanted = arg.split("=", 1)[1].strip().lower()
 NEW	window launches cannot keep running with pre-reset values."""
 NEW	with ThreadPoolExecutor(max_workers=TUNING.max_workers) as executor:
