@@ -246,8 +246,29 @@ class LayoutMixin:
         self.vol_slider.valueChanged.connect(self.on_volume_changed)
         c.addWidget(self.vol_slider)
         
-        self.vol_pct = VolLabel(f"{self.volume_val}%")
-        self.vol_pct.setFixedWidth(50)
+        # The percentage is typed as well as dragged. The number is what everything else in the
+        # program works in - the tray presets, the saved config, libVLC itself - so a listener who
+        # wants exactly 73% should be able to say 73 instead of hunting for it along a 100 px
+        # slider. The box is a route to that number rather than a caption of it: it shows the "73%"
+        # the slider earns, the click that focuses it takes the whole of it (so typing replaces the
+        # number instead of editing around the digits that were there), and it commits on Enter or
+        # the moment the click goes anywhere else in the window - which is the same moment its caret
+        # goes, because that click is the focus-out that MainApp._release_typing_focus answers with.
+        class VolBox(QLineEdit):
+            def focusInEvent(self, e):
+                self.selectAll()
+                super().focusInEvent(e)
+
+        self.vol_pct = VolBox(f"{self.volume_val}%")
+        self.vol_pct.setObjectName("volPct")
+        # 58 rather than the 50 the caption needed: the box wears the app's QLineEdit rule, and
+        # its 6 px of padding is inside this width, so a caption's width would clip "150%".
+        self.vol_pct.setFixedWidth(58)
+        self.vol_pct.setAlignment(Qt.AlignCenter)
+        self.vol_pct.setMaxLength(4)      # 0 to 150 and the percent sign it is shown with
+        self.vol_pct.setToolTip("Type a volume from 0 to 150 and press Enter")
+        self.vol_pct.returnPressed.connect(self.on_volume_typed)
+        self.vol_pct.editingFinished.connect(self.on_volume_typed)
         if self.volume_val > 115:
             self.vol_pct.setStyleSheet("color: #E31E24; font-weight: bold;")
         elif self.volume_val > 100:

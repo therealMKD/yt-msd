@@ -2703,7 +2703,7 @@ check("AD5 the orange and red warnings keep the thresholds they have always had"
                      116: "red", 150: "red"}, _ad_states)
 
 _ad_handler = _source[_source.index("    def on_volume_changed"):
-                      _source.index("    def update_player_ui")]
+                      _source.index("    def on_volume_typed")]
 check("AD6 the handler rescales nothing any more",
       "vlc_vol" not in _ad_handler and "self.vlc_player.audio_set_volume(val)" in _ad_handler,
       _ad_handler)
@@ -2843,6 +2843,260 @@ check("AF13 the player's own startup is timed where it happens, and only asks fo
 check("AF14 and the wait is measured from the retry, not from a guess about how long VLC takes",
       "trace.note(\"holding the pick" in _source)
 unpatch()
+
+
+# ============================================================================
+# AG. what a click is for: the caret a press anywhere else takes away, the number
+# typed into the volume box, and the track a thumbnail starts
+# ============================================================================
+# Three things the pointer could not do until now. A row played only if the press landed on the
+# 30 px button floating over its thumbnail. The volume could only be dragged along a 100 px slider.
+# And a press that landed on anything that does not ask for focus - a caption, a result row's
+# placeholder, the empty part of a pane, the plain widget behind the player bar - left the box that
+# had the focus holding it, cursor still blinking, while the next keystroke went nowhere near it.
+#
+# All of it is measured with real widgets and real press events. QApplication.sendEvent is how the
+# suite already drives events (section AC sends Enter and Leave with it) and it runs the
+# application's own filters on the way in, which is the path MainApp is installed on as a filter of
+# the whole QApplication. MainApp itself cannot be that filter here - a harness MainApp never ran
+# __init__ and so has no Qt object behind it to install - so the click half of it is held by a real
+# QWidget, and the wiring that puts it on the application is checked in the source below.
+from PySide6.QtCore import Qt, QPoint, QPointF
+from PySide6.QtGui import QMouseEvent
+from PySide6.QtWidgets import QLineEdit, QPushButton
+
+
+def _ag_drain(times=12):
+    for _ in range(times):
+        QApplication.processEvents()
+
+
+def _ag_press(widget, dx=0, dy=0, button=Qt.LeftButton):
+    """A press delivered to this widget at dx, dy away from its middle - the press a click on that
+    spot of it is, without anybody's mouse moving."""
+    local = QPoint(widget.rect().center().x() + dx, widget.rect().center().y() + dy)
+    QApplication.sendEvent(widget, QMouseEvent(QEvent.MouseButtonPress, QPointF(local),
+                                               QPointF(widget.mapToGlobal(local)),
+                                               button, button, Qt.NoModifier))
+    _ag_drain()
+
+
+def _ag_release(widget):
+    centre = widget.rect().center()
+    QApplication.sendEvent(widget, QMouseEvent(QEvent.MouseButtonRelease, QPointF(centre),
+                                               QPointF(widget.mapToGlobal(centre)),
+                                               Qt.LeftButton, Qt.NoButton, Qt.NoModifier))
+    _ag_drain()
+
+
+class _AgClickFilter(mod.QWidget):
+    """MainApp's answer to a click, on an object Qt will accept as an application filter.
+
+    The shim cannot simply hold MainApp.eventFilter: that method ends in a bare super() call bound
+    to MainApp itself, which refuses an object that is not one. So the shim makes the same call the
+    real filter makes - MainApp's own click answer - and lets the press through, while the check
+    below reads the wiring that puts that answer on the whole application."""
+    def eventFilter(self, obj, event):
+        if event.type() in (event.Type.MouseButtonPress, event.Type.MouseButtonDblClick):
+            mod.MainApp._release_typing_focus(self, obj, event)
+        return False
+
+
+_ag_filter = _AgClickFilter()
+QApplication.instance().installEventFilter(_ag_filter)
+
+_ag_window = mod.QWidget()
+_ag_window.resize(420, 300)
+_ag_window.move(-32000, -32000)            # shown, because a press only lands on a widget that is
+_ag_layout = mod.QVBoxLayout(_ag_window)   # on screen at all, but nowhere a probe is looked at
+_ag_box = QLineEdit("search terms")
+_ag_caption = mod.QLabel("Format:")
+_ag_button = QPushButton("Search")
+_ag_placeholder = mod.QWidget()            # a result row is one of these, with widgets built into it
+_ag_placeholder.setFixedHeight(54)
+for _ag_w in (_ag_box, _ag_caption, _ag_button, _ag_placeholder):
+    _ag_layout.addWidget(_ag_w)
+_ag_window.show()
+_ag_drain()
+
+_ag_box.setFocus()
+_ag_drain()
+check("AG1 the typable box holds the caret to begin with", QApplication.focusWidget() is _ag_box)
+_ag_press(_ag_caption)
+check("AG2 a press on something that cannot type takes the caret out of it",
+      QApplication.focusWidget() is None)
+_ag_box.setFocus()
+_ag_drain()
+_ag_press(_ag_box)
+check("AG3 a press inside the box leaves the caret where it is", QApplication.focusWidget() is _ag_box)
+_ag_box.setFocus()
+_ag_drain()
+_ag_press(_ag_button)
+check("AG4 a press on a control that takes focus for itself is not the window asking for no caret",
+      QApplication.focusWidget() is _ag_box)
+_ag_box.setFocus()
+_ag_drain()
+_ag_press(_ag_placeholder)
+check("AG5 a press on the empty part of a row or a pane takes the caret too",
+      QApplication.focusWidget() is None)
+_ag_button.setFocus()
+_ag_drain()
+_ag_press(_ag_caption)
+check("AG6 and a press never strips focus off a control that already had it - the local list's "
+      "Ctrl+A, Ctrl+C, Del and F2 are answered only while that focus holds",
+      QApplication.focusWidget() is _ag_button)
+_ag_filter_src = _source[_source.index("    def eventFilter"):
+                         _source.index("    def open_search_on_youtube")]
+check("AG7 the answer is wired into the filter MainApp installs on the whole application",
+      "MouseButtonPress" in _ag_filter_src
+      and "self._release_typing_focus(obj, event)" in _ag_filter_src, _ag_filter_src[:400])
+
+
+class _AgVolumeBoxHarness(mod.QWidget):
+    on_volume_changed = mod.MainApp.on_volume_changed
+    on_volume_typed = mod.MainApp.on_volume_typed
+
+
+def _ag_volume_box():
+    """What a typed volume touches: the box, the slider wired to the handler a dragged volume uses,
+    and a stand-in player remembering every number it was handed instead of sending one to an output."""
+    h = _AgVolumeBoxHarness()
+    h.volume_val = 100
+    h.applied = []
+    h.vol_slider = QSlider(Qt.Horizontal, h)
+    h.vol_slider.setRange(0, 150)
+    h.vol_slider.setValue(100)      # the slider starts where the saved volume is, as it does in the app
+    h.vol_pct = QLineEdit("100%", h)
+    h.vol_pct.setMaxLength(4)
+    h.vol_slider.valueChanged.connect(h.on_volume_changed)
+
+    class _Recorder:
+        def audio_set_volume(self, val):
+            h.applied.append(val)
+
+    h.vlc_player = _Recorder()
+    return h
+
+
+_ag_h = _ag_volume_box()
+_ag_h.vol_pct.setText("73")                     # what typing 7 then 3 leaves in the box
+_ag_h.on_volume_typed()
+check("AG8 typing 73 hands 73 to libVLC, to the slider and to the box",
+      _ag_h.applied == [73] and _ag_h.vol_slider.value() == 73 and _ag_h.vol_pct.text() == "73%",
+      (_ag_h.applied, _ag_h.vol_pct.text()))
+_ag_h = _ag_volume_box()
+_ag_h.vol_pct.setText("999")
+_ag_h.on_volume_typed()
+check("AG9 a number past the top of the slider is clamped to it, and the warning colour goes with it",
+      _ag_h.applied == [150] and _ag_h.vol_pct.text() == "150%"
+      and _ag_h.vol_slider.property("volume_state") == "red", _ag_h.applied)
+_ag_h = _ag_volume_box()
+_ag_h.vol_pct.setText("")
+_ag_h.on_volume_typed()
+check("AG10 a box emptied and committed applies nothing and shows the volume the player is holding",
+      _ag_h.applied == [] and _ag_h.vol_pct.text() == "100%", _ag_h.applied)
+_ag_h = _ag_volume_box()
+_ag_h.vol_pct.setText("ab")
+_ag_h.on_volume_typed()
+check("AG11 a box with no number in it is not a volume",
+      _ag_h.applied == [] and _ag_h.vol_pct.text() == "100%", _ag_h.applied)
+_ag_h = _ag_volume_box()
+_ag_h.vol_pct.setText("0")
+_ag_h.on_volume_typed()
+check("AG12 0 is reachable by typing, and it is the mute it has always been",
+      _ag_h.applied == [0] and _ag_h.vol_slider.property("volume_state") == "normal", _ag_h.applied)
+_ag_h = _ag_volume_box()
+_ag_h.vol_pct.setText("73")
+_ag_h.on_volume_typed()
+_ag_h.vol_slider.setValue(60)                   # and then the slider is dragged
+check("AG13 a typed number and a dragged one go through the same handler, so they cannot disagree",
+      _ag_h.applied == [73, 60] and _ag_h.vol_pct.text() == "60%", _ag_h.applied)
+check("AG14 the box commits on Enter and on losing focus, through that one handler",
+      _source.count("self.vol_pct.returnPressed.connect(self.on_volume_typed)") == 1
+      and _source.count("self.vol_pct.editingFinished.connect(self.on_volume_typed)") == 1
+      and "self.vol_pct = VolBox(" in _source)
+_ag_commit = _ag_volume_box()
+_ag_commit.vol_pct.editingFinished.connect(_ag_commit.on_volume_typed)
+_ag_commit.resize(240, 90)
+_ag_commit.move(-32000, -32000)
+_ag_commit.show()
+_ag_drain()
+_ag_commit.vol_pct.setFocus()
+_ag_drain()
+_ag_commit.vol_pct.setText("42")
+_ag_press(_ag_commit, 0, 80)                    # the click that goes somewhere else in the window
+check("AG15 the click that takes the caret is also the commit - Enter is not the only way out",
+      _ag_commit.applied == [42] and _ag_commit.vol_pct.text() == "42%"
+      and QApplication.focusWidget() is None, _ag_commit.applied)
+
+
+_ag_pick_host = mod.MainApp.__new__(mod.MainApp)
+_ag_pick_host.accent_color_name = "Blue"
+_ag_pick_host._thumbnail_labels = {}
+_ag_pick_host._playback_box = None
+_ag_pick_host._fetch_thumbnail = lambda video: None
+_ag_pick_host._hover_tile = None
+_ag_pick_host.current_video_id = None
+_ag_pick_host.picked = []
+_ag_pick_host.toggles = []
+_ag_pick_host.play_result = lambda video, paused_at_start=False, from_nav=False: \
+    _ag_pick_host.picked.append(video.get('id'))
+_ag_pick_host.toggle_playback = lambda: _ag_pick_host.toggles.append(True)
+
+_ag_pick_window = mod.QWidget()
+_ag_pick_window.resize(220, 120)
+_ag_pick_window.move(-32000, -32000)
+_ag_pick_layout = mod.QVBoxLayout(_ag_pick_window)
+_ag_pick_layout.setAlignment(mod.Qt.AlignTop)
+_ag_tile = mod.ThumbnailWidget({"id": "tilePress", "title": "Press Anywhere"}, _ag_pick_host)
+_ag_pick_layout.addWidget(_ag_tile)
+_ag_pick_window.show()
+_ag_drain()
+
+for _ag_at in ((0, 0), (-40, -18), (40, 18), (-42, 0)):
+    _ag_press(_ag_tile, *_ag_at)                # the middle of the tile, and each side of it
+check("AG16 a press anywhere on the thumbnail plays that track - middle and edges alike",
+      _ag_pick_host.picked == ["tilePress"] * 4, _ag_pick_host.picked)
+_ag_pick_host.picked.clear()
+_ag_tile.play_btn.show()
+_ag_press(_ag_tile.play_btn)
+_ag_release(_ag_tile.play_btn)
+check("AG17 the hover button is left in place and still plays its row",
+      _ag_pick_host.picked == ["tilePress"], _ag_pick_host.picked)
+_ag_pick_host.picked.clear()
+_ag_press(_ag_tile, 0, 0, Qt.RightButton)
+check("AG18 a right press is not a pick",
+      _ag_pick_host.picked == [] and _ag_pick_host.toggles == [])
+_ag_pick_host.current_video_id = "tilePress"    # the track on the player is the one under the pointer
+_ag_press(_ag_tile)
+check("AG19 the tile of the track already on the player is the pause the player bar's own button "
+      "gives, not a fresh pick that re-resolves the stream behind a track being heard",
+      _ag_pick_host.picked == [] and _ag_pick_host.toggles == [True],
+      (_ag_pick_host.picked, _ag_pick_host.toggles))
+_ag_pick_host.current_video_id = "someOtherTrack"
+_ag_pick_host.toggles.clear()
+_ag_press(_ag_tile)
+check("AG20 and a tile that is not the loaded track is picked",
+      _ag_pick_host.picked == ["tilePress"] and _ag_pick_host.toggles == [])
+_ag_pick_host.picked.clear()
+_ag_press(_ag_tile.thumb_label)                 # the picture is a label filling the tile, so a click on
+check("AG21 a press on the picture reaches the tile through the label that carries it - and the label "
+      "wears no focus policy of its own, which is what makes that same press the click away from a "
+      "typable box",
+      _ag_pick_host.picked == ["tilePress"]
+      and not (_ag_tile.thumb_label.focusPolicy() & (Qt.ClickFocus | Qt.StrongFocus)),
+      _ag_pick_host.picked)
+_ag_pick_host.picked.clear()
+_ag_press_src = _source[_source.index("Play this track on a press anywhere"):
+                        _source.index("    def enterEvent",
+                                      _source.index("Play this track on a press anywhere"))]
+check("AG22 the whole tile answers the press, and only a left one, and the tile wears the cursor "
+      "that says so",
+      "if event.button() == Qt.LeftButton:" in _ag_press_src
+      and "self.parent_app.play_result(self.video)" in _ag_press_src
+      and _source.count("self.setCursor(Qt.PointingHandCursor)") == 1, _ag_press_src)
+
+QApplication.instance().removeEventFilter(_ag_filter)
 
 
 print(f"{CHECKS - len(FAILS)} / {CHECKS} checks passed")

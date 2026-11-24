@@ -320,6 +320,9 @@ class ThumbnailWidget(QWidget):
         self.play_btn.setStyleSheet(f"background: rgba(0,0,0,180); color: {accent}; border-radius: 15px; font-weight: bold; font-family: 'Segoe MDL2 Assets'; font-size: 14px; padding: 0px;")
         self.play_btn.clicked.connect(self.on_play)
         self.play_btn.hide()
+        # The whole tile answers a click now (see mousePressEvent), so it wears the cursor that
+        # says so.
+        self.setCursor(Qt.PointingHandCursor)
         
     def _pointer_on_tile(self):
         """True when the pointer is on this tile right now.
@@ -378,6 +381,27 @@ class ThumbnailWidget(QWidget):
 
     def on_play(self, checked=False):
         self.parent_app.play_result(self.video)
+        
+    def mousePressEvent(self, event):
+        """Play this track on a press anywhere on the tile.
+
+        The picture is the thing the eye is on, and making the listener land a 30 px round button
+        on top of it to start a track was the difference between a row that plays and a row that
+        only looks playable. The button is left exactly where it is - a press that lands on it is
+        taken by the button and never reaches here - so the row now plays both ways. A press on the
+        tile of the track that is already on the player is the pause the player bar's own button
+        gives rather than a fresh pick: restarting the track the listener is already hearing throws
+        away where they got to and re-resolves the stream behind it, which is the one thing a click
+        on that track's own row cannot be meant to ask for.
+        """
+        if event.button() == Qt.LeftButton:
+            if self.video.get('id', '') == getattr(self.parent_app, 'current_video_id', None):
+                self.parent_app.toggle_playback()
+            else:
+                self.parent_app.play_result(self.video)
+            event.accept()
+            return
+        super().mousePressEvent(event)
         
     def enterEvent(self, event):
         # Qt says the pointer came onto the row; the pointer is still what decides, because a

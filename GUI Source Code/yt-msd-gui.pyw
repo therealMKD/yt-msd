@@ -94,7 +94,7 @@ from PIL import Image
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QLineEdit, QComboBox, QCheckBox, QScrollArea,
                                QFileDialog, QMessageBox, QDialog, QSystemTrayIcon, QMenu, QStyle)
-from PySide6.QtCore import Qt, Signal, QTimer, QPoint, QObject, QByteArray
+from PySide6.QtCore import Qt, Signal, QTimer, QPoint, QObject, QByteArray, QEvent
 from PySide6.QtGui import QIcon, QPixmap, QColor, QPainter, QCursor
 from PySide6.QtCore import QMimeData, QUrl
 from PySide6.QtNetwork import QLocalServer
@@ -4870,7 +4870,36 @@ class MainApp(BootstrapMixin,
                     if event.key() in (Qt.Key_Return, Qt.Key_Enter):
                         self._open_local_selection()
                         return True
+        if event.type() in (event.Type.MouseButtonPress, event.Type.MouseButtonDblClick):
+            self._release_typing_focus(obj, event)
         return super().eventFilter(obj, event)
+
+    def _release_typing_focus(self, obj, event):
+        """Take the caret out of a typable box when the click lands on something that cannot type.
+
+        Qt hands focus to whatever asks for it, and leaves it where it was when the click lands on
+        something that does not - a caption, a result row's placeholder, the empty part of a pane,
+        the plain widget behind the player bar. Every one of those used to leave the search box the
+        focus widget with its cursor still blinking, which reads as a box that is still being typed
+        into while the next keystroke goes nowhere near it. So a press that does not land on a
+        control able to take focus for itself is taken as the window asking for no caret at all.
+        Only typable boxes are dropped this way: a control that already had the focus - the local
+        list's row button, a combo, the volume slider - keeps it, because the File Explorer keys
+        (Ctrl+A, Ctrl+C, Del, F2) are answered only while that focus is where it is.
+        """
+        try:
+            if QApplication.activePopupWidget() is not None:
+                return          # a menu or a combo list is open; those settle their own focus
+            focused = QApplication.focusWidget()
+            if not isinstance(focused, (QLineEdit, QComboBox)):
+                return          # no typable box is holding the caret to take away
+            if not isinstance(obj, QWidget):
+                return
+            if (obj.focusPolicy() & (Qt.ClickFocus | Qt.StrongFocus)) and obj.isEnabled():
+                return          # the control under the press takes focus for itself
+            focused.clearFocus()
+        except RuntimeError:
+            pass                # the widget this press was delivered to is already gone
 
     def open_search_on_youtube(self):
         query = self.search_entry.text().strip()
@@ -5091,6 +5120,28 @@ class MainApp(BootstrapMixin,
             self.vol_slider.style().unpolish(self.vol_slider)
             self.vol_slider.style().polish(self.vol_slider)
 
+    def on_volume_typed(self):
+        """Apply the number typed into the box beside the slider.
+
+        Both ways out of the box reach this one handler: Enter in it, and the click that takes it
+        out of focus (see _release_typing_focus), which is the same moment its caret goes. The
+        number is then handed to the slider rather than to the player directly, so a typed volume
+        and a dragged one cannot drift apart - the slider's own valueChanged is what colours the
+        slider and the box at 101 and at 116, and what the tray menu reads back. A box committed
+        with nothing usable in it - a bare Enter, an emptied box, a box full of letters - applies
+        nothing and is redrawn with the volume the player is already holding, so it never sits in
+        the player bar showing a number the audio is not doing.
+        """
+        if not hasattr(self, 'vol_pct') or not hasattr(self, 'vol_slider'):
+            return
+        digits = ''.join(ch for ch in self.vol_pct.text() if ch.isdigit())
+        if not digits:
+            self.vol_pct.setText(f"{self.volume_val}%")
+            return
+        val = max(0, min(self.vol_slider.maximum(), int(digits)))
+        self.vol_slider.setValue(val)        # valueChanged -> on_volume_changed, the slider's route
+        self.vol_pct.setText(f"{val}%")      # what was applied, not what was typed: "73" shows as 73%
+    
     def update_player_ui(self):
         # The tick that already asks libVLC what the media is doing is the one place in
         # this app that knows the play state, so it is the one place that colours the row
