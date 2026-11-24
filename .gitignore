@@ -7,6 +7,7 @@ gui_config.json
 # the .pyw from source leaves one in "GUI Source Code"; the installed program leaves
 # its own beside the exe under %LOCALAPPDATA%\Programs\yt-msd.
 yt-msd-crash.log
+*.log
 
 # Ignore test directories / generic folders created
 Test Songs/

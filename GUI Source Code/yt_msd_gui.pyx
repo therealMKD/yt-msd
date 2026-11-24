@@ -925,13 +925,13 @@ class MainApp(BootstrapMixin,
                            for hc in legacy)
         body = (
             "This version can keep a hosted sync chain private. The chains already saved on this "
-            "computer are visible, which is what they have always been: any yt-msd on your local "
-            "network can find them by name and connect using the code below.\n\n"
+            "computer are visible, which means any yt-msd on your local network can find them by "
+            "name and connect using the code below.\n\n"
             f"{listed}\n\n"
             "To keep one to yourself, open Sync Chains and press \"Make Private\" on its card. A "
-            "private chain names itself in nothing and answers no search - it can still be synced, "
-            "but only by a client that was already given its 4-digit sync code. Chains you create "
-            "from now on are asked about as they are made."
+            "private chain will not show up in client searches without its 4-digit sync code. It "
+            "is still synced by previously paired clients. New sync chains are visible by default. "
+            "You can change this when you create a new chain."
         )
         self.chain_visibility_signal.emit("Sync chains are visible on your network", body)
 

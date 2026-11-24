@@ -235,7 +235,11 @@ def clean_and_tag_files(folder_path, start_auto=False):
                     idx += 1
                     continue
             
-            if not is_manually_inputted:
+            # A break out of the prompt that never settled on a name - 'prev' typed at the
+            # first file, where there is no previous to redo - leaves `final_name` as it was
+            # left: nothing. Cleaning that was the crash; the check on the next line is what
+            # was written to handle a file with no name, and it still gets to run.
+            if not is_manually_inputted and final_name:
                 final_name = clean_youtube_title(final_name)
             if not final_name:
                 print(f"  {Colors.RED}Invalid name. Skipped.{Colors.END}\n")

@@ -412,6 +412,15 @@ class LayoutMixin:
             self.search_entry.setText(self.last_search)
         
         # Restore session
+        #
+        # `v_id` is bound here, not only inside the branch below, because the re-search that
+        # follows hands it to `perform_search` whatever the start looked like. A start with the
+        # "remember my place" option off - which is how it ships, `save_place` defaults to False -
+        # or one with nothing saved never reaches the line that used to be the only assignment,
+        # and the re-search then read a local that had never been given a value: the window died
+        # in setup_ui with an UnboundLocalError before it was drawn. None is what perform_search
+        # asks for when there is no fetch to keep, so that is what a start with no session says.
+        v_id = None
         if self.save_place and hasattr(self, 'session_data'):
             sd = self.session_data
             if sd.get('search_results'):

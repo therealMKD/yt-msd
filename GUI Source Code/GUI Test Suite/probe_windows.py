@@ -1,13 +1,14 @@
 """The windows regression harness.
 
-Sections WN-A..WN-J cover the windows half of `GUI Source Code/yt-msd-gui.pyw`: the settings window
+Sections WN-A..WN-K cover the windows half of `GUI Source Code/yt-msd-gui.pyw`: the settings window
 and where each of its controls writes, the three windows that build a sync chain (host, client,
 removable drive), the sync manager that lists and pauses and removes them, the playlist picker, the
 tray progress bubble, the three update windows, the rename-from-metadata window, the two things
 the program promises the machine - which file Windows is told to start, and which yt-dlp it looks for
 - the question a sync asks before it deletes more than its chain allows, and the window that searches
 the network for a host along with the once-only notice a Host is given about chains that were already
-visible when this choice existed.
+visible when this choice existed, and the start of the main window itself - a saved search with no
+saved session behind it, which is how a new install starts.
 
 Recipe (AI Readme section 20): the `.pyw` is copied to a throwaway `.py` in this folder's `copy/` and
 imported, and the windows are driven directly against a stand-in for the main window they are opened
@@ -916,9 +917,13 @@ check("WN-E5 one of the two boxes empty still produces a name, because half a ti
       _rename_dlg._new_stem_for(_rename_dlg.rows[1]))
 _rename_dlg.rows[2]["artist_edit"].setText("")
 _rename_dlg.rows[2]["title_edit"].setText("")
+# The name column is 164 px wide whatever the display is doing, so on a large Windows scaling
+# setting - or on Qt's offscreen plugin - the sentence this window shows is elided. The whole
+# sentence is on the tooltip, which is what WN-E4 established the window keeps.
 check("WN-E6 both boxes empty says so on the window instead of proposing an empty file name",
-      "(enter an artist or a title)" in _rename_dlg.rows[2]["new_lbl"].text(),
-      _rename_dlg.rows[2]["new_lbl"].text())
+      _rename_dlg.rows[2]["new_lbl"].text().startswith("(enter an a")
+      and "(enter an artist or a title)" in _rename_dlg.rows[2]["new_lbl"].toolTip(),
+      (_rename_dlg.rows[2]["new_lbl"].text(), _rename_dlg.rows[2]["new_lbl"].toolTip()))
 _rename_dlg.rows[2]["artist_edit"].setText("Bad: /name*?")
 check("WN-E7 a name Windows cannot hold is made into one it can before it is offered",
       all(bad not in _rename_dlg._new_stem_for(_rename_dlg.rows[2]) for bad in ':/?*'),
@@ -1461,6 +1466,150 @@ check("WN-J25 and it is wired where the sync subsystem is built: the signal is c
       "_on_chain_visibility_notice" in _bootstrap_attrs
       and "_notify_legacy_visible_chains" in _bootstrap_attrs,
       sorted(name for name in _bootstrap_attrs if "visibility" in name))
+
+# ===========================================================================
+# WN-K: a name the program never gave itself
+# ===========================================================================
+#
+#   setup_ui puts the last search back in the box, puts the saved session back on the screen
+#   when "remember my place" is on, and then starts a background re-search to refresh the
+#   cache. That re-search is told which track it must not cancel, and the name holding it used
+#   to be assigned only inside the session branch. A start with the session option off - which
+#   is how the program ships, save_place defaults to False in ui/bootstrap.py - never reached
+#   the line that assigned it, and the window died in setup_ui with an UnboundLocalError
+#   before it was drawn. The installed copy on a second machine proved it, and none of the
+#   1081 checks here ever did, because every start they described either had a session to
+#   restore or had no saved search to re-search.
+#
+#   The same shape sits at the end of this section, in the rename pass.
+#
+#   These checks run the shipped text. The restore half of setup_ui touches no widget - it
+#   reads the saved settings and calls back into the app - so those lines are lifted out of
+#   yt_msd/ui/layout.py whole, put behind a stub holding only the attributes they ask for, and
+#   run the way __init__ runs them. Nothing is opened, no folder written, no network asked.
+_layout_lines = (Path(SRC_DIR) / "yt_msd" / "ui" / "layout.py").read_text(encoding="utf-8").splitlines()
+_restore_first = next(i for i, line in enumerate(_layout_lines) if "# Restore last search" in line)
+_restore_last = next(i for i, line in enumerate(_layout_lines) if "keep_fetch_vid_id=" in line)
+_restore_lines = _layout_lines[_restore_first:_restore_last + 1]
+_restore_indent = min(len(line) - len(line.lstrip()) for line in _restore_lines if line.strip())
+_restore_src = "def _startup(self):\n" + "".join(
+    ("    " + line[_restore_indent:] if line.strip() else "") + "\n" for line in _restore_lines)
+_startup_env = {}
+exec(compile(_restore_src, "yt_msd/ui/layout.py", "exec"), _startup_env)
+_startup = _startup_env["_startup"]
+
+
+class _SearchBox:
+    def __init__(self):
+        self.texts = []
+
+    def setText(self, text):
+        self.texts.append(text)
+
+
+class _StartUp:
+    """Only the attributes the restore half of setup_ui asks for, and a record of each call
+    it makes, so a check can say what the start did as well as that it survived."""
+
+    def __init__(self, last_search="", save_place=False, session_data=None, recent_playlists=()):
+        self.last_search = last_search
+        self.save_place = save_place
+        self.recent_playlists = list(recent_playlists)
+        if session_data is not None:
+            self.session_data = session_data
+        self.search_entry = _SearchBox()
+        self.playback_index = -1
+        self.handed = []
+        self.started = []
+        self.searches = []
+
+    def _on_search_results(self, results, is_playlist, reset_view=True):
+        self.handed.append((results, reset_view))
+
+    def play_result(self, video, paused_at_start=False):
+        self.started.append((video, paused_at_start))
+
+    def perform_search(self, is_playlist=False, keep_fetch_vid_id=None):
+        self.searches.append((is_playlist, keep_fetch_vid_id))
+
+
+def _start(app):
+    """Run the real lines over one described start, and hand back whatever they raised."""
+    try:
+        _startup(app)
+        return None
+    except Exception as exc:
+        return exc
+
+
+_plain = _StartUp(last_search="https://www.youtube.com/watch?v=abc")
+_plain_raised = _start(_plain)
+check("WN-K1 the start every new install makes - a saved search, the session option off - raises nothing",
+      _plain_raised is None, repr(_plain_raised))
+check("WN-K2 and it still re-searches that search, saying there is no track to keep",
+      _plain.searches == [(False, None)], _plain.searches)
+check("WN-K3 the last search goes back in the box it was typed into",
+      _plain.search_entry.texts == ["https://www.youtube.com/watch?v=abc"], _plain.search_entry.texts)
+
+_no_session = _StartUp(last_search="a search", save_place=True, session_data={})
+_no_session_raised = _start(_no_session)
+check("WN-K4 the session option on with nothing saved is the same start, not a different one",
+      _no_session_raised is None and _no_session.handed == [] and _no_session.searches == [(False, None)],
+      (repr(_no_session_raised), _no_session.handed, _no_session.searches))
+
+_SESSION = {"search_results": [{"id": "vid1", "title": "one"}, {"id": "vid2", "title": "two"}],
+            "playback_index": 1, "current_video_id": "vid2"}
+_saved = _StartUp(last_search="a search", save_place=True, session_data=_SESSION)
+_saved_raised = _start(_saved)
+check("WN-K5 a machine that does remember its place gets its list back, without moving where the reader was looking",
+      _saved_raised is None and len(_saved.handed) == 1 and _saved.handed[0][1] is False
+      and _saved.playback_index == 1,
+      (repr(_saved_raised), _saved.handed, _saved.playback_index))
+check("WN-K6 the track it was holding is put back on the player paused, ready for the listener to resume it",
+      _saved.started == [(_SESSION["search_results"][1], True)], _saved.started)
+check("WN-K7 the re-search that follows is told to leave that track's fetch alone - the reason it is passed an id at all",
+      _saved.searches == [(False, "vid2")], _saved.searches)
+
+_local = _StartUp(last_search="a search", save_place=True,
+                  session_data={"search_results": [], "playback_index": -1, "current_video_id": "local"})
+_local_raised = _start(_local)
+check("WN-K8 a place remembered on the local pane starts nothing on the player, and the re-search still runs",
+      _local_raised is None and _local.started == [] and len(_local.searches) == 1,
+      (repr(_local_raised), _local.started, _local.searches))
+
+_playlist = _StartUp(last_search="https://www.youtube.com/playlist?list=PL1", save_place=False,
+                     recent_playlists=[{"name": "my list", "url": "https://www.youtube.com/playlist?list=PL1"}])
+_playlist_raised = _start(_playlist)
+check("WN-K9 a saved playlist is re-searched as a playlist, so its rows come back under the name it was given",
+      _playlist_raised is None and _playlist.searches == [(True, None)],
+      (repr(_playlist_raised), _playlist.searches))
+
+_first_run = _StartUp(last_search="")
+_first_run_raised = _start(_first_run)
+check("WN-K10 a first run with nothing saved re-searches nothing - the one start that never hit the bug, which is why it hid",
+      _first_run_raised is None and _first_run.searches == [], repr(_first_run_raised))
+
+_setup_ui = next(node for node in ast.walk(ast.parse(
+    (Path(SRC_DIR) / "yt_msd" / "ui" / "layout.py").read_text(encoding="utf-8")))
+    if isinstance(node, ast.FunctionDef) and node.name == "setup_ui")
+_top_level_v_id = [st for st in _setup_ui.body
+                   if isinstance(st, ast.Assign)
+                   and any(isinstance(t, ast.Name) and t.id == "v_id" for t in st.targets)]
+check("WN-K11 the id the re-search passes is given a value at the top of setup_ui, not inside a branch a start may never take",
+      len(_top_level_v_id) == 1, _top_level_v_id)
+check("WN-K12 and the lines these checks ran are the shipped ones: the saved search through the re-search, nothing between",
+      "# Restore last search" in _restore_lines[0] and _restore_lines[-1].strip().startswith("self.perform_search("),
+      (_restore_lines[0], _restore_lines[-1]))
+
+_renamer_src = (Path(SRC_DIR) / "yt_msd" / "audio" / "renamer.py").read_text(encoding="utf-8")
+check("WN-K13 the rename pass only cleans a name the prompt actually settled on - 'prev' at the first file settles on none",
+      "if not is_manually_inputted and final_name:" in _renamer_src)
+check("WN-K14 and the branch that skips a file with no name still gets its turn, so the pass moves on instead of dying",
+      _renamer_src.index("if not is_manually_inputted and final_name:")
+      < _renamer_src.index("if not final_name:") <= _renamer_src.index("Invalid name. Skipped."),
+      _renamer_src[_renamer_src.index("if not is_manually_inputted and final_name:"):][:220])
+
+
 
 shutil.rmtree(FIXTURE_ROOT, ignore_errors=True)
 check("WN-F9 every folder this suite wrote is gone again", not FIXTURE_ROOT.exists())
