@@ -305,6 +305,9 @@ Make an issue report, and tell me how you created the error. Since adding the er
 ### Won't fetch a stream, won't play anything, very laggy
 This is caused by windows audio drivers getting messed up. Check your audio device. If it's blank, then windows is trying to play audio on a device where the driver has crashed. You'll notice that other applications will act similar when playing sound. This is a problem with windows, because it doesn't have error handling if the audio pipeline fails. Unplug the problematic audio device and try again. If it still fails, your audio device is probably dying. (This happens to me occasionally when I use my half dead earbuds)
 
+### Stream is fetched, and starts playing, but you can't hear anything
+This seems to be caused by something else stealing your audio device and failing to give it back. It also could be a yt-msd bug, but I cannot consistently reproduce it. Stop anything else that is playing audio, then restart yt-msd. If it still doesn't work, make an issue.
+
 ## Known Issues
 
 These are things that are either not easily reproduceable (so I can't easily figure out the cause) or things that might seem like bugs, but are features (heh)
