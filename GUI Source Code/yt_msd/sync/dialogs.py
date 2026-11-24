@@ -13,8 +13,8 @@ import socket
 from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QComboBox, QScrollArea, QFileDialog, QMessageBox, QDialog, QMenu, QFrame, QSpinBox, QInputDialog
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont
-from yt_msd.sync.client import ClientSyncThread
-from yt_msd.sync.config import SyncConfigManager, is_client_chain_paused
+from yt_msd.sync.client import ClientSyncThread, deletions_were_declined, make_delete_confirm_cb
+from yt_msd.sync.config import DEFAULT_DELETE_CONFIRM_LIMIT, DELETE_CONFIRM_LIMIT_MAX, SyncConfigManager, delete_confirm_limit, is_client_chain_paused
 from yt_msd.sync.discovery import send_lan_update_notification
 from yt_msd.sync.lan import get_current_wifi_ssid, get_local_ip
 from yt_msd.sync.removable import RemovableInitThread
@@ -144,7 +144,7 @@ class ConnectClientChainDialog(QDialog):
         self.parent_window = parent_window
         self.config_manager = config_manager
         self.setWindowTitle("Connect to Sync Chain (Client)")
-        self.setFixedSize(520, 390)
+        self.setFixedSize(520, 430)
         self.setWindowFlags(self.windowFlags() | Qt.Tool)
 
         layout = QVBoxLayout(self)
@@ -194,6 +194,29 @@ class ConnectClientChainDialog(QDialog):
         self.del_mode_combo.addItem("Additive Mode (Only download new/updated files, keep local files)", "additive")
         layout.addWidget(self.del_mode_combo)
 
+        # How many files this chain may delete before it asks. It lives beside the mode choice
+        # because it is a rule about deleting, and the row is hidden for Additive - a chain that
+        # keeps every file it has never has anything to be asked about.
+        self.delete_limit_row = QWidget()
+        limit_row = QHBoxLayout(self.delete_limit_row)
+        limit_row.setContentsMargins(0, 0, 0, 0)
+        limit_row.setSpacing(8)
+        limit_row.addWidget(QLabel("Ask before deleting more than:"))
+        self.delete_limit_spin = QSpinBox()
+        self.delete_limit_spin.setRange(0, DELETE_CONFIRM_LIMIT_MAX)
+        self.delete_limit_spin.setValue(DEFAULT_DELETE_CONFIRM_LIMIT)
+        self.delete_limit_spin.setSuffix(" files")
+        self.delete_limit_spin.setFixedWidth(110)
+        self.delete_limit_spin.setToolTip("Number of files this chain may delete on its own before it asks you first. 0 means any number - it will never ask.")
+        limit_row.addWidget(self.delete_limit_spin)
+        limit_hint = QLabel("(0 = never ask)")
+        limit_hint.setStyleSheet("color: #888; font-size: 11px;")
+        limit_row.addWidget(limit_hint)
+        limit_row.addStretch()
+        layout.addWidget(self.delete_limit_row)
+        self.del_mode_combo.currentIndexChanged.connect(self._sync_delete_limit_row)
+        self._sync_delete_limit_row()
+
         layout.addStretch()
 
         btn_h = QHBoxLayout()
@@ -214,6 +237,17 @@ class ConnectClientChainDialog(QDialog):
         f = QFileDialog.getExistingDirectory(self, "Select Base Music Directory", self.folder_edit.text() or "")
         if f:
             self.folder_edit.setText(f)
+
+    def _sync_delete_limit_row(self):
+        """Show the deletion limit only for a Mirror chain.
+
+        The limit is a rule about deleting files this PC no longer has on its host's list. An
+        Additive chain keeps every file it holds whatever the host does, so there is nothing for it
+        to be asked about and no number for it to be given.
+        """
+        is_mirror = self.del_mode_combo.currentData() == 'mirror'
+        self.delete_limit_row.setVisible(is_mirror)
+        self.delete_limit_spin.setEnabled(is_mirror)
 
     def _connect_chain(self):
         ip = self.ip_edit.text().strip()
@@ -241,7 +275,8 @@ class ConnectClientChainDialog(QDialog):
             folder_path=full_dest_path,
             sync_code=code,
             host_ip=ip,
-            deletion_mode=del_mode
+            deletion_mode=del_mode,
+            delete_confirm_limit=self.delete_limit_spin.value()
         )
         self.accept()
 
@@ -654,6 +689,9 @@ class SyncManagerDialog(QDialog):
         clients = tuple(
             (cc.get('id'), cc.get('name'), str(cc.get('sync_code', '')), cc.get('last_known_host_ip', ''),
              bool(is_client_chain_paused(cc)[0]), cc.get('wifi_ssid', ''), cc.get('status', ''))
+            # delete_confirm_limit is left out on purpose. A card carries a live spin box for it
+            # now, and a signature that changed every time a keystroke landed in that box would
+            # rebuild the card - and the box - out from under the user mid-edit.
             for cc in self.config_manager.client_chains
         )
         removables = tuple(
@@ -960,6 +998,29 @@ class SyncManagerDialog(QDialog):
         card.setProperty("progress_lbl", progress_lbl)
         l.addWidget(progress_lbl)
 
+        # The deletion guard, on the chain it applies to. An Additive chain keeps local files
+        # whatever its host does, so it has nothing to be asked about and gets no box.
+        if cc.get('deletion_mode', 'mirror') != 'additive':
+            limit_row = QHBoxLayout()
+            limit_row.setSpacing(8)
+            limit_lbl = QLabel("Ask before deleting more than:")
+            limit_lbl.setStyleSheet("color: #888; font-size: 11px;")
+            limit_row.addWidget(limit_lbl)
+            limit_spin = QSpinBox()
+            limit_spin.setRange(0, DELETE_CONFIRM_LIMIT_MAX)
+            limit_spin.setValue(delete_confirm_limit(cc))
+            limit_spin.setSuffix(" files")
+            limit_spin.setFixedWidth(110)
+            limit_spin.setToolTip("Number of files this chain may delete on its own before it asks you first. 0 means any number - it will never ask.")
+            limit_spin.valueChanged.connect(lambda val, cid=cid_val: self._update_delete_limit(cid, val))
+            limit_row.addWidget(limit_spin)
+            limit_hint = QLabel("(0 = never ask)")
+            limit_hint.setStyleSheet("color: #666; font-size: 10px;")
+            limit_row.addWidget(limit_hint)
+            limit_row.addStretch()
+            card.setProperty("delete_limit_spin", limit_spin)
+            l.addLayout(limit_row)
+
         info_h = QHBoxLayout()
         path_lbl = QLabel(f"Path: {folder_str}")
         path_lbl.setStyleSheet("color: #888; font-size: 11px;")
@@ -1094,6 +1155,16 @@ class SyncManagerDialog(QDialog):
                 self.parent_app.refresh_sync_watchers()
             self.refresh_cards(force=True)
 
+    def _update_delete_limit(self, chain_id: str, value):
+        """Store the number of files a chain may delete before it asks, and stop there.
+
+        Deliberately no refresh_cards() here, and the limit is deliberately not part of
+        _cards_signature() either: the box is being edited at this moment, and rebuilding the card
+        out from under it would drop the keystroke, the focus and whatever the user was mid-way
+        through typing. The next sync reads the number straight out of the chain dict instead.
+        """
+        self.config_manager.set_client_delete_limit(chain_id, value)
+
     def _sync_single_client_chain(self, cc: dict):
         cid = cc.get('id')
         if cid in self.sync_threads and self.sync_threads[cid].isRunning():
@@ -1103,10 +1174,15 @@ class SyncManagerDialog(QDialog):
         self.parent_app.sync_progress_state[cid] = {'status': 'Syncing...', 'progress': ''}
         self.refresh_cards()
 
-        thread = ClientSyncThread(cc)
-        self.sync_threads[cid] = thread
-
         chain_name = cc.get('name', 'Sync')
+
+        thread = ClientSyncThread(
+            cc,
+            # None when the app this dialog belongs to cannot put a question on screen, which is
+            # how the harness drives these windows; the worker then syncs the way it always did.
+            confirm_cb=make_delete_confirm_cb(self.parent_app, chain_name)
+        )
+        self.sync_threads[cid] = thread
 
         def _on_status(txt):
             self.parent_app.sync_progress_state.setdefault(cid, {})['status'] = txt
@@ -1126,6 +1202,11 @@ class SyncManagerDialog(QDialog):
             cc['status'] = "Up to date" if ok else f"Failed: {msg}"
             if ok:
                 cc['last_synced'] = time.time()
+                if deletions_were_declined(msg):
+                    # Say so on the status bar too: the card will read "Up to date" while the
+                    # files the host stopped offering are still sitting in the folder.
+                    if hasattr(self.parent_app, 'status_signal'):
+                        self.parent_app.status_signal.emit(f"Sync Chain '{chain_name}': {msg}", False, "#FF8C00")
             self.config_manager.save()
             self.parent_app.sync_progress_state.pop(cid, None)
             self._update_client_card_label(cid, "progress_lbl", "")

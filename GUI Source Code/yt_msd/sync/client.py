@@ -6,14 +6,108 @@
 # added.
 import os
 from pathlib import Path
+import threading
 import time
 import socket
 from typing import List, Optional, Tuple, Callable
 from PySide6.QtCore import Signal, QThread
 from yt_msd.audio.tags import read_metadata_tags, write_metadata_tags
+from yt_msd.sync.config import delete_confirm_limit
 from yt_msd.sync.discovery import discover_host_on_lan
-from yt_msd.sync.lan import SYNC_SOCKET_TIMEOUT, get_local_ip
+from yt_msd.sync.lan import SYNC_CONFIRM_PING_INTERVAL, SYNC_SOCKET_TIMEOUT, get_local_ip
 from yt_msd.sync.transfer import compute_file_sha256, filter_audio_files, get_drive_io_lock, make_throttled_progress_cb, recv_file_from_socket, recv_json_msg, send_json_msg
+
+
+class _HostKeepalive:
+    """Keeps a host patient while the client has stopped to ask the user something.
+
+    A host reads the next command with a 30-second timeout (SyncHostServer._handle_client), so a
+    client that parks to show a dialog would find the connection closed and the whole sync
+    reported as a failure before anyone had answered. While it runs, this sends PING - the one
+    command every host since 3.0 answers - often enough that the host's read never times out, and
+    throws the reply away. It is only ever started for the length of one question, so an ordinary
+    sync sends exactly the commands it always sent, and nothing else may touch the socket while it
+    is running.
+    """
+
+    def __init__(self, sock: socket.socket, interval: Optional[float] = None):
+        self.sock = sock
+        # Read when it is asked for rather than bound when this is defined, so the value the
+        # program holds is the value used - and so the test harness can shorten it.
+        self.interval = SYNC_CONFIRM_PING_INTERVAL if interval is None else interval
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def _run(self):
+        # Event.wait rather than a sleep: a question answered at once stops this before it has
+        # sent anything.
+        while not self._stop.wait(self.interval):
+            try:
+                send_json_msg(self.sock, {'cmd': 'PING'})
+                recv_json_msg(self.sock, timeout=self.interval)
+            except Exception:
+                # The host is not answering any more. Stop rather than keep writing into a
+                # connection nobody is reading; the sync finds that out when it resumes, and says
+                # so the way it always has.
+                return
+
+    def start(self):
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            # Long enough that the thread has finished whatever send/recv pair it was in. Joining
+            # short would leave a PONG unread on a socket the sync is about to read a file answer
+            # from, and the client would mistake the answer to its PING for the answer to its pull.
+            self._thread.join(timeout=self.interval + 1.0)
+
+
+# The wording a sync_chain message carries when the user refused a batch of deletions. Named here
+# so the one place that builds it and the places that look for it cannot drift apart.
+DELETIONS_DECLINED_NOTE = "deletion(s) left undone - you said no."
+
+
+def deletions_were_declined(message) -> bool:
+    """Whether a finished client sync is reporting deletions the user turned down."""
+    return DELETIONS_DECLINED_NOTE in str(message)
+
+
+def _deletion_question(dest_folder: Path, names: List[str], limit: int) -> str:
+    """The text a client shows before deleting more tracks than its chain may delete on its own."""
+    shown = names[:8]
+    listing = "\n".join(f"    {name}" for name in shown)
+    hidden = len(names) - len(shown)
+    if hidden > 0:
+        listing += f"\n    ... and {hidden} more"
+    return (
+        f"The host has stopped offering {len(names)} file(s) that are in:\n"
+        f"    {dest_folder}\n\n"
+        f"{listing}\n\n"
+        f"Delete {len(names)} file(s)?\n\n"
+        f"(This chain asks once it has more than {limit} to delete. Change that number in Sync "
+        f"Chains - or set it to 0 to delete any number without being asked.)"
+    )
+
+
+def make_delete_confirm_cb(app, chain_name: str) -> Optional[Callable[[str], bool]]:
+    """The confirm_cb a client sync is given when something on screen can answer it.
+
+    The worker calls this from its own thread. The app it is built from puts the question on the
+    GUI thread and parks this one until the answer comes back. An app that cannot ask - a stand-in
+    in the test suite, a probe calling the worker directly - gets None, which the worker reads as
+    "nobody is here to ask", and the chain deletes the way it always has.
+    """
+    ask = getattr(app, 'ask_sync_confirm', None)
+    if not callable(ask):
+        return None
+
+    def _confirm(question: str) -> bool:
+        return bool(ask(f"Sync Chain '{chain_name}' - Delete Files?", question))
+
+    return _confirm
 
 
 
@@ -22,7 +116,8 @@ class SyncClientWorker:
     @staticmethod
     def sync_chain(chain_config: dict,
                    status_cb: Optional[Callable[[str], None]] = None,
-                   progress_cb: Optional[Callable[[int, int, str, int, int], None]] = None) -> Tuple[bool, str, int, int]:
+                   progress_cb: Optional[Callable[[int, int, str, int, int], None]] = None,
+                   confirm_cb: Optional[Callable[[str], bool]] = None) -> Tuple[bool, str, int, int]:
         sync_code = str(chain_config.get('sync_code', ''))
         folder_str = chain_config.get('folder_path', '')
         dest_folder = Path(folder_str)
@@ -66,6 +161,9 @@ class SyncClientWorker:
 
         transferred = 0
         deleted = 0
+        # Tracks a Mirror sync was asked to delete and the user said no to. They stay on disk, and
+        # the count is what the status line and the returned message report them with.
+        unconfirmed = 0
         # Everything below reads and writes dest_folder, which may be a slow
         # device: hold the per-drive lock so only one sync works it over.
         drive_lock = get_drive_io_lock(dest_folder)
@@ -91,16 +189,48 @@ class SyncClientWorker:
             local_files = filter_audio_files(dest_folder)
             local_files_map = {f.name: f for f in local_files}
 
-            if deletion_mode == 'mirror':
-                for local_name, local_path in list(local_files_map.items()):
-                    if local_name not in host_files_map:
-                        try:
-                            local_path.unlink()
-                            deleted += 1
-                            if status_cb:
-                                status_cb(f"Removed deleted track: {local_name}")
-                        except Exception:
-                            pass
+            def _remove_offered_no_more(names: List[str]):
+                nonlocal deleted
+                for local_name in names:
+                    local_path = local_files_map.get(local_name)
+                    if local_path is None:
+                        continue
+                    try:
+                        local_path.unlink()
+                        deleted += 1
+                        if status_cb:
+                            status_cb(f"Removed deleted track: {local_name}")
+                    except Exception:
+                        pass
+
+            # Everything Mirror mode would delete, listed before a single file is removed. Only a
+            # Mirror chain deletes at all, so an Additive chain never reaches the question, and a
+            # removable-media sync (which pulls from here but writes to a drive) is handed no
+            # confirm_cb and so is never held up asking either.
+            doomed = [name for name in local_files_map if name not in host_files_map] \
+                if deletion_mode == 'mirror' else []
+            limit = delete_confirm_limit(chain_config)
+
+            if doomed:
+                if confirm_cb is None or limit == 0 or len(doomed) <= limit:
+                    _remove_offered_no_more(doomed)
+                else:
+                    if status_cb:
+                        status_cb(f"Host no longer offers {len(doomed)} local track(s) - asking before deleting...")
+                    # The host gives up on an idle connection after 30 seconds, so the connection
+                    # is kept warm for as long as the user takes.
+                    keepalive = _HostKeepalive(sock)
+                    keepalive.start()
+                    try:
+                        approved = bool(confirm_cb(_deletion_question(dest_folder, doomed, limit)))
+                    finally:
+                        keepalive.stop()
+                    if approved:
+                        _remove_offered_no_more(doomed)
+                    else:
+                        unconfirmed = len(doomed)
+                        if status_cb:
+                            status_cb(f"Deletions not confirmed - {unconfirmed} track(s) left where they are")
 
             total_items = len(host_files)
             for idx, hf in enumerate(host_files, 1):
@@ -157,7 +287,8 @@ class SyncClientWorker:
                         status_cb(f"Updated metadata [{idx}/{total_items}]: {name}")
                     transferred += 1
 
-            return True, f"Synced successfully ({transferred} updated, {deleted} removed).", transferred, deleted
+            note = f" {unconfirmed} {DELETIONS_DECLINED_NOTE}" if unconfirmed else ""
+            return True, f"Synced successfully ({transferred} updated, {deleted} removed).{note}", transferred, deleted
         except Exception as e:
             return False, f"Sync error: {e}", transferred, deleted
         finally:
@@ -175,9 +306,12 @@ class ClientSyncThread(QThread):
     progress_signal = Signal(int, int, str, int, int)
     finished_signal = Signal(bool, str, int, int)
 
-    def __init__(self, chain_config: dict):
+    def __init__(self, chain_config: dict, confirm_cb: Optional[Callable[[str], bool]] = None):
         super().__init__()
         self.chain_config = chain_config
+        # Left None by anything that cannot put a question on screen; the worker then proceeds
+        # exactly as it did before this existed.
+        self.confirm_cb = confirm_cb
 
     def run(self):
         def _status(txt):
@@ -189,6 +323,7 @@ class ClientSyncThread(QThread):
         ok, msg, transferred, deleted = SyncClientWorker.sync_chain(
             self.chain_config,
             status_cb=_status,
-            progress_cb=_progress
+            progress_cb=_progress,
+            confirm_cb=self.confirm_cb
         )
         self.finished_signal.emit(ok, msg, transferred, deleted)

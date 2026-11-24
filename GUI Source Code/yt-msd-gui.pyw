@@ -200,11 +200,18 @@ from yt_msd.ui.render import (
 # still reads them by name. Wave 5h checked the group and dropped whatever nothing read.
 from yt_msd.sync.client import (
     SyncClientWorker,
+    _HostKeepalive,
+    deletions_were_declined,
+    make_delete_confirm_cb,
 )
 from yt_msd.sync.config import (
+    DEFAULT_DELETE_CONFIRM_LIMIT,
     DEFAULT_SYNC_SETTINGS,
+    DELETE_CONFIRM_LIMIT_MAX,
+    SYNC_CONFIRM_WAIT_LIMIT,
     SyncConfigManager,
     _CONFIG_WRITE_LOCK,
+    delete_confirm_limit,
     is_client_chain_paused,
 )
 from yt_msd.sync.discovery import (
@@ -216,6 +223,7 @@ from yt_msd.sync.host import (
     SyncHostServer,
 )
 from yt_msd.sync.lan import (
+    SYNC_CONFIRM_PING_INTERVAL,
     get_current_wifi_ssid,
     get_local_ip,
 )
@@ -325,6 +333,7 @@ class MainApp(BootstrapMixin,
     ytdlp_version_signal = Signal(str)  # yt-dlp version found by a bg thread, shown on the GUI thread
     stream_refreshed_signal = Signal(bool, str)  # (re-resolved ok, track title) from the stream-refresh thread
     stream_fetch_failed_signal = Signal(str, bool)  # (video id, whether this was an automatic changeover) from bg_fetch
+    sync_confirm_signal = Signal(str, str, str)  # (request id, window title, question) from a sync worker - parked until _on_sync_confirm answers
 
     def _on_host_activity(self, sync_code: str, client_ip: str, activity: str):
         """Called when a client connects or pulls files from our hosted sync chain."""
@@ -433,7 +442,8 @@ class MainApp(BootstrapMixin,
                 ok, msg, transferred, deleted = SyncClientWorker.sync_chain(
                     cc,
                     status_cb=_status,
-                    progress_cb=_prog
+                    progress_cb=_prog,
+                    confirm_cb=make_delete_confirm_cb(self, chain_name)
                 )
                 if hasattr(self, 'dl_progress_signal'):
                     self.dl_progress_signal.emit("")
@@ -444,6 +454,10 @@ class MainApp(BootstrapMixin,
                         self.status_signal.emit(f"Sync Chain '{cc.get('name')}': {transferred} updated, {deleted} removed.", False, "#1abd33")
                         if self.local_current_path == cc.get('folder_path'):
                             self.local_list_refresh_signal.emit()
+                    elif deletions_were_declined(msg):
+                        # Nothing was updated and nothing was deleted: the only thing that happened
+                        # is that the user was asked, and said no.
+                        self.status_signal.emit(f"Sync Chain '{cc.get('name')}': {msg}", False, "#FF8C00")
                 else:
                     cc['status'] = f"Host Offline"
             self.sync_config_manager.save()
@@ -480,7 +494,8 @@ class MainApp(BootstrapMixin,
                     status_cb=lambda t: self.dl_progress_signal.emit(f"[Sync: {c.get('name', 'Sync')}] {t}") if hasattr(self, 'dl_progress_signal') else None,
                     progress_cb=lambda done, total, fname, idx, total_items: self.dl_progress_signal.emit(
                         f"[Sync: {c.get('name', 'Sync')}] [{idx}/{total_items}] ({int(done/total*100) if total > 0 else 0}%) {fname}"
-                    ) if hasattr(self, 'dl_progress_signal') else None
+                    ) if hasattr(self, 'dl_progress_signal') else None,
+                    confirm_cb=make_delete_confirm_cb(self, c.get('name', 'Sync'))
                 )
                 if hasattr(self, 'dl_progress_signal'):
                     self.dl_progress_signal.emit("")
@@ -491,6 +506,8 @@ class MainApp(BootstrapMixin,
                         self.status_signal.emit(f"Sync Chain '{c.get('name')}': {transferred} updated, {deleted} removed.", False, "#1abd33")
                         if self.local_current_path == c.get('folder_path'):
                             self.local_list_refresh_signal.emit()
+                    elif deletions_were_declined(msg):
+                        self.status_signal.emit(f"Sync Chain '{c.get('name')}': {msg}", False, "#FF8C00")
                 self.sync_config_manager.save()
             threading.Thread(target=_bg, daemon=True).start()
 
@@ -807,6 +824,56 @@ class MainApp(BootstrapMixin,
             thread.answer_confirm(proceed)
         except RuntimeError:
             pass
+
+    def ask_sync_confirm(self, title: str, question: str) -> bool:
+        """Ask the user something a sync worker has stopped to ask, from the worker's own thread.
+
+        The worker calls this and parks here while sync_confirm_signal puts the question on the
+        GUI thread, which is the same shape the removable worker's "this drive holds a newer
+        version" question already uses (_on_retrograde_sync_confirm). Nothing is deleted, written
+        or downloaded while it waits, and nobody is asked on a worker thread - Qt windows belong on
+        the GUI thread. An answer that never comes counts as No, because a question left
+        unanswered has to leave the files where they are.
+        """
+        waiter = {"event": threading.Event(), "answer": False}
+        with self._sync_confirm_lock:
+            self._sync_confirm_counter += 1
+            request_id = f"sc_{int(time.time() * 1000)}_{self._sync_confirm_counter}"
+            self.sync_confirm_waiters[request_id] = waiter
+        try:
+            self.sync_confirm_signal.emit(request_id, title, question)
+            deadline = time.time() + SYNC_CONFIRM_WAIT_LIMIT
+            while time.time() < deadline:
+                if waiter["event"].wait(timeout=0.5):
+                    return bool(waiter["answer"])
+            return False
+        except Exception:
+            return False
+        finally:
+            with self._sync_confirm_lock:
+                self.sync_confirm_waiters.pop(request_id, None)
+
+    def _on_sync_confirm(self, request_id: str, title: str, question: str):
+        """Main-thread slot for a client sync that is about to delete more files than its chain's
+        limit lets it delete on its own. The worker parks until this answers, so the question is
+        asked on the GUI thread and defaulting to No leaves every file exactly where it is."""
+        waiter = self.sync_confirm_waiters.get(request_id)
+        if waiter is None:
+            return
+        parent = None
+        try:
+            if self.sync_manager_dialog is not None and self.sync_manager_dialog.isVisible():
+                parent = self.sync_manager_dialog
+        except RuntimeError:
+            parent = None
+        try:
+            answer = QMessageBox.question(parent, title, question,
+                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            proceed = (answer == QMessageBox.Yes)
+        except Exception:
+            proceed = False
+        waiter["answer"] = proceed
+        waiter["event"].set()
 
     def open_sync_manager(self, parent_dialog=None):
         """Opens or brings the Sync Chains Manager to the foreground directly with Main < Settings < Sync stacking."""

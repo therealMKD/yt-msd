@@ -24,6 +24,12 @@ UDP_BEACON_PORT = 63350
 
 SYNC_SOCKET_TIMEOUT = 12.0
 
+# How often a client pings its host while it has stopped to ask the user something. The host
+# reads the next command with a 30-second timeout (SyncHostServer._handle_client), so this has to
+# be comfortably shorter than that - and long enough that a question answered straight away costs
+# nothing. See _HostKeepalive in yt_msd.sync.client.
+SYNC_CONFIRM_PING_INTERVAL = 10.0
+
 SYNC_CHUNK_SIZE = 1024 * 1024
 
 

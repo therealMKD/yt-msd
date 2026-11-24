@@ -185,6 +185,9 @@ class SyncRemovableWorker:
                     status_cb(f"[USB Sync: {chain_name}] This PC's copy is older than the drive's; "
                               f"refreshing from host before writing...")
                 status_cb(f"[USB Sync: {chain_name}] Step 1/2: Updating client chain from host...")
+            # No confirm_cb here on purpose: this is the removable half, and the deletion guard is
+            # a LAN-chain rule. A sync that has to stop and ask about files never does that on the
+            # way onto or off a USB drive.
             ok, msg, t, d = SyncClientWorker.sync_chain(matching_cc, status_cb=status_cb, progress_cb=progress_cb)
             if ok:
                 # This copy genuinely did just come off the host, so say so. Without

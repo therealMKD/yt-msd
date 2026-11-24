@@ -41,6 +41,40 @@ _CONFIG_WRITE_LOCK = threading.Lock()
 DEFAULT_SYNC_SETTINGS = {"auto_sync_interval_mins": 30, "firewall_prompted": False}
 
 
+# How many files a client chain is allowed to delete on its own before it has to ask the user
+# first. A chain that was made before this setting existed carries no number at all, and every
+# reader of one falls back to this - so a 3.0, 3.1, 3.2, 3.3 or 3.4 chain keeps syncing exactly as
+# it always did, just now behind the guard.
+DEFAULT_DELETE_CONFIRM_LIMIT = 10
+
+# The top end the option boxes offer. It is a ceiling on what can be typed, not a rule the sync
+# enforces: delete_confirm_limit() takes whatever non-negative number a config file hands it.
+DELETE_CONFIRM_LIMIT_MAX = 999999
+
+# How long a sync worker may wait for an answer before the question counts as a No. The worker is
+# parked and its host connection is being kept warm while it waits (see _HostKeepalive), so this
+# only exists so a question nobody answers cannot hold a chain open forever.
+SYNC_CONFIRM_WAIT_LIMIT = 30 * 60
+
+
+def delete_confirm_limit(chain_config: dict) -> int:
+    """How many files this client chain may delete without asking, or 0 for any number.
+
+    Read with a fallback rather than required. Chains saved by earlier builds have no such key,
+    a hand-edited config can hold anything, and neither may turn into a crash or into a sync that
+    quietly deletes nothing: a value that is not a number becomes the default, and a negative one
+    becomes 0, which is this program's own "no ceiling" value.
+    """
+    raw = chain_config.get('delete_confirm_limit')
+    if raw is None or isinstance(raw, bool):
+        return DEFAULT_DELETE_CONFIRM_LIMIT
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_DELETE_CONFIRM_LIMIT
+    return value if value > 0 else 0
+
+
 
 class SyncConfigManager:
     """Manages persistence of sync configuration within the unified gui_config.json."""
@@ -142,7 +176,12 @@ class SyncConfigManager:
         return chain
 
     def add_client_chain(self, name: str, folder_path: str, sync_code: str, host_ip: str,
-                         host_port: int = 63350, deletion_mode: str = 'mirror', bound_wifi_ssid: str = '') -> dict:
+                         host_port: int = 63350, deletion_mode: str = 'mirror', bound_wifi_ssid: str = '',
+                         delete_confirm_limit: int = DEFAULT_DELETE_CONFIRM_LIMIT) -> dict:
+        try:
+            limit = max(0, int(delete_confirm_limit))
+        except (TypeError, ValueError):
+            limit = DEFAULT_DELETE_CONFIRM_LIMIT
         chain = {
             'id': f'cc_{sync_code}',
             'sync_code': sync_code,
@@ -151,6 +190,10 @@ class SyncConfigManager:
             'last_known_host_ip': host_ip,
             'host_port': host_port,
             'deletion_mode': deletion_mode,
+            # How many files this chain may delete before it asks. Kept on the chain rather than
+            # in the shared settings because Mirror is a property of one chain: a chain synced in
+            # Additive mode never deletes, and so has no use for a number.
+            'delete_confirm_limit': limit,
             'paused_until': 0,
             'wifi_ssid': bound_wifi_ssid,
             'created_at': time.time(),
@@ -184,6 +227,22 @@ class SyncConfigManager:
                 # made "Bind Wi-Fi" / "Unbind Wi-Fi" on a live chain look like a no-op: the card
                 # kept its old label and the auto-sync gate kept the SSID the chain was created with.
                 c['wifi_ssid'] = ssid.strip()
+                break
+        self.save()
+
+    def set_client_delete_limit(self, chain_id: str, value):
+        """Store how many files a client chain may delete before it asks (0 for any number).
+
+        Only ever writes a number the worker can use, for the same reason delete_confirm_limit()
+        guards what it reads: this value comes out of a box the user types into.
+        """
+        try:
+            limit = max(0, int(value))
+        except (TypeError, ValueError):
+            limit = DEFAULT_DELETE_CONFIRM_LIMIT
+        for c in self.client_chains:
+            if c.get('id') == chain_id:
+                c['delete_confirm_limit'] = limit
                 break
         self.save()
 

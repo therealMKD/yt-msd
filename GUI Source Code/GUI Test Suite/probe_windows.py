@@ -34,6 +34,7 @@ import os
 import shutil
 import sys
 import threading
+import time
 
 from pathlib import Path
 
@@ -203,7 +204,8 @@ class _Answers:
 
     @classmethod
     def question(cls, parent, title, text, *args, **kwargs):
-        cls.asked.append((title, text))
+        # args and text are kept apart so a check can see which button a box defaults to.
+        cls.asked.append((title, text, args))
         return cls.Yes if cls.answer_yes else cls.No
 
     @classmethod
@@ -454,6 +456,26 @@ check("WN-B14 a joined chain is stored as base folder plus subfolder, with the h
       and CM.client_chains[0]["last_known_host_ip"] == "192.168.1.50"
       and CM.client_chains[0]["deletion_mode"] == "additive" and _client_dlg.result() == 1,
       CM.client_chains)
+check("WN-B15 it also asks how many files this chain may delete unheard - and offers no number for the mode that never deletes",
+      _client_dlg.delete_limit_spin.value() == mod.DEFAULT_DELETE_CONFIRM_LIMIT
+      and _client_dlg.delete_limit_spin.minimum() == 0
+      and _client_dlg.delete_limit_spin.maximum() == mod.DELETE_CONFIRM_LIMIT_MAX
+      and not _client_dlg.delete_limit_row.isVisibleTo(_client_dlg),
+      (_client_dlg.delete_limit_spin.value(), _client_dlg.delete_limit_row.isVisibleTo(_client_dlg)))
+_client_dlg.del_mode_combo.setCurrentIndex(0)
+check("WN-B16 and it offers that number again the moment Mirror is chosen, because Mirror is the mode that deletes",
+      _client_dlg.delete_limit_row.isVisibleTo(_client_dlg)
+      and _client_dlg.delete_limit_spin.isEnabled(),
+      (_client_dlg.delete_limit_row.isVisibleTo(_client_dlg), _client_dlg.delete_limit_spin.isEnabled()))
+_GUARD_DLG = mod.ConnectClientChainDialog(None, CM)
+_GUARD_DLG.ip_edit.setText("192.0.2.44")
+_GUARD_DLG.code_edit.setText("5810")
+_GUARD_DLG.folder_edit.setText(str(CLIENT_BASE))
+_GUARD_DLG.playlist_name_edit.setText("Guarded")
+_GUARD_DLG.delete_limit_spin.setValue(4)
+answering(True, lambda: _GUARD_DLG._connect_chain())
+check("WN-B17 the number typed into that box is the number the chain is saved with",
+      CM.client_chains[-1]["delete_confirm_limit"] == 4, CM.client_chains[-1])
 
 # ===========================================================================
 # WN-C: the window that runs the chains
@@ -630,6 +652,41 @@ check("WN-C20 the network reads this section stood in for are back with the prog
       not seam.is_patched("get_local_ip") and not seam.is_patched("get_current_wifi_ssid")
       and "yt_msd.sync.lan" in seam.owned_by("get_local_ip"),
       (seam.owned_by("get_local_ip"), seam.owned_by("get_current_wifi_ssid")))
+
+_GUARD_CARD = _card_for(_dlg, CLIENT_CHAIN["id"])
+_GUARD_SPIN = _GUARD_CARD.property("delete_limit_spin")
+check("WN-C21 a Mirror chain's card carries the number of files it may delete before it asks, starting at the default and allowing 0",
+      _GUARD_SPIN is not None and _GUARD_SPIN.value() == mod.DEFAULT_DELETE_CONFIRM_LIMIT
+      and _GUARD_SPIN.minimum() == 0 and _GUARD_SPIN.maximum() == mod.DELETE_CONFIRM_LIMIT_MAX
+      and "files" in _GUARD_SPIN.suffix(), _GUARD_SPIN)
+_before_guard_card = _GUARD_CARD
+_dlg._update_delete_limit(CLIENT_CHAIN["id"], 4)
+check("WN-C22 changing it lands on the chain and in the config file, so the next sync reads the number it was given",
+      CLIENT_CHAIN["delete_confirm_limit"] == 4
+      and mod.SyncConfigManager(str(SYNC_CFG)).client_chains[0].get("delete_confirm_limit") == 4,
+      mod.SyncConfigManager(str(SYNC_CFG)).client_chains[0])
+check("WN-C23 and it does not rebuild the card it was changed on - the box being typed into is part of that card",
+      _card_for(_dlg, CLIENT_CHAIN["id"]) is _before_guard_card)
+SYNC_CM.add_client_chain(name="Additive Mix", folder_path=str(Path(CLIENT_BASE) / "Additive"),
+                         sync_code="6161", host_ip="192.0.2.61", deletion_mode="additive")
+_dlg.refresh_cards(force=True)
+_additive_card = _card_for(_dlg, "cc_6161")
+check("WN-C24 an Additive chain's card carries no such box at all, while the Mirror chain beside it still does",
+      _additive_card is not None and _additive_card.property("delete_limit_spin") is None
+      and _card_for(_dlg, CLIENT_CHAIN["id"]).property("delete_limit_spin") is not None,
+      (_additive_card.property("delete_limit_spin") if _additive_card else "no card",
+       _card_for(_dlg, CLIENT_CHAIN["id"]).property("delete_limit_spin")))
+_OLD_CFG = fixture("chain saved without a limit")
+(_OLD_CFG / "gui_config.json").write_text(json.dumps({"client_chains": [
+    {"id": "cc_3141", "sync_code": "3141", "name": "Old Mix", "folder_path": str(CLIENT_BASE),
+     "last_known_host_ip": "192.0.2.9", "host_port": 63350, "deletion_mode": "mirror",
+     "paused_until": 0, "wifi_ssid": "", "created_at": 0, "last_synced": 0,
+     "status": "Pending Sync"}]}), encoding="utf-8")
+_OLD_DLG = QuietSyncDialog(AppStandIn(sync_config_manager=mod.SyncConfigManager(str(_OLD_CFG))))
+_OLD_SPIN = _card_for(_OLD_DLG, "cc_3141").property("delete_limit_spin")
+check("WN-C25 a chain saved by a build that had no such number gets the box anyway, set to the default it never carried",
+      _OLD_SPIN is not None and _OLD_SPIN.value() == mod.DEFAULT_DELETE_CONFIRM_LIMIT, _OLD_SPIN)
+_OLD_DLG.accept()
 
 
 # ===========================================================================
@@ -1030,6 +1087,94 @@ _signals = {n: type(getattr(mod.MainApp, n)).__name__
             for n in ("status_signal", "search_results_signal", "stream_refreshed_signal")}
 check("WN-H5 the signals MainApp wires its worker threads to are still declared on the class itself",
       all("Signal" in t for t in _signals.values()), _signals)
+
+# ===========================================================================
+# WN-I: the question a sync asks before it deletes
+# ===========================================================================
+# `ask_sync_confirm` is the door a sync worker walks through when it has more files to delete than
+# its chain allows: it is called on the worker's thread, parks that thread, and the answer is given
+# by the GUI-thread slot. The worker half of that is proved in probe_sync (SY-M); what is proved
+# here is the gate itself - the park, the answer, the default, and the wording the user is shown.
+class _GateSignal:
+    """A signal that answers itself, some time after it is emitted, as a queued one does on the GUI thread."""
+
+    def __init__(self, app, answer_after=0.0):
+        self.app = app
+        self.answer_after = answer_after
+        self.emitted = []
+
+    def emit(self, request_id, title, question):
+        self.emitted.append((request_id, title, question))
+        timer = threading.Timer(self.answer_after,
+                                lambda: self.app._on_sync_confirm(request_id, title, question))
+        # A daemon, because one of these is deliberately never answered: the check that proves a
+        # question nobody answers still finishes must not hold the run open for it.
+        timer.daemon = True
+        timer.start()
+
+
+class _GateApp:
+    """The gate without the window: both halves are the program's own methods, taken unbound.
+
+    Building a MainApp to reach two methods would need a player, a tray and a config file. What is
+    under test is the parking and the answering, so the attributes those two methods touch are the
+    only ones here.
+    """
+
+    ask_sync_confirm = mod.MainApp.ask_sync_confirm
+    _on_sync_confirm = mod.MainApp._on_sync_confirm
+
+    def __init__(self, answer_after=0.0):
+        self.sync_confirm_waiters = {}
+        self._sync_confirm_lock = threading.Lock()
+        self._sync_confirm_counter = 0
+        self.sync_manager_dialog = None
+        self.sync_confirm_signal = _GateSignal(self, answer_after)
+
+
+_gate_yes = _GateApp()
+_answer_yes = answering(True, lambda: _gate_yes.ask_sync_confirm(
+    "Sync Chain 'Studio' - Delete Files?", "Delete 11 file(s)?"))
+check("WN-I1 a worker's question is asked out loud, in the words the worker's chain put on it, and its answer comes back to the worker",
+      _answer_yes is True and len(_gate_yes.sync_confirm_signal.emitted) == 1
+      and _Answers.asked[0][0] == "Sync Chain 'Studio' - Delete Files?"
+      and "Delete 11 file(s)?" in _Answers.asked[0][1], (_answer_yes, _Answers.asked))
+check("WN-I2 the box offers exactly Yes and No, and No is the button it defaults to",
+      _Answers.asked[0][2] == (_Answers.Yes | _Answers.No, _Answers.No), _Answers.asked[0][2])
+check("WN-I3 answering it clears the waiter it was parked on, so a finished question cannot be left waiting",
+      _gate_yes.sync_confirm_waiters == {}, _gate_yes.sync_confirm_waiters)
+
+_gate_no = _GateApp()
+_answer_no = answering(False, lambda: _gate_no.ask_sync_confirm("Sync Chain 'Studio' - Delete Files?", "Delete 11 file(s)?"))
+check("WN-I4 a No is handed back as a No, which is the half that leaves every file where it is",
+      _answer_no is False, _answer_no)
+
+_gate_wait = _GateApp(answer_after=0.6)
+_gate_started = time.time()
+_answer_wait = answering(True, lambda: _gate_wait.ask_sync_confirm("t", "q"))
+_gate_waited = time.time() - _gate_started
+check("WN-I5 and it really waits: the answer that arrives half a second late is the answer the worker acts on, not the first one to hand",
+      _answer_wait is True and _gate_waited >= 0.5, _gate_waited)
+
+seam.patch("SYNC_CONFIRM_WAIT_LIMIT", 0.5)
+_gate_stalled = _GateApp(answer_after=30.0)
+_answer_stalled = answering(True, lambda: _gate_stalled.ask_sync_confirm("t", "q"))
+seam.restore("SYNC_CONFIRM_WAIT_LIMIT")
+check("WN-I6 a question nobody answers is a No, and the wait is bounded, so a sync cannot be held open by a box nobody read",
+      _answer_stalled is False and _gate_stalled.sync_confirm_waiters == {}, _answer_stalled)
+
+_stand_in_cb = mod.make_delete_confirm_cb(AppStandIn(), "Studio")
+_real_cb = mod.make_delete_confirm_cb(_GateApp(), "Studio")
+check("WN-I7 the callback a sync is built with is handed over only by an app that can ask, and is nothing at all to one that cannot",
+      _stand_in_cb is None and _real_cb is not None, _stand_in_cb)
+_answer_cb = answering(True, lambda: _real_cb("Delete 12 file(s)?"))
+check("WN-I8 and going through that callback is the same gate: the chain's name is in the title the box is opened with",
+      _answer_cb is True and _Answers.asked[-1][0] == "Sync Chain 'Studio' - Delete Files?",
+      _Answers.asked[-1])
+check("WN-I9 the gate is a signal MainApp declares and a pair of methods it owns, so a worker thread has something to reach for",
+      "Signal" in type(getattr(mod.MainApp, "sync_confirm_signal")).__name__
+      and "ask_sync_confirm" in dir(mod.MainApp) and "_on_sync_confirm" in dir(mod.MainApp),
+      type(getattr(mod.MainApp, "sync_confirm_signal")).__name__)
 
 shutil.rmtree(FIXTURE_ROOT, ignore_errors=True)
 check("WN-F9 every folder this suite wrote is gone again", not FIXTURE_ROOT.exists())

@@ -1,13 +1,14 @@
 """The sync-chain regression harness.
 
-Sections SY-A..SY-L cover the sync half of `GUI Source Code/yt-msd-gui.pyw`: the TAG.yaml marker
+Sections SY-A..SY-M cover the sync half of `GUI Source Code/yt-msd-gui.pyw`: the TAG.yaml marker
 a chain leaves on removable media and what comes back when it is read, the two forms `last_synced`
 takes (an epoch in the chain dict, a wall-clock string in TAG.yaml) and the clock grace between
 them, the drive scan that looks for tagged folders, sync-chain persistence inside the shared
 gui_config.json, the length-prefixed socket protocol both ends of a chain speak, the host server's
 answers to a client, the client worker's decisions about what to download and what to delete, the
-removable-media worker and the failsafe that stops a newer drive from being rolled back to an
-older copy, and the hosted folder watcher's debounce.
+number of files a client chain may delete before it has to ask the user and what keeping the host
+interested during that question looks like, the removable-media worker and the failsafe that stops a
+newer drive from being rolled back to an older copy, and the hosted folder watcher's debounce.
 
 Recipe (AI Readme section 20): same as probe_playback - the `.pyw` is copied to a throwaway `.py`
 in this folder's `copy/` and imported, and the functions are driven directly. Every replacement
@@ -919,6 +920,181 @@ check("SY-K5 a change in a chain nobody watches is not a notification", WATCH_FI
 WATCHER.stop_all()
 
 # ===========================================================================
+# SY-M: the deletion guard - how many files a client may delete before it asks
+# ===========================================================================
+# The mirror half of a client chain deletes every local track its host has stopped offering. This
+# section covers the ceiling on that: the number a chain may delete unheard, 0 meaning any number,
+# the question shown when the ceiling is passed, and the fact that none of it reaches a chain built
+# by an earlier version or a USB drive.
+GUARD_MIX = fixture("guard host mix")
+audio_file(GUARD_MIX, "keep1.mp3", body=b"still on the host")
+audio_file(GUARD_MIX, "keep2.mp3", body=b"still on the host too")
+GUARD_HOST = _FakeHost(GUARD_MIX)
+
+
+def _guard_dest(name, orphans):
+    """A client folder holding `orphans` tracks its host has stopped offering."""
+    folder = fixture(name)
+    for n in range(orphans):
+        audio_file(folder, f"orphan{n:02d}.mp3", body=b"mine")
+    return folder
+
+
+check("SY-M1 a chain naming no limit - every chain built before this existed - gets the default, and the default is ten",
+      mod.DEFAULT_DELETE_CONFIRM_LIMIT == 10
+      and mod.delete_confirm_limit(_client_chain(fixture("guard no limit"), GUARD_HOST.port)) == 10)
+check("SY-M2 a limit read out of a hand-edited config is turned into a usable number rather than a crash",
+      mod.delete_confirm_limit({"delete_confirm_limit": "12"}) == 12
+      and mod.delete_confirm_limit({"delete_confirm_limit": 0}) == 0
+      and mod.delete_confirm_limit({"delete_confirm_limit": -5}) == 0
+      and mod.delete_confirm_limit({"delete_confirm_limit": True}) == 10
+      and mod.delete_confirm_limit({"delete_confirm_limit": "plenty"}) == 10)
+
+GUARD_ASKED = []
+GUARD_DEST11 = _guard_dest("guard eleven", 11)
+ok, message, moved, removed = mod.SyncClientWorker.sync_chain(
+    _client_chain(GUARD_DEST11, GUARD_HOST.port),
+    confirm_cb=lambda q: GUARD_ASKED.append(q) or True)
+check("SY-M3 eleven is more than ten, so the client stops and asks before deleting a single file",
+      len(GUARD_ASKED) == 1 and ok is True and removed == 11
+      and not any(track.name.startswith("orphan") for track in GUARD_DEST11.iterdir()),
+      (ok, message, removed, len(GUARD_ASKED)))
+check("SY-M4 the question says how many, where they are, and what it is asking to do",
+      "11" in GUARD_ASKED[0] and str(GUARD_DEST11) in GUARD_ASKED[0]
+      and "Delete 11 file(s)?" in GUARD_ASKED[0] and "orphan00.mp3" in GUARD_ASKED[0],
+      GUARD_ASKED)
+check("SY-M5 a Yes deletes them and still brings down what the host does offer",
+      moved == 2 and (GUARD_DEST11 / "keep1.mp3").is_file()
+      and (GUARD_DEST11 / "keep2.mp3").is_file(), (ok, message, moved))
+check("SY-M6 a quick answer costs nothing on the wire: the host saw exactly the commands a sync always sends",
+      GUARD_HOST.commands == ["AUTH", "GET_INDEX", "PULL_FILE", "PULL_FILE"], GUARD_HOST.commands)
+
+GUARD_HOST2 = _FakeHost(GUARD_MIX)
+GUARD_EXACT = []
+GUARD_DEST10 = _guard_dest("guard ten", 10)
+ok, message, moved, removed = mod.SyncClientWorker.sync_chain(
+    _client_chain(GUARD_DEST10, GUARD_HOST2.port),
+    confirm_cb=lambda q: GUARD_EXACT.append(q) or True)
+check("SY-M7 the limit means more than: exactly ten deletions go ahead unheard",
+      GUARD_EXACT == [] and ok is True and removed == 10, (GUARD_EXACT, removed))
+
+GUARD_REFUSED = []
+GUARD_DESTNO = _guard_dest("guard refused", 11)
+ok, message, moved, removed = mod.SyncClientWorker.sync_chain(
+    _client_chain(GUARD_DESTNO, GUARD_HOST2.port),
+    confirm_cb=lambda q: GUARD_REFUSED.append(q) or False)
+check("SY-M8 a No leaves every file exactly where it was, and the sync reports that it did",
+      ok is True and removed == 0
+      and sum(1 for track in GUARD_DESTNO.iterdir() if track.name.startswith("orphan")) == 11
+      and mod.deletions_were_declined(message), (ok, message, removed))
+check("SY-M9 a No is about deleting only - the tracks the host still offers came down anyway",
+      moved == 2 and (GUARD_DESTNO / "keep2.mp3").is_file(), (ok, message, moved))
+CLEAN_MESSAGE = mod.SyncClientWorker.sync_chain(
+    _client_chain(_guard_dest("guard clean", 1), GUARD_HOST2.port))[1]
+check("SY-M10 a sync that deleted what it was told to is not read as a refused one",
+      not mod.deletions_were_declined(CLEAN_MESSAGE), CLEAN_MESSAGE)
+
+UNLIMITED = _client_chain(_guard_dest("guard unlimited", 12), GUARD_HOST2.port)
+UNLIMITED["delete_confirm_limit"] = 0
+UNLIMITED_ASKED = []
+ok, message, moved, removed = mod.SyncClientWorker.sync_chain(
+    UNLIMITED, confirm_cb=lambda q: UNLIMITED_ASKED.append(q) or False)
+check("SY-M11 a limit of 0 means any number: twelve gone, and a listener who would have said no is never asked",
+      UNLIMITED_ASKED == [] and ok is True and removed == 12, (UNLIMITED_ASKED, removed))
+
+ADDITIVE_DEST = _guard_dest("guard additive", 12)
+ADDITIVE = _client_chain(ADDITIVE_DEST, GUARD_HOST2.port, deletion_mode="additive")
+ADDITIVE["delete_confirm_limit"] = 5
+ADDITIVE_ASKED = []
+ok, message, moved, removed = mod.SyncClientWorker.sync_chain(
+    ADDITIVE, confirm_cb=lambda q: ADDITIVE_ASKED.append(q) or True)
+check("SY-M12 an Additive chain keeps local files, so it has nothing to be asked about and nothing to delete",
+      ADDITIVE_ASKED == [] and ok is True and removed == 0
+      and sum(1 for track in ADDITIVE_DEST.iterdir() if track.name.startswith("orphan")) == 12,
+      (ADDITIVE_ASKED, removed))
+
+LEGACY_SHAPE = _guard_dest("guard legacy shape", 12)
+ok, message, moved, removed = mod.SyncClientWorker.sync_chain(
+    _client_chain(LEGACY_SHAPE, GUARD_HOST2.port))
+check("SY-M13 a caller that hands over nobody to ask - the call shape every earlier build and the USB half use - deletes the way it always did",
+      ok is True and removed == 12
+      and not any(track.name.startswith("orphan") for track in LEGACY_SHAPE.iterdir()),
+      (ok, message, removed))
+GUARD_HOST.stop()
+GUARD_HOST2.stop()
+
+GUARD_RC_CM = mod.SyncConfigManager(str(fixture("config guard removable")))
+GUARD_RC_CLIENT = GUARD_RC_CM.add_client_chain("Guard Client", str(_guard_dest("guard rc copy", 12)),
+                                               "7113", "127.0.0.1", host_port=_closed_port())
+GUARD_RC_CLIENT["delete_confirm_limit"] = 3
+GUARD_RC_CLIENT["last_synced"] = time.time()
+GUARD_RC_ASKED = []
+ok, message, moved, removed = _removable(GUARD_RC_CM, "7113", fixture("guard rc stick"),
+                                         confirm_cb=lambda q: GUARD_RC_ASKED.append(q) or True,
+                                         name="Guard Client")
+check("SY-M14 the USB half is not held up by a chain's delete ceiling: a drive sync asks nothing about files and writes the copy across",
+      GUARD_RC_ASKED == [] and ok is True and moved == 12, (GUARD_RC_ASKED, ok, message, moved))
+
+
+class _SeenSocket:
+    """A real socket with a notebook: everything sent through it is kept, everything else is the real thing."""
+
+    def __init__(self, sock):
+        self.sock = sock
+        self.sent = []
+
+    def sendall(self, data):
+        self.sent.append(bytes(data))
+        self.sock.sendall(data)
+
+    def recv(self, n):
+        return self.sock.recv(n)
+
+    def settimeout(self, timeout):
+        self.sock.settimeout(timeout)
+
+    def close(self):
+        self.sock.close()
+
+
+KEEP_MIX = fixture("guard keep mix")
+audio_file(KEEP_MIX, "keep1.mp3", body=b"the host still has this")
+KEEP_SERVER = mod.SyncHostServer(lambda: [{"sync_code": "8899", "name": "Keeper",
+                                           "folder_path": str(KEEP_MIX)}])
+KEEP_SERVER._running = True
+KEEP_CLIENT, KEEP_SERVER_SIDE = _loopback_pair()
+_keep_host = threading.Thread(target=lambda: KEEP_SERVER._handle_client(KEEP_SERVER_SIDE, "127.0.0.1"),
+                              daemon=True)
+_keep_host.start()
+_seen = _SeenSocket(KEEP_CLIENT)
+mod.send_json_msg(_seen, {"cmd": "AUTH", "sync_code": "8899"})
+keep_auth = mod.recv_json_msg(_seen, timeout=8.0)
+before_keeper = len(_seen.sent)
+keeper = mod._HostKeepalive(_seen, interval=0.25)
+keeper.start()
+time.sleep(0.7)
+keeper.stop()
+sent_after_stop = len(_seen.sent)
+time.sleep(0.4)
+pings = [json.loads(chunk[4:].decode("utf-8")) for chunk in _seen.sent[before_keeper:]]
+check("SY-M15 while the user is deciding, the client keeps its host interested, and sends nothing else",
+      keep_auth.get("status") == "OK" and len(pings) >= 2
+      and all(command == {"cmd": "PING"} for command in pings), (keep_auth, pings))
+check("SY-M16 and it stops the moment it is told to - the keeping-alive does not outlive the question",
+      len(_seen.sent) == sent_after_stop, (sent_after_stop, len(_seen.sent)))
+mod.send_json_msg(_seen, {"cmd": "PULL_FILE", "filename": "keep1.mp3"})
+keep_sending = mod.recv_json_msg(_seen, timeout=8.0)
+keep_bytes = _drain(_seen, keep_sending.get("filesize", 0))
+check("SY-M17 every PING it sent was answered and read back by the keeper itself, so the pull that follows reads the answer to its own pull",
+      keep_sending.get("status") == "SENDING" and keep_sending.get("filename") == "keep1.mp3"
+      and keep_bytes == (KEEP_MIX / "keep1.mp3").read_bytes(), (keep_sending, keep_bytes))
+_seen.close()
+_keep_host.join(8)
+KEEP_SERVER._running = False
+check("SY-M18 the keepalive is on a schedule the host's own patience allows, so a long think is not mistaken for a dead client",
+      0 < mod.SYNC_CONFIRM_PING_INTERVAL < 30.0, mod.SYNC_CONFIRM_PING_INTERVAL)
+
+# ===========================================================================
 # SY-L: the seam this suite reaches the program through
 # ===========================================================================
 _real_discovery = seam.original("discover_host_on_lan")
@@ -939,7 +1115,9 @@ check("SY-L3 every sync name this suite drives is a module-level name the seam c
                                          "parse_sync_timestamp", "format_sync_timestamp",
                                          "find_tagged_sync_folders_on_drive", "SyncConfigManager",
                                          "SyncHostServer", "SyncRemovableWorker",
-                                         "HostFolderWatcher", "get_drive_io_lock")))
+                                         "HostFolderWatcher", "get_drive_io_lock",
+                                         "delete_confirm_limit", "make_delete_confirm_cb",
+                                         "deletions_were_declined", "_HostKeepalive")))
 try:
     seam.patch("sync_chain_that_is_not_in_the_program", lambda: None)
     _refused_unowned = False

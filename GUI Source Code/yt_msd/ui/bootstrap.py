@@ -228,6 +228,11 @@ class BootstrapMixin:
         # Persistent sync thread registry - lives at MainApp level so it survives dialog close/reopen
         self.sync_threads = {}  # chain_id -> QThread
         self.sync_progress_state = {}  # chain_id -> {'status': str, 'progress': str}
+        # Questions a sync worker has asked the user, waiting for the GUI thread to answer them.
+        # request_id -> {'event': threading.Event, 'answer': bool}. See ask_sync_confirm.
+        self.sync_confirm_waiters: dict = {}
+        self._sync_confirm_lock = threading.Lock()
+        self._sync_confirm_counter = 0
         # Runtime-only registry of currently connected removable drives (not persisted)
         self.active_removable_drives: dict = {}  # folder_path_str -> rc dict
         # Cached answers about the filesystem. Only the background probe thread
@@ -276,6 +281,7 @@ class BootstrapMixin:
         self.playback_started_signal.connect(self._on_playback_started)
         self.stream_refreshed_signal.connect(self._on_stream_refreshed)
         self.stream_fetch_failed_signal.connect(self._on_stream_fetch_failed)
+        self.sync_confirm_signal.connect(self._on_sync_confirm)
         self.queue_update_signal.connect(self._refresh_queue_display)
         self.queue_status_changed_signal.connect(self._on_queue_status_changed)
         self.thumbnails_loaded_signal.connect(self._on_thumbnail_loaded)
