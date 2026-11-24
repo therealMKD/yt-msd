@@ -276,6 +276,38 @@ def entry_channel_name(video):
     return ""
 
 
+
+def entry_display_title(video, fallback='Unknown'):
+    """The words a search row is drawn with, which must never be nothing.
+
+    `.get('title', 'Unknown')` only supplies its default when the key is *missing*, and yt-dlp
+    answers some rows with the key present and nothing in it: the withdrawn upload a playlist
+    still lists, a video whose title this client was not allowed to read, and the sparse search
+    answer that strips a row down to its id. That None travels with the row into every checkbox,
+    queue label and status line built from it, and it is what killed a results window while it was
+    drawing a row - `AttributeError: 'NoneType' object has no attribute 'replace'`.
+
+    The row itself is kept: it is a row of the search the listener asked for, and dropping the
+    nameless ones would lose a track in silence. What changes is what it is called by - whatever
+    the row does name becomes its label, in the order the row is worth reading: its own title,
+    then the channel it belongs to, then its id, then the caller's word for it.
+    """
+    if not isinstance(video, dict):
+        return fallback
+    for key in ('title', 'fulltitle'):
+        value = video.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    channel = entry_channel_name(video)
+    if channel:
+        return channel
+    vid_id = video.get('id')
+    if isinstance(vid_id, str) and vid_id.strip():
+        return vid_id.strip()
+    return fallback
+
+
+
 # A search page lists more than tracks. Among the fifteen rows yt-dlp hands back can be the
 # channel itself, a playlist, or a shelf of that channel's uploads, and a flat entry for one
 # of those looks like any other entry - id, title, url, the channel's own name - except that

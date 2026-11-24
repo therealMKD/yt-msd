@@ -227,7 +227,8 @@ class SyncConfigManager:
 
     def add_client_chain(self, name: str, folder_path: str, sync_code: str, host_ip: str,
                          host_port: int = 63350, deletion_mode: str = 'mirror', bound_wifi_ssid: str = '',
-                         delete_confirm_limit: int = DEFAULT_DELETE_CONFIRM_LIMIT) -> dict:
+                         delete_confirm_limit: int = DEFAULT_DELETE_CONFIRM_LIMIT,
+                         host_chain_name: str = '') -> dict:
         try:
             limit = max(0, int(delete_confirm_limit))
         except (TypeError, ValueError):
@@ -240,6 +241,13 @@ class SyncConfigManager:
             'last_known_host_ip': host_ip,
             'host_port': host_port,
             'deletion_mode': deletion_mode,
+            # What the host calls this chain, read off the host's own answer - the HELLO a network
+            # search gets, or the AUTH a sync makes. The name above is the folder this machine
+            # writes into, which the listener may have named differently; this one is what the
+            # other machine is serving, and it is what its card shows. Written every time, empty
+            # included, so a chain made by this build is never mistaken for one that never learned
+            # the name.
+            'host_chain_name': str(host_chain_name or '').strip(),
             # How many files this chain may delete before it asks. Kept on the chain rather than
             # in the shared settings because Mirror is a property of one chain: a chain synced in
             # Additive mode never deletes, and so has no use for a number.

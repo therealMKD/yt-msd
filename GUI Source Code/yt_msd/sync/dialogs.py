@@ -149,6 +149,23 @@ class CreateHostChainDialog(QDialog):
 
 
 
+# How *Connect To Remote Chain* is sized, and how it is sized once a search has put hosts on it.
+# This window used to be one `setFixedSize(520, 640)`, and a fixed size is a wall: the list of found
+# hosts only exists after a search answers, and a window that cannot grow pays for it by squeezing
+# everything else - which is exactly what happened, the search button cut short, the status line
+# beside it cut short, and the hosts themselves cut off and unclickable. The window now takes the
+# height and width its rows ask for (`_fit_to_content`), with the two values below as the design
+# height and width it is not shrunk below when the rows ask for less.
+CLIENT_DIALOG_WIDTH = 560
+CLIENT_DIALOG_BASE_HEIGHT = 620
+# The found-host list. It is the only row here that can be given less height and lose nothing,
+# because it scrolls, so it is the row that gives way when a desktop is small or heavily scaled.
+CLIENT_HOST_LIST_HEIGHT = 118
+CLIENT_HOST_LIST_MAX_HEIGHT = 148
+CLIENT_HOST_LIST_MIN_HEIGHT = 64
+CLIENT_HOST_LIST_STEP = 18
+
+
 class ConnectClientChainDialog(QDialog):
     """Dialog to connect to a remote Host's Sync Chain."""
     def __init__(self, parent_window, config_manager: SyncConfigManager):
@@ -156,7 +173,8 @@ class ConnectClientChainDialog(QDialog):
         self.parent_window = parent_window
         self.config_manager = config_manager
         self.setWindowTitle("Connect to Sync Chain (Client)")
-        self.setFixedSize(520, 640)
+        self.setMinimumWidth(CLIENT_DIALOG_WIDTH)
+        self.resize(CLIENT_DIALOG_WIDTH, CLIENT_DIALOG_BASE_HEIGHT)
         self.setWindowFlags(self.windowFlags() | Qt.Tool)
 
         layout = QVBoxLayout(self)
@@ -180,15 +198,27 @@ class ConnectClientChainDialog(QDialog):
         # ... or none of the above. A search asks this machine's own networks whether anything on
         # them is hosting a chain, which is the whole point of it: the address is the part nobody
         # knows off by heart, and a visible chain hands over its code with its name.
+        # The button is deliberately not pinned to a width any more. Its label is a whole sentence,
+        # and the 185 px it used to be fixed at is a width that fits that sentence at one Windows
+        # scaling setting and cuts the sentence short at another. The minimum below is the width its
+        # own text asked for at whatever scaling this machine is set to, so the sentence always fits,
+        # and the "Searching..." state cannot shrink the button out from under the cursor.
         scan_row = QHBoxLayout()
         self.scan_btn = QPushButton("Find Hosts On My Network")
-        self.scan_btn.setFixedWidth(185)
+        self.scan_btn.setMinimumWidth(self.scan_btn.sizeHint().width())
         self.scan_btn.setToolTip("Search this network for yt-msd hosts. A visible chain is named with its code, so nothing has to be typed. A private chain answers only if its code is typed here first.")
         scan_row.addWidget(self.scan_btn)
-        self.scan_status = QLabel("Nothing searched yet.")
-        self.scan_status.setStyleSheet("color: #888; font-size: 11px;")
-        scan_row.addWidget(self.scan_status, 1)
+        scan_row.addStretch()
         layout.addLayout(scan_row)
+
+        # What the search did, on a line of its own across the whole window. It used to sit beside
+        # that button, and the longest answer it gives - "No host found. Is yt-msd running on the
+        # other PC, and is its chain Visible?" - is longer than the room left beside a pinned button,
+        # and a QLabel that is not given the room it asked for is drawn cut off rather than wrapped.
+        self.scan_status = QLabel("Nothing searched yet.")
+        self.scan_status.setWordWrap(True)
+        self.scan_status.setStyleSheet("color: #888; font-size: 11px;")
+        layout.addWidget(self.scan_status)
 
         layout.addWidget(QLabel("4-Digit Sync Code:"))
         self.code_edit = QLineEdit()
@@ -201,7 +231,16 @@ class ConnectClientChainDialog(QDialog):
         self.host_list_label.setVisible(False)
         layout.addWidget(self.host_list_label)
         self.host_list = QListWidget()
-        self.host_list.setMaximumHeight(112)
+        # One row of this list is a line of its own - address, port, chain name, code, visible or
+        # private - and 112 px inside a window that was not allowed to grow left no room for the
+        # hosts a search had actually found. It now holds a height of its own, and the window is
+        # made taller for it (see `_fit_to_content`).
+        self.host_list.setMinimumHeight(CLIENT_HOST_LIST_HEIGHT)
+        self.host_list.setMaximumHeight(CLIENT_HOST_LIST_MAX_HEIGHT)
+        # A chain name long enough to need sideways room gets truncated instead: the window has the
+        # width it has, and a sideways scrollbar in a list this short is worse than a long name
+        # ending in an ellipsis.
+        self.host_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.host_list.setVisible(False)
         self.host_list.setToolTip("Pick one and its address, its code and its chain name go in. A private chain only answers a search that already named its code.")
         self.host_list.currentItemChanged.connect(self._apply_scan_choice)
@@ -278,15 +317,29 @@ class ConnectClientChainDialog(QDialog):
         self._scan_results = []
         self._scanned_port = SYNC_PORT_START
         self._scanned_ip = ''
+        # What a search has told us about the host a chain is about to be saved for: the port it
+        # answered on (above) and the name that host's chain has on its own machine. Both belong to
+        # the address they came from, so an address typed in afterwards is not quietly given someone
+        # else's port or someone else's chain name.
+        self._host_chain_name = ''
+        # The last name a search put into the box below. It is what lets a found host's own chain name
+        # fill that box - and fill it again when a different host is picked - without ever overwriting
+        # a name that came from the listener: a name the box holds that this window did not put there
+        # is one somebody typed, pasted or autocompleted in, and that outranks the host's name.
+        self._name_from_scan = ''
         self.scan_btn.clicked.connect(self._start_scan)
+        # Sizing is the last thing the constructor does, because it is asked of the finished layout:
+        # every row above has to be in place before the window can be told the height and width they
+        # need together.
+        self._fit_to_content()
 
     def _start_scan(self):
         """Search this machine's networks for hosts, on its own thread, off the GUI thread."""
         self._stop_scan()
         self._scan_results = []
+        self._host_chain_name = ''
         self.host_list.clear()
-        self.host_list.setVisible(False)
-        self.host_list_label.setVisible(False)
+        self._show_scan_results(False)
         self.scan_btn.setEnabled(False)
         self.scan_btn.setText("Searching...")
         self.scan_status.setStyleSheet("color: #888; font-size: 11px;")
@@ -325,6 +378,47 @@ class ConnectClientChainDialog(QDialog):
         self._stop_scan()
         super().reject()
 
+    def _show_scan_results(self, show: bool):
+        """Put the found-host list on the window or take it off, and resize for it."""
+        self.host_list.setVisible(show)
+        self.host_list_label.setVisible(show)
+        self._fit_to_content()
+
+    def _fit_to_content(self):
+        """Give the window the size the rows it is holding need.
+
+        This window used to be `setFixedSize(520, 640)`, and a fixed size is a wall. The host list
+        only appears once a search has answered, and a window that is not allowed to grow pays for it
+        by taking height off everything else: the search button, the line that reports what the search
+        did, and the hosts themselves all ended up drawn cut off, the list among them too short to
+        read or click. The window now asks its own layout how much room its rows want and takes it -
+        never below the design size above, and never with a row squeezed under the room it asked for.
+
+        The one thing that gives way is the found-host list, and only when the desktop is too small
+        for the window at full height: a laptop running Windows at 150% scaling has less room than
+        this window wants, and the list is the single row here that can be handed less height and
+        lose nothing, because it scrolls. Taking height off anything else is the bug this method
+        exists to fix.
+        """
+        screen = QApplication.primaryScreen()
+        available = screen.availableGeometry().height() if screen is not None else 0
+        list_height = CLIENT_HOST_LIST_HEIGHT
+        width, height = CLIENT_DIALOG_WIDTH, CLIENT_DIALOG_BASE_HEIGHT
+        while True:
+            self.host_list.setMinimumHeight(list_height)
+            self.host_list.setMaximumHeight(max(list_height, CLIENT_HOST_LIST_MAX_HEIGHT))
+            asked = self.layout().totalMinimumSize()
+            # The width is floored by the same measurement. The complaint that started this was the
+            # host list cut off at the side of the window as well as at the bottom, and a window
+            # narrower than the row it is holding is where that happens.
+            width = max(CLIENT_DIALOG_WIDTH, asked.width())
+            height = max(CLIENT_DIALOG_BASE_HEIGHT, asked.height())
+            if list_height <= CLIENT_HOST_LIST_MIN_HEIGHT or not available or height <= available:
+                break
+            list_height -= CLIENT_HOST_LIST_STEP
+        self.setMinimumSize(width, height)
+        self.resize(width, height)
+
     def _scan_line(self, entry: dict) -> str:
         """How one found host is written on the list."""
         if not entry.get('sync_code'):
@@ -340,8 +434,7 @@ class ConnectClientChainDialog(QDialog):
         item.setData(Qt.UserRole, entry)
         self.host_list.addItem(item)
         self._scan_results.append(entry)
-        self.host_list.setVisible(True)
-        self.host_list_label.setVisible(True)
+        self._show_scan_results(True)
         # The first host found is picked on its own. The point of a search is that nothing has to be
         # chosen, and a second host on the list is the rare case rather than the one to design for.
         if len(self._scan_results) == 1:
@@ -350,6 +443,9 @@ class ConnectClientChainDialog(QDialog):
     def _on_scan_done(self, count: int, how: str):
         self.scan_btn.setEnabled(True)
         self.scan_btn.setText("Find Hosts On My Network")
+        # A search that found nothing has nothing to show, and the room its list was taking is
+        # handed back to the window.
+        self._show_scan_results(bool(count))
         if count:
             self.scan_status.setStyleSheet("color: #1abd33; font-size: 11px;")
             self.scan_status.setText(f"{count} host(s) found ({how}).")
@@ -367,8 +463,19 @@ class ConnectClientChainDialog(QDialog):
         self._scanned_port = int(entry['port'])
         if entry.get('sync_code'):
             self.code_edit.setText(entry['sync_code'])
-        if entry.get('chain_name') and not self.playlist_name_edit.text().strip():
-            self.playlist_name_edit.setText(entry['chain_name'])
+        # The name the host gives its own chain. It is the name the folder has on the host's machine
+        # and the name the host's card shows, so it is the name this window prefers for the local
+        # folder it is about to make - including when a host is hosting more than one chain and a
+        # different row is picked: "Other" and "Christian" are two chains on one machine, and picking
+        # the other row has to be able to change the name. The one thing that outranks it is a name
+        # typed at this box.
+        host_name = str(entry.get('chain_name') or '').strip()
+        if host_name:
+            self._host_chain_name = host_name
+            holding = self.playlist_name_edit.text().strip()
+            if not holding or holding == self._name_from_scan:
+                self.playlist_name_edit.setText(host_name)
+                self._name_from_scan = host_name
         self.scan_status.setStyleSheet("color: #1abd33; font-size: 11px;")
         self.scan_status.setText(f"Picked {entry['ip']}:{entry['port']}" +
                                  (f", code {entry['sync_code']}" if entry.get('sync_code')
@@ -416,6 +523,10 @@ class ConnectClientChainDialog(QDialog):
         # suggests. Only the port belonging to the address being saved is used, so an address typed
         # in after a search is not given the port of the address the search picked.
         host_port = (self._scanned_port if self._scanned_ip == ip else SYNC_PORT_START)
+        # The name travels with the chain for the same reason the port does: it came from this
+        # address. An address typed in after a search is somebody else's machine, and its name is
+        # not the one this window was told.
+        host_chain_name = self._host_chain_name if self._scanned_ip == ip else ''
         self.config_manager.add_client_chain(
             name=subfolder,
             folder_path=full_dest_path,
@@ -423,7 +534,8 @@ class ConnectClientChainDialog(QDialog):
             host_ip=ip,
             host_port=host_port,
             deletion_mode=del_mode,
-            delete_confirm_limit=self.delete_limit_spin.value()
+            delete_confirm_limit=self.delete_limit_spin.value(),
+            host_chain_name=host_chain_name
         )
         self.accept()
 
@@ -835,7 +947,8 @@ class SyncManagerDialog(QDialog):
         )
         clients = tuple(
             (cc.get('id'), cc.get('name'), str(cc.get('sync_code', '')), cc.get('last_known_host_ip', ''),
-             bool(is_client_chain_paused(cc)[0]), cc.get('wifi_ssid', ''), cc.get('status', ''))
+             bool(is_client_chain_paused(cc)[0]), cc.get('wifi_ssid', ''), cc.get('status', ''),
+             str(cc.get('host_chain_name') or ''))
             # delete_confirm_limit is left out on purpose. A card carries a live spin box for it
             # now, and a signature that changed every time a keystroke landed in that box would
             # rebuild the card - and the box - out from under the user mid-edit.
@@ -1059,7 +1172,14 @@ class SyncManagerDialog(QDialog):
         header.addWidget(name_lbl)
 
         header.addSpacing(10)
-        code_lbl = QLabel(f"Code: <b style='color: #FF8C00;'>{cc.get('sync_code')}</b> | Host: {cc.get('last_known_host_ip', 'Unknown')}")
+        # What the host calls this chain, whenever a host has ever told us - through the search that
+        # found it, the address it answered after moving, or the AUTH of a sync. It is a different
+        # name from the one in this card's title, which is the name of the folder on *this* machine,
+        # and a chain joined by an address and a code typed in by hand only ever learns it from the
+        # host itself.
+        host_chain_name = str(cc.get('host_chain_name') or '').strip()
+        host_chain_info = f" | Host chain: <b>{host_chain_name}</b>" if host_chain_name else ""
+        code_lbl = QLabel(f"Code: <b style='color: #FF8C00;'>{cc.get('sync_code')}</b> | Host: {cc.get('last_known_host_ip', 'Unknown')}{host_chain_info}")
         code_lbl.setStyleSheet("color: #aaa; font-size: 11px;")
         header.addWidget(code_lbl)
 

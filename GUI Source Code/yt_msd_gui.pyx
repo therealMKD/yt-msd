@@ -185,6 +185,7 @@ from yt_msd.ytdlp.runner import (
     _stream_fetches,
     cancel_stream_fetches,
     entry_channel_name,
+    entry_display_title,
     find_yt_dlp_executable,
     get_yt_dlp_version,
     resolve_stream_url,
@@ -3452,7 +3453,11 @@ class MainApp(BootstrapMixin,
                         query, status_cb=lambda text: self.status_signal.emit(text, False, "#3B8ED0"))
                         
                 if is_playlist and ('youtube.com' in query or 'youtu.be' in query):
-                    title = info.get('title', query) if isinstance(info, dict) else query
+                    # The name this playlist gets in the recent list. A playlist answer can carry
+                    # its title key empty just as a row can, and a recent entry named None comes
+                    # back as a blank row in the picker - the URL it was typed from is the honest
+                    # name for it when nothing else is.
+                    title = entry_display_title(info, fallback=query)
                     updated = False
                     for i, rp in enumerate(self.recent_playlists):
                         if isinstance(rp, dict) and rp.get("url") == query:
@@ -3603,15 +3608,19 @@ class MainApp(BootstrapMixin,
             tw.set_highlight(box[2])
         threading.Thread(target=self._fetch_thumbnail, args=(video,), daemon=True).start()
             
-        title = video.get('title', 'Unknown')
-        cb = QCheckBox(f"{title.replace('&', '&&')}")
+        # The row's own words, and never nothing: a search row can carry its title key empty, and
+        # building a checkbox straight out of it is where a results window died (see
+        # `entry_display_title`). '&' is doubled once for both the checkbox and its elider.
+        title = entry_display_title(video)
+        cb_text = title.replace('&', '&&')
+        cb = QCheckBox(cb_text)
         cb.setProperty("video_id", video.get('id', ''))
         
         # Persist checked state
         cb.setChecked(video.get('id') in queue_ids)
             
         cb.stateChanged.connect(lambda state, v=video: self.toggle_queue(v, state))
-        cb._elide = _ElideTextFilter(f"{title.replace('&', '&&')}", reserve=28).attach(cb)
+        cb._elide = _ElideTextFilter(cb_text, reserve=28).attach(cb)
         l.addWidget(cb, 1)
         
         # Channel name (to the left of duration/timestamp)
@@ -3726,7 +3735,7 @@ class MainApp(BootstrapMixin,
         l.setContentsMargins(5,5,5,5)
         
         st = "\uE73E " if q['status'] == "Finished" else ("\uE896 " if q['status'] == "Downloading" else "")
-        t = q['video'].get('title', 'Unknown')
+        t = entry_display_title(q['video'])
         if len(t) > 40: t = t[:37] + "..."
         t_escaped = html.escape(t)
         
@@ -3763,7 +3772,7 @@ class MainApp(BootstrapMixin,
             labels = placeholder.findChildren(QLabel)
             if labels:
                 st = "\uE73E " if q['status'] == "Finished" else ("\uE896 " if q['status'] == "Downloading" else "")
-                t = q['video'].get('title', 'Unknown')
+                t = entry_display_title(q['video'])
                 if len(t) > 40: t = t[:37] + "..."
                 labels[0].setText(f"<span style='font-family: \"Segoe MDL2 Assets\";'>{st}</span> {html.escape(t)}")
             new_name = "queueItemFinished" if q['status'] == "Finished" else "queueItemPending"
@@ -4914,7 +4923,7 @@ class MainApp(BootstrapMixin,
             self._on_status_update("Playback unavailable: VLC Media Player is not installed.", False, "#E31E24")
             return
 
-        self._on_status_update(f"Fetching stream: {video.get('title', 'Unknown')}...", False, "#3B8ED0")
+        self._on_status_update(f"Fetching stream: {entry_display_title(video)}...", False, "#3B8ED0")
         
         # Track pending fetch ID and loading state
         vid_id = video.get('id', '')
@@ -4985,7 +4994,7 @@ class MainApp(BootstrapMixin,
                 # list again - and so that a track left paused past the life of its URL can be
                 # picked up where it stopped.
                 self._note_loaded_stream(vid_id, url, user_agent, url_age)
-                self.playback_started_signal.emit(video.get('title', 'Unknown'), vid_id, paused_at_start)
+                self.playback_started_signal.emit(entry_display_title(video), vid_id, paused_at_start)
             except StreamFetchSupersededError:
                 # Stopped on purpose by a newer pick. That pick reports its own state, so this
                 # track is not a failure and the status line is not touched by it.

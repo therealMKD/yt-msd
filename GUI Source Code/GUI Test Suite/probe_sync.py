@@ -1400,6 +1400,65 @@ check("SY-N36 the search a client falls back to when the address it remembers st
       _fallback == ("127.0.0.1", _fallback_port, "Made by 3.4"), _fallback)
 
 # ===========================================================================
+# SY-O: what a host calls its chain, and where a client keeps that name
+# ===========================================================================
+# Two names travel with a synced chain: the name the client's folder carries, and the name the host's
+# chain carries. The host gives its own in both answers a client can get - the HELLO a network search
+# reads and the AUTH a sync makes - but the client's record kept only the address and the code, so a
+# chain joined by an address typed in by hand was called by a name neither machine agreed with, and the
+# search that found a host whose address had moved threw the name away on the way. Bounds as in SY-N:
+# loopback sockets on port 0, and no packet put on the LAN.
+HOST_TWO_CHAINS = [{"sync_code": "5401", "name": "Other", "folder_path": str(HOST_CHAIN_FOLDER)},
+                   {"sync_code": "5402", "name": "Christian", "folder_path": str(HOST_CHAIN_FOLDER)}]
+_o_search_answer = hello_reply(HOST_TWO_CHAINS, '', 63360)
+check("SY-O1 a host hosting two chains names both to a search, each by the name it gives that chain",
+      [(c["sync_code"], c["name"]) for c in _o_search_answer["chains"]]
+      == [("5401", "Other"), ("5402", "Christian")], _o_search_answer["chains"])
+
+_o_auth, _ = _round_with(SEARCH_SERVER, [{"cmd": "AUTH", "sync_code": "5301"}], 1)
+check("SY-O2 the answer that lets a client into a chain names the chain it is letting it into",
+      _o_auth[0].get("status") == "OK" and _o_auth[0].get("chain_name") == "Front Room", _o_auth)
+
+_o_cfg = mod.SyncConfigManager(str(fixture("host chain name")))
+_o_named = _o_cfg.add_client_chain(name="Local Folder", folder_path=str(fixture("named dest")),
+                                   sync_code="5411", host_ip="127.0.0.1", host_chain_name="Christian")
+_o_plain = _o_cfg.add_client_chain(name="Typed In", folder_path=str(fixture("plain dest")),
+                                   sync_code="5412", host_ip="127.0.0.1")
+_o_cfg.save()
+_o_saved = {c["sync_code"]: c for c in mod.SyncConfigManager(_o_cfg.config_dir).client_chains}
+check("SY-O3 the name is saved with the chain, and a chain no host has named is saved naming nothing rather than missing the key",
+      _o_saved["5411"]["host_chain_name"] == "Christian" and _o_saved["5412"]["host_chain_name"] == "",
+      _o_saved)
+
+_o_host_mix = fixture("named host mix")
+audio_file(_o_host_mix, "one.mp3", body=b"a hosted track")
+_o_host = _FakeHost(_o_host_mix)
+_o_chain = _client_chain(fixture("named client dest"), _o_host.port)
+_o_ok, _o_msg, _o_moved, _ = mod.SyncClientWorker.sync_chain(_o_chain)
+check("SY-O4 a sync that reaches its host keeps the name that host gives its own chain",
+      _o_ok is True and _o_chain["host_chain_name"] == "Remote Mix", (_o_chain, _o_msg))
+_o_live = _FakeHost(_o_host_mix)
+_o_moved_chain = _client_chain(fixture("moved host dest"), _closed_port())
+seam.patch("discover_host_on_lan",
+           lambda sync_code=None, timeout=2.5: ("127.0.0.1", _o_live.port, "Christian"))
+_o_ok2, _o_msg2, _o_moved2, _ = mod.SyncClientWorker.sync_chain(_o_moved_chain)
+_o_host.stop()
+_o_live.stop()
+check("SY-O5 a chain whose host has moved is found again by its code, and the name travels back with the address",
+      _o_ok2 is True and _o_moved_chain["host_port"] == _o_live.port
+      and _o_moved_chain["host_chain_name"] == "Remote Mix", (_o_moved_chain, _o_msg2))
+_o_quiet_chain = _client_chain(fixture("quiet host dest"), _closed_port())
+_o_quiet_port = _closed_port()
+seam.patch("discover_host_on_lan",
+           lambda sync_code=None, timeout=2.5: ("127.0.0.1", _o_quiet_port, "Study"))
+_o_ok3, _o_msg3, _, _ = mod.SyncClientWorker.sync_chain(_o_quiet_chain)
+seam.patch("discover_host_on_lan", _no_host_on_lan)
+check("SY-O6 and even a search that finds an address it cannot reach leaves the name it was given on the chain",
+      _o_ok3 is False and _o_quiet_chain["host_chain_name"] == "Study"
+      and _o_quiet_chain["last_known_host_ip"] == "127.0.0.1", (_o_quiet_chain, _o_msg3))
+
+
+# ===========================================================================
 # SY-L: the seam this suite reaches the program through
 # ===========================================================================
 _real_discovery = seam.original("discover_host_on_lan")

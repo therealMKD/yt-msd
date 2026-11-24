@@ -149,9 +149,15 @@ class SyncClientWorker:
             found = discover_host_on_lan(sync_code, timeout=3.0)
             if not found:
                 return False, f"Could not find active host for Sync Code {sync_code} on local network.", 0, 0
-            host_ip, host_port, _ = found
+            host_ip, host_port, host_chain = found
             chain_config['last_known_host_ip'] = host_ip
             chain_config['host_port'] = host_port
+            # The name came back with the address. A chain whose host changed address is found again
+            # by its code, and the answer that found it names the chain - which is the name the host
+            # calls it by, and the one worth having on the card for a chain whose own folder name was
+            # typed in by hand.
+            if host_chain:
+                chain_config['host_chain_name'] = str(host_chain).strip()
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(SYNC_SOCKET_TIMEOUT)
@@ -175,6 +181,14 @@ class SyncClientWorker:
             if not auth_resp or auth_resp.get('status') != 'OK':
                 err = auth_resp.get('reason', 'Authentication rejected by host') if auth_resp else 'No auth response'
                 return False, err, 0, 0
+
+            # The host names its own chain in the answer to an AUTH, and that name is the one the
+            # host's card shows and the folder on the host carries. A chain joined by an address and
+            # a code typed in by hand had no way of ever learning it, so a client that joined
+            # "Christian" by number kept calling it whatever it typed into the connect window.
+            host_chain_name = str(auth_resp.get('chain_name') or '').strip()
+            if host_chain_name:
+                chain_config['host_chain_name'] = host_chain_name
 
             if status_cb:
                 status_cb("Fetching file index from host...")

@@ -1611,6 +1611,133 @@ check("WN-K14 and the branch that skips a file with no name still gets its turn,
 
 
 
+# ============================================================================
+# WN-L: the window that joins a chain, and the size it gives itself
+# ============================================================================
+# *Connect To Remote Chain* used to be `setFixedSize(520, 640)` with a found-host list inside it that
+# only exists once a search answers. A window that is not allowed to grow pays for the list by taking
+# room off everything else, and that is what it did: the search button cut short at the side, the line
+# beside it cut short, and the hosts a search had really found cut off and unclickable. The window now
+# asks its own layout how much room its rows want (AI Readme gotcha 55).
+#
+# What follows is measured off the real widgets. A window that has never been put on the screen still
+# knows the room each of its rows asks for - its minimum size, its layout's total, the width a button's
+# own text needs in the font it will be drawn in - and those numbers are the whole difference between a
+# row that fits and a row that is cut.
+from PySide6.QtGui import QFontMetrics
+
+_wl_cfg = fixture("connect sizing config")
+_wl_cm = mod.SyncConfigManager(str(_wl_cfg))
+_wl_dlg = mod.ConnectClientChainDialog(None, _wl_cm)
+_wl_font = QFontMetrics(_wl_dlg.scan_btn.font())
+
+check("WN-L1 the window is no longer pinned to a size it cannot grow past",
+      _wl_dlg.minimumSize() != _wl_dlg.maximumSize()
+      and _wl_dlg.minimumWidth() == seam.original("CLIENT_DIALOG_WIDTH"),
+      (_wl_dlg.minimumSize().width(), _wl_dlg.minimumSize().height(),
+       _wl_dlg.maximumSize().width()))
+check("WN-L2 before a search has found anything, it is already roomier than its rows ask for",
+      _wl_dlg.width() >= _wl_dlg.layout().totalMinimumSize().width()
+      and _wl_dlg.height() >= _wl_dlg.layout().totalMinimumSize().height(),
+      (_wl_dlg.width(), _wl_dlg.height(), _wl_dlg.layout().totalMinimumSize().width(),
+       _wl_dlg.layout().totalMinimumSize().height()))
+_wl_before = _wl_dlg.height()
+_wl_dlg._on_scan_host({"ip": "192.168.1.50", "port": 63351, "sync_code": "4821",
+                       "chain_name": "Other", "visible": True, "host_name": "KITCHEN",
+                       "advertised": True})
+check("WN-L3 hosts arriving make the window taller rather than squeezing the rows that were already there",
+      _wl_dlg.height() > _wl_before
+      and _wl_dlg.layout().totalMinimumSize().height() <= _wl_dlg.height(),
+      (_wl_before, _wl_dlg.height(), _wl_dlg.layout().totalMinimumSize().height()))
+check("WN-L4 the found-host list holds a height of its own to read them in",
+      _wl_dlg.host_list.minimumHeight() >= 100
+      and _wl_dlg.host_list.maximumHeight() >= _wl_dlg.host_list.minimumHeight(),
+      (_wl_dlg.host_list.minimumHeight(), _wl_dlg.host_list.maximumHeight()))
+check("WN-L5 the search button is at least as wide as the sentence it carries, and is not pinned",
+      _wl_dlg.scan_btn.minimumWidth() >= _wl_font.horizontalAdvance(_wl_dlg.scan_btn.text())
+      and _wl_dlg.scan_btn.minimumWidth() != _wl_dlg.scan_btn.maximumWidth(),
+      (_wl_dlg.scan_btn.minimumWidth(), _wl_font.horizontalAdvance(_wl_dlg.scan_btn.text()),
+       _wl_dlg.scan_btn.maximumWidth()))
+_wl_dlg.scan_btn.setText("Searching...")
+check("WN-L6 and the searching state does not shrink it out from under the cursor",
+      _wl_dlg.scan_btn.minimumWidth() >= _wl_font.horizontalAdvance(_wl_dlg.scan_btn.text()),
+      (_wl_dlg.scan_btn.minimumWidth(), _wl_font.horizontalAdvance(_wl_dlg.scan_btn.text())))
+_wl_dlg.scan_btn.setText("Find Hosts On My Network")
+check("WN-L7 what the search did is said on a line of its own across the window, wrapping when it is long",
+      _wl_dlg.layout().indexOf(_wl_dlg.scan_status) >= 0 and _wl_dlg.scan_status.wordWrap(),
+      (_wl_dlg.layout().indexOf(_wl_dlg.scan_status), _wl_dlg.scan_status.wordWrap()))
+# The name a host gives its own chain, and what a client does with it. The example is a host
+# hosting two chains, "Other" and "Christian": the search lists both, and whichever row is picked is
+# the chain the client is joining - its name goes into the box the local folder is named from.
+_wl_base = fixture("connect base")
+_wl_dlg.folder_edit.setText(str(_wl_base))
+_wl_dlg._on_scan_host({"ip": "192.168.1.50", "port": 63351, "sync_code": "7788",
+                       "chain_name": "Christian", "visible": True, "host_name": "KITCHEN",
+                       "advertised": True})
+_wl_dlg.host_list.setCurrentRow(1)
+check("WN-L8 two chains on one host are two rows, and the row picked names the chain being joined",
+      _wl_dlg.host_list.count() == 2 and "Other" in _wl_dlg.host_list.item(0).text()
+      and "Christian" in _wl_dlg.host_list.item(1).text()
+      and _wl_dlg.playlist_name_edit.text() == "Christian",
+      (_wl_dlg.host_list.item(0).text(), _wl_dlg.host_list.item(1).text(),
+       _wl_dlg.playlist_name_edit.text()))
+_wl_dlg.host_list.setCurrentRow(0)
+check("WN-L9 picking the other row changes the name to that chain's, instead of keeping the first one found",
+      _wl_dlg.playlist_name_edit.text() == "Other", _wl_dlg.playlist_name_edit.text())
+_wl_dlg._connect_chain()
+_wl_chain = _wl_cm.client_chains[-1]
+check("WN-L10 the chain made from that pick carries the host's chain name - as its own name, as the folder it names, and as what the host said",
+      _wl_chain['name'] == 'Other' and Path(_wl_chain['folder_path']).name == 'Other'
+      and _wl_chain['host_chain_name'] == 'Other', _wl_chain)
+_wl_dlg.playlist_name_edit.setText("My Own Name")
+_wl_dlg.host_list.setCurrentRow(1)
+check("WN-L11 a name typed at the box outranks the name a search filled it with",
+      _wl_dlg.playlist_name_edit.text() == "My Own Name", _wl_dlg.playlist_name_edit.text())
+_wl_dlg._connect_chain()
+_wl_typed = _wl_cm.client_chains[-1]
+check("WN-L12 and the host's own name is kept beside it, because that is what the other machine calls the chain",
+      _wl_typed['name'] == 'My Own Name' and _wl_typed['host_chain_name'] == 'Christian', _wl_typed)
+_wl_dlg.ip_edit.setText("192.0.2.88")
+_wl_dlg.code_edit.setText("9012")
+_wl_dlg._connect_chain()
+check("WN-L13 an address typed in afterwards is not quietly given another machine's chain name",
+      _wl_cm.client_chains[-1]['host_chain_name'] == ''
+      and _wl_cm.client_chains[-1]['last_known_host_ip'] == '192.0.2.88',
+      _wl_cm.client_chains[-1])
+_wl_dlg.reject()
+
+_wl_sync_cfg = fixture("host chain name cards")
+_wl_sync_cm = mod.SyncConfigManager(str(_wl_sync_cfg))
+_wl_named = _wl_sync_cm.add_client_chain(name="Local Folder",
+                                         folder_path=str(_wl_sync_cfg / "Local Folder"),
+                                         sync_code="6421", host_ip="192.168.1.50",
+                                         host_chain_name="Christian")
+_wl_plain = _wl_sync_cm.add_client_chain(name="Joined By Typing",
+                                         folder_path=str(_wl_sync_cfg / "Joined By Typing"),
+                                         sync_code="6422", host_ip="192.168.1.51")
+check("WN-L14 the name is written into the chain's own record, empty included when no host has ever told it",
+      _wl_named['host_chain_name'] == 'Christian' and _wl_plain['host_chain_name'] == '',
+      (_wl_named, _wl_plain))
+_wl_mgr = QuietSyncDialog(AppStandIn(sync_config_manager=_wl_sync_cm))
+check("WN-L15 the client card says what the host calls this chain, beside the address its host answers on",
+      any('Host chain: <b>Christian</b>' in text for text in _texts(_card_for(_wl_mgr, _wl_named['id']))),
+      _texts(_card_for(_wl_mgr, _wl_named['id'])))
+check("WN-L16 and a chain no host has ever named says nothing about one",
+      not any('Host chain' in text for text in _texts(_card_for(_wl_mgr, _wl_plain['id']))),
+      _texts(_card_for(_wl_mgr, _wl_plain['id'])))
+_wl_plain['host_chain_name'] = 'Study'
+_wl_mgr.refresh_cards()
+check("WN-L17 a card is rebuilt when the name is learned, because the name is part of what a refresh compares",
+      any('Host chain: <b>Study</b>' in text for text in _texts(_card_for(_wl_mgr, _wl_plain['id']))),
+      _texts(_card_for(_wl_mgr, _wl_plain['id'])))
+_wl_client_src = (Path(SRC_DIR) / 'yt_msd' / 'sync' / 'client.py').read_text(encoding='utf-8')
+check("WN-L18 the name is taken from the host's own answers - the AUTH of a sync and the search that finds a host whose address moved",
+      "auth_resp.get('chain_name')" in _wl_client_src
+      and "host_ip, host_port, host_chain = found" in _wl_client_src,
+      [line for line in _wl_client_src.splitlines() if 'chain_name' in line])
+
+
+
 shutil.rmtree(FIXTURE_ROOT, ignore_errors=True)
 check("WN-F9 every folder this suite wrote is gone again", not FIXTURE_ROOT.exists())
 

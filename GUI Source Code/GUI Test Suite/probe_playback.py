@@ -2617,14 +2617,16 @@ _ab_text_branch = _ab_search_window[_ab_search_window.index("                els
 check("AB22 the typed-in search goes through the retrying helper",
       "run_yt_dlp_text_search(" in _ab_text_branch and "ytsearch15:" not in _ab_text_branch,
       _ab_text_branch)
-# Five readers of a channel name now, and all five through the one lookup: the definition, the
+# Six readers of a channel name now, and all six through the one lookup: the definition, the
 # search's retry test, the result row, yt-dlp's summary line (added with the trace, which counts how
-# many entries named a channel because that is what a sparse search is judged on), and - new with the
-# channel-prefix setting - the download path, which names a file whose title carries no artist after
-# the same owner the row showed. The count is exact on purpose, and AB23b keeps the entry point's own
-# half of it exact too: none of these readers is in the entry point.
+# many entries named a channel because that is what a sparse search is judged on), the download path
+# (added with the channel-prefix setting, naming a file whose title carries no artist after the same
+# owner the row showed), and - new with the nameless-row fix of AI below - the word a row is drawn
+# with, which falls back to the channel when the row names no title at all. The count is exact on
+# purpose, and AB23b keeps the entry point's own half of it exact too: none of these readers is in the
+# entry point.
 check("AB23 the row reads its channel through the lookup the search also checks",
-      _source.count("entry_channel_name(") == 5, _source.count("entry_channel_name("))
+      _source.count("entry_channel_name(") == 6, _source.count("entry_channel_name("))
 check("AB23b the entry point still reads a channel in exactly one place",
       open(SRC, encoding="utf-8").read().count("entry_channel_name(") == 1,
       open(SRC, encoding="utf-8").read().count("entry_channel_name("))
@@ -3560,6 +3562,127 @@ check("AH15 a started track clears the allowance, so a later dead row gets the s
       "self._stream_skip_streak = 0"
       in _source[_source.index("def _on_playback_started"):][:900])
 unpatch()
+
+# ============================================================================
+# AI - a search row that names no title is still a row, and it is still named
+# ============================================================================
+# A results window died mid-draw on the installed build. The crash log said it plainly:
+#
+#   File "GUI Source Code/yt_msd_gui.pyx", line 3713, in yt_msd_gui.MainApp.lazy_load_visible_results
+#   File "GUI Source Code/yt_msd_gui.pyx", line 3607, in yt_msd_gui.MainApp.build_result_ui
+#   AttributeError: 'NoneType' object has no attribute 'replace'
+#
+# Line 3607 is `cb = QCheckBox(f"{title.replace('&', '&&')}")`, and `title` came from
+# `video.get('title', 'Unknown')` - which supplies its default only when the key is *missing*. yt-dlp
+# answers some rows with the key there and nothing in it: the withdrawn upload a playlist still
+# lists, a video this client was not allowed to read the name of, and the sparse search answer AB9
+# already knows YouTube serves. So the row reaching the row builder carried `title: None`, and the
+# first thing done with it was a string method. (AI Readme gotcha 55.)
+#
+# What is proved below is the answer the program now keeps: `entry_display_title` names a row out of
+# whatever it does name - title, then fulltitle, then its channel, then its id - and hands back a word
+# the label makers can use for every row it is given, including one that is not a row at all. The row
+# that killed the window is then drawn by the real row builder and the real queue-item builder, which
+# is the site of the crash rather than a stand-in for it.
+print("=" * 72)
+print("AI. a search row with no title, and the word it is drawn with")
+
+display_title = seam.original("entry_display_title")
+
+check("AI1 a row whose title key is there and empty is named by the channel it belongs to",
+      display_title({'id': 'rowNoTitle', 'title': None, 'channel': 'Song F'}) == 'Song F',
+      display_title({'id': 'rowNoTitle', 'title': None, 'channel': 'Song F'}))
+check("AI2 a row naming no owner is named by its id, which is the part of it that is definitely real",
+      display_title({'id': 'rowNoTitle', 'title': ''}) == 'rowNoTitle',
+      display_title({'id': 'rowNoTitle', 'title': ''}))
+check("AI3 a row nothing names gets the caller's word for it rather than nothing",
+      display_title({'url': 'https://www.youtube.com/watch?v=x'}) == 'Unknown'
+      and display_title({}, fallback='the query') == 'the query',
+      (display_title({'url': 'https://www.youtube.com/watch?v=x'}),
+       display_title({}, fallback='the query')))
+check("AI4 a title of only spaces is no more a title than a missing one",
+      display_title({'id': 'rowBlank', 'title': '   ', 'channel': 'Ch'}) == 'Ch',
+      display_title({'id': 'rowBlank', 'title': '   ', 'channel': 'Ch'}))
+check("AI5 a row that does name a title is called by it, with the padding yt-dlp puts around it off",
+      display_title({'id': 'rowNamed', 'title': '  NewJeans - OMG  ', 'channel': 'Ch'}) == 'NewJeans - OMG',
+      display_title({'id': 'rowNamed', 'title': '  NewJeans - OMG  ', 'channel': 'Ch'}))
+check("AI6 yt-dlp's unshortened title is used when the shortened one is not there",
+      display_title({'id': 'rowLong', 'title': None,
+                     'fulltitle': 'A Very Long Song Name (Official Music Video)'})
+      == 'A Very Long Song Name (Official Music Video)',
+      display_title({'id': 'rowLong', 'title': None,
+                     'fulltitle': 'A Very Long Song Name (Official Music Video)'}))
+check("AI7 a row that is not a row at all still gets a word, and nothing is raised about it",
+      display_title(None) == 'Unknown' and display_title('not a row', fallback='none') == 'none',
+      (display_title(None), display_title('not a row', fallback='none')))
+
+_AI_CRASH_ROW = {'id': 'vidQHn3Ud1Y4', 'title': None,
+                 'url': 'https://www.youtube.com/watch?v=vidQHn3Ud1Y4',
+                 'duration': None, 'channel': None, 'uploader': None, 'uploader_id': None}
+check("AI8 the shape of row the crash log was made by comes back named, and never as None",
+      isinstance(display_title(_AI_CRASH_ROW), str) and bool(display_title(_AI_CRASH_ROW)),
+      display_title(_AI_CRASH_ROW))
+
+
+_ai_app = mod.MainApp.__new__(mod.MainApp)
+_ai_app.accent_color_name = "Blue"
+_ai_app._thumbnail_labels = {}
+_ai_app._playback_box = None
+_ai_app._fetch_thumbnail = lambda video: None
+
+
+def _ai_result_row(video):
+    """`build_result_ui` on a row of its own, which is how the pane builds each row it scrolls to."""
+    row = mod.QWidget()
+    row.setFixedHeight(54)
+    try:
+        _ai_app.build_result_ui(row, video, set())
+        return row, None
+    except Exception as exc:
+        return row, exc
+
+
+_ai_row, _ai_raised = _ai_result_row(_AI_CRASH_ROW)
+check("AI9 the row that killed the results window is drawn by the real row builder without raising",
+      _ai_raised is None and _ai_row.property("has_ui") is True, _ai_raised)
+_ai_cb = _ai_row.findChild(mod.QCheckBox)
+check("AI10 and the nameless row's checkbox is named - by its id, the only name it has",
+      _ai_cb is not None and _ai_cb.text() == 'vidQHn3Ud1Y4',
+      _ai_cb.text() if _ai_cb is not None else None)
+_ai_amp_row, _ai_amp_raised = _ai_result_row({'id': 'rowAmp', 'title': None, 'channel': 'Tom & Jerry'})
+check("AI11 a fallback name goes through the same '&' doubling a real title does",
+      _ai_amp_raised is None and _ai_amp_row.findChild(mod.QCheckBox).text() == 'Tom && Jerry',
+      _ai_amp_row.findChild(mod.QCheckBox).text())
+_ai_app._thumbnail_labels.clear()
+
+_ai_queue_row = mod.QWidget()
+_ai_queue_raised = None
+try:
+    _ai_app.build_queue_item_ui(_ai_queue_row, {'status': 'Pending', 'video': _AI_CRASH_ROW}, 0)
+except Exception as exc:
+    _ai_queue_raised = exc
+check("AI12 the queue list names the same row instead of dying on it",
+      _ai_queue_raised is None
+      and any('vidQHn3Ud1Y4' in label.text() for label in _ai_queue_row.findChildren(mod.QLabel)),
+      (_ai_queue_raised, [label.text() for label in _ai_queue_row.findChildren(mod.QLabel)]))
+
+check("AI13 the two places a playing track is named out loud go through the same helper",
+      'f"Fetching stream: {entry_display_title(video)}..."' in _source
+      and 'self.playback_started_signal.emit(entry_display_title(video), vid_id, paused_at_start)' in _source)
+check("AI14 no display line reads a title the way the one that died did",
+      _source.count("video.get('title', 'Unknown')") == 0
+      and open(SRC, encoding="utf-8").read().count("q['video'].get('title'") == 0
+      and _source.count('title = entry_display_title(video)') == 1
+      and _source.count("t = entry_display_title(q['video'])") == 2,
+      (_source.count("video.get('title', 'Unknown')"), _source.count('title = entry_display_title(video)')))
+check("AI15 a playlist named into the recent list falls back to the address it was typed from, not to None",
+      "entry_display_title(info, fallback=query)" in _source
+      and "info.get('title', query)" not in _source)
+check("AI16 the helper is the program's own, held by the module that reads search entries",
+      'def entry_display_title' in open(os.path.join(os.path.dirname(SRC), "yt_msd", "ytdlp",
+                                                     "runner.py"), encoding="utf-8").read()
+      and any(module.__name__ == 'yt_msd.ytdlp.runner' for module in seam.owners('entry_display_title')),
+      [module.__name__ for module in seam.owners('entry_display_title')])
 
 
 print(f"{CHECKS - len(FAILS)} / {CHECKS} checks passed")
