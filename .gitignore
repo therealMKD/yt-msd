@@ -19,12 +19,13 @@ build_dir/
 build_dir_gui/
 ffmpeg_extracted/
 dist/
-# Scratch probes and throwaway copies from past debugging sessions are not part of the repo,
-# but the refactor tooling is: the wave plan, the wave splitter, the verification gate and the
-# record of every content edit it signed off. A refactor guarantee that only exists on one
-# machine is not a guarantee, and verify.py reads its baseline out of this repo's history.
+
+# The refactor harness and everything inside it - the wave scripts, verify.py, and the
+# approved_edits.txt baseline recorded with --record. Untracked deliberately: it is scaffolding for
+# moving code around rather than part of the shipped program, and that baseline belongs to whichever
+# machine ran the wave, so a clone regenerates it rather than inheriting it.
 .test_harness/
-.test_harness/refactor/
+
 # The GUI regression suite is tracked - every refactor wave is checked against it, so the
 # checks themselves have to be part of the repo. Its throwaway import copies and the glyph
 # sheet it paints are build residue, not tests.
