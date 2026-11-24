@@ -43,7 +43,7 @@ import time
 from pathlib import Path
 
 from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QWidget
-from PySide6.QtCore import QThread
+from PySide6.QtCore import QThread, Qt
 
 HERE = os.path.dirname(os.path.abspath(__file__))              # .../GUI Source Code/GUI Test Suite
 SRC = os.path.join(os.path.dirname(HERE), "yt-msd-gui.pyw")    # the master copy, one folder up
@@ -726,41 +726,68 @@ seam.patch("get_local_ip", lambda: "192.0.2.11")
 seam.patch("get_current_wifi_ssid", lambda: "patched network")
 _vis_app = AppStandIn(sync_config_manager=_VIS_CM)
 _VIS_DLG = QuietSyncDialog(_vis_app)
-check("WN-C26 a hosted chain's card says out loud whether a search can find it, and offers the other answer as a button",
-      any(text == "Visible" for text in _texts(_card_for(_VIS_DLG, _OPEN_CHAIN["id"])))
-      and any(text == "Make Private" for text in _button_texts(_card_for(_VIS_DLG, _OPEN_CHAIN["id"])))
-      and any(text == "Private" for text in _texts(_card_for(_VIS_DLG, _SHUT_CHAIN["id"])))
-      and any(text == "Make Visible" for text in _button_texts(_card_for(_VIS_DLG, _SHUT_CHAIN["id"]))),
-      (_button_texts(_card_for(_VIS_DLG, _OPEN_CHAIN["id"])),
-       _texts(_card_for(_VIS_DLG, _SHUT_CHAIN["id"]))))
-_make_private = [btn for btn in _card_for(_VIS_DLG, _OPEN_CHAIN["id"]).findChildren(QPushButton)
-                 if btn.text() == "Make Private"]
-_make_private[0].click()
-check("WN-C27 pressing Make Private writes the decision into the chain and rebuilds the card so it now says Private",
+
+
+def _visibility_badge(card):
+    """The one widget on a hosted card that answers "can a search find this chain".
+
+    It answers by being pressable: the word on the card and the control that changes the answer are
+    the same QPushButton, so there is nothing to press that is not the state itself. None is returned
+    when the card does not carry exactly one such widget, which is part of what the checks below are
+    about - a label with a button beside it would be two widgets, and both words together would be one
+    card answering the question twice.
+    """
+    found = [btn for btn in card.findChildren(QPushButton) if btn.text() in ("Visible", "Private")]
+    return found[0] if len(found) == 1 else None
+
+
+_open_card = _card_for(_VIS_DLG, _OPEN_CHAIN["id"])
+_shut_card = _card_for(_VIS_DLG, _SHUT_CHAIN["id"])
+_open_badge = _visibility_badge(_open_card)
+_shut_badge = _visibility_badge(_shut_card)
+check("WN-C26 a hosted chain's card answers whether a search can find it, and that answer is the thing you press",
+      _open_badge is not None and _open_badge.text() == "Visible"
+      and _shut_badge is not None and _shut_badge.text() == "Private"
+      and not any(text.startswith("Make ") for text in _button_texts(_open_card))
+      and not any(text.startswith("Make ") for text in _button_texts(_shut_card)),
+      (_button_texts(_open_card), _button_texts(_shut_card)))
+check("WN-C27 the badge says in its own tooltip what pressing it would do, and the card says the same underneath",
+      _open_badge is not None and "Click to make it private" in _open_badge.toolTip()
+      and "Click the green badge above" in " ".join(_texts(_open_card))
+      and "Click the badge above" in " ".join(_texts(_shut_card)),
+      (_open_badge.toolTip() if _open_badge else "no badge", _texts(_open_card), _texts(_shut_card)))
+_open_badge.click()
+check("WN-C28 pressing the Visible badge writes the decision into the chain and rebuilds the card so its badge reads Private",
       mod.SyncConfigManager(str(_VIS_CFG)).hosted_chains[0]["visible"] is False
-      and any(text == "Private" for text in _texts(_card_for(_VIS_DLG, _OPEN_CHAIN["id"])))
-      and any(text == "Make Visible" for text in _button_texts(_card_for(_VIS_DLG, _OPEN_CHAIN["id"]))),
-      (_button_texts(_card_for(_VIS_DLG, _OPEN_CHAIN["id"])),
-       mod.SyncConfigManager(str(_VIS_CFG)).hosted_chains))
-check("WN-C28 and it asks nobody to re-arm the watchers while doing it, because a host answers a search by re-reading its chains",
-      _vis_app.called("refresh_sync_watchers") == 0, _vis_app.calls)
-_make_private = [btn for btn in _card_for(_VIS_DLG, _SHUT_CHAIN["id"]).findChildren(QPushButton)
-                 if btn.text() == "Make Visible"]
-_make_private[0].click()
-check("WN-C29 and the other way round works too, so a chain is not committed to the first answer given it",
-      mod.SyncConfigManager(str(_VIS_CFG)).hosted_chains[1]["visible"] is True
-      and any(text == "Visible" for text in _texts(_card_for(_VIS_DLG, _SHUT_CHAIN["id"]))),
+      and _visibility_badge(_card_for(_VIS_DLG, _OPEN_CHAIN["id"])) is not None
+      and _visibility_badge(_card_for(_VIS_DLG, _OPEN_CHAIN["id"])).text() == "Private",
       mod.SyncConfigManager(str(_VIS_CFG)).hosted_chains)
+check("WN-C29 and it asks nobody to re-arm the watchers while doing it, because a host answers a search by re-reading its chains",
+      _vis_app.called("refresh_sync_watchers") == 0, _vis_app.calls)
+_shut_badge = _visibility_badge(_card_for(_VIS_DLG, _SHUT_CHAIN["id"]))
+_shut_badge.click()
+check("WN-C30 and the other way round works too, so a chain is not committed to the first answer given it",
+      mod.SyncConfigManager(str(_VIS_CFG)).hosted_chains[1]["visible"] is True
+      and _visibility_badge(_card_for(_VIS_DLG, _SHUT_CHAIN["id"])).text() == "Visible",
+      mod.SyncConfigManager(str(_VIS_CFG)).hosted_chains)
+_after_badge = _visibility_badge(_card_for(_VIS_DLG, _OPEN_CHAIN["id"]))
+check("WN-C31 the badge is reachable by Tab, is named for a screen reader, and is never the window's default button - so a stray Enter cannot shut a chain and Space pressed on it can",
+      _after_badge is not None and bool(int(_after_badge.focusPolicy()) & int(Qt.TabFocus))
+      and _after_badge.autoDefault() is False and _after_badge.isDefault() is False
+      and bool(_after_badge.accessibleName()),
+      (int(_after_badge.focusPolicy()) if _after_badge else "no badge",
+       _after_badge.accessibleName() if _after_badge else "",
+       _after_badge.autoDefault() if _after_badge else ""))
 _VIS_DLG.accept()
 _LEGACY_CFG = fixture("hosted chain saved before visibility")
 (_LEGACY_CFG / "gui_config.json").write_text(json.dumps({"hosted_chains": [
     {"id": "hc_2580", "sync_code": "2580", "name": "Made by 3.2", "folder_path": str(HOST_FOLDER),
      "notify_delay_mins": 5, "created_at": 0, "last_synced": 0, "status": "Active"}]}), encoding="utf-8")
 _legacy_dlg = QuietSyncDialog(AppStandIn(sync_config_manager=mod.SyncConfigManager(str(_LEGACY_CFG))))
-check("WN-C30 a hosted chain saved by a build that had no such choice shows as Visible, because visible is what it already was",
-      any(text == "Visible" for text in _texts(_card_for(_legacy_dlg, "hc_2580")))
-      and any(text == "Make Private" for text in _button_texts(_card_for(_legacy_dlg, "hc_2580"))),
-      (_texts(_card_for(_legacy_dlg, "hc_2580")), _button_texts(_card_for(_legacy_dlg, "hc_2580"))))
+check("WN-C32 a hosted chain saved by a build that had no such choice shows as Visible, because visible is what it already was",
+      _visibility_badge(_card_for(_legacy_dlg, "hc_2580")) is not None
+      and _visibility_badge(_card_for(_legacy_dlg, "hc_2580")).text() == "Visible",
+      _button_texts(_card_for(_legacy_dlg, "hc_2580")))
 _legacy_dlg.accept()
 seam.restore("get_local_ip")
 seam.restore("get_current_wifi_ssid")
@@ -1425,7 +1452,7 @@ check("WN-J16 a Host still holding chains saved before this choice existed is to
       and "2580" in _notice_app.emitted[0][1] and "Made by 3.5" not in _notice_app.emitted[0][1],
       _notice_app.emitted)
 check("WN-J17 the notice says where the choice is, because a privacy setting nobody can find is not one",
-      "Make Private" in _notice_app.emitted[0][1], _notice_app.emitted[0][1])
+      '"Visible" badge' in _notice_app.emitted[0][1], _notice_app.emitted[0][1])
 check("WN-J18 and it is marked as given and saved before it is opened, so it is a notice and not something read every launch",
       _legacy_manager.settings[mod.VISIBILITY_NOTICE_SETTING] is True and _legacy_manager.saves == 1,
       (_legacy_manager.settings, _legacy_manager.saves))
@@ -1451,7 +1478,7 @@ _open_dialog.show()
 _dialog_app = _NoticeApp(_NoticeManager([]))
 _dialog_app.sync_manager_dialog = _open_dialog
 answering(True, lambda: _dialog_app._on_chain_visibility_notice("a title", "a body"))
-check("WN-J23 and it opens on the Sync Chains window when that window is already open, because that is where the button it names is",
+check("WN-J23 and it opens on the Sync Chains window when that window is already open, because that is where the badge it names is",
       _Answers.told[0][0] is _open_dialog, _Answers.told)
 _open_dialog.hide()
 check("WN-J24 the notice is a signal MainApp declares and a pair of methods it owns, so the startup check has somewhere to put it",

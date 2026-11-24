@@ -15,7 +15,7 @@ From `GUI Source Code`:
 ```powershell
 python "GUI Test Suite\probe_playback.py"      # 537 playback / search / search-row / seam checks. No visible window, no network, no library writes.
 python "GUI Test Suite\probe_sync.py"          # 180 sync-chain checks. Loopback sockets only, fixture folders only, no LAN broadcast and no removable device.
-python "GUI Test Suite\probe_windows.py"       # 201 window checks: the settings window, the three chain builders, the sync manager, the tray bubble, the three update windows, the rename window, the two promises made to the machine - which file Windows starts, which yt-dlp is looked for - what MainApp is assembled from since wave 6, the question a sync asks before it deletes, the window that searches the network for a host and how big it makes itself, and the main window's own start when there is a saved search and no saved session to go with it.
+python "GUI Test Suite\probe_windows.py"       # 203 window checks: the settings window, the three chain builders, the sync manager and the visibility badge on a hosted card, the tray bubble, the three update windows, the rename window, the two promises made to the machine - which file Windows starts, which yt-dlp is looked for - what MainApp is assembled from since wave 6, the question a sync asks before it deletes, the window that searches the network for a host and how big it makes itself, and the main window's own start when there is a saved search and no saved session to go with it.
 python "GUI Test Suite\probe_shell.py"         # 75 single-instance and crash-reporting checks. The crash log these checks write lands in their own fixture folder, never in the log a user reads.
 python "GUI Test Suite\probe_export.py"        # 70 export-package checks. Fixture folders only; every archive built is read back and deleted.
 python "GUI Test Suite\probe_trace.py"         # 42 command-trace checks. Fake yt-dlp, ffmpeg, ffprobe and winget stand in for the real ones: no network, no audio touched, nothing installed.
@@ -26,7 +26,7 @@ python "GUI Test Suite\measure_changeover.py"  # optional dev tool: where the ti
 ```
 
 Every regression script prints one line per check and a final `N / N checks passed`, and exits 1 when
-anything fails, so they are safe to chain. Those nine are the gate - 1149 checks - and they are what a
+anything fails, so they are safe to chain. Those nine are the gate - 1151 checks - and they are what a
 wave is measured against before it is accepted. `probe_playback.py` is the one to run after any edit to
 the `.pyw` or to `yt_msd/`; `probe_sync.py` is the one to run after anything in the sync chains - the
 TAG.yaml marker, the socket protocol, either end of a chain, or the removable-media worker;
@@ -226,6 +226,12 @@ driven `setFocus()`, which is the road the Tab key takes into the box, and its l
 `probe_playback.py` went 521 to 537, `probe_sync.py` 174 to 180, `probe_windows.py` 183 to 201 and the gate to 1149. Nothing was folded and no label moved, with
 one exception: `AB23` counts the readers of a channel name, and `entry_display_title` is now the sixth of them - it falls back to the channel when a row names no
 title - so its exact count went 5 to 6 and the comment above it names the new reader.
+
+Later the same day the hosted card's visibility control became the badge itself, and `probe_windows.py` went 201 to 203. `WN-C26`-`WN-C32` now press the
+**Visible / Private** button that is the state: `C26` that the card carries exactly one such widget and no `Make …` button beside it, `C27` that its tooltip and the
+card's own sentence both say what a click does, `C28`-`C30` that pressing it writes the decision, rebuilds the card and needs no watcher re-arming, `C31` that it is
+Tab-reachable, named for a screen reader and never the window's default button - so the keyboard access the removed button carried is still there - and `C32` that a
+chain saved before the choice existed still shows a pressable `Visible`. `WN-J17` reads the notice's wording for the badge it now names.
 
 - `AI1`-`AI8` are `entry_display_title` asked about the shape of search row yt-dlp serves: `title` present and empty (`AI1`), a row naming no owner named by its id
   (`AI2`), a row nothing names given the caller's word rather than None (`AI3`), a title of only spaces (`AI4`), a real title trimmed (`AI5`), `fulltitle` when

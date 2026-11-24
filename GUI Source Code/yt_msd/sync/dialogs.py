@@ -1067,22 +1067,46 @@ class SyncManagerDialog(QDialog):
         code_lbl = QLabel(f"Sync Code: <b style='color: #FF8C00;'>{hc.get('sync_code')}</b>")
         header.addWidget(code_lbl)
 
-        # Whether this chain tells the network it exists. It is asked once when the chain is made and
-        # changed here afterwards, because a chain saved before the choice existed has to be made
-        # private without deleting and re-making it.
+        # Whether this chain tells the network it exists. It is asked once when the chain is made, and
+        # changed afterwards by clicking that answer itself: the badge IS the control, so the state the
+        # card shows and the way to change it are one widget rather than a word with a button standing
+        # beside it. A chain saved before the choice existed has to be made private without deleting
+        # and re-making it, and it shows as Visible because visible is what it already was.
         is_visible = host_chain_is_visible(hc)
-        vis_badge = QLabel("Visible" if is_visible else "Private")
-        vis_badge.setStyleSheet("background: " + ("#1abd33" if is_visible else "#FF8C00") +
-                                "; color: white; padding: 2px 6px; border-radius: 3px; font-weight: bold; font-size: 10px;")
+        vis_badge = QPushButton("Visible" if is_visible else "Private")
+        vis_badge.setCursor(Qt.PointingHandCursor)
+        badge_bg = "#1abd33" if is_visible else "#FF8C00"
+        badge_hover = "#2fd152" if is_visible else "#ffa42e"
+        # A badge has no button frame to tell you it can be pressed, so hover and focus are what tell
+        # you: the border lights under the pointer, and again when Tab has reached it and Space is the
+        # toggle. Tab order and a name for a screen reader are what the removed button used to give,
+        # and a badge that is a QPushButton keeps both.
+        vis_badge.setStyleSheet(
+            "QPushButton { background: " + badge_bg + "; color: white; padding: 3px 8px;"
+            " border: 1px solid rgba(255, 255, 255, 0); border-radius: 3px;"
+            " font-weight: bold; font-size: 10px; }"
+            " QPushButton:hover { background: " + badge_hover + ";"
+            " border: 1px solid rgba(255, 255, 255, 0.6); }"
+            " QPushButton:focus { border: 1px solid #9ecbff; }"
+        )
+        # The same width for both words, so a card does not shuffle the rest of its row when the
+        # answer on it changes.
+        vis_badge.setMinimumWidth(72)
+        # Not the dialog's default button: Enter belongs to the window, and a stray Enter pressed
+        # while the window has focus must not turn a chain private.
+        vis_badge.setAutoDefault(False)
+        vis_badge.setDefault(False)
+        vis_badge.setAccessibleName("Chain visibility")
+        vis_badge.setAccessibleDescription("Shared with this network" if is_visible
+                                           else "Private to this computer")
+        vis_badge.setToolTip(
+            "A visible chain names itself to any client searching this network, code included. A "
+            "private one answers no search at all, and only a client that was already given the code "
+            "can find it. Click to make it " + ("private" if is_visible else "visible") + ".")
+        vis_badge.clicked.connect(lambda chk=False, cid=hc.get('id'), want=not is_visible: self._set_chain_visibility(cid, want))
         header.addWidget(vis_badge)
 
         header.addStretch()
-
-        vis_btn = QPushButton("Make Private" if is_visible else "Make Visible")
-        vis_btn.setFixedWidth(110)
-        vis_btn.setToolTip("A visible chain names itself to any client searching this network, code included. A private one answers no search at all, and only a client that was already given the code can find it.")
-        vis_btn.clicked.connect(lambda chk=False, cid=hc.get('id'), want=not is_visible: self._set_chain_visibility(cid, want))
-        header.addWidget(vis_btn)
 
         copy_code_btn = QPushButton("Copy Code")
         copy_code_btn.setFixedWidth(105)
@@ -1101,9 +1125,11 @@ class SyncManagerDialog(QDialog):
 
         l.addLayout(header)
 
-        vis_hint = QLabel("Any yt-msd on this network can find this chain by name and connect with its code."
+        vis_hint = QLabel("Any yt-msd on this network can find this chain by name and connect with its code. "
+                          "Click the green badge above to keep it to this computer."
                           if is_visible else
-                          "This chain names itself in nothing and answers no search: only a client already holding the code can reach it.")
+                          "This chain names itself in nothing and answers no search: only a client already "
+                          "holding the code can reach it. Click the badge above to let a search find it again.")
         vis_hint.setWordWrap(True)
         vis_hint.setStyleSheet("color: #888; font-size: 11px;")
         l.addWidget(vis_hint)
@@ -1449,9 +1475,9 @@ class SyncManagerDialog(QDialog):
 
         Nothing else has to be re-armed to make it take effect: the beacon and a host's answer to a
         search both re-read the chains every time they run, so the next advertisement and the next
-        search already see the change. The card is rebuilt straight away because the badge and the
-        button on it are the answer, and a card that still said the old thing after a click would
-        read as a click that did nothing.
+        search already see the change. The card is rebuilt straight away because the badge on it is
+        both the answer and the way to change it, and a card that still said the old thing after a
+        click would read as a click that did nothing.
         """
         self.config_manager.set_host_chain_visibility(chain_id, visible)
         self.refresh_cards(force=True)

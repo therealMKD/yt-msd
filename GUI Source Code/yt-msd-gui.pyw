@@ -887,7 +887,7 @@ class MainApp(BootstrapMixin,
         so a chain that could be found before this build must not quietly become unfindable after it.
         But a privacy setting that arrives by an upgrade is not something a user can be assumed to
         have agreed to, so the first launch that finds such a chain says so, names them, and points
-        at the button that changes it. The flag is written before the box is opened rather than after
+        at the badge that changes it. The flag is written before the box is opened rather than after
         it is closed: this is a notice and not a question, and it is given once per machine.
         """
         manager = getattr(self, 'sync_config_manager', None)
@@ -907,7 +907,7 @@ class MainApp(BootstrapMixin,
             "computer are visible, which means any yt-msd on your local network can find them by "
             "name and connect using the code below.\n\n"
             f"{listed}\n\n"
-            "To keep one to yourself, open Sync Chains and press \"Make Private\" on its card. A "
+            "To keep one to yourself, open Sync Chains and click the \"Visible\" badge on its card. A "
             "private chain will not show up in client searches without its 4-digit sync code. It "
             "is still synced by previously paired clients. New sync chains are visible by default. "
             "You can change this when you create a new chain."
