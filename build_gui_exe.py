@@ -826,17 +826,212 @@ Filename: "{app}\\@EXE_NAME@.exe"; Description: "Start yt-msd"; Flags: nowait po
 // /SUPPRESSMSGBOXES: the setup then waits for someone to click OK, which is exactly
 // what a silent run (winget, a login script, "winget install") cannot do.
 // SuppressibleMsgBox shows the same text in an interactive run and answers itself
-// when the install is silent.
+// when the install is silent, and the answer it gives itself is the button named as
+// its default - which is why every question below defaults to Yes.
+//
+// A copy of yt-msd that is running when this setup starts is holding the very files
+// the setup is about to rewrite. Left to Inno, that is the "files that need to be
+// closed are in use" message followed by a Restart Manager close which waits on a Qt
+// program that is saving its settings or finishing a download - a setup that appears
+// to freeze. So this asks the question first ("yt-msd is running. Close it now?"),
+// closes it the way its own window closes, and only then clears the older files away.
+// Nothing is deleted until the program is verifiably down, so a "No" answer stops the
+// install with the older install still intact.
+const
+  ProgramExeName = '@EXE_NAME@.exe';
+  ProgramProcessName = '@EXE_NAME@';   // Windows names a process without its .exe
+  GracefulCloseWaitMs = 12000;
+  ForcedCloseWaitMs = 8000;
+  CheckStepMs = 500;
+
+// A PowerShell single-quoted string carries its own quote as two quotes, and an install
+// folder is allowed to hold an apostrophe - a listener named O'Brien has one - so every
+// folder handed to PowerShell goes through here.
+function ForPowerShell(const Value: string): string;
+var
+  Quoted: string;
+begin
+  Quoted := Value;
+  StringChangeEx(Quoted, '''', '''''', True);
+  Result := Quoted;
+end;
+
+function MarkerFile(const Which: string): string;
+begin
+  Result := ExpandConstant('{tmp}\\ytmsd-' + Which + '.txt');
+end;
+
+// Where this setup should look for a Windows tool: {sysnative} is the 64-bit system
+// folder, which is where the 64-bit copies live, and {sys} is this 32-bit setup's own
+// view of it. The native one is not a preference but a requirement: a 32-bit Windows
+// PowerShell reads an empty Path for a 64-bit process, which makes every running yt-msd
+// look like one whose folder is unknown. {sys} is only the fallback, for a 32-bit
+// Windows where {sysnative} does not exist.
+function ToolPath(const Name: string): string;
+begin
+  Result := ExpandConstant('{sysnative}\\' + Name);
+  if not FileExists(Result) then
+    Result := ExpandConstant('{sys}\\' + Name);
+end;
+
+// Asks Windows which yt-msd processes are running and leaves a marker file for each
+// answer: "here" is one running out of the folder this setup installs into - the only
+// kind that can be holding these files - "elsewhere" is a copy running out of some other
+// folder (a build folder, say), and "download" is a yt-dlp / ffmpeg job in flight, which
+// is what makes a forced close cost the listener something. Inno's Exec cannot read what
+// a process prints, so the answer comes back as files instead of text. Returns False
+// when the question could not be asked at all.
+function ScanPrograms(const Folder: string): Boolean;
+var
+  PowerShell: string;
+  ResultCode: Integer;
+begin
+  DeleteFile(MarkerFile('here'));
+  DeleteFile(MarkerFile('elsewhere'));
+  DeleteFile(MarkerFile('download'));
+  PowerShell := ToolPath('WindowsPowerShell\\v1.0\\powershell.exe');
+  if not FileExists(PowerShell) then
+  begin
+    Log('yt-msd: no Windows PowerShell to ask, so the running check was skipped');
+    Result := False;
+    Exit;
+  end;
+  Log('yt-msd: asking ' + PowerShell + ' which yt-msd is running');
+  Result := Exec(PowerShell,
+    '-NoProfile -ExecutionPolicy Bypass -Command "' +
+    '$app=''' + ForPowerShell(Folder) + ''';' +
+    '$m=@(Get-Process -Name ''' + ProgramProcessName + ''' -ErrorAction SilentlyContinue);' +
+    'if (@($m | Where-Object { -not $_.Path -or $_.Path.ToLower().StartsWith($app.ToLower()) }).Count -gt 0) ' +
+    '{ Set-Content -LiteralPath ''' + ForPowerShell(MarkerFile('here')) + ''' -Value 1 };' +
+    'if (@($m | Where-Object { $_.Path -and -not $_.Path.ToLower().StartsWith($app.ToLower()) }).Count -gt 0) ' +
+    '{ Set-Content -LiteralPath ''' + ForPowerShell(MarkerFile('elsewhere')) + ''' -Value 1 };' +
+    'if (@(Get-Process -Name ''yt-dlp'',''ffmpeg'',''ffprobe'' -ErrorAction SilentlyContinue).Count -gt 0) ' +
+    '{ Set-Content -LiteralPath ''' + ForPowerShell(MarkerFile('download')) + ''' -Value 1 }"',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if not Result then
+    Log('yt-msd: the running check could not run (exit code ' + IntToStr(ResultCode) + ')');
+end;
+
+// The question "is it down yet?" is asked by the same PowerShell that does the first
+// check, and it is bounded by a deadline it measures itself. That keeps the wait honest:
+// a check run from here would cost about a second each time, and a count of checks would
+// quietly turn twelve seconds into forty.
+function CloseWaitCommand(const Folder: string; const Limit: Integer): string;
+begin
+  Result := '-NoProfile -ExecutionPolicy Bypass -Command "' +
+    '$app=''' + ForPowerShell(Folder) + ''';' +
+    '$deadline=(Get-Date).AddMilliseconds(' + IntToStr(Limit) + ');' +
+    'while ((Get-Date) -lt $deadline) {' +
+    '$m=@(Get-Process -Name ''' + ProgramProcessName + ''' -ErrorAction SilentlyContinue);' +
+    'if (@($m | Where-Object { -not $_.Path -or $_.Path.ToLower().StartsWith($app.ToLower()) }).Count -eq 0) { Exit 0 };' +
+    'Start-Sleep -Milliseconds ' + IntToStr(CheckStepMs) +
+    '}; Exit 1"';
+end;
+
+// True when nothing is left running out of that folder. Without /F, taskkill sends
+// WM_CLOSE to the program's windows - the same close as clicking its X, so yt-msd still
+// saves its settings and stops its background work - and the tree it started (yt-dlp,
+// ffmpeg, the swap helper) is asked along with it. /F is reached only after a second
+// answer, and the result is checked by asking Windows again rather than by trusting
+// taskkill's exit code: taskkill reports success the moment it has sent the signal.
+function ClosePrograms(const Folder: string; const Forced: Boolean): Boolean;
+var
+  Limit: Integer;
+  ResultCode: Integer;
+begin
+  Result := False;
+  if Forced then
+  begin
+    Limit := ForcedCloseWaitMs;
+    Log('yt-msd: closing yt-msd by force, along with the programs it started');
+    if not Exec(ToolPath('taskkill.exe'), '/T /F /IM "' + ProgramExeName + '"',
+        '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+      Log('yt-msd: taskkill could not run (exit code ' + IntToStr(ResultCode) + ')');
+  end
+  else
+  begin
+    Limit := GracefulCloseWaitMs;
+    Log('yt-msd: asking yt-msd to close, the way its own window closes');
+    if not Exec(ToolPath('taskkill.exe'), '/T /IM "' + ProgramExeName + '"',
+        '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+      Log('yt-msd: taskkill could not run (exit code ' + IntToStr(ResultCode) + ')');
+  end;
+  if not Exec(ToolPath('WindowsPowerShell\\v1.0\\powershell.exe'),
+      CloseWaitCommand(Folder, Limit), '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  begin
+    Log('yt-msd: no Windows PowerShell to wait with (exit code ' + IntToStr(ResultCode) + ')');
+    Exit;
+  end;
+  Result := (ResultCode = 0);
+  if not Result then
+    Log('yt-msd: still running after ' + IntToStr(Limit div 1000) + ' seconds');
+end;
+
+// Pascal has no ternary, and this is the one sentence that changes with what was found.
+function DownloadClause(const WasDownloading: Boolean): string;
+begin
+  if WasDownloading then
+    Result := ', and a download is in progress'
+  else
+    Result := '';
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
+  Answer: Integer;
   OldInternal: string;
 begin
+  Result := '';
+
+  if ScanPrograms(ExpandConstant('{app}')) then
+  begin
+    if FileExists(MarkerFile('elsewhere')) then
+      Log('yt-msd: a copy running out of another folder was found and left alone');
+    if FileExists(MarkerFile('download')) then
+      Log('yt-msd: a yt-dlp / ffmpeg job is in flight, so a forced close costs something');
+
+    if FileExists(MarkerFile('here')) then
+    begin
+      Log('yt-msd: running out of ' + ExpandConstant('{app}') + ' - asking before anything is touched');
+      Answer := SuppressibleMsgBox(
+        'yt-msd is running.'#13#13 +
+        'This installer needs to replace the files it is running from.'#13#13 +
+        'Close it now? Anything it is in the middle of - a download, an auto-sync - stops.',
+        mbConfirmation, MB_YESNO, IDYES);
+      if Answer <> IDYES then
+      begin
+        Result := 'Setup was stopped: yt-msd was left running. Close yt-msd, then run this setup again.';
+        Exit;
+      end;
+
+      if not ClosePrograms(ExpandConstant('{app}'), False) then
+      begin
+        Answer := SuppressibleMsgBox(
+          'yt-msd did not close by itself - it may be saving its settings' +
+          DownloadClause(FileExists(MarkerFile('download'))) + '.'#13#13 +
+          'Close it by force?',
+          mbConfirmation, MB_YESNO, IDYES);
+        if Answer <> IDYES then
+        begin
+          Result := 'Setup was stopped: yt-msd was left running. Close yt-msd, then run this setup again.';
+          Exit;
+        end;
+        if not ClosePrograms(ExpandConstant('{app}'), True) then
+        begin
+          Result := 'yt-msd would not close, so this setup could not replace its files. ' +
+                    'Close yt-msd, then run this setup again.';
+          Exit;
+        end;
+      end;
+      Log('yt-msd: closed, so its files can be replaced');
+    end;
+  end;
+
   OldInternal := ExpandConstant('{app}\\_internal');
   if DirExists(OldInternal) then begin
     if not DelTree(OldInternal, True, True, True) then
       SuppressibleMsgBox('Could not remove the older yt-msd files in ' + OldInternal + '. Close yt-msd if it is running, then run this setup again.', mbError, MB_OK, IDOK);
   end;
-  Result := '';
 end;
 """
 
@@ -853,6 +1048,16 @@ def write_iss():
            .replace("@OUTPUT_NAME@", SETUP_NAME)
            .replace("@EXE_NAME@", EXE_NAME)
            .replace("@ICON@", ICON))
+    # A backslash written once in the template above is eaten by Python before it ever
+    # reaches this file: '\v' becomes a vertical tab and '\p' loses nothing but its own
+    # doubling, and both read as a broken path inside the installer. Every path in the
+    # template is therefore written with doubled backslashes, and this is the check that
+    # a stray one never ships.
+    for stray in ("\x00", "\x0b", "\x0c"):
+        if stray in iss:
+            print("  the installer script has a stray control character in it - "
+                  "a backslash in the template was not doubled")
+            return 1
     with open(ISS_PATH, "w", encoding="utf-8") as fh:
         fh.write(iss)
     print("  -> %s (installs %s)" % (ISS_PATH, APP_DIR))
