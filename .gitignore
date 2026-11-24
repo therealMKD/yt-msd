@@ -24,7 +24,10 @@ dist/
 # approved_edits.txt baseline recorded with --record. Untracked deliberately: it is scaffolding for
 # moving code around rather than part of the shipped program, and that baseline belongs to whichever
 # machine ran the wave, so a clone regenerates it rather than inheriting it.
+# Both spellings are listed because ignore patterns are matched case-sensitively, and the harness
+# folder has been referred to (and re-created) as either .test_harness or .Test_Harness.
 .test_harness/
+.Test_Harness/
 
 # The GUI regression suite is tracked - every refactor wave is checked against it, so the
 # checks themselves have to be part of the repo. Its throwaway import copies and the glyph
