@@ -2861,8 +2861,10 @@ unpatch()
 # the whole QApplication. MainApp itself cannot be that filter here - a harness MainApp never ran
 # __init__ and so has no Qt object behind it to install - so the click half of it is held by a real
 # QWidget, and the wiring that puts it on the application is checked in the source below.
+import textwrap
+
 from PySide6.QtCore import Qt, QPoint, QPointF
-from PySide6.QtGui import QMouseEvent
+from PySide6.QtGui import QKeyEvent, QMouseEvent
 from PySide6.QtWidgets import QLineEdit, QPushButton
 
 
@@ -2886,6 +2888,12 @@ def _ag_release(widget):
     QApplication.sendEvent(widget, QMouseEvent(QEvent.MouseButtonRelease, QPointF(centre),
                                                QPointF(widget.mapToGlobal(centre)),
                                                Qt.LeftButton, Qt.NoButton, Qt.NoModifier))
+    _ag_drain()
+
+
+def _ag_key(widget, key, text="", modifiers=Qt.NoModifier):
+    """A keystroke delivered to this widget - the key a hand on the keyboard is."""
+    QApplication.sendEvent(widget, QKeyEvent(QEvent.KeyPress, key, modifiers, text))
     _ag_drain()
 
 
@@ -3095,6 +3103,69 @@ check("AG22 the whole tile answers the press, and only a left one, and the tile 
       "if event.button() == Qt.LeftButton:" in _ag_press_src
       and "self.parent_app.play_result(self.video)" in _ag_press_src
       and _source.count("self.setCursor(Qt.PointingHandCursor)") == 1, _ag_press_src)
+
+# The typed number is written by the class layout.py builds, so that class is lifted out of the
+# file it lives in and driven here: what these checks measure is the widget the player bar gets.
+_volbox_start = _source.index("        class VolBox(QLineEdit):")
+_volbox_src = textwrap.dedent(_source[_volbox_start:
+                                      _source.index("        self.vol_pct = VolBox(", _volbox_start)])
+_volbox_ns = {"QLineEdit": QLineEdit, "Qt": Qt}      # what the class body reaches for
+exec(compile(_volbox_src, "yt_msd/ui/layout.py:VolBox", "exec"), _volbox_ns)
+
+_ag_typed = _ag_volume_box()                    # the same harness a dragged volume is measured on
+_ag_typed.vol_pct = _volbox_ns["VolBox"]("73%")
+_ag_typed.vol_pct.setObjectName("volPct")
+_ag_typed.vol_pct.setFixedWidth(50)
+_ag_typed.vol_pct.setMaxLength(4)
+_ag_typed.vol_pct.returnPressed.connect(_ag_typed.on_volume_typed)
+_ag_typed.vol_pct.editingFinished.connect(_ag_typed.on_volume_typed)
+mod.QVBoxLayout(_ag_typed).addWidget(_ag_typed.vol_pct)
+_ag_typed.resize(140, 40)
+_ag_typed.move(-32000, -32000)
+_ag_typed.show()
+_ag_drain()
+_ag_typed.vol_pct.setFocus()
+_ag_drain()
+check("AG23 the click that focuses the box selects the number and leaves the sign out of it",
+      _ag_typed.vol_pct.selectionStart() == 0 and _ag_typed.vol_pct.selectionLength() == 2,
+      (_ag_typed.vol_pct.selectionStart(), _ag_typed.vol_pct.selectionLength()))
+_ag_press(_ag_typed.vol_pct, 18, 0)             # a press to the right of the percent sign
+check("AG24 a press past the sign puts the caret back on the number rather than after the read-out",
+      _ag_typed.vol_pct.cursorPosition() <= 2 and _ag_typed.vol_pct.text() == "73%",
+      _ag_typed.vol_pct.cursorPosition())
+_ag_key(_ag_typed.vol_pct, Qt.Key_End)
+check("AG25 and so does End", _ag_typed.vol_pct.cursorPosition() == 2,
+      _ag_typed.vol_pct.cursorPosition())
+_ag_key(_ag_typed.vol_pct, Qt.Key_5, "5")
+check("AG26 which is why a digit typed there can only land inside the number",
+      _ag_typed.vol_pct.text() == "735%", _ag_typed.vol_pct.text())
+_ag_typed.vol_pct.clearFocus()                  # the click that goes elsewhere is the commit
+_ag_drain()
+check("AG27 a number typed past the top of the slider is clamped, and the caret it is rewritten "
+      "with is back on the number",
+      _ag_typed.applied == [150] and _ag_typed.vol_pct.text() == "150%"
+      and _ag_typed.vol_pct.cursorPosition() <= len("150%") - 1,
+      (_ag_typed.applied, _ag_typed.vol_pct.text(), _ag_typed.vol_pct.cursorPosition()))
+_ag_typed.vol_pct.setText("73%")                  # and the read-out itself is not editable
+_ag_drain()
+_ag_typed.vol_pct.setFocus()                      # the commit above was a focus-out, so it is back
+_ag_drain()
+_ag_press(_ag_typed.vol_pct, 18, 0)               # caret on the number, nothing selected
+_ag_key(_ag_typed.vol_pct, Qt.Key_Delete)
+check("AG28 a forward delete stops at the sign rather than eating the read-out",
+      _ag_typed.vol_pct.text() == "73%", _ag_typed.vol_pct.text())
+_ag_key(_ag_typed.vol_pct, Qt.Key_A, "a", Qt.ControlModifier)   # Ctrl+A over the whole read-out
+check("AG29 a select-all that reaches the sign selects the number and stops there",
+      _ag_typed.vol_pct.selectionStart() == 0 and _ag_typed.vol_pct.selectionLength() == 2,
+      (_ag_typed.vol_pct.selectionStart(), _ag_typed.vol_pct.selectionLength()))
+check("AG30 the number wears none of the box every other QLineEdit in the app is given - the theme "
+      "says so beside the slider's own colour rules",
+      "QLineEdit#volPct {{ background: transparent; border: none; padding: 0px; }}" in _source)
+check("AG31 it is the caption's own 50 px again, and the double click that put the volume back to "
+      "100 survived the change",
+      "self.vol_pct.setFixedWidth(50)" in _source
+      and "def mouseDoubleClickEvent" in _volbox_src
+      and "win.vol_slider.setValue(100)" in _volbox_src)
 
 QApplication.instance().removeEventFilter(_ag_filter)
 

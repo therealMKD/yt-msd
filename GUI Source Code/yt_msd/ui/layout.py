@@ -249,21 +249,66 @@ class LayoutMixin:
         # The percentage is typed as well as dragged. The number is what everything else in the
         # program works in - the tray presets, the saved config, libVLC itself - so a listener who
         # wants exactly 73% should be able to say 73 instead of hunting for it along a 100 px
-        # slider. The box is a route to that number rather than a caption of it: it shows the "73%"
-        # the slider earns, the click that focuses it takes the whole of it (so typing replaces the
-        # number instead of editing around the digits that were there), and it commits on Enter or
-        # the moment the click goes anywhere else in the window - which is the same moment its caret
-        # goes, because that click is the focus-out that MainApp._release_typing_focus answers with.
+        # slider. What is written is still the read-out it always was, only writable: it keeps the
+        # caption's 50 px and it wears no frame, because the app's QLineEdit rule (background,
+        # border, 6 px of padding) is taken off it by the QLineEdit#volPct line in apply_theme.
+        # The percent sign is a read-out and not part of the number, so nothing is ever edited
+        # around it: the click that focuses the box selects the digits rather than the whole of it,
+        # and a click or an End key that lands past the sign pulls the caret back onto the number -
+        # which is also why a typed digit can only ever land inside the number. It commits on Enter
+        # or the moment the click goes anywhere else in the window - the same moment its caret goes,
+        # because that click is the focus-out that MainApp._release_typing_focus answers with - and
+        # keeps the double click the caption had, which put the volume back to 100.
         class VolBox(QLineEdit):
+            def __init__(self, text):
+                super().__init__(text)
+                # A number arriving from the slider is written here with the caret wherever Qt
+                # happens to put it - setText puts it past the sign - and the sign is not a place a
+                # caret belongs, so both the writing and the caret it leaves are pulled back onto
+                # the number.
+                self.textChanged.connect(lambda _text: self._keep_caret_on_the_number())
+                self.cursorPositionChanged.connect(lambda _position: self._keep_caret_on_the_number())
+
+            def _number_end(self):
+                text = self.text()
+                return len(text) - 1 if text.endswith("%") else len(text)
+
+            def _keep_caret_on_the_number(self):
+                end = self._number_end()
+                start, length = self.selectionStart(), self.selectionLength()
+                if length and start + length > end:
+                    # A selection that reached the sign - a select-all does - keeps the part that is
+                    # the number and loses the sign, rather than being thrown away with the caret.
+                    self.setSelection(start, max(0, end - start))
+                if self.cursorPosition() > end:
+                    self.setCursorPosition(end)      # clearing the selection with it is the point
+
             def focusInEvent(self, e):
-                self.selectAll()
+                self.setSelection(0, self._number_end())   # typing replaces the number, the sign stays
                 super().focusInEvent(e)
+
+            def mousePressEvent(self, e):
+                super().mousePressEvent(e)
+                self._keep_caret_on_the_number()
+
+            def keyPressEvent(self, e):
+                if (e.key() == Qt.Key_Delete and not self.selectionLength()
+                        and self.text().endswith("%") and self.cursorPosition() == self._number_end()):
+                    e.accept()        # forward delete stops at the sign - it is not part of the number
+                    return
+                super().keyPressEvent(e)
+                self._keep_caret_on_the_number()
+
+            def mouseDoubleClickEvent(self, e):
+                win = self.window()
+                if hasattr(win, 'vol_slider'):
+                    win.vol_slider.setValue(100)
+                e.accept()
 
         self.vol_pct = VolBox(f"{self.volume_val}%")
         self.vol_pct.setObjectName("volPct")
-        # 58 rather than the 50 the caption needed: the box wears the app's QLineEdit rule, and
-        # its 6 px of padding is inside this width, so a caption's width would clip "150%".
-        self.vol_pct.setFixedWidth(58)
+        self.vol_pct.setFixedWidth(50)      # the width the caption had: "150%" is 32 px of text and
+                                            # the box now adds nothing around it
         self.vol_pct.setAlignment(Qt.AlignCenter)
         self.vol_pct.setMaxLength(4)      # 0 to 150 and the percent sign it is shown with
         self.vol_pct.setToolTip("Type a volume from 0 to 150 and press Enter")

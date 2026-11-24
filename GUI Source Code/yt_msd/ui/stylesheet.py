@@ -160,6 +160,13 @@ class StylesheetMixin:
             QSlider#volSlider[volume_state="red"]::sub-page:horizontal {{ background: #E31E24; }}
             QSlider#volSlider[volume_state="red"]::handle:horizontal {{ background: #E31E24; }}
             QSlider#volSlider::sub-page:horizontal {{ border-radius: 1px; }}
+            /* The volume read-out is typed as well as dragged now, so it is a QLineEdit - and
+               every QLineEdit in the app above it gets a background, a border and 6 px of padding,
+               which around a number in the player bar is a box nobody asked for. This takes the
+               chrome off and leaves the caption where it always sat. The colour MainApp writes onto
+               it at 101 and at 116 is only a colour, so it rides on top of this line instead of
+               replacing it. */
+            QLineEdit#volPct {{ background: transparent; border: none; padding: 0px; }}
             
             QCheckBox {{ color: {fg}; spacing: 8px; }}
             QCheckBox::indicator {{ width: 16px; height: 16px; border: 1px solid {accent}; border-radius: 3px; background: {frame_bg}; }}
