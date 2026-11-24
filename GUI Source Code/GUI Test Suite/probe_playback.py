@@ -3347,7 +3347,7 @@ _ag_typed.show()
 _ag_drain()
 _ag_typed.vol_pct.setFocus()
 _ag_drain()
-check("AG23 the click that focuses the box selects the number and leaves the sign out of it",
+check("AG23 the caret arriving from the keyboard picks the number out and leaves the sign out of it",
       _ag_typed.vol_pct.selectionStart() == 0 and _ag_typed.vol_pct.selectionLength() == 2,
       (_ag_typed.vol_pct.selectionStart(), _ag_typed.vol_pct.selectionLength()))
 _ag_press(_ag_typed.vol_pct, 18, 0)             # a press to the right of the percent sign
@@ -3387,6 +3387,49 @@ check("AG31 it is the caption's own 50 px again, and the double click that put t
       "self.vol_pct.setFixedWidth(50)" in _source
       and "def mouseDoubleClickEvent" in _volbox_src
       and "win.vol_slider.setValue(100)" in _volbox_src)
+
+# Everything above hands the box the caret with setFocus(), which is the road the Tab key takes.
+# A click is two events in Qt's own order - measured with QTest, which takes the focus step that
+# QApplication.sendEvent skips: the focus arrives first and says the mouse brought it, and the
+# press that follows it in the same click is answered by QLineEdit itself, which puts the caret
+# where the pointer landed and loses whatever was picked out. The two steps are asked for here in
+# that order, because a click on this box is a request to change the volume and the number has to
+# still be picked out when the second of them is done.
+_ag_typed.vol_pct.setText("73%")
+_ag_typed.vol_pct.clearFocus()
+_ag_drain()
+check("AG32 the number is nobody's business while the caret is held elsewhere",
+      not _ag_typed.vol_pct.hasFocus() and _ag_typed.vol_pct.selectionLength() == 0,
+      (_ag_typed.vol_pct.hasFocus(), _ag_typed.vol_pct.selectionStart(),
+       _ag_typed.vol_pct.selectionLength()))
+_ag_typed.vol_pct.setFocus(Qt.MouseFocusReason)      # the first half of the click
+_ag_drain()
+check("AG33 that half picks the number out whole - 73 out of 73% - and leaves the sign alone",
+      _ag_typed.vol_pct.hasFocus() and _ag_typed.vol_pct.selectionStart() == 0
+      and _ag_typed.vol_pct.selectionLength() == 2,
+      (_ag_typed.vol_pct.hasFocus(), _ag_typed.vol_pct.selectionStart(),
+       _ag_typed.vol_pct.selectionLength()))
+_ag_press(_ag_typed.vol_pct)                         # the press the same click delivers
+check("AG34 and the press that lands on top of it leaves the number picked out all the same",
+      _ag_typed.vol_pct.selectionStart() == 0 and _ag_typed.vol_pct.selectionLength() == 2
+      and _ag_typed.vol_pct.text() == "73%",
+      (_ag_typed.vol_pct.selectionStart(), _ag_typed.vol_pct.selectionLength(),
+       _ag_typed.vol_pct.text()))
+_ag_key(_ag_typed.vol_pct, Qt.Key_9, "9")
+check("AG35 which is what one key straight after such a click is for: the whole number is replaced",
+      _ag_typed.vol_pct.text() == "9%", _ag_typed.vol_pct.text())
+_ag_press(_ag_typed.vol_pct)                         # the box already holds the caret now
+check("AG36 a click on a box that already holds the caret is the click that puts the caret between "
+      "the digits, and it picks nothing out",
+      _ag_typed.vol_pct.selectionLength() == 0 and _ag_typed.vol_pct.text() == "9%",
+      (_ag_typed.vol_pct.selectionStart(), _ag_typed.vol_pct.selectionLength(),
+       _ag_typed.vol_pct.text()))
+check("AG37 both roads in end at the same pick-out, and the click is remembered only long enough to "
+      "outlast the press that came with it",
+      "_pick_out_the_number" in _volbox_src
+      and "self._focus_came_with_a_click = (e.reason() == Qt.MouseFocusReason)" in _volbox_src
+      and _volbox_src.count("self._focus_came_with_a_click = False") == 2,
+      _volbox_src[:400])
 
 QApplication.instance().removeEventFilter(_ag_filter)
 

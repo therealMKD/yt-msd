@@ -253,9 +253,15 @@ class LayoutMixin:
         # caption's 50 px and it wears no frame, because the app's QLineEdit rule (background,
         # border, 6 px of padding) is taken off it by the QLineEdit#volPct line in apply_theme.
         # The percent sign is a read-out and not part of the number, so nothing is ever edited
-        # around it: the click that focuses the box selects the digits rather than the whole of it,
-        # and a click or an End key that lands past the sign pulls the caret back onto the number -
-        # which is also why a typed digit can only ever land inside the number. It commits on Enter
+        # around it: whichever way the caret arrives - a click or the Tab key - the number is
+        # picked out whole so the first digit typed replaces it rather than landing inside it, and
+        # a click or an End key that lands past the sign pulls the caret back onto the number.
+        # Picking it out on a click needs doing twice, because Qt hands that click as two events:
+        # the focus arrives first and picks out the number, then the press arrives and QLineEdit
+        # answers it by putting the caret where the pointer landed, selection gone. A click on this
+        # box is a request to change the volume, so the number is picked out again after that
+        # caret - while a click on a box that already has the caret is left alone, because that is
+        # the click that means "put the caret between the digits". It commits on Enter
         # or the moment the click goes anywhere else in the window - the same moment its caret goes,
         # because that click is the focus-out that MainApp._release_typing_focus answers with - and
         # keeps the double click the caption had, which put the volume back to 100.
@@ -268,6 +274,9 @@ class LayoutMixin:
                 # the number.
                 self.textChanged.connect(lambda _text: self._keep_caret_on_the_number())
                 self.cursorPositionChanged.connect(lambda _position: self._keep_caret_on_the_number())
+                # Set by the focus that a click brought, and answered by the press that follows it
+                # in the same click. See the pick-out in mousePressEvent below.
+                self._focus_came_with_a_click = False
 
             def _number_end(self):
                 text = self.text()
@@ -283,13 +292,24 @@ class LayoutMixin:
                 if self.cursorPosition() > end:
                     self.setCursorPosition(end)      # clearing the selection with it is the point
 
-            def focusInEvent(self, e):
+            def _pick_out_the_number(self):
                 self.setSelection(0, self._number_end())   # typing replaces the number, the sign stays
+
+            def focusInEvent(self, e):
+                self._pick_out_the_number()
+                # A click is remembered as such because the press that came with it is about to
+                # arrive and undo this; a caret arriving from the Tab key has no press coming, and
+                # its number stays picked out.
+                self._focus_came_with_a_click = (e.reason() == Qt.MouseFocusReason)
                 super().focusInEvent(e)
 
             def mousePressEvent(self, e):
                 super().mousePressEvent(e)
-                self._keep_caret_on_the_number()
+                if self._focus_came_with_a_click:
+                    self._focus_came_with_a_click = False
+                    self._pick_out_the_number()   # the click that brought the focus means "change it"
+                else:
+                    self._keep_caret_on_the_number()
 
             def keyPressEvent(self, e):
                 if (e.key() == Qt.Key_Delete and not self.selectionLength()

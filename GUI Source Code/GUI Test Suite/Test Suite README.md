@@ -13,7 +13,7 @@ as the program.
 From `GUI Source Code`:
 
 ```powershell
-python "GUI Test Suite\probe_playback.py"      # 515 playback / search / search-row / seam checks. No visible window, no network, no library writes.
+python "GUI Test Suite\probe_playback.py"      # 521 playback / search / search-row / seam checks. No visible window, no network, no library writes.
 python "GUI Test Suite\probe_sync.py"          # 120 sync-chain checks. Loopback sockets only, fixture folders only, no LAN broadcast and no removable device.
 python "GUI Test Suite\probe_windows.py"       # 119 window checks: the settings window, the three chain builders, the sync manager, the tray bubble, the three update windows, the rename window, the two promises made to the machine - which file Windows starts, which yt-dlp is looked for - and what MainApp is assembled from since wave 6.
 python "GUI Test Suite\probe_shell.py"         # 75 single-instance and crash-reporting checks. The crash log these checks write lands in their own fixture folder, never in the log a user reads.
@@ -26,7 +26,7 @@ python "GUI Test Suite\measure_changeover.py"  # optional dev tool: where the ti
 ```
 
 Every regression script prints one line per check and a final `N / N checks passed`, and exits 1 when
-anything fails, so they are safe to chain. Those nine are the gate - 985 checks - and they are what a
+anything fails, so they are safe to chain. Those nine are the gate - 991 checks - and they are what a
 wave is measured against before it is accepted. `probe_playback.py` is the one to run after any edit to
 the `.pyw` or to `yt_msd/`; `probe_sync.py` is the one to run after anything in the sync chains - the
 TAG.yaml marker, the socket protocol, either end of a chain, or the removable-media worker;
@@ -201,4 +201,22 @@ candidate replay glyphs and settled on `U+E72C` is not repeated here; its result
 - Two pieces of the harness itself grew, and both are load-bearing for the above: `Sig.connect()` is now recorded, because a signal the window connects at
   start-up was otherwise invisible to the fixture (`AH13` asks about it directly), and `patch_resolve(..., fail_for=...)` makes exactly one video id
   unresolvable so that a scripted search list can hold one dead row while every other row plays.
+
+
+## Added with the volume read-out picked out under a click (24 Nov 2026)
+
+`probe_playback.py` went 515 to 521 and the gate to 991. Nothing was folded and no label moved. `AG23` was **relabelled rather than rewritten**: it has always
+driven `setFocus()`, which is the road the Tab key takes into the box, and its label said click. What it asserts is unchanged.
+
+- `AG32`-`AG36` the road a hand on the mouse takes into the volume read-out: nothing picked out while another control holds the caret (`AG32`), the focus half of
+  the click picking 73 out of 73% and leaving the sign alone (`AG33`), the press that same click delivers leaving it picked out all the same (`AG34`) - the promise
+  the box did not keep before, because `QLineEdit` answers that press by putting the caret where the pointer landed and losing the selection with it - one key
+  after that replacing the whole number instead of landing inside it (`AG35`), and a click on a box that already holds the caret placing the caret and picking
+  nothing out (`AG36`), which is the half that must not change because it is how one digit is edited.
+- `AG37` is the source-text pair to `AG34` and `AG36`: one `_pick_out_the_number` for both roads in, and the flag that remembers the click set only for
+  `Qt.MouseFocusReason` and cleared again by the single press that came with it.
+- The order these checks ask for was measured first, in `.test_harness/scratch_volbox_click.py`, with `QTest.mouseClick` - `QApplication.sendEvent`, which is how
+  every press in this suite is delivered, hands a widget the press *without* the focus a pointer causes, so a press-only harness cannot see the undo at all and
+  `AG34` would have been written against the wrong order. `QtTest` is not imported here: the two halves are asked for by hand, `setFocus(Qt.MouseFocusReason)`
+  then `_ag_press`, in the order that measurement showed them.
 
