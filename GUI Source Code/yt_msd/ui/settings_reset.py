@@ -38,6 +38,8 @@ class SettingsResetMixin:
         self._last_downloaded_files = []
         self.normalization_mode = "ask"
         self.auto_rename = False
+        # Back to the default the constructor and load_config() both start from, not to off.
+        self.channel_prefix_rename = True
         self.silence_pad_dur = 2.0
         self.silence_trim = True
         self.use_custom_norm_cmd = False
@@ -122,6 +124,12 @@ class SettingsResetMixin:
             self.run_renamer_cb.blockSignals(True)
             self.run_renamer_cb.setChecked(False)
             self.run_renamer_cb.blockSignals(False)
+        if hasattr(self, 'channel_prefix_cb'):
+            # The reset value for this one is on, so the box is put back to the state the
+            # attributes were just set to rather than cleared with the rest.
+            self.channel_prefix_cb.blockSignals(True)
+            self.channel_prefix_cb.setChecked(self.channel_prefix_rename)
+            self.channel_prefix_cb.blockSignals(False)
         self.splitter_sizes = [300, 800, 300]
         
         # Apply changes

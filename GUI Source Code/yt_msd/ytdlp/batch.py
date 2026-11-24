@@ -17,8 +17,11 @@ import threading
 import shlex
 import time
 from yt_msd.audio.tags import _add_placeholder_tag, _remove_placeholder_tag
-from yt_msd.util.text import _title_match_key, _title_matches_filename
+from yt_msd.constants import TAGGABLE_EXTENSIONS
+from yt_msd.util import trace
+from yt_msd.util.text import _title_match_key, _title_matches_filename, channel_prefixed_stem
 from yt_msd.ytdlp.download import DOWNLOAD_ITEM_ATTEMPTS, _is_permanent_download_error, run_yt_dlp_download
+from yt_msd.ytdlp.runner import entry_channel_name
 
 class BatchDownloadMixin:
     def start_batch_download(self):
@@ -422,6 +425,73 @@ class BatchDownloadMixin:
                 for f in list(dict.fromkeys(downloaded_filepaths + list(produced_files.values()))):
                     if os.path.exists(f):
                         _remove_placeholder_tag(f)
+
+            # The renamer's own artist/title check, run here on the file each track produced.
+            # A YouTube title with no artist in it is exactly the state the renamer's "No artist
+            # found" prompt exists for, and what that prompt asks the user to type is the channel
+            # name the result row already showed him - so it is filled in now instead of leaving
+            # every bare title for a console question. It runs after every match against a title
+            # has been made: the verification pass looks for the file a title produced, and a name
+            # that already carries the channel does not match that title any more.
+            #
+            # Rename only, deliberately. Writing artist/title into the file here would make it read
+            # as hand-tagged, and the same test that keeps a hand-tagged file from being renamed
+            # keeps it out of the normalization pass - every auto-named song would have skipped the
+            # volume work. Left untagged, the renamer reads the pair out of the new name, tags it,
+            # and normalizes it exactly as it does today.
+            if getattr(self, 'channel_prefix_rename', False) and not getattr(self, 'cancel_download', False):
+                def channel_prefix_for(q, produced_path):
+                    """Rename one finished track to 'Channel - Title', or leave it where it is."""
+                    if not produced_path or not os.path.isfile(produced_path):
+                        return None
+                    suffix = os.path.splitext(produced_path)[1].lower()
+                    if suffix not in TAGGABLE_EXTENSIONS:
+                        return None
+                    new_stem = channel_prefixed_stem(
+                        os.path.splitext(os.path.basename(produced_path))[0],
+                        entry_channel_name(q.get('video') or {}))
+                    if not new_stem:
+                        return None
+                    new_path = os.path.join(os.path.dirname(produced_path), new_stem + suffix)
+                    if new_path == produced_path or os.path.exists(new_path):
+                        # Nothing in this program numbers a name: a target that is taken leaves
+                        # the file where it is, same as the console renamer and the rename dialog.
+                        return None
+                    try:
+                        os.rename(produced_path, new_path)
+                    except OSError as exc:
+                        trace.note("channel prefix skipped for %s: %s"
+                                   % (os.path.basename(produced_path), exc))
+                        return None
+                    trace.note("channel prefix: %s -> %s"
+                               % (os.path.basename(produced_path), os.path.basename(new_path)))
+                    return new_path
+
+                # One map of old path -> new path, because the two lists that still name the old
+                # file have to be rewritten through the same answer: produced_files and
+                # downloaded_filepaths hold the same path for one track, and a queue entry whose
+                # file was already renamed by the entry ahead of it (two uploads of one title)
+                # finds no file where its own file used to be and is left alone.
+                prefixed_paths = {}
+                for q in list(self.queue_items):
+                    produced_path = produced_files.get(id(q))
+                    new_path = channel_prefix_for(q, produced_path)
+                    if new_path:
+                        prefixed_paths[produced_path] = new_path
+                        produced_files[id(q)] = new_path
+                if prefixed_paths:
+                    # Read through the map, every entry that names a moved file - not only the
+                    # ones that moved. An entry whose file was renamed by the entry ahead of it
+                    # is left alone, but its recorded path still points at a name that no longer
+                    # exists, and produced_files is one of the two lists this batch hands on.
+                    for key, value in list(produced_files.items()):
+                        produced_files[key] = prefixed_paths.get(value, value)
+                    downloaded_filepaths[:] = [prefixed_paths.get(p, p) for p in downloaded_filepaths]
+                    count = len(prefixed_paths)
+                    self.status_signal.emit(
+                        f"Added the channel name to {count} download"
+                        f"{'s' if count != 1 else ''} with no artist in the title.",
+                        False, "#1abd33")
 
             self._last_downloaded_files = list(dict.fromkeys(
                 downloaded_filepaths + [p for p in produced_files.values() if p]

@@ -2617,12 +2617,14 @@ _ab_text_branch = _ab_search_window[_ab_search_window.index("                els
 check("AB22 the typed-in search goes through the retrying helper",
       "run_yt_dlp_text_search(" in _ab_text_branch and "ytsearch15:" not in _ab_text_branch,
       _ab_text_branch)
-# Four readers of a channel name now, and all four through the one lookup: the definition, the
-# search's retry test, the result row, and - new with the trace - yt-dlp's summary line, which
-# counts how many entries named a channel because that is what a sparse search is judged on. The
-# count is exact on purpose, and AB23b keeps the entry point's own half of it exact too.
+# Five readers of a channel name now, and all five through the one lookup: the definition, the
+# search's retry test, the result row, yt-dlp's summary line (added with the trace, which counts how
+# many entries named a channel because that is what a sparse search is judged on), and - new with the
+# channel-prefix setting - the download path, which names a file whose title carries no artist after
+# the same owner the row showed. The count is exact on purpose, and AB23b keeps the entry point's own
+# half of it exact too: none of these readers is in the entry point.
 check("AB23 the row reads its channel through the lookup the search also checks",
-      _source.count("entry_channel_name(") == 4, _source.count("entry_channel_name("))
+      _source.count("entry_channel_name(") == 5, _source.count("entry_channel_name("))
 check("AB23b the entry point still reads a channel in exactly one place",
       open(SRC, encoding="utf-8").read().count("entry_channel_name(") == 1,
       open(SRC, encoding="utf-8").read().count("entry_channel_name("))

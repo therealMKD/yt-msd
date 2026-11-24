@@ -1296,6 +1296,10 @@ class MainApp(BootstrapMixin,
                     self.custom_script_path = c.get('custom_script_path', '')
                     self.normalization_mode = c.get('normalization_mode', 'ask')
                     self.auto_rename = c.get('auto_rename', False)
+                    # Default on: a download whose title names no artist gains the channel name
+                    # that the result row already showed, and the box below is how that is turned
+                    # off for someone who names files himself.
+                    self.channel_prefix_rename = bool(c.get('channel_prefix_rename', True))
                     self.silence_pad_dur = c.get('silence_pad_dur', 2.0)
                     self.silence_trim = bool(c.get('silence_trim', True))
                     self.use_custom_norm_cmd = c.get('use_custom_norm_cmd', False)
@@ -1373,6 +1377,7 @@ class MainApp(BootstrapMixin,
             'custom_script_path': getattr(self, 'custom_script_path', ''),
             'normalization_mode': self.normalization_mode,
             'auto_rename': self.auto_rename,
+            'channel_prefix_rename': getattr(self, 'channel_prefix_rename', True),
             'silence_pad_dur': self.silence_pad_dur,
             'silence_trim': self.silence_trim,
             'use_custom_norm_cmd': self.use_custom_norm_cmd,
@@ -2012,6 +2017,15 @@ class MainApp(BootstrapMixin,
             self.normalization_mode = str(cfg.get('normalization_mode'))
         if 'auto_rename' in cfg:
             self.auto_rename = bool(cfg.get('auto_rename'))
+        if 'channel_prefix_rename' in cfg:
+            self.channel_prefix_rename = bool(cfg.get('channel_prefix_rename'))
+            if hasattr(self, 'channel_prefix_cb'):
+                # The same reason the box above is re-checked with its signals held: writing the
+                # box fires the toggle handler, which writes the settings straight back over the
+                # package that was just imported.
+                self.channel_prefix_cb.blockSignals(True)
+                self.channel_prefix_cb.setChecked(self.channel_prefix_rename)
+                self.channel_prefix_cb.blockSignals(False)
         if 'silence_pad_dur' in cfg:
             try:
                 self.silence_pad_dur = float(cfg.get('silence_pad_dur'))

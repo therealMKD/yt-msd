@@ -220,3 +220,38 @@ def _split_artist_title(stem: str) -> Tuple[str, str]:
         artist, title = stem.split(" - ", 1)
         return artist.strip(), title.strip()
     return "", stem.strip()
+
+
+def channel_prefixed_stem(stem: str, channel: str) -> str:
+    """The name the renamer would have built for 'stem' had the channel name been
+    typed at its "No artist found" prompt, or '' when there is nothing to add.
+
+    The prediction is the renamer's own - clean_youtube_title plus the same ' - '
+    split auto mode accepts - so a downloaded track is judged by the rule that
+    renames it rather than by a second copy of that rule that can drift from it.
+    The channel half is sanitized on its own and the pair is then joined the way
+    the prompt joins it: a name the user supplied is used as typed and is never
+    run back through the cleaner, which is why a channel carrying a ' - ' of its
+    own keeps it here too - the renamer splits such a name at its first ' - ' just
+    as it splits the one the user typed.
+    """
+    prediction = clean_youtube_title(stem)
+    artist, title = _split_artist_title(prediction)
+    if artist or not title:
+        # The name already carries an artist, so this is the renamer's job and not
+        # this one's; or nothing survived the cleaner, and there is no title left to
+        # build a pair around.
+        return ""
+    prefix = _sanitize_filename(channel or "")
+    if not any(ch.isalnum() for ch in prefix):
+        # Covers a row that names no owner at all, and one whose name was nothing but
+        # characters a filename cannot hold - neither is a name worth putting on a file.
+        return ""
+    # A title that already opens with the channel must not be prefixed twice, but the test is
+    # made word by word on the cleaned title: 'IVE Looks Can Kill' from channel IVE is already
+    # named, while 'Ferry Has A Name' from @ferryhasaname is not - one is the channel followed
+    # by a title, the other only looks alike once the spaces are gone.
+    cleaned = prediction.strip().lower()
+    if cleaned == prefix.strip().lower() or cleaned.startswith(prefix.strip().lower() + " "):
+        return ""
+    return f"{prefix} - {title}"

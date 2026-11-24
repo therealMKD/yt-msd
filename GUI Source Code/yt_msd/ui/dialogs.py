@@ -202,6 +202,23 @@ class SettingsDialog(QDialog):
         self.auto_rename_cb.toggled.connect(self._toggle_auto_rename)
         right_layout.addWidget(self.auto_rename_cb)
 
+        # The channel name the download already knows, applied to the file it produced.
+        # This one runs in the download itself, not in the renamer window, so it is the only
+        # naming decision on this side that happens without a prompt - which is why it gets its
+        # own box and its own worked example instead of hiding under the auto-rename one.
+        self.channel_prefix_cb = QCheckBox("Add the channel name when a title has no artist")
+        self.channel_prefix_cb.setToolTip(
+            "A video named 'Looks Can Kill' from the channel 'IVE' is downloaded as "
+            "'IVE - Looks Can Kill'.\nOnly when the title carries no artist of its own: "
+            "'IVE - Looks Can Kill (Official Audio)' is left exactly as it is.\nThe file is "
+            "renamed only - the tags are still written by the renamer, so normalization still runs.")
+        self.channel_prefix_cb.setChecked(getattr(parent, 'channel_prefix_rename', True))
+        self.channel_prefix_cb.toggled.connect(self._toggle_channel_prefix)
+        right_layout.addWidget(self.channel_prefix_cb)
+        right_layout.addWidget(QLabel("Names it for you when the title alone has no artist  |  "
+                                      "untagged, so the renamer and the volume pass still take it",
+                                      font=QFont("Segoe UI", 8)))
+
         # Silence pad duration
         pad_h = QHBoxLayout()
         pad_h.addWidget(QLabel("Silence padded at end of file (seconds):"))
@@ -450,6 +467,10 @@ class SettingsDialog(QDialog):
 
     def _toggle_auto_rename(self, state):
         self.main_app.auto_rename = state
+        self.main_app.save_config()
+
+    def _toggle_channel_prefix(self, state):
+        self.main_app.channel_prefix_rename = state
         self.main_app.save_config()
 
     def _update_silence_pad(self, text):

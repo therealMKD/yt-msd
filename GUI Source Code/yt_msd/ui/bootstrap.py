@@ -105,6 +105,9 @@ class BootstrapMixin:
         self._last_downloaded_files = []
         self.normalization_mode = "ask"  # "on" | "off" | "ask"
         self.auto_rename = False
+        # Read before the first batch is built, so it has to exist here the way the two
+        # settings beside it do: the download path asks for it with getattr(..., False).
+        self.channel_prefix_rename = True
         self.silence_pad_dur = 2.0
         self.silence_trim = True
         self.use_custom_norm_cmd = False
