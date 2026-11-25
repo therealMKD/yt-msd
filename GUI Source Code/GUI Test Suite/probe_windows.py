@@ -5,7 +5,9 @@ and where each of its controls writes, the three windows that build a sync chain
 removable drive), the sync manager that lists and pauses and removes them, the playlist picker, the
 tray progress bubble, the three update windows, the rename-from-metadata window, the two things
 the program promises the machine - which file Windows is told to start, and which yt-dlp it looks for
-- the question a sync asks before it deletes more than its chain allows, and the window that searches
+- the question a sync asks before it deletes more than its chain allows, the three answers that question
+has once Restore Host exists and the windows that carry them - the code a Host puts on its own screen and
+the box a client types it into - and the window that searches
 the network for a host along with the once-only notice a Host is given about chains that were already
 visible when this choice existed, and the start of the main window itself - a saved search with no
 saved session behind it, which is how a new install starts.
@@ -42,8 +44,9 @@ import time
 
 from pathlib import Path
 
-from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QWidget
+from PySide6.QtWidgets import QApplication, QDialog, QLabel, QPushButton, QWidget
 from PySide6.QtCore import QThread, Qt
+from PySide6.QtGui import QCloseEvent
 
 HERE = os.path.dirname(os.path.abspath(__file__))              # .../GUI Source Code/GUI Test Suite
 SRC = os.path.join(os.path.dirname(HERE), "yt-msd-gui.pyw")    # the master copy, one folder up
@@ -64,6 +67,14 @@ _spec.loader.exec_module(mod)
 import harness_seam as seam
 
 seam.install(mod, SRC_DIR)
+
+# The shape a restore code has belongs to the layer that checks a code against, and the entry point
+# does not re-export it, so this is the one place this suite names a package name directly. The two
+# host functions are the host's own restore registry: a check about a code on a host's screen is worth
+# running against the thing that hands out codes rather than against a hand-written copy of one.
+from yt_msd.sync.lan import RESTORE_CODE_LENGTH
+from yt_msd.sync.host import cancel_restore_offer as _close_restore_offer
+from yt_msd.sync.host import issue_restore_code as _issue_restore_offer
 
 CHECKS = 0
 FAILS = []
@@ -1202,18 +1213,22 @@ check("WN-H5 the signals MainApp wires its worker threads to are still declared 
 # its chain allows: it is called on the worker's thread, parks that thread, and the answer is given
 # by the GUI-thread slot. The worker half of that is proved in probe_sync (SY-M); what is proved
 # here is the gate itself - the park, the answer, the default, and the wording the user is shown.
+# Restore Host puts two more questions through that same gate - the delete-or-keep-or-restore choice,
+# and the four characters a client has to read off a host's screen - and the windows that carry all
+# three answers are checked here too.
 class _GateSignal:
     """A signal that answers itself, some time after it is emitted, as a queued one does on the GUI thread."""
 
-    def __init__(self, app, answer_after=0.0):
+    def __init__(self, app, answer_after=0.0, handler="_on_sync_confirm"):
         self.app = app
         self.answer_after = answer_after
+        self.handler = handler
         self.emitted = []
 
-    def emit(self, request_id, title, question):
-        self.emitted.append((request_id, title, question))
+    def emit(self, request_id, *args):
+        self.emitted.append((request_id,) + tuple(args))
         timer = threading.Timer(self.answer_after,
-                                lambda: self.app._on_sync_confirm(request_id, title, question))
+                                lambda: getattr(self.app, self.handler)(request_id, *args))
         # A daemon, because one of these is deliberately never answered: the check that proves a
         # question nobody answers still finishes must not hold the run open for it.
         timer.daemon = True
@@ -1221,22 +1236,34 @@ class _GateSignal:
 
 
 class _GateApp:
-    """The gate without the window: both halves are the program's own methods, taken unbound.
+    """The gate without the window: every half of it is the program's own method, taken unbound.
 
     Building a MainApp to reach two methods would need a player, a tray and a config file. What is
-    under test is the parking and the answering, so the attributes those two methods touch are the
+    under test is the parking and the answering, so the attributes those methods touch are the
     only ones here.
+
+    All three questions a sync can ask - the Yes/No limit, the delete-or-keep-or-restore choice, and
+    the four characters a client reads off a host - share `sync_confirm_waiters` and the lock around
+    it in the program, so they share them here. Each of the three signals knows which slot answers it.
     """
 
     ask_sync_confirm = mod.MainApp.ask_sync_confirm
     _on_sync_confirm = mod.MainApp._on_sync_confirm
+    ask_sync_decision = mod.MainApp.ask_sync_decision
+    _on_sync_decision = mod.MainApp._on_sync_decision
+    ask_restore_code = mod.MainApp.ask_restore_code
+    _on_restore_code = mod.MainApp._on_restore_code
+
+    _sync_question_parent = mod.MainApp._sync_question_parent
 
     def __init__(self, answer_after=0.0):
         self.sync_confirm_waiters = {}
         self._sync_confirm_lock = threading.Lock()
         self._sync_confirm_counter = 0
         self.sync_manager_dialog = None
-        self.sync_confirm_signal = _GateSignal(self, answer_after)
+        self.sync_confirm_signal = _GateSignal(self, answer_after, "_on_sync_confirm")
+        self.sync_decision_signal = _GateSignal(self, answer_after, "_on_sync_decision")
+        self.restore_code_signal = _GateSignal(self, answer_after, "_on_restore_code")
 
 
 _gate_yes = _GateApp()
@@ -1270,18 +1297,527 @@ seam.restore("SYNC_CONFIRM_WAIT_LIMIT")
 check("WN-I6 a question nobody answers is a No, and the wait is bounded, so a sync cannot be held open by a box nobody read",
       _answer_stalled is False and _gate_stalled.sync_confirm_waiters == {}, _answer_stalled)
 
-_stand_in_cb = mod.make_delete_confirm_cb(AppStandIn(), "Studio")
-_real_cb = mod.make_delete_confirm_cb(_GateApp(), "Studio")
-check("WN-I7 the callback a sync is built with is handed over only by an app that can ask, and is nothing at all to one that cannot",
-      _stand_in_cb is None and _real_cb is not None, _stand_in_cb)
-_answer_cb = answering(True, lambda: _real_cb("Delete 12 file(s)?"))
-check("WN-I8 and going through that callback is the same gate: the chain's name is in the title the box is opened with",
-      _answer_cb is True and _Answers.asked[-1][0] == "Sync Chain 'Studio' - Delete Files?",
-      _Answers.asked[-1])
+# The two windows Restore Host adds are stood in for while the gate that carries them is exercised -
+# `exec()` blocks, and a check that drives a gate must not wait on a window. Each stand-in records the
+# words it was built with and closes with the answer the check hands it, which is all the gate ever
+# reads back out of the real window.
+class _DecisionBoxStandIn:
+    """The delete-or-keep-or-restore window, without a window on the screen."""
+    built = []
+    hands_back = mod.SYNC_DECISION_RESTORE
+
+    def __init__(self, parent, title, question):
+        type(self).built.append((parent, title, question))
+
+    def exec(self):
+        return 0
+
+    @property
+    def decision(self):
+        return type(self).hands_back
+
+
+class _CodeBoxStandIn:
+    """The four-characters-a-client-types window, stood in for the same reason."""
+    built = []
+    hands_back = "K7PZ"
+
+    def __init__(self, parent, title, host_label):
+        type(self).built.append((parent, title, host_label))
+
+    def exec(self):
+        return 0
+
+    @property
+    def code(self):
+        return type(self).hands_back
+
+
+def _ask_on_worker(app, method_name, *args):
+    """Ask one of the gate's questions the way a sync worker asks it - on a thread of its own, parked
+    on an answer - and hand back whatever the gate finally returns."""
+    out = [None]
+
+    def _drive():
+        out[0] = getattr(app, method_name)(*args)
+
+    t = threading.Thread(target=_drive)
+    t.daemon = True
+    t.start()
+    t.join(30)
+    return out[0]
+
+
+_stand_in_decision_cb = mod.make_sync_decision_cb(AppStandIn(), "Studio")
+_stand_in_code_cb = mod.make_restore_code_cb(AppStandIn(), "Studio")
+_gate_cb_app = _GateApp()
+_decision_cb = mod.make_sync_decision_cb(_gate_cb_app, "Studio")
+_code_cb = mod.make_restore_code_cb(_gate_cb_app, "Studio")
+check("WN-I7 the callbacks a Restore Host sync is built with are handed over only by an app that can ask, and are nothing at all to one that cannot",
+      _stand_in_decision_cb is None and _stand_in_code_cb is None
+      and _decision_cb is not None and _code_cb is not None,
+      (_stand_in_decision_cb, _stand_in_code_cb, _decision_cb, _code_cb))
+_D_box = _DecisionBoxStandIn
+_D_box.built.clear()
+_D_box.hands_back = mod.SYNC_DECISION_DELETE
+with seam.patched("SyncDeleteDecisionDialog", _D_box):
+    _decision_via_cb = _decision_cb("The host has stopped offering 3000 file(s). Delete 3000 file(s)?")
+check("WN-I8 and going through that callback is the same gate: the chain's name is on the title the window is opened with, and the answer comes back as the word the worker acts on",
+      _decision_via_cb == mod.SYNC_DECISION_DELETE and len(_gate_cb_app.sync_decision_signal.emitted) == 1
+      and _D_box.built and _D_box.built[0][1] == "Sync Chain 'Studio' - Delete Files?",
+      (_decision_via_cb, _D_box.built))
+_C_box = _CodeBoxStandIn
+_C_box.built.clear()
+_C_box.hands_back = "QD54"
+with seam.patched("RestoreHostCodeDialog", _C_box):
+    _code_via_cb = _code_cb("192.168.1.5:63351")
+check("WN-I8b the code callback is the same gate too: it takes nothing, asks the worker's own question, and hands back the code as it was typed",
+      _code_via_cb == "QD54" and _C_box.built and _C_box.built[0][1] == "Sync Chain 'Studio' - Restore Host",
+      (_code_via_cb, _C_box.built))
 check("WN-I9 the gate is a signal MainApp declares and a pair of methods it owns, so a worker thread has something to reach for",
       "Signal" in type(getattr(mod.MainApp, "sync_confirm_signal")).__name__
       and "ask_sync_confirm" in dir(mod.MainApp) and "_on_sync_confirm" in dir(mod.MainApp),
       type(getattr(mod.MainApp, "sync_confirm_signal")).__name__)
+check("WN-I9b Restore Host's two extra questions are gates of the same shape on the same window - a signal each and a slot each - and the host server has a signal to talk back to this screen with",
+      all("Signal" in type(getattr(mod.MainApp, _n)).__name__
+          for _n in ("sync_decision_signal", "restore_code_signal", "host_restore_signal"))
+      and all(_m in dir(mod.MainApp) for _m in ("ask_sync_decision", "_on_sync_decision",
+                                                "ask_restore_code", "_on_restore_code",
+                                                "_open_host_restore_dialog", "_cancel_host_restore_offer",
+                                                "_on_host_restore_event")))
+
+
+class _OpenManagerStandIn:
+    """A Sync Chains window that is open on the screen, without a window on the screen."""
+
+    def isVisible(self):
+        return True
+
+
+class _DeletedManagerStandIn:
+    """A Sync Chains window that was deleted underneath a worker: the one parent that must not be used."""
+
+    def isVisible(self):
+        raise RuntimeError("wrapped C++ object has already been deleted")
+
+
+# The delete-or-keep-or-restore answer: asked on the worker's thread, parked, answered from the other.
+_D_box.built.clear()
+_D_box.hands_back = mod.SYNC_DECISION_RESTORE
+_gate_decision = _GateApp(answer_after=0.1)
+with seam.patched("SyncDeleteDecisionDialog", _D_box):
+    _decision_answer = _ask_on_worker(_gate_decision, "ask_sync_decision",
+                                      "Sync Chain 'Studio' - Delete Files?",
+                                      "The host has stopped offering 3000 file(s).")
+check("WN-I10 the third answer comes back to the parked worker as the word the worker acts on, and the window that gave it was built with the words the chain put on it",
+      _decision_answer == mod.SYNC_DECISION_RESTORE
+      and len(_gate_decision.sync_decision_signal.emitted) == 1
+      and _D_box.built and _D_box.built[0][1] == "Sync Chain 'Studio' - Delete Files?",
+      (_decision_answer, _D_box.built))
+check("WN-I11 with no Sync Chains window open, the question is raised against the main window itself",
+      _D_box.built and _D_box.built[0][0] is _gate_decision, _D_box.built)
+_D_box.built.clear()
+_gate_decision.sync_manager_dialog = _OpenManagerStandIn()
+with seam.patched("SyncDeleteDecisionDialog", _D_box):
+    _ask_on_worker(_gate_decision, "ask_sync_decision", "t", "q")
+check("WN-I11b with the Sync Chains window open, that is the window the question lands on - it is where anybody watching the sync is looking",
+      len(_D_box.built) == 1 and isinstance(_D_box.built[0][0], _OpenManagerStandIn), _D_box.built)
+_D_box.built.clear()
+_gate_decision.sync_manager_dialog = _DeletedManagerStandIn()
+with seam.patched("SyncDeleteDecisionDialog", _D_box):
+    _ask_on_worker(_gate_decision, "ask_sync_decision", "t", "q")
+check("WN-I11c a window that was deleted underneath the worker is not a parent: the question is still asked, on no parent at all",
+      len(_D_box.built) == 1 and _D_box.built[0][0] is None, _D_box.built)
+_gate_decision.sync_manager_dialog = None
+check("WN-I12 answering it clears the waiter it was parked on, exactly as the Yes/No box does",
+      _gate_decision.sync_confirm_waiters == {}, _gate_decision.sync_confirm_waiters)
+
+_D_box.hands_back = mod.SYNC_DECISION_KEEP
+_gate_decision_stalled = _GateApp(answer_after=30.0)
+with seam.patched("SYNC_CONFIRM_WAIT_LIMIT", 0.5), seam.patched("SyncDeleteDecisionDialog", _D_box):
+    _decision_timeout = _ask_on_worker(_gate_decision_stalled, "ask_sync_decision", "t", "q")
+check("WN-I13 a decision nobody answers is Keep, and the wait is bounded, so a sync cannot be held open by a window nobody read",
+      _decision_timeout == mod.SYNC_DECISION_KEEP
+      and _gate_decision_stalled.sync_confirm_waiters == {}, _decision_timeout)
+
+_D_box.hands_back = "delete them please"
+_gate_decision_odd = _GateApp(answer_after=0.1)
+with seam.patched("SyncDeleteDecisionDialog", _D_box):
+    _odd_answer = _ask_on_worker(_gate_decision_odd, "ask_sync_decision", "t", "q")
+check("WN-I14 an answer that is not one of the three words this program names an answer with is Keep, never permission to delete",
+      _odd_answer == mod.SYNC_DECISION_KEEP, _odd_answer)
+
+_D_box.built.clear()
+_D_box.hands_back = mod.SYNC_DECISION_RESTORE
+with seam.patched("SyncDeleteDecisionDialog", _D_box):
+    _gate_decision._on_sync_decision("sd_no_such_request", "t", "q")
+check("WN-I15 a decision window for a request nothing is waiting on is never built, so a late slot call cannot invent an answer",
+      _D_box.built == [], _D_box.built)
+
+# The four characters a client reads off a host's screen. They never travel down the connection the
+# sync is parked on, so this window is the only road they have - and the host, not this PC, is the one
+# that gives up on them.
+_C_box.built.clear()
+_C_box.hands_back = "K7PZ"
+_gate_code = _GateApp(answer_after=0.1)
+with seam.patched("RestoreHostCodeDialog", _C_box):
+    _typed_code = _ask_on_worker(_gate_code, "ask_restore_code",
+                                 "Sync Chain 'Studio' - Restore Host", "192.168.1.5:63351")
+check("WN-I16 the code typed on this PC comes back to the worker that is holding the host's connection open, and the machine it is being typed for is written on the window",
+      _typed_code == "K7PZ" and len(_gate_code.restore_code_signal.emitted) == 1
+      and _C_box.built and _C_box.built[0][2] == "192.168.1.5:63351", (_typed_code, _C_box.built))
+check("WN-I17 the request the worker parked on is gone the moment the code arrives, so one code cannot be handed to two syncs",
+      _gate_code.sync_confirm_waiters == {}, _gate_code.sync_confirm_waiters)
+
+_C_box.hands_back = None
+_gate_code_cancelled = _GateApp(answer_after=0.1)
+with seam.patched("RestoreHostCodeDialog", _C_box):
+    _no_code = _ask_on_worker(_gate_code_cancelled, "ask_restore_code",
+                              "Sync Chain 'Studio' - Restore Host", "192.168.1.5:63351")
+check("WN-I18 nobody typing anything is no code at all - None, the answer that closes the host's offer from this end",
+      _no_code is None and _gate_code_cancelled.sync_confirm_waiters == {}, _no_code)
+
+_C_box.hands_back = "K7PZ"
+_gate_code_stalled = _GateApp(answer_after=30.0)
+with seam.patched("SYNC_CONFIRM_WAIT_LIMIT", 0.5), seam.patched("RestoreHostCodeDialog", _C_box):
+    _code_timeout = _ask_on_worker(_gate_code_stalled, "ask_restore_code",
+                                   "Sync Chain 'Studio' - Restore Host", "192.168.1.5:63351")
+check("WN-I18b a code nobody waits for is given up on, on this PC's clock, and the waiter is left empty",
+      _code_timeout is None and _gate_code_stalled.sync_confirm_waiters == {}, _code_timeout)
+
+# The three windows themselves, built against a stand-in main window. Not one of them is exec()'d -
+# exec() blocks - so each is driven through its own buttons and its own handlers, which is what an
+# exec() of a window somebody pressed a button on comes to.
+_restore_windows_app = AppStandIn()
+_ACCEPTED = int(QDialog.Accepted)
+
+_dec_window = mod.SyncDeleteDecisionDialog(
+    _restore_windows_app, "Sync Chain 'Studio' - Delete Files?",
+    "The host has stopped offering 3000 file(s) that are in:\n    C:\\Music")
+check("WN-I19 the warning the Yes/No box used to carry is still the first thing said, in the host's own words",
+      _dec_window.windowTitle() == "Sync Chain 'Studio' - Delete Files?"
+      and "stopped offering 3000 file(s)" in _dec_window.question_lbl.text(),
+      _dec_window.question_lbl.text())
+check("WN-I19b all three answers are on the window, and the one the window opens with is the one that changes nothing",
+      (_dec_window.restore_btn.text(), _dec_window.keep_btn.text(), _dec_window.delete_btn.text())
+      == ("Restore Host", "Keep Them", "Delete Them")
+      and _dec_window.keep_btn.isDefault() and _dec_window.decision == mod.SYNC_DECISION_KEEP,
+      (_dec_window.restore_btn.text(), _dec_window.keep_btn.text(),
+       _dec_window.delete_btn.text(), _dec_window.decision))
+check("WN-I19c the window says what each answer does to this PC before anybody reads it: Delete takes files out of this folder and Restore takes none",
+      "Nothing here is deleted" in _dec_window.restore_btn.toolTip()
+      and "Delete the files listed above from this folder" in _dec_window.delete_btn.toolTip()
+      and "Leave every file exactly where it is" in _dec_window.keep_btn.toolTip(),
+      (_dec_window.restore_btn.toolTip(), _dec_window.delete_btn.toolTip()))
+_dec_window.restore_btn.click()
+check("WN-I20 pressing Restore Host is the answer the worker reads back, and the window closes on it",
+      _dec_window.decision == mod.SYNC_DECISION_RESTORE and _dec_window.result() == _ACCEPTED,
+      (_dec_window.decision, _dec_window.result()))
+_dec_kept = mod.SyncDeleteDecisionDialog(_restore_windows_app, "t", "q")
+_dec_kept.keep_btn.click()
+check("WN-I20b pressing Keep Them closes the window on the answer that leaves the sync alone",
+      _dec_kept.decision == mod.SYNC_DECISION_KEEP and _dec_kept.result() == _ACCEPTED,
+      (_dec_kept.decision, _dec_kept.result()))
+_dec_closed = mod.SyncDeleteDecisionDialog(_restore_windows_app, "t", "q")
+_dec_closed.reject()
+check("WN-I20c a window closed by its X, by Escape or by nobody at all is Keep: the safe answer is the one that needs no button pressed",
+      _dec_closed.decision == mod.SYNC_DECISION_KEEP and _dec_closed.result() != _ACCEPTED,
+      (_dec_closed.decision, _dec_closed.result()))
+
+_code_window = mod.RestoreHostCodeDialog(_restore_windows_app,
+                                         "Sync Chain 'Studio' - Restore Host", "192.168.1.5:63351")
+check("WN-I21 nothing typed is no code, there is nothing to press until there is one, and the machine being written into is the one named on the window",
+      _code_window.code is None and not _code_window.restore_btn.isEnabled()
+      and _code_window.code_edit.maxLength() == RESTORE_CODE_LENGTH
+      and _code_window.host_label == "192.168.1.5:63351",
+      (_code_window.code, _code_window.code_edit.maxLength()))
+_code_window.code_edit.setText("k7")
+check("WN-I21b what is typed is upper-cased as it is typed - both ends compare a code upper case - and a half code stays unpressable",
+      _code_window.code_edit.text() == "K7" and not _code_window.restore_btn.isEnabled()
+      and "not the code" in _code_window.hint_lbl.text(),
+      (_code_window.code_edit.text(), _code_window.hint_lbl.text()))
+_code_window.code_edit.setText("IO01")
+check("WN-I21c the four characters this code never uses are refused as a code instead of quietly normalised into one",
+      _code_window.code_edit.text() == "IO01" and not _code_window.restore_btn.isEnabled()
+      and "no I, O, 0 or 1" in _code_window.hint_lbl.text(), _code_window.hint_lbl.text())
+_code_window.code_edit.setText("k7pz")
+check("WN-I22 a whole code opens the button, and the window says the host is the one that will check it",
+      _code_window.code_edit.text() == "K7PZ" and _code_window.restore_btn.isEnabled()
+      and _code_window.hint_lbl.text().startswith("That is a code."),
+      (_code_window.restore_btn.isEnabled(), _code_window.hint_lbl.text()))
+_code_window.restore_btn.click()
+check("WN-I22b the one thing this window hands back is the code, and it hands it back upper-cased",
+      _code_window.code == "K7PZ" and _code_window.result() == _ACCEPTED,
+      (_code_window.code, _code_window.result()))
+_code_half = mod.RestoreHostCodeDialog(_restore_windows_app, "t", "192.168.1.5:63351")
+_code_half.code_edit.setText("K7P")
+_code_half._accept_code()
+check("WN-I23 pressing Restore with a half code is refused rather than sent, and the window stays where it is",
+      _code_half.code is None and _code_half.result() != _ACCEPTED,
+      (_code_half.code, _code_half.result()))
+_code_cancelled = mod.RestoreHostCodeDialog(_restore_windows_app, "t", "192.168.1.5:63351")
+_code_cancelled.code_edit.setText("k7pz")
+_code_cancelled.cancel_btn.click()
+check("WN-I23b Cancel hands back no code even when a whole one was typed - the host is left exactly as it is",
+      _code_cancelled.code is None and _code_cancelled.result() != _ACCEPTED,
+      (_code_cancelled.code, _code_cancelled.result()))
+
+# The window a Host shows its own code on. It is deliberately not modal - a host that froze its own
+# screen while somebody typed four characters on another machine could not cancel the offer it had
+# just made either - so it is built here and driven through its own timer and its own buttons.
+_restore_cancellations = []
+
+
+def _note_restore_cancel(sync_code, code):
+    """What the server is handed when a code window decides it is finished: which chain, which code."""
+    _restore_cancellations.append((str(sync_code), str(code)))
+
+
+_expiry_window = mod.HostRestoreCodeDialog(_restore_windows_app, "4999", "Studio", "192.168.1.9",
+                                           "K7PZ", 2.0, on_cancel=_note_restore_cancel)
+check("WN-I24 the host's window names the machine waiting, shows the code a person has to read out to it, and is already counting down",
+      _expiry_window.windowTitle() == "Restore Host - Code for Studio"
+      and _expiry_window.code_lbl.text() == "K7PZ" and _expiry_window.client_ip == "192.168.1.9"
+      and _expiry_window.count_timer.isActive() and "another 2 second" in _expiry_window.count_lbl.text(),
+      (_expiry_window.code_lbl.text(), _expiry_window.count_lbl.text()))
+check("WN-I24b while a code is open, nothing has been cancelled here and nothing has been written",
+      _expiry_window.cancelled is False and _expiry_window.settled_by_program is False
+      and _expiry_window.closed_reason == '' and not _restore_cancellations)
+for _ in range(3):
+    _expiry_window._tick()
+check("WN-I25 when the time runs out the code is closed here, the machine waiting on it is told, and the offer is not left open for whoever asks next",
+      _expiry_window.cancelled is True and _expiry_window.closed_reason == "its time ran out"
+      and _restore_cancellations == [("4999", "K7PZ")] and not _expiry_window.count_timer.isActive()
+      and "Restore not carried out - its time ran out" in _expiry_window.count_lbl.text(),
+      (_expiry_window.closed_reason, _restore_cancellations, _expiry_window.count_lbl.text()))
+check("WN-I25b a code that has closed stops being something a person here can act on: both of its buttons are shut",
+      not _expiry_window.cancel_btn.isEnabled() and not _expiry_window.copy_btn.isEnabled())
+_expiry_window._close_offer("a Cancel pressed afterwards")
+check("WN-I25c and closing is not counted twice: a second Cancel reports nothing a second time",
+      _restore_cancellations == [("4999", "K7PZ")], _restore_cancellations)
+
+_restore_cancellations.clear()
+_settled_window = mod.HostRestoreCodeDialog(_restore_windows_app, "4999", "Studio", "192.168.1.9",
+                                            "QD54", 40.0, on_cancel=_note_restore_cancel)
+_settled_window.settled_elsewhere("the code was named and the rebuild has begun")
+check("WN-I26 when the rebuild takes the code off the screen the window closes without cancelling anything - the offer was already settled by the side that owns it",
+      _settled_window.settled_by_program is True and _settled_window.cancelled is False
+      and not _restore_cancellations and not _settled_window.count_timer.isActive(),
+      (_settled_window.settled_by_program, _restore_cancellations))
+_settled_window._close_offer("a Cancel pressed afterwards")
+_settled_window.closeEvent(QCloseEvent())
+check("WN-I27 a window the rebuild has already settled cannot report a cancellation over the top of the first one - not by its Cancel button, and not by its own X",
+      _restore_cancellations == [] and _settled_window.cancelled is False, _restore_cancellations)
+
+class _RecordingEmit:
+    """Records what a signal on the main window would have put on the screen."""
+
+    def __init__(self):
+        self.emitted = []
+
+    def emit(self, *args):
+        self.emitted.append(args)
+
+
+class _HostChainManagerStandIn:
+    """The hosted chains the main window looks a chain up out of."""
+
+    def __init__(self, hosted):
+        self.hosted_chains = [dict(chain) for chain in hosted]
+
+
+class _HostServerStandIn:
+    """The host server as the main window talks to it: which chains are mid-rebuild, and what a cancel
+    call is answered with."""
+
+    def __init__(self, restoring=(), cancel_returns=True):
+        self.restoring = {str(code) for code in restoring}
+        self.cancel_returns = cancel_returns
+        self.cancels = []
+        self.active_port = 63351
+
+    def is_restoring(self, sync_code):
+        return str(sync_code) in self.restoring
+
+    def cancel_restore_request(self, sync_code, code=None):
+        self.cancels.append((str(sync_code), str(code)))
+        return self.cancel_returns
+
+
+class _HostRestoreApp(AppStandIn):
+    """The main window as the receiving end of a Restore Host: a hosted chain, the server behind it,
+    the two signals a restore reaches (both recorded), and the receiving half of MainApp's own methods,
+    taken unbound - nothing here is a re-implementation of them."""
+
+    _host_chain_for_code = mod.MainApp._host_chain_for_code
+    _host_restore_dialog = mod.MainApp._host_restore_dialog
+    _settle_host_restore_dialog = mod.MainApp._settle_host_restore_dialog
+    _open_host_restore_dialog = mod.MainApp._open_host_restore_dialog
+    _cancel_host_restore_offer = mod.MainApp._cancel_host_restore_offer
+    _on_host_restore_event = mod.MainApp._on_host_restore_event
+    _after_host_restore = mod.MainApp._after_host_restore
+    _on_hosted_folder_changed = mod.MainApp._on_hosted_folder_changed
+    _sync_question_parent = mod.MainApp._sync_question_parent
+
+    def __init__(self, hosted, restoring=(), cancel_returns=True, current_path=""):
+        super().__init__(sync_config_manager=_HostChainManagerStandIn(hosted),
+                         sync_host_server=_HostServerStandIn(restoring, cancel_returns),
+                         local_current_path=current_path)
+        self.status_signal = _RecordingEmit()
+        self.local_list_refresh_signal = _RecordingEmit()
+        self._host_restore_dialogs = {}
+
+    def said(self, words):
+        return any(words in str(entry[0]) for entry in self.status_signal.emitted)
+
+
+class _HostCodeWindowStandIn(QDialog):
+    """The host's code window without a window on the screen: the same methods and the same registry,
+    so a check can see which chains have a code showing and what took it off. `show()` is not the real
+    one, because a host's code window stays open for minutes and this suite does not put windows on the
+    desktop."""
+
+    def __init__(self, parent_window, sync_code, chain_name, client_ip, code, expires_in, on_cancel=None):
+        super().__init__(None)
+        self.parent_window = parent_window
+        self.sync_code = str(sync_code)
+        self.chain_name = chain_name
+        self.client_ip = client_ip
+        self.code = str(code)
+        self.expires_in = expires_in
+        self.on_cancel_cb = on_cancel
+        self.settled_with = None
+        self.shown = 0
+
+    def show(self, *args):
+        self.shown += 1
+        return True
+
+    def raise_(self):
+        pass
+
+    def activateWindow(self):
+        pass
+
+    def settled_elsewhere(self, reason):
+        self.settled_with = reason
+
+
+_HOST_RESTORE_FOLDER = str(FIXTURE_ROOT / "host_restore_folder")
+_host_restore_app = _HostRestoreApp([{"sync_code": "4999", "name": "Studio",
+                                      "folder_path": _HOST_RESTORE_FOLDER}],
+                                    current_path=_HOST_RESTORE_FOLDER)
+# The host's own restore registry, holding a genuine offer for this chain: the socket thread fills this
+# in when a client asks, and the window is built out of it rather than out of what arrived over the wire.
+_restore_offer = _issue_restore_offer("4999", "192.168.1.9")
+
+with seam.patched("HostRestoreCodeDialog", _HostCodeWindowStandIn):
+    _host_restore_app._on_host_restore_event("4999", "192.168.1.9", "requested", "ZZZZ")
+    _showing = _host_restore_app._host_restore_dialogs.get("4999")
+    check("WN-I28 a client asking this machine to rebuild itself puts that chain's code on this machine's own screen, under the chain it belongs to",
+          _showing is not None and _showing.chain_name == "Studio" and _showing.shown == 1,
+          None if _showing is None else (_showing.chain_name, _showing.shown))
+    check("WN-I28b the code shown is the one this host's own registry is holding and not the one that arrived over the connection - the window and the offer behind it have to be the same code",
+          _showing is not None and _showing.code == _restore_offer['code'] and _showing.code != "ZZZZ"
+          and _showing.expires_in > 60.0,
+          None if _showing is None else (_showing.code, _restore_offer['code']))
+    check("WN-I28c and the person sitting at this machine is told to read it out, in the chain's own name",
+          _host_restore_app.said("Sync Chain 'Studio': 192.168.1.9 is asking to rebuild this host")
+          and _host_restore_app.said("Read the code on the Restore Host window"),
+          _host_restore_app.status_signal.emitted)
+
+    # An offer that is gone by the time somebody gets around to showing it. The socket made it, the
+    # window was raised a moment later, and in between it stopped being anything anybody could use.
+    _issue_restore_offer("8123", "192.168.1.9", timeout=0.0)
+    _host_restore_app.status_signal.emitted.clear()
+    _host_restore_app._on_host_restore_event("8123", "192.168.1.9", "requested", "QD54")
+    check("WN-I29 an offer that closed between the socket making it and the window raising it shows no code at all, and says so instead of showing a code nothing would accept",
+          "8123" not in _host_restore_app._host_restore_dialogs
+          and _host_restore_app.said("closed before a code could be shown")
+          and _host_restore_app.said("Nothing was changed here"), _host_restore_app.status_signal.emitted)
+
+    _first_showing = _showing
+    _newer_offer = _issue_restore_offer("4999", "192.168.1.7")
+    _host_restore_app._on_host_restore_event("4999", "192.168.1.7", "requested", _newer_offer['code'])
+    check("WN-I30 a newer request for the same chain takes the older window off the screen before the new one goes up, exactly as it took the offer off the host",
+          _first_showing.settled_with == "a newer request replaced it"
+          and _host_restore_app._host_restore_dialogs["4999"].code == _newer_offer['code']
+          and _newer_offer['code'] != _restore_offer['code'],
+          (_first_showing.settled_with, _host_restore_app._host_restore_dialogs["4999"].code))
+
+    _host_restore_app.status_signal.emitted.clear()
+    _host_restore_app._on_host_restore_event("4999", "192.168.1.7", "started", "")
+    check("WN-I31 the moment the code is named the window is off the screen, and the screen says what is about to happen to this host: only what it is missing is written, and nothing here is deleted",
+          "4999" not in _host_restore_app._host_restore_dialogs
+          and _host_restore_app.said("nothing here is being deleted")
+          and _host_restore_app.said("only what this host is missing is being written"),
+          _host_restore_app.status_signal.emitted)
+
+    _host_restore_app._on_host_restore_event("4999", "192.168.1.7", "cancelled", "the code was wrong")
+    check("WN-I32 a restore that did not happen is said out loud on this machine too, with the reason the host was given, and it says nothing here was changed",
+          _host_restore_app.said("restore not carried out (the code was wrong)")
+          and _host_restore_app.said("Nothing on this host was changed"),
+          _host_restore_app.status_signal.emitted)
+
+    # The offers this section put into the host's real registry are taken back out of it. An offer left
+    # open is a code somebody could still be handed, and this suite has no business leaving one behind.
+    _close_restore_offer("4999", None)
+    check("WN-I32b and nothing is left open in the host's own registry when this section is done",
+          mod.pending_restore_request("4999") is None and mod.pending_restore_request("8123") is None,
+          (mod.pending_restore_request("4999"), mod.pending_restore_request("8123")))
+
+_host_restore_app.sync_host_server.cancels.clear()
+_host_restore_app.status_signal.emitted.clear()
+with seam.patched("HostRestoreCodeDialog", _HostCodeWindowStandIn):
+    _host_restore_app._cancel_host_restore_offer("4999", "QD54")
+check("WN-I33 Cancel on this machine's own window closes the offer behind it, and says what that did to the machine waiting on it",
+      _host_restore_app.sync_host_server.cancels == [("4999", "QD54")]
+      and _host_restore_app.said("restore code closed here")
+      and _host_restore_app.said("nothing on this host was changed"),
+      (_host_restore_app.sync_host_server.cancels, _host_restore_app.status_signal.emitted))
+
+_late_cancel_app = _HostRestoreApp([{"sync_code": "8123", "name": "Kitchen",
+                                     "folder_path": _HOST_RESTORE_FOLDER}], cancel_returns=False)
+_late_cancel_app._cancel_host_restore_offer("8123", "QD54")
+check("WN-I33b a Cancel that arrives after that restore was already accepted or closed says so, instead of reporting a cancellation that never happened",
+      _late_cancel_app.said("already been accepted or closed"), _late_cancel_app.status_signal.emitted)
+
+_notifications = []
+with seam.patched("send_lan_update_notification",
+                  lambda code, port: _notifications.append((str(code), int(port)))):
+    _host_restore_app.status_signal.emitted.clear()
+    _host_restore_app._on_host_restore_event("4999", "192.168.1.7", "finished", "wrote 12 file(s)")
+    check("WN-I34 a rebuild that finished is said out loud here, and the rest of the chain is told about a folder that is now whole",
+          _host_restore_app.said("Sync Chain (Code 4999) rebuilt from 192.168.1.7: wrote 12 file(s)")
+          and _notifications == [("4999", 63351)],
+          (_host_restore_app.status_signal.emitted, _notifications))
+    check("WN-I34b and the folder list on this machine is asked for again when the folder that was rebuilt is the one being looked at",
+          len(_host_restore_app.local_list_refresh_signal.emitted) == 1,
+          _host_restore_app.local_list_refresh_signal.emitted)
+
+    _other_view_app = _HostRestoreApp([{"sync_code": "4999", "name": "Studio",
+                                        "folder_path": _HOST_RESTORE_FOLDER}],
+                                      current_path=str(FIXTURE_ROOT / "a_different_folder"))
+    _notifications.clear()
+    _other_view_app._after_host_restore("4999")
+    check("WN-I34c the other clients are told even when this PC is looking at a different folder - the rebuild is theirs to hear about either way",
+          _notifications == [("4999", 63351)]
+          and _other_view_app.local_list_refresh_signal.emitted == [],
+          (_notifications, _other_view_app.local_list_refresh_signal.emitted))
+
+    _notifications.clear()
+    _host_restore_app.sync_host_server.restoring.add("4999")
+    _host_restore_app.status_signal.emitted.clear()
+    _host_restore_app._on_hosted_folder_changed("4999")
+    check("WN-I35 a hosted folder that is mid-rebuild tells the clients nothing, because a Mirror client that synced against a half-built folder would delete its own tracks to match it",
+          _notifications == [] and _host_restore_app.status_signal.emitted == [],
+          (_notifications, _host_restore_app.status_signal.emitted))
+    _host_restore_app.sync_host_server.restoring.remove("4999")
+    _host_restore_app._on_hosted_folder_changed("4999")
+    check("WN-I35b the same folder once it is whole tells them once - the one notification the rebuild owed, sent once",
+          _notifications == [("4999", 63351)]
+          and _host_restore_app.said("Notified clients on LAN"),
+          (_notifications, _host_restore_app.status_signal.emitted))
 
 # ===========================================================================
 # WN-J: finding a host without being told where it is

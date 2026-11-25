@@ -233,6 +233,10 @@ class BootstrapMixin:
         self.sync_confirm_waiters: dict = {}
         self._sync_confirm_lock = threading.Lock()
         self._sync_confirm_counter = 0
+        # Restore codes this host has put on its own screen, per chain: sync_code -> the window showing
+        # it. A client asking this PC to rebuild itself gets one window and one code, and the window is
+        # the thing that cancels it. See _on_host_restore_event.
+        self._host_restore_dialogs: dict = {}
         # Runtime-only registry of currently connected removable drives (not persisted)
         self.active_removable_drives: dict = {}  # folder_path_str -> rc dict
         # Cached answers about the filesystem. Only the background probe thread
@@ -282,6 +286,9 @@ class BootstrapMixin:
         self.stream_refreshed_signal.connect(self._on_stream_refreshed)
         self.stream_fetch_failed_signal.connect(self._on_stream_fetch_failed)
         self.sync_confirm_signal.connect(self._on_sync_confirm)
+        self.sync_decision_signal.connect(self._on_sync_decision)
+        self.restore_code_signal.connect(self._on_restore_code)
+        self.host_restore_signal.connect(self._on_host_restore_event)
         self.chain_visibility_signal.connect(self._on_chain_visibility_notice)
         self.queue_update_signal.connect(self._refresh_queue_display)
         self.queue_status_changed_signal.connect(self._on_queue_status_changed)
@@ -357,7 +364,11 @@ class BootstrapMixin:
         self.sync_config_manager = SyncConfigManager(self.config_dir)
         self.sync_host_server = SyncHostServer(
             lambda: self.sync_config_manager.hosted_chains,
-            on_client_activity_cb=self.host_activity_signal.emit
+            on_client_activity_cb=self.host_activity_signal.emit,
+            # A restore is the one thing a hosted chain does that this window has to take part in: the
+            # code is made on the server's thread and shown on this one, and the folder watcher has to
+            # be told to hold its tongue while the folder is being written into.
+            on_restore_event_cb=self.host_restore_signal.emit
         )
         self.udp_beacon = UDPBeaconBroadcaster(
             lambda: self.sync_config_manager.hosted_chains,

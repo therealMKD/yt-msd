@@ -88,7 +88,7 @@ import html
 import io
 import time
 import random
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 from PIL import Image
 
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -200,10 +200,17 @@ from yt_msd.ui.render import (
 # Wave 4: moved into yt_msd.sync.client and imported back because this file or the GUI Test Suite
 # still reads them by name. Wave 5h checked the group and dropped whatever nothing read.
 from yt_msd.sync.client import (
+    HOST_REBUILT_NOTE,
+    SYNC_DECISION_DELETE,
+    SYNC_DECISION_KEEP,
+    SYNC_DECISION_RESTORE,
     SyncClientWorker,
     _HostKeepalive,
     deletions_were_declined,
-    make_delete_confirm_cb,
+    host_was_rebuilt,
+    make_restore_code_cb,
+    make_sync_decision_cb,
+    restore_was_left_undone,
 )
 from yt_msd.sync.config import (
     DEFAULT_DELETE_CONFIRM_LIMIT,
@@ -223,9 +230,11 @@ from yt_msd.sync.discovery import (
 from yt_msd.sync.host import (
     HostFolderWatcher,
     SyncHostServer,
+    pending_restore_request,
 )
 from yt_msd.sync.lan import (
     SYNC_CONFIRM_PING_INTERVAL,
+    SYNC_RESTORE_CODE_TIMEOUT,
     get_current_wifi_ssid,
     get_local_ip,
 )
@@ -263,6 +272,9 @@ from yt_msd.sync.transfer import (
 from yt_msd.sync.dialogs import (
     ConnectClientChainDialog,
     CreateHostChainDialog,
+    HostRestoreCodeDialog,
+    RestoreHostCodeDialog,
+    SyncDeleteDecisionDialog,
     SyncManagerDialog,
 )
 # Wave 5b: moved into yt_msd.export and imported back because this file or the GUI Test Suite
@@ -336,6 +348,9 @@ class MainApp(BootstrapMixin,
     stream_refreshed_signal = Signal(bool, str)  # (re-resolved ok, track title) from the stream-refresh thread
     stream_fetch_failed_signal = Signal(str, bool)  # (video id, whether this was an automatic changeover) from bg_fetch
     sync_confirm_signal = Signal(str, str, str)  # (request id, window title, question) from a sync worker - parked until _on_sync_confirm answers
+    sync_decision_signal = Signal(str, str, str)  # (request id, window title, question) from a client sync at its delete limit - parked until _on_sync_decision answers
+    restore_code_signal = Signal(str, str, str)  # (request id, window title, "host ip:port" whose copy is being rebuilt) - parked until _on_restore_code answers
+    host_restore_signal = Signal(str, str, str, str)  # (sync code, client ip, event, note) from the host server, at each point of a rebuild this PC is the receiving end of
     chain_visibility_signal = Signal(str, str)  # (title, body) naming the hosted chains that are visible on the network - a box on the main window, from the startup check
 
     def _on_host_activity(self, sync_code: str, client_ip: str, activity: str):
@@ -399,6 +414,14 @@ class MainApp(BootstrapMixin,
 
     def _on_hosted_folder_changed(self, sync_code: str):
         """Called from the folder watcher's debounce thread when a hosted folder changes."""
+        server = getattr(self, 'sync_host_server', None)
+        if server is not None and server.is_restoring(sync_code):
+            # A rebuild writes this folder file by file and the watcher fires for every one of them.
+            # Telling clients about a folder that is half written is how the next thing they do makes it
+            # worse: a Mirror client that syncs against a half-built copy deletes its own tracks to match
+            # it, and the host itself refuses GET_INDEX and PULL_FILE for the same reason. The one
+            # notification this owed is sent once, by _after_host_restore, with the folder complete.
+            return
         port = self.sync_host_server.active_port if hasattr(self, 'sync_host_server') else 63350
         send_lan_update_notification(sync_code, port)
         # Emitted, not called directly: this runs on a watcher thread.
@@ -446,14 +469,21 @@ class MainApp(BootstrapMixin,
                     cc,
                     status_cb=_status,
                     progress_cb=_prog,
-                    confirm_cb=make_delete_confirm_cb(self, chain_name)
+                    decision_cb=make_sync_decision_cb(self, chain_name),
+                    restore_code_cb=make_restore_code_cb(self, chain_name)
                 )
                 if hasattr(self, 'dl_progress_signal'):
                     self.dl_progress_signal.emit("")
                 if ok:
                     cc['last_synced'] = time.time()
                     cc['status'] = "Up to date"
-                    if transferred > 0 or deleted > 0:
+                    if host_was_rebuilt(msg):
+                        cc['status'] = HOST_REBUILT_NOTE
+                        # The question was answered by rebuilding the other machine instead of deleting
+                        # this one, so there is nothing here to refresh and nothing to count as updated:
+                        # what was written is on the host, and how much of it was needed is in the message.
+                        self.status_signal.emit(f"Sync Chain '{cc.get('name')}': {msg}", False, "#1abd33")
+                    elif transferred > 0 or deleted > 0:
                         self.status_signal.emit(f"Sync Chain '{cc.get('name')}': {transferred} updated, {deleted} removed.", False, "#1abd33")
                         if self.local_current_path == cc.get('folder_path'):
                             self.local_list_refresh_signal.emit()
@@ -461,6 +491,11 @@ class MainApp(BootstrapMixin,
                         # Nothing was updated and nothing was deleted: the only thing that happened
                         # is that the user was asked, and said no.
                         self.status_signal.emit(f"Sync Chain '{cc.get('name')}': {msg}", False, "#FF8C00")
+                elif restore_was_left_undone(msg):
+                    # A restore that did not happen is not a host that is offline. This PC reached its
+                    # host, asked for a rebuild and did not get one; the chain is exactly as up to date
+                    # as it was before, and what happened is in the message rather than in the status.
+                    self.status_signal.emit(f"Sync Chain '{cc.get('name')}': {msg}", False, "#FF8C00")
                 else:
                     cc['status'] = f"Host Offline"
             self.sync_config_manager.save()
@@ -498,19 +533,25 @@ class MainApp(BootstrapMixin,
                     progress_cb=lambda done, total, fname, idx, total_items: self.dl_progress_signal.emit(
                         f"[Sync: {c.get('name', 'Sync')}] [{idx}/{total_items}] ({int(done/total*100) if total > 0 else 0}%) {fname}"
                     ) if hasattr(self, 'dl_progress_signal') else None,
-                    confirm_cb=make_delete_confirm_cb(self, c.get('name', 'Sync'))
+                    decision_cb=make_sync_decision_cb(self, c.get('name', 'Sync')),
+                    restore_code_cb=make_restore_code_cb(self, c.get('name', 'Sync'))
                 )
                 if hasattr(self, 'dl_progress_signal'):
                     self.dl_progress_signal.emit("")
                 if ok:
                     c['last_synced'] = time.time()
                     c['status'] = "Up to date"
-                    if transferred > 0 or deleted > 0:
+                    if host_was_rebuilt(msg):
+                        c['status'] = HOST_REBUILT_NOTE
+                        self.status_signal.emit(f"Sync Chain '{c.get('name')}': {msg}", False, "#1abd33")
+                    elif transferred > 0 or deleted > 0:
                         self.status_signal.emit(f"Sync Chain '{c.get('name')}': {transferred} updated, {deleted} removed.", False, "#1abd33")
                         if self.local_current_path == c.get('folder_path'):
                             self.local_list_refresh_signal.emit()
                     elif deletions_were_declined(msg):
                         self.status_signal.emit(f"Sync Chain '{c.get('name')}': {msg}", False, "#FF8C00")
+                elif restore_was_left_undone(msg):
+                    self.status_signal.emit(f"Sync Chain '{c.get('name')}': {msg}", False, "#FF8C00")
                 self.sync_config_manager.save()
             threading.Thread(target=_bg, daemon=True).start()
 
@@ -877,6 +918,267 @@ class MainApp(BootstrapMixin,
             proceed = False
         waiter["answer"] = proceed
         waiter["event"].set()
+
+    def _sync_question_parent(self):
+        """Which window a question a sync is waiting on should be raised against.
+
+        The Sync Chains window if it is open - that is where the question came from for anybody
+        watching - and this window otherwise. A dialog that has been deleted underneath a worker is
+        not a parent, so a window that went away mid-sync is answered with no parent at all rather
+        than with a reference that raises.
+        """
+        try:
+            dialog = getattr(self, 'sync_manager_dialog', None)
+            if dialog is not None and dialog.isVisible():
+                return dialog
+        except RuntimeError:
+            return None
+        except Exception:
+            return None
+        return self
+
+    def ask_sync_decision(self, title: str, question: str) -> str:
+        """Ask a client sync its delete-or-keep-or-restore question, from the worker's own thread.
+
+        The same arrangement as ask_sync_confirm and the same waiter bookkeeping, because it is the
+        same kind of question: a worker parked on an answer, a window on the GUI thread, and an answer
+        that has to come back as one of the words the worker understands rather than as a button. The
+        wait is as long as the old one - Restore Host adds a trip to another machine's screen and back,
+        but the clock it runs on is the host's, not this one.
+
+        An answer that never arrives is SYNC_DECISION_KEEP. A window nobody read, a window left open
+        while this PC goes to sleep, and a window closed by its own X all have to leave the files where
+        they are, and they all arrive here the same way.
+        """
+        waiter = {"event": threading.Event(), "answer": SYNC_DECISION_KEEP}
+        with self._sync_confirm_lock:
+            self._sync_confirm_counter += 1
+            request_id = f"sd_{int(time.time() * 1000)}_{self._sync_confirm_counter}"
+            self.sync_confirm_waiters[request_id] = waiter
+        try:
+            self.sync_decision_signal.emit(request_id, title, question)
+            deadline = time.time() + SYNC_CONFIRM_WAIT_LIMIT
+            while time.time() < deadline:
+                if waiter["event"].wait(timeout=0.5):
+                    answer = str(waiter["answer"] or '')
+                    if answer in (SYNC_DECISION_DELETE, SYNC_DECISION_RESTORE):
+                        return answer
+                    return SYNC_DECISION_KEEP
+            return SYNC_DECISION_KEEP
+        except Exception:
+            return SYNC_DECISION_KEEP
+        finally:
+            with self._sync_confirm_lock:
+                self.sync_confirm_waiters.pop(request_id, None)
+
+    def _on_sync_decision(self, request_id: str, title: str, question: str):
+        """Main-thread slot for a client sync that has more to delete than its chain's limit allows.
+
+        Three answers instead of the Yes/No _on_sync_confirm gives, because the warning is the same one
+        and Restore Host is a third thing a person can do about it. Everything after this is the window
+        reading its own buttons back: the worker's keepalive is already running, and this is the part
+        of the sync that touches no file at all.
+        """
+        waiter = self.sync_confirm_waiters.get(request_id)
+        if waiter is None:
+            return
+        try:
+            box = SyncDeleteDecisionDialog(self._sync_question_parent(), title, question)
+            box.exec()
+            answer = box.decision
+        except Exception:
+            answer = SYNC_DECISION_KEEP
+        waiter["answer"] = answer
+        waiter["event"].set()
+
+    def ask_restore_code(self, title: str, host_label: str) -> Optional[str]:
+        """Ask for the code the host is showing, from the worker that is holding its connection open.
+
+        Called by the same worker, on the same thread, a moment after the decision above came back as
+        Restore Host: that answer left the connection open and started a keepalive on it, and the host
+        is holding a code open behind it. This window is the only way those four characters get here -
+        they are never sent down the connection - so the wait for it is the longest wait in the program
+        and the host, not this PC, is the one that gives up on it.
+
+        None means nothing was typed, and a None from here closes the offer from this end so the host's
+        screen stops showing a code nobody is going to read.
+        """
+        waiter = {"event": threading.Event(), "answer": None}
+        with self._sync_confirm_lock:
+            self._sync_confirm_counter += 1
+            request_id = f"rc_{int(time.time() * 1000)}_{self._sync_confirm_counter}"
+            self.sync_confirm_waiters[request_id] = waiter
+        try:
+            self.restore_code_signal.emit(request_id, title, host_label)
+            deadline = time.time() + SYNC_CONFIRM_WAIT_LIMIT
+            while time.time() < deadline:
+                if waiter["event"].wait(timeout=0.5):
+                    return waiter["answer"]
+            return None
+        except Exception:
+            return None
+        finally:
+            with self._sync_confirm_lock:
+                self.sync_confirm_waiters.pop(request_id, None)
+
+    def _on_restore_code(self, request_id: str, title: str, host_label: str):
+        """Main-thread slot for a client sync that is holding a host's restore offer open.
+
+        `host_label` is the host's 'ip:port', which is the only name this PC has for the machine it is
+        about to write into, and it is printed on the window so a person who has two chains open can
+        tell which machine they are being asked to walk over to.
+        """
+        waiter = self.sync_confirm_waiters.get(request_id)
+        if waiter is None:
+            return
+        try:
+            box = RestoreHostCodeDialog(self._sync_question_parent(), title, host_label)
+            box.exec()
+            typed = box.code
+        except Exception:
+            typed = None
+        waiter["answer"] = typed
+        waiter["event"].set()
+
+    def _host_chain_for_code(self, sync_code) -> Optional[dict]:
+        """The hosted chain on this PC that a sync code belongs to, or nothing."""
+        manager = getattr(self, 'sync_config_manager', None)
+        if manager is None:
+            return None
+        for hc in list(manager.hosted_chains):
+            if str(hc.get('sync_code')) == str(sync_code):
+                return hc
+        return None
+
+    def _host_restore_dialog(self, sync_code):
+        """The code window this host is showing for this chain, if it is showing one."""
+        return getattr(self, '_host_restore_dialogs', {}).get(str(sync_code))
+
+    def _settle_host_restore_dialog(self, sync_code, reason: str):
+        """Take this chain's code window off the screen because the offer behind it is over.
+
+        The window is taken out of the registry before it is closed, so the only reference left to it is
+        Qt's, and a window that has closed itself cannot be settled a second time by whatever the
+        rebuild does next.
+        """
+        dialog = getattr(self, '_host_restore_dialogs', {}).pop(str(sync_code), None)
+        if dialog is None:
+            return
+        try:
+            dialog.settled_elsewhere(reason)
+        except Exception:
+            pass
+
+    def _open_host_restore_dialog(self, sync_code: str, client_ip: str, code: str):
+        """Put the code a client is waiting for on this machine's own screen.
+
+        Called on the GUI thread from host_restore_signal, a moment after the socket thread made the
+        offer. The code is read out of the host's own registry rather than out of what arrived over the
+        wire: this window and the offer behind it have to be showing the same thing, and the registry is
+        the one thing both of them were built from.
+        """
+        session = pending_restore_request(sync_code)
+        chain = self._host_chain_for_code(sync_code)
+        chain_name = str((chain or {}).get('name') or f"Code {sync_code}")
+        if session is None:
+            # The offer closed between the socket making it and this window being raised - another client
+            # asked about the same chain, or nothing was keeping it alive. Showing a code that nothing
+            # would accept is worse than showing nothing: it is a window somebody will read out to
+            # somebody else for nothing.
+            self._settle_host_restore_dialog(sync_code, 'the offer closed')
+            self.status_signal.emit(f"Sync Chain '{chain_name}': restore request from {client_ip} closed "
+                                    "before a code could be shown. Nothing was changed here.", False, "#FF8C00")
+            return
+        # One chain, one code at a time: a newer request for this chain replaces the window that was
+        # showing the older one, exactly as it replaced the offer behind it.
+        self._settle_host_restore_dialog(sync_code, 'a newer request replaced it')
+        seconds_left = float(session.get('expires_at', 0.0)) - time.time()
+        dialog = HostRestoreCodeDialog(
+            self._sync_question_parent(), str(sync_code), chain_name, client_ip,
+            str(session.get('code') or code),
+            seconds_left if seconds_left > 0 else SYNC_RESTORE_CODE_TIMEOUT,
+            on_cancel=self._cancel_host_restore_offer,
+        )
+        self._host_restore_dialogs[str(sync_code)] = dialog
+        dialog.finished.connect(lambda _result=0, _key=str(sync_code): self._host_restore_dialogs.pop(_key, None))
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        self.status_signal.emit(f"Sync Chain '{chain_name}': {client_ip} is asking to rebuild this host. "
+                                "Read the code on the Restore Host window to whoever is at that machine.",
+                                False, "#FF8C00")
+
+    def _cancel_host_restore_offer(self, sync_code: str, code: str):
+        """Close a code from this machine's screen, and say what that did to the machine waiting on it.
+
+        Called by the window's own Cancel button, by its countdown, and by its X. `code` is what that
+        window is holding and it is handed to the registry with the sync code: a card refreshed a moment
+        after somebody else was let in closes nothing, and this is the one place where that difference
+        matters.
+        """
+        server = getattr(self, 'sync_host_server', None)
+        chain = self._host_chain_for_code(sync_code)
+        chain_name = str((chain or {}).get('name') or f"Code {sync_code}")
+        closed = bool(server.cancel_restore_request(sync_code, code)) if server is not None else False
+        if not closed:
+            self.status_signal.emit(f"Sync Chain '{chain_name}': that restore had already been accepted or "
+                                    "closed, so there was nothing here to cancel.", False, "#d9822b")
+            return
+        self.status_signal.emit(f"Sync Chain '{chain_name}': restore code closed here. The client waiting "
+                                "on it was told, and nothing on this host was changed.", False, "#FF8C00")
+
+    def _on_host_restore_event(self, sync_code: str, client_ip: str, event: str, note: str):
+        """Main-thread slot for the points of a rebuild that this PC is the receiving end of.
+
+        Emitted by the host server from its own connection thread, which is why nothing in here reaches
+        for a window except from this thread: the socket thread is not allowed to build a Qt window.
+        Whatever the rebuild does to this machine's folder has already happened, or is about to, between
+        the two sockets - what arrives here is only what somebody at this screen has to know, and the
+        one window that has to appear on it.
+        """
+        if event == 'requested':
+            self._open_host_restore_dialog(sync_code, client_ip, note)
+            return
+        if event == 'started':
+            self._settle_host_restore_dialog(sync_code, 'the code was named and the rebuild has begun')
+            self.status_signal.emit(f"Sync Chain (Code {sync_code}) is being rebuilt from {client_ip}: "
+                                    "nothing here is being deleted, and only what this host is missing is "
+                                    "being written.", False, "#3B8ED0")
+            return
+        if event == 'cancelled':
+            self._settle_host_restore_dialog(sync_code, f"the restore was cancelled ({note})")
+            self.status_signal.emit(f"Sync Chain (Code {sync_code}) restore not carried out ({note}). "
+                                    "Nothing on this host was changed.", False, "#FF8C00")
+            return
+        if event == 'finished':
+            self._settle_host_restore_dialog(sync_code, 'the rebuild finished')
+            self.status_signal.emit(f"Sync Chain (Code {sync_code}) rebuilt from {client_ip}: {note}. "
+                                    "Clients on the LAN have been told.", False, "#1abd33")
+            self._after_host_restore(sync_code)
+
+    def _after_host_restore(self, sync_code: str):
+        """Tell the rest of the chain about a hosted folder that has just been rebuilt.
+
+        The folder watcher was held off for the length of the rebuild - it fires per file, and a rebuild
+        is thousands of them - so this is the one notification it owed, sent once, with the folder
+        complete. A client that has just rebuilt this host out of its own folder has nothing to pull
+        back, but the other clients on the chain do, and a Mirror client syncing against a folder
+        half-built is the one thing this whole arrangement exists to prevent.
+        """
+        server = getattr(self, 'sync_host_server', None)
+        port = server.active_port if server is not None else 63350
+        try:
+            send_lan_update_notification(sync_code, port)
+        except Exception:
+            pass
+        chain = self._host_chain_for_code(sync_code)
+        folder = str((chain or {}).get('folder_path') or '')
+        if folder and folder == getattr(self, 'local_current_path', ''):
+            self.local_list_refresh_signal.emit()
+
+
+
+
 
     def _notify_legacy_visible_chains(self):
         """Tell the user, once, that the chains already saved on this PC are visible on the network.
@@ -1781,6 +2083,17 @@ class MainApp(BootstrapMixin,
                 thread.wait(1000)
             except Exception:
                 pass
+
+        # A restore code still on this screen stops meaning anything the moment the server behind it
+        # stops, and a window left open holds the process until somebody dismisses it. These go before
+        # the services, and they go settled rather than cancelled: the offer itself is closed with the
+        # server a moment later, without a cancel call reaching into a thread that is already stopping.
+        for dialog in list(getattr(self, '_host_restore_dialogs', {}).values()):
+            try:
+                dialog.settled_elsewhere("this app is closing")
+            except Exception:
+                pass
+        self._host_restore_dialogs = {}
 
         # The LAN services: their threads call back into this window.
         for service_name in ('udp_beacon', 'sync_host_server'):

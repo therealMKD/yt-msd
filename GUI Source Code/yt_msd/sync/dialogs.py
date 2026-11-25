@@ -10,15 +10,21 @@ import threading
 from pathlib import Path
 import time
 import socket
+from typing import Callable, Optional
 from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QComboBox, QScrollArea, QFileDialog, QMessageBox, QDialog, QMenu, QFrame, QSpinBox, QInputDialog, QCheckBox, QListWidget, QListWidgetItem
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont
-from yt_msd.sync.client import ClientSyncThread, deletions_were_declined, make_delete_confirm_cb
+from yt_msd.sync.client import (ClientSyncThread, SYNC_DECISION_DELETE, SYNC_DECISION_KEEP,
+                                SYNC_DECISION_RESTORE, deletions_were_declined, host_was_rebuilt,
+                                make_restore_code_cb, make_sync_decision_cb)
+
 from yt_msd.sync.config import (DEFAULT_DELETE_CONFIRM_LIMIT, DEFAULT_HOST_CHAIN_VISIBLE,
                                 DELETE_CONFIRM_LIMIT_MAX, SyncConfigManager, delete_confirm_limit,
                                 host_chain_is_visible, is_client_chain_paused)
 from yt_msd.sync.discovery import HostScanThread, send_lan_update_notification
-from yt_msd.sync.lan import SYNC_PORT_START, get_current_wifi_ssid, get_local_ip
+from yt_msd.sync.lan import (RESTORE_CODE_LENGTH, SYNC_PORT_START, get_current_wifi_ssid, get_local_ip,
+                             restore_code_shape)
+
 from yt_msd.sync.removable import RemovableInitThread
 from yt_msd.sync.tags import SYNC_TAG_FILENAME, make_removable_chain_id
 from yt_msd.sync.transfer import filter_audio_files
@@ -1507,8 +1513,10 @@ class SyncManagerDialog(QDialog):
             cc,
             # None when the app this dialog belongs to cannot put a question on screen, which is
             # how the harness drives these windows; the worker then syncs the way it always did.
-            confirm_cb=make_delete_confirm_cb(self.parent_app, chain_name)
+            decision_cb=make_sync_decision_cb(self.parent_app, chain_name),
+            restore_code_cb=make_restore_code_cb(self.parent_app, chain_name)
         )
+
         self.sync_threads[cid] = thread
 
         def _on_status(txt):
@@ -1534,7 +1542,14 @@ class SyncManagerDialog(QDialog):
                     # files the host stopped offering are still sitting in the folder.
                     if hasattr(self.parent_app, 'status_signal'):
                         self.parent_app.status_signal.emit(f"Sync Chain '{chain_name}': {msg}", False, "#FF8C00")
+                elif host_was_rebuilt(msg):
+                    # And the other way round: the card will read "Up to date" here as well, while
+                    # what actually happened is that the other end of the chain was rebuilt from this
+                    # folder. Nothing on this PC changed, so the card is not where that shows up.
+                    if hasattr(self.parent_app, 'status_signal'):
+                        self.parent_app.status_signal.emit(f"Sync Chain '{chain_name}': {msg}", False, "#1abd33")
             self.config_manager.save()
+
             self.parent_app.sync_progress_state.pop(cid, None)
             self._update_client_card_label(cid, "progress_lbl", "")
             self.refresh_cards()
@@ -1604,3 +1619,348 @@ class SyncManagerDialog(QDialog):
             threading.Thread(target=_notify, daemon=True).start()
         if hasattr(self.parent_app, 'status_signal'):
             self.parent_app.status_signal.emit("Force Sync initiated: syncing clients & removable drives, notified LAN peers.", False, "#1abd33")
+
+
+# ---------------------------------------------------------------------------
+# Restore Host: the windows a rebuild is decided in
+#
+# One decision, three screens. On the client, the box that used to offer "delete these files or keep
+# them" now offers a third answer; then a second box on that same client takes the four characters the
+# host is showing. On the host, a window shows those four characters and stays open only as long as
+# they are worth showing. No one of the three can start a rebuild on its own: the client's boxes cannot
+# without a code that only the host has, and the host's window cannot without a client naming it.
+# ---------------------------------------------------------------------------
+
+
+class SyncDeleteDecisionDialog(QDialog):
+    """The box a client sync shows before deleting more tracks than its chain may delete unheard.
+
+    Three answers where a confirmation used to have two, because the warning itself - "the host has
+    stopped offering 400 files that are in this folder" - has a third response that neither of the two
+    old buttons could carry. The machine being told to delete is the machine that still has the files,
+    and the machine that lost them is the one doing the asking. Restore Host is that third answer, and
+    this window is the only place it can be given.
+
+    Nothing is decided here except which word is handed back. The sync that asked is parked on its own
+    thread until this window closes, and it is the one that touches any file.
+    """
+
+    def __init__(self, parent_window, title: str, question: str):
+        super().__init__(parent_window)
+        self.parent_window = parent_window
+        # What this window was closed with. It starts as 'keep' and stays that way if the window is
+        # closed by its own X, by Escape, or by nobody reading it at all - which is the same answer a
+        # confirmation box that timed out has always given.
+        self.decision = SYNC_DECISION_KEEP
+        self.setWindowTitle(title)
+        self.setFixedSize(640, 460)
+        self.setWindowFlags(self.windowFlags() | Qt.Tool)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+
+        heading = QLabel("THE HOST HAS STOPPED OFFERING THESE FILES")
+        heading.setFont(QFont("Segoe UI Semibold", 11))
+        layout.addWidget(heading)
+
+        self.question_lbl = QLabel(question)
+        self.question_lbl.setWordWrap(True)
+        layout.addWidget(self.question_lbl)
+
+        self.delete_note = QLabel("Deleting takes these files out of this folder on this PC. The host is not touched, "
+                                  "and nothing here can bring them back.")
+        self.delete_note.setWordWrap(True)
+        self.delete_note.setStyleSheet("color: #C0392B; font-size: 11px;")
+        layout.addWidget(self.delete_note)
+
+        self.restore_note = QLabel("Restore Host turns it around instead: the host rebuilds its own copy from this "
+                                   "folder, and nothing on this PC is deleted. The host shows a four-character code "
+                                   "on its own screen first, and this PC has to type it in before anything is written.")
+        self.restore_note.setWordWrap(True)
+        self.restore_note.setStyleSheet("color: #888; font-size: 11px;")
+        layout.addWidget(self.restore_note)
+
+        layout.addStretch()
+
+        buttons = QHBoxLayout()
+        self.restore_btn = QPushButton("Restore Host")
+        self.restore_btn.setMinimumWidth(140)
+        self.restore_btn.setToolTip("Rebuild the host's copy from this PC's copy. Nothing here is deleted.")
+        self.restore_btn.clicked.connect(lambda: self._choose(SYNC_DECISION_RESTORE))
+        buttons.addWidget(self.restore_btn)
+        buttons.addStretch()
+        self.keep_btn = QPushButton("Keep Them")
+        self.keep_btn.setToolTip("Leave every file exactly where it is and finish this sync.")
+        self.keep_btn.clicked.connect(lambda: self._choose(SYNC_DECISION_KEEP))
+        buttons.addWidget(self.keep_btn)
+        self.delete_btn = QPushButton("Delete Them")
+        self.delete_btn.setToolTip("Delete the files listed above from this folder.")
+        self.delete_btn.clicked.connect(lambda: self._choose(SYNC_DECISION_DELETE))
+        buttons.addWidget(self.delete_btn)
+        layout.addLayout(buttons)
+
+        # The safe answer is the one the window opens with, and the one Escape gives. A box that a
+        # sync is waiting on has to be safe to walk away from.
+        self.keep_btn.setDefault(True)
+        self.keep_btn.setFocus()
+
+    def _choose(self, decision: str):
+        self.decision = decision
+        self.accept()
+
+
+class RestoreHostCodeDialog(QDialog):
+    """The box on the client that asks for the four characters the host is showing on its own screen.
+
+    Opened while that client's sync worker is parked mid-sync with its connection to the host still
+    open. The code never travels down that connection - which is the whole arrangement: the only way
+    these four characters can reach this machine is a person reading them off the other one, so a
+    client that has been talked into a rebuild still has to be told the thing that makes it possible.
+
+    The Restore button is disabled until what has been typed is a code at all, so pressing Enter with
+    an empty box does nothing. Closing this window in any other way is the same as not typing: the
+    host is left exactly as it is.
+    """
+
+    def __init__(self, parent_window, title: str, host_label: str, chain_name: str = ''):
+        super().__init__(parent_window)
+        self.parent_window = parent_window
+        self.host_label = str(host_label)
+        self.chain_name = str(chain_name or '')
+        # What was accepted, or None for "nobody typed anything". The sync reads anything else - a
+        # cancelled window, a half-typed one - the same way.
+        self.code: Optional[str] = None
+        self.setWindowTitle(title)
+        self.setFixedSize(560, 350)
+        self.setWindowFlags(self.windowFlags() | Qt.Tool)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+
+        heading = QLabel("REBUILD THE HOST FROM THIS PC")
+        heading.setFont(QFont("Segoe UI Semibold", 11))
+        layout.addWidget(heading)
+
+        body = QLabel(f"{'This chain is being restored from this PC to ' + self.host_label}.\n\n"
+                      "Nothing in this folder is deleted. Files are copied from here onto the host, which keeps "
+                      "anything it already holds and takes only what it is missing.")
+        body.setWordWrap(True)
+        layout.addWidget(body)
+
+        ask = QLabel("Four characters are showing on the host's own screen. Type them here:")
+        ask.setWordWrap(True)
+        ask.setFont(QFont("Segoe UI Semibold", 10))
+        layout.addWidget(ask)
+
+        self.code_edit = QLineEdit()
+        self.code_edit.setPlaceholderText("e.g. K7PZ")
+        self.code_edit.setMaxLength(RESTORE_CODE_LENGTH)
+        self.code_edit.setAlignment(Qt.AlignCenter)
+        self.code_edit.setFont(QFont("Consolas", 18))
+        self.code_edit.textChanged.connect(self._on_typed)
+        layout.addWidget(self.code_edit)
+
+        self.hint_lbl = QLabel(f"{RESTORE_CODE_LENGTH} characters, taken from the host's screen.")
+        self.hint_lbl.setWordWrap(True)
+        self.hint_lbl.setStyleSheet("color: #888; font-size: 11px;")
+        layout.addWidget(self.hint_lbl)
+
+        layout.addStretch()
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setToolTip("Leave the host exactly as it is. Nothing on either PC is changed.")
+        self.cancel_btn.clicked.connect(self.reject)
+        buttons.addWidget(self.cancel_btn)
+        self.restore_btn = QPushButton("Restore The Host")
+        self.restore_btn.setToolTip("Send this PC's copy to the host. Nothing on this PC is deleted.")
+        self.restore_btn.clicked.connect(self._accept_code)
+        # Nothing to accept yet, so nothing to press. The button becomes the default once there is.
+        self.restore_btn.setEnabled(False)
+        buttons.addWidget(self.restore_btn)
+        layout.addLayout(buttons)
+
+        self.code_edit.setFocus()
+
+    def _on_typed(self, text: str):
+        """Show whether what has been typed is a code, and only let it be pressed when it is."""
+        upper = str(text or '').upper()
+        if upper != str(text or ''):
+            # Typed in lower case, which is what a keyboard gives. The code is compared upper case at
+            # both ends, so this is the same characters - it just stops the box looking wrong.
+            self.code_edit.blockSignals(True)
+            self.code_edit.setText(upper)
+            self.code_edit.blockSignals(False)
+        if restore_code_shape(upper) is None:
+            self.restore_btn.setEnabled(False)
+            if str(upper or '').strip():
+                self.hint_lbl.setText("That is not the code: four characters from the host's screen, with no I, O, 0 or 1.")
+                self.hint_lbl.setStyleSheet("color: #C0392B; font-size: 11px;")
+            else:
+                self.hint_lbl.setText(f"{RESTORE_CODE_LENGTH} characters, taken from the host's screen.")
+                self.hint_lbl.setStyleSheet("color: #888; font-size: 11px;")
+            return
+        self.restore_btn.setEnabled(True)
+        self.restore_btn.setDefault(True)
+        self.hint_lbl.setText("That is a code. The host will check it against the one on its screen.")
+        self.hint_lbl.setStyleSheet("color: #1abd33; font-size: 11px;")
+
+    def _accept_code(self):
+        """Hand the typed code to the sync, or refuse to until what was typed is one."""
+        code = restore_code_shape(self.code_edit.text())
+        if code is None:
+            self._on_typed(self.code_edit.text())
+            return
+        self.code = code
+        self.accept()
+
+
+class HostRestoreCodeDialog(QDialog):
+    """The code a host shows when a client has asked it to rebuild itself from that client.
+
+    Deliberately not modal: this window is open while another machine is waiting for it, and a host
+    that froze its own interface while somebody typed four characters on a different PC would be a
+    host that could not cancel the offer, watch its own cards, or do anything else at all.
+
+    The offer it is showing is on a clock. A code that sits on a screen is a code anybody at the
+    client could eventually be handed, and what it unlocks is writing into this machine's hosted
+    folder - so this window closes the offer when its time is up, when its Cancel button is pressed,
+    and when it is closed by its own X, and says which of those happened each time.
+    """
+
+    def __init__(self, parent_window, sync_code: str, chain_name: str, client_ip: str, code: str,
+                 expires_in: float, on_cancel: Optional[Callable[[str, str], None]] = None):
+        super().__init__(parent_window)
+        self.parent_window = parent_window
+        self.sync_code = str(sync_code)
+        self.chain_name = str(chain_name or 'Sync')
+        self.client_ip = str(client_ip)
+        self.code = str(code)
+        self.on_cancel_cb = on_cancel
+        # Whether this window has already closed the offer, and whether it is going away for a reason
+        # decided elsewhere (the client backed out, the rebuild started) rather than by somebody here
+        # pressing Cancel. Those have to be told apart: a window that closes after its offer was
+        # already settled must not report a cancellation that has already been reported.
+        self.cancelled = False
+        self.settled_by_program = False
+        self.closed_reason = ''
+        self.setWindowTitle(f"Restore Host - Code for {self.chain_name}")
+        self.setFixedSize(540, 400)
+        self.setWindowFlags(self.windowFlags() | Qt.Tool)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+
+        heading = QLabel("A CLIENT IS ASKING TO REBUILD THIS HOST")
+        heading.setFont(QFont("Segoe UI Semibold", 11))
+        layout.addWidget(heading)
+
+        body = QLabel(f"{self.client_ip} is waiting to restore Sync Chain '{self.chain_name}' from its own copy.\n\n"
+                      "Read these four characters to whoever is at that machine and type them in on it. Until they "
+                      "are typed nothing here is written to and nothing here is deleted, and this host takes only "
+                      "the files it does not already hold.")
+        body.setWordWrap(True)
+        layout.addWidget(body)
+
+        self.code_lbl = QLabel(self.code)
+        self.code_lbl.setFont(QFont("Consolas", 34))
+        self.code_lbl.setAlignment(Qt.AlignCenter)
+        self.code_lbl.setStyleSheet("color: #1abd33; letter-spacing: 6px; padding: 10px;")
+        # Selectable, so it can be picked at and copied rather than only read out loud across a room.
+        self.code_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(self.code_lbl)
+
+        self.count_lbl = QLabel("")
+        self.count_lbl.setWordWrap(True)
+        self.count_lbl.setStyleSheet("color: #888; font-size: 11px;")
+        layout.addWidget(self.count_lbl)
+
+        self._seconds_left = max(0, int(round(float(expires_in))))
+        self._show_time_left()
+        self.count_timer = QTimer(self)
+        self.count_timer.setInterval(1000)
+        self.count_timer.timeout.connect(self._tick)
+        self.count_timer.start()
+
+        layout.addStretch()
+
+        buttons = QHBoxLayout()
+        self.copy_btn = QPushButton("Copy Code")
+        self.copy_btn.clicked.connect(self._copy_code)
+        buttons.addWidget(self.copy_btn)
+        buttons.addStretch()
+        self.cancel_btn = QPushButton("Cancel Restore")
+        self.cancel_btn.setToolTip("Close this code. The client waiting on it is told it is no longer open.")
+        self.cancel_btn.clicked.connect(lambda: self._close_offer("cancelled here"))
+        buttons.addWidget(self.cancel_btn)
+        layout.addLayout(buttons)
+
+    def _show_time_left(self):
+        self.count_lbl.setText(f"This code is good for another {self._seconds_left} second(s). After that it is no "
+                               "longer any use to the machine waiting on it.")
+
+    def _tick(self):
+        """One second of this offer's life gone, and a window that may have stopped being worth looking at."""
+        self._seconds_left -= 1
+        if self._seconds_left > 0:
+            self._show_time_left()
+            return
+        self.count_timer.stop()
+        self._close_offer("its time ran out")
+
+    def _close_offer(self, reason: str):
+        """Stop showing the code, and tell the server that showed it that nobody is going to use it.
+
+        Only for as long as this window is the one that still owns the offer - `settled_elsewhere` has
+        already handed it over, and the close it asks for arrives here as a closeEvent.
+        """
+        if self.cancelled or self.settled_by_program:
+            return
+
+        self.cancelled = True
+        self.closed_reason = reason
+        self.count_timer.stop()
+        self.code_lbl.setStyleSheet("color: #888; letter-spacing: 6px; padding: 10px;")
+        self.count_lbl.setText(f"Restore not carried out - {reason}. Nothing was written to this host.")
+        self.cancel_btn.setEnabled(False)
+        self.copy_btn.setEnabled(False)
+        if self.on_cancel_cb is not None:
+            try:
+                self.on_cancel_cb(self.sync_code, self.code)
+            except Exception:
+                pass
+
+    def _copy_code(self):
+        try:
+            QApplication.clipboard().setText(self.code)
+            self.count_lbl.setText("Code copied. Read it out, or paste it in on the machine waiting for it.")
+        except Exception:
+            pass
+
+    def settled_elsewhere(self, reason: str):
+        """Close this window because something elsewhere has already settled the offer.
+
+        The client backed out, the code was named correctly and the rebuild is writing, or the rebuild
+        finished. In each of those the offer is already closed by the side that owns it, and this window
+        closing itself must not go and report a second cancellation over the top of the first.
+        """
+        if self.cancelled or self.settled_by_program:
+            return
+        self.settled_by_program = True
+        self.closed_reason = reason
+        self.count_timer.stop()
+        self.close()
+
+    def closeEvent(self, event):
+        # Closed by its X, by Escape or by the window manager: nobody here is going to read this code
+        # out, and an offer nobody is looking at is an offer nobody should be able to use.
+        self._close_offer("the window was closed")
+        super().closeEvent(event)
+
+
+
+

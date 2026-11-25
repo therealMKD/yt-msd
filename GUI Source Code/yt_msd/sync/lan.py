@@ -32,6 +32,44 @@ SYNC_CONFIRM_PING_INTERVAL = 10.0
 
 SYNC_CHUNK_SIZE = 1024 * 1024
 
+# How long a restore code stays good on the host that shows it. The code is meant to be read off one
+# screen and typed into another machine by two people who are standing in the same room, so it needs
+# long enough to be read aloud and typed - and it must not sit on screen indefinitely, because while
+# it is open anybody at the client could be handed the one thing that lets them overwrite this
+# machine's hosted folder.
+SYNC_RESTORE_CODE_TIMEOUT = 180.0
+
+# How long each read of the swapped half of a chain may take. The ordinary socket timeout is a
+# handshake timeout: it assumes the next message is already on its way. During a rebuild the host is
+# hashing its own library before it answers, and a client is hashing its own before it sends the
+# index, and either of those is a slow drive doing a lot of work rather than a dead connection.
+SYNC_RESTORE_HANDSHAKE_TIMEOUT = 300.0
+
+# The code a host shows when a client asks it to rebuild itself from that client. Four characters,
+# from an alphabet with the look-alikes taken out of it - no I, O, 0 or 1 - because it is read off
+# one screen and typed into another, usually out loud. It is deliberately not four digits: the number
+# a chain is found by is four digits, and a code that must never be confused with that one should not
+# look like it.
+RESTORE_CODE_LENGTH = 4
+
+RESTORE_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+def restore_code_shape(text) -> Optional[str]:
+    """A typed restore code in the shape it can be checked in, or nothing if it is not one.
+
+    Uppercased, with the spaces and dashes somebody adds while copying four characters off a screen
+    taken back out. Anything else - the wrong length, a letter this code does not use, nothing at all
+    - is not a code, and is answered as that rather than sent along to be compared against one.
+    """
+    typed = str(text or '').strip().upper().replace(' ', '').replace('-', '')
+    if len(typed) != RESTORE_CODE_LENGTH:
+        return None
+    if any(ch not in RESTORE_CODE_ALPHABET for ch in typed):
+        return None
+    return typed
+
+
 # What a host calls itself when a client asks it "are you a yt-msd, and what are you hosting?"
 # before authenticating. The answer is what makes a scan able to tell a sync host from whatever
 # else happens to have a port open on a machine down the hall. See HELLO in yt_msd.sync.host.

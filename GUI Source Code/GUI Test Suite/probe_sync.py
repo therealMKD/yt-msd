@@ -1459,6 +1459,511 @@ check("SY-O6 and even a search that finds an address it cannot reach leaves the 
 
 
 # ===========================================================================
+# SY-P: Restore Host - the answer that lets a client rebuild the host it is synced to
+# ===========================================================================
+# Every section above this one assumes the host holds the library and the client is the one catching up
+# to it. Restore Host is the same chain turned around: the hosted folder is the one that has lost its
+# tracks, the client's folder is the one that still holds them, and what gets written is the host's copy
+# instead of the client's. Two things are proved here. The offer - a four-character code that appears on
+# the host's own screen and nowhere else, on a clock, that the person standing at the host can close -
+# and the rebuild that follows it, which is the one place in this program where a host writes into its
+# hosted folder rather than reading out of it: only what it asked for, only inside the folder, and with
+# nothing deleted at either end.
+#
+# The offer half lives in yt_msd.sync.host and the shape of a code in yt_msd.sync.lan, so this section
+# reads them off the seam's own map of the program instead of off names the entry point happens to
+# re-export: the protocol is what is under test, and the entry point is only one of the places that
+# reads it. Naming the module each one is defined in, rather than taking whichever module the map
+# happens to list first, so a name that moves out of the file this section is describing fails here
+# instead of quietly reading a re-export nobody calls.
+def _defined_in(dotted, name):
+    """The module this program names in `dotted`, looked up through the seam's own map."""
+    found = next((m for m in seam.owners(name) if m.__name__ == dotted), None)
+    if found is None:
+        raise seam.SeamError(f"{name!r} is not a module-level name in {dotted}.")
+    return found
+
+
+_host_layer = _defined_in("yt_msd.sync.host", "SyncHostServer")
+_lan_layer = _defined_in("yt_msd.sync.lan", "restore_code_shape")
+_client_layer = _defined_in("yt_msd.sync.client", "SyncClientWorker")
+
+P_HOST_FOLDER = fixture("restore host folder")
+audio_file(P_HOST_FOLDER, "here.mp3", body=b"the track the host still has", mtime=1600000000.0)
+P_CLIENT_FOLDER = fixture("restore client folder")
+audio_file(P_CLIENT_FOLDER, "here.mp3", body=b"the track the host still has", mtime=1600000000.0)
+audio_file(P_CLIENT_FOLDER, "lost.mp3", body=b"the track the host lost", mtime=1500000000.0)
+audio_file(P_CLIENT_FOLDER, "gone.mp3", body=b"and this one too", mtime=1400000000.0)
+(P_CLIENT_FOLDER / "notes.txt").write_text("not a track", encoding="utf-8")
+
+P_EVENTS = []
+P_SERVER = mod.SyncHostServer(
+    lambda: [{"sync_code": "6001", "name": "Rebuild Me", "folder_path": str(P_HOST_FOLDER)}],
+    on_restore_event_cb=lambda code, ip, event, note: P_EVENTS.append((code, ip, event, note)))
+# As every other host in this suite is built: the handler is driven over a connected loopback pair,
+# because start() binds SYNC_PORT_START..END and a yt-msd that is genuinely running is listening there.
+P_SERVER._running = True
+
+
+def _restore_pair(server, client_ip="192.168.1.20"):
+    """One end of a restore: a connected client, and the host's own handler on its own thread."""
+    client, server_side = _loopback_pair()
+    worker = threading.Thread(target=lambda: server._handle_client(server_side, client_ip), daemon=True)
+    worker.start()
+    return client, worker
+
+
+def _authenticate(client, sync_code="6001"):
+    mod.send_json_msg(client, {"cmd": "AUTH", "sync_code": sync_code})
+    return mod.recv_json_msg(client, timeout=8.0)
+
+
+def _ask_for_restore(client, sync_code="6001", from_ip="192.168.1.20"):
+    """Ask for a rebuild the way a client asks for one, and hand back what the host answered."""
+    mod.send_json_msg(client, {"cmd": "RESTORE_REQUEST", "sync_code": sync_code, "client_ip": from_ip})
+    return mod.recv_json_msg(client, timeout=8.0)
+
+
+def _client_index(folder):
+    """The index a client offers a host: name, size, date and checksum of every track it holds."""
+    entries = []
+    for held in mod.filter_audio_files(folder):
+        stat = held.stat()
+        entries.append({"name": held.name, "size": stat.st_size, "mtime": stat.st_mtime,
+                        "sha256": mod.compute_file_sha256(held)})
+    return entries
+
+
+_p_offer = _host_layer.issue_restore_code("6001", "192.168.1.20")
+check("SY-P1 a restore code is four characters from an alphabet with the look-alikes taken out, and is never a number a sync code could be",
+      _lan_layer.RESTORE_CODE_LENGTH == 4
+      and not any(ch in "IO01" for ch in _lan_layer.RESTORE_CODE_ALPHABET)
+      and not _p_offer["code"].isdigit(), (_lan_layer.RESTORE_CODE_ALPHABET, _p_offer["code"]))
+check("SY-P2 what a person types is read in the shape it can be checked in, and every way it can be wrong is refused before it is compared to anything",
+      _lan_layer.restore_code_shape("k7pz") == "K7PZ"
+      and _lan_layer.restore_code_shape(" K7-PZ ") == "K7PZ"
+      and _lan_layer.restore_code_shape("K7P") is None
+      and _lan_layer.restore_code_shape("K7PZZ") is None
+      and _lan_layer.restore_code_shape("IO01") is None
+      and _lan_layer.restore_code_shape("K7P_") is None
+      and _lan_layer.restore_code_shape("") is None
+      and _lan_layer.restore_code_shape(None) is None
+      and _lan_layer.restore_code_shape(4821) is None)
+check("SY-P3 an offer names the chain it belongs to, the machine that asked for it, the code, and the moment it stops being any use",
+      _p_offer["sync_code"] == "6001" and _p_offer["client_ip"] == "192.168.1.20"
+      and _lan_layer.restore_code_shape(_p_offer["code"]) == _p_offer["code"]
+      and abs((_p_offer["expires_at"] - _p_offer["issued_at"]) - _lan_layer.SYNC_RESTORE_CODE_TIMEOUT) < 1.0,
+      _p_offer)
+_p_second = _host_layer.issue_restore_code("6001", "192.168.1.21")
+check("SY-P4 one chain has one open offer at a time: a newer request replaces the older one rather than competing with it, and the replaced code stops being a way in",
+      _host_layer.pending_restore_request("6001")["code"] == _p_second["code"]
+      and _host_layer.take_restore_offer("6001", _p_offer["code"]) is None
+      and _host_layer.pending_restore_request("6001") is None, (_p_offer["code"], _p_second["code"]))
+_p_one = _host_layer.issue_restore_code("6002", "192.168.1.22")
+_p_guess = "AAAA" if _p_one["code"] != "AAAA" else "BBBB"
+check("SY-P5 a code that is not the one open is an answer and not a hint: it closes the offer instead of leaving it open to be guessed at",
+      _host_layer.take_restore_offer("6002", _p_guess) is None
+      and _host_layer.pending_restore_request("6002") is None, (_p_one["code"], _p_guess))
+_p_stale = _host_layer.issue_restore_code("6003", "192.168.1.23", timeout=0.05)
+time.sleep(0.1)
+check("SY-P6 an offer nobody used stops being one on its own, and it cannot be spent after that",
+      _host_layer.pending_restore_request("6003") is None
+      and _host_layer.take_restore_offer("6003", _p_stale["code"]) is None, _p_stale)
+_p_card = _host_layer.issue_restore_code("6004", "192.168.1.24")
+_p_other_code = "AAAA" if _p_card["code"] != "AAAA" else "BBBB"
+check("SY-P7 a code window that closes itself closes only the code it is holding - a card refreshed after somebody else was let in cancels nothing - and the code it is holding does close it",
+      _host_layer.cancel_restore_offer("6004", _p_other_code) is False
+      and _host_layer.pending_restore_request("6004")["code"] == _p_card["code"]
+      and _host_layer.cancel_restore_offer("6004", _p_card["code"]) is True
+      and _host_layer.pending_restore_request("6004") is None, _p_card)
+check("SY-P8 a restored file may only ever be a name this folder can hold: separators, climbs out of the folder and file types a chain cannot hold are all refused",
+      _host_layer.restore_target(P_HOST_FOLDER, "lost.mp3") == P_HOST_FOLDER / "lost.mp3"
+      and _host_layer.restore_target(P_HOST_FOLDER, "../evil.mp3") is None
+      and _host_layer.restore_target(P_HOST_FOLDER, "..\\..\\evil.mp3") is None
+      and _host_layer.restore_target(P_HOST_FOLDER, "nested/lost.mp3") is None
+      and _host_layer.restore_target(P_HOST_FOLDER, "notes.txt") is None
+      and _host_layer.restore_target(P_HOST_FOLDER, "") is None
+      and _host_layer.restore_target(P_HOST_FOLDER, ".") is None
+      and _host_layer.restore_target(P_HOST_FOLDER, "..") is None
+      and _host_layer.restore_target(P_HOST_FOLDER, None) is None)
+
+_p_client, _p_worker = _restore_pair(P_SERVER)
+_p_auth = _authenticate(_p_client)
+_p_ask = _ask_for_restore(_p_client)
+_p_open = _host_layer.pending_restore_request("6001")
+check("SY-P9 a client that asks to rebuild the host is told the host is waiting for its code, with the chain's name and how long the wait lasts - and with no code in the answer",
+      _p_auth.get("status") == "OK" and _p_ask.get("status") == "WAITING_FOR_CODE"
+      and _p_ask.get("chain_name") == "Rebuild Me"
+      and _p_ask.get("expires_in") == int(_lan_layer.SYNC_RESTORE_CODE_TIMEOUT)
+      and _p_open is not None and _p_open["code"] not in json.dumps(_p_ask), (_p_ask, _p_open))
+check("SY-P10 the code that answer is waiting for is on the host's own side of the exchange and in its own callback, so the host's window can show it and the host's window alone can close it",
+      any(event[2] == "requested" and event[3] == _p_open["code"] and event[1] == "192.168.1.20"
+          for event in P_EVENTS), (P_EVENTS, _p_open))
+mod.send_json_msg(_p_client, {"cmd": "PING"})
+_p_pong = mod.recv_json_msg(_p_client, timeout=8.0)
+check("SY-P11 a client holding its connection open while somebody reads a code off another screen does it with a PING, and a host waiting on that code answers it",
+      _p_pong.get("status") == "PONG", _p_pong)
+P_SERVER.cancel_restore_request("6001", _p_open["code"])
+mod.send_json_msg(_p_client, {"cmd": "PING"})
+_p_closed = mod.recv_json_msg(_p_client, timeout=8.0)
+check("SY-P12 a code closed on the host's own screen is reported to the machine that was waiting for it, and it is closed rather than left open to be tripped over",
+      _p_closed.get("status") == "RESTORE_CLOSED" and "no longer open" in _p_closed.get("reason", "")
+      and _host_layer.pending_restore_request("6001") is None
+      and any(event[2] == "cancelled" for event in P_EVENTS), (_p_closed, P_EVENTS))
+_p_worker.join(8); _p_client.close()
+
+_p_client, _p_worker = _restore_pair(P_SERVER)
+_authenticate(_p_client)
+_ask_for_restore(_p_client)
+_p_code = _host_layer.pending_restore_request("6001")["code"]
+_p_wrong = "AAAA" if _p_code != "AAAA" else "BBBB"
+mod.send_json_msg(_p_client, {"cmd": "RESTORE_CONFIRM", "sync_code": "6001", "code": _p_wrong})
+_p_refused = mod.recv_json_msg(_p_client, timeout=8.0)
+check("SY-P13 a code typed wrong on the client is refused, closes the offer rather than leaving it open to be tried again, and writes nothing into the hosted folder",
+      _p_refused.get("status") == "ERROR" and "not the code" in _p_refused.get("reason", "")
+      and _host_layer.pending_restore_request("6001") is None
+      and sorted(held.name for held in mod.filter_audio_files(P_HOST_FOLDER)) == ["here.mp3"]
+      and not any(event[2] == "started" for event in P_EVENTS), (_p_refused, _p_wrong))
+_p_client.close(); _p_worker.join(8)
+
+
+def _restore_round(server, requests, expecting, client_ip="192.168.1.30"):
+    """A short visit to a host that is mid-restore: send these, read those answers, and go."""
+    client, worker = _restore_pair(server, client_ip)
+    for message in requests:
+        mod.send_json_msg(client, message)
+    answers = [mod.recv_json_msg(client, timeout=8.0) for _ in range(expecting)]
+    client.close()
+    worker.join(8)
+    return answers
+
+
+_p_client, _p_worker = _restore_pair(P_SERVER)
+_authenticate(_p_client)
+_ask_for_restore(_p_client)
+_p_code = _host_layer.pending_restore_request("6001")["code"]
+mod.send_json_msg(_p_client, {"cmd": "RESTORE_CONFIRM", "sync_code": "6001", "code": _p_code})
+_p_accepted = mod.recv_json_msg(_p_client, timeout=8.0)
+check("SY-P14 the right code, accepted on the host, is what lets the machine that typed it through, and the host's own half of the rebuild starts at that moment",
+      _p_accepted.get("status") == "CODE_ACCEPTED" and _p_accepted.get("chain_name") == "Rebuild Me"
+      and any(event[2] == "started" for event in P_EVENTS)
+      and P_SERVER.is_restoring("6001") is True, (_p_accepted, P_EVENTS))
+_p_here_before = (P_HOST_FOLDER / "here.mp3").read_bytes()
+_p_offered = (_client_index(P_CLIENT_FOLDER)
+              + [{"name": "../escape.mp3", "size": 9, "mtime": 1300000000.0, "sha256": ""},
+                 {"name": "notes.txt", "size": 11, "mtime": 1300000000.0, "sha256": ""}])
+mod.send_json_msg(_p_client, {"cmd": "PUSH_INDEX", "sync_code": "6001", "files": _p_offered})
+_p_short = mod.recv_json_msg(_p_client, timeout=_lan_layer.SYNC_RESTORE_HANDSHAKE_TIMEOUT + 4)
+check("SY-P15 a host being rebuilt answers with a shortlist of its own: the files its folder still needs, a count of what it already holds, and nothing it was not offered a name for",
+      _p_short.get("status") == "RESTORING"
+      and set(_p_short.get("files") or []) == {"lost.mp3", "gone.mp3"}
+      and _p_short.get("already_there") == 1, (_p_short, _p_offered))
+_p_busy = _restore_round(P_SERVER, [{"cmd": "AUTH", "sync_code": "6001"},
+                                    {"cmd": "GET_INDEX"},
+                                    {"cmd": "PULL_FILE", "sync_code": "6001", "filename": "lost.mp3"},
+                                    {"cmd": "RESTORE_REQUEST", "sync_code": "6001"}], 4)
+check("SY-P16 while a hosted folder is being rebuilt it is not a host and it is not a half-host either: another machine on the same chain is refused its index, refused a file and refused its own rebuild, each time with a reason that says why",
+      _p_busy[0].get("status") == "OK"
+      and all(answer.get("status") == "ERROR" for answer in _p_busy[1:])
+      and "being rebuilt" in _p_busy[1].get("reason", "")
+      and "being rebuilt" in _p_busy[2].get("reason", "")
+      and "being rebuilt" in _p_busy[3].get("reason", ""), _p_busy)
+mod.send_json_msg(_p_client, {"cmd": "PUSH_FILE", "sync_code": "6001", "filename": "here.mp3",
+                              "filesize": 5, "sha256": "x" * 64, "mtime": 1300000000.0})
+_p_stray = mod.recv_json_msg(_p_client, timeout=8.0)
+mod.send_json_msg(_p_client, {"cmd": "PUSH_FILE", "sync_code": "6001", "filename": "../escape.mp3",
+                              "filesize": 5, "sha256": "x" * 64, "mtime": 1300000000.0})
+_p_trick = mod.recv_json_msg(_p_client, timeout=8.0)
+check("SY-P17 a host being rebuilt takes only what it asked for and only inside its folder: a file it did not ask for is refused, a name that climbs out of the folder is refused, and neither refusal closes the connection or writes anything",
+      "did not ask for that file" in _p_stray.get("reason", "")
+      and "name this folder can hold" in _p_trick.get("reason", "")
+      and (P_HOST_FOLDER / "here.mp3").read_bytes() == _p_here_before
+      and not (P_HOST_FOLDER / "escape.mp3").exists()
+      and not (P_HOST_FOLDER.parent / "escape.mp3").exists(), (_p_stray, _p_trick))
+_p_written = 0
+for _p_name in sorted(_p_short.get("files") or []):
+    _p_src = P_CLIENT_FOLDER / _p_name
+    _p_stat = _p_src.stat()
+    mod.send_json_msg(_p_client, {"cmd": "PUSH_FILE", "sync_code": "6001", "filename": _p_name,
+                                  "filesize": _p_stat.st_size, "sha256": mod.compute_file_sha256(_p_src),
+                                  "mtime": _p_stat.st_mtime})
+    mod.recv_json_msg(_p_client, timeout=8.0)
+    mod.stream_file_to_socket(_p_client, _p_src)
+    if mod.recv_json_msg(_p_client, timeout=8.0).get("status") == "OK":
+        _p_written += 1
+mod.send_json_msg(_p_client, {"cmd": "PUSH_DONE", "sync_code": "6001"})
+_p_done = mod.recv_json_msg(_p_client, timeout=8.0)
+_p_client.close(); _p_worker.join(8)
+check("SY-P18 the rebuild writes the files the host asked for into its own folder, keeps the dates the tracks were made on, and leaves what the host already held exactly as it was",
+      _p_written == 2
+      and sorted(held.name for held in mod.filter_audio_files(P_HOST_FOLDER)) == ["gone.mp3", "here.mp3", "lost.mp3"]
+      and (P_HOST_FOLDER / "lost.mp3").read_bytes() == b"the track the host lost"
+      and abs((P_HOST_FOLDER / "lost.mp3").stat().st_mtime - 1500000000.0) < 2.0
+      and abs((P_HOST_FOLDER / "gone.mp3").stat().st_mtime - 1400000000.0) < 2.0
+      and (P_HOST_FOLDER / "here.mp3").read_bytes() == _p_here_before
+      and abs((P_HOST_FOLDER / "here.mp3").stat().st_mtime - 1600000000.0) < 2.0, _p_written)
+check("SY-P19 and it closes with the host saying what it received and what never arrived, with the folder a host again, and with nothing deleted on either side",
+      _p_done.get("status") == "SYNCED" and _p_done.get("received") == 2 and _p_done.get("missing") == []
+      and P_SERVER.is_restoring("6001") is False
+      and any(event[2] == "finished" and "2 file(s) rebuilt" in event[3] for event in P_EVENTS)
+      and sorted(held.name for held in mod.filter_audio_files(P_CLIENT_FOLDER)) == ["gone.mp3", "here.mp3", "lost.mp3"],
+      (_p_done, P_EVENTS))
+_p_client.close()
+
+_p_early, _p_early_worker = _restore_pair(P_SERVER)
+_authenticate(_p_early)
+_ask_for_restore(_p_early)
+_p_code = _host_layer.pending_restore_request("6001")["code"]
+mod.send_json_msg(_p_early, {"cmd": "RESTORE_CONFIRM", "sync_code": "6001", "code": _p_code})
+mod.recv_json_msg(_p_early, timeout=8.0)
+mod.send_json_msg(_p_early, {"cmd": "PUSH_INDEX", "sync_code": "6001", "files": _client_index(P_CLIENT_FOLDER)})
+mod.recv_json_msg(_p_early, timeout=_lan_layer.SYNC_RESTORE_HANDSHAKE_TIMEOUT + 4)
+mod.send_json_msg(_p_early, {"cmd": "PING"})
+_p_mistake = mod.recv_json_msg(_p_early, timeout=8.0)
+_p_early.close(); _p_early_worker.join(8)
+check("SY-P20 a client that sends the wrong thing in the middle of a restore ends the restore rather than leaving the host stuck in one: the host answers with the mistake it saw, reports the transfer as ended, and is a host again",
+      _p_mistake.get("status") == "ERROR" and "Unknown command" in _p_mistake.get("reason", "")
+      and any(event[2] == "finished" and "in the middle of a restore" in event[3] for event in P_EVENTS)
+      and P_SERVER.is_restoring("6001") is False
+      and sorted(held.name for held in mod.filter_audio_files(P_HOST_FOLDER)) == ["gone.mp3", "here.mp3", "lost.mp3"],
+      _p_mistake)
+
+for _p_name in ("lost.mp3", "gone.mp3"):
+    (P_HOST_FOLDER / _p_name).unlink()
+_p_client, _p_worker = _restore_pair(P_SERVER)
+_authenticate(_p_client)
+_p_said = []
+_p_ok, _p_message, _p_sent = _client_layer.SyncClientWorker._rebuild_host(
+    _p_client, {"sync_code": "6001", "name": "Rebuild Me"}, P_CLIENT_FOLDER, "192.168.1.20:63350",
+    status_cb=lambda line: _p_said.append(line), progress_cb=None,
+    restore_code_cb=lambda host_label: _host_layer.pending_restore_request("6001")["code"])
+_p_client.close(); _p_worker.join(8)
+check("SY-P21 the client half of a restore asks for an offer, waits on the code, lists its own folder, and sends only the files the host comes back and asks for",
+      _p_ok is True and _p_sent == 2 and _client_layer.host_was_rebuilt(_p_message)
+      and sorted(held.name for held in mod.filter_audio_files(P_HOST_FOLDER)) == ["gone.mp3", "here.mp3", "lost.mp3"]
+      and sorted(held.name for held in mod.filter_audio_files(P_CLIENT_FOLDER)) == ["gone.mp3", "here.mp3", "lost.mp3"],
+      (_p_ok, _p_message, _p_sent))
+check("SY-P22 and the client says what it did in words a window can report without guessing: which host it rebuilt, how much it wrote, and that nothing was deleted here",
+      "Host rebuilt from this PC: 2 file(s) written to 192.168.1.20:63350, 1 already there" in _p_message
+      and _p_message.endswith("Nothing was deleted here.")
+      and any("Asking the host to open a restore" in line for line in _p_said)
+      and any("Restoring [1/2]" in line for line in _p_said), (_p_message, _p_said))
+
+_p_client, _p_worker = _restore_pair(P_SERVER)
+_authenticate(_p_client)
+_p_ok2, _p_message2, _p_sent2 = _client_layer.SyncClientWorker._rebuild_host(
+    _p_client, {"sync_code": "6001"}, P_CLIENT_FOLDER, "192.168.1.20:63350",
+    restore_code_cb=lambda host_label: "no code")
+_p_client.close(); _p_worker.join(8)
+check("SY-P23 something typed that is not a restore code stops the restore on the client's own side, closes the offer it was waiting on, and leaves both folders exactly as they were",
+      _p_ok2 is False and _p_sent2 == 0 and "'no code' is not a restore code" in _p_message2
+      and _client_layer.restore_was_left_undone(_p_message2) is True
+      and _host_layer.pending_restore_request("6001") is None
+      and sorted(held.name for held in mod.filter_audio_files(P_HOST_FOLDER)) == ["gone.mp3", "here.mp3", "lost.mp3"],
+      (_p_ok2, _p_message2))
+
+_p_client, _p_worker = _restore_pair(P_SERVER)
+_authenticate(_p_client)
+_p_ok3, _p_message3, _p_sent3 = _client_layer.SyncClientWorker._rebuild_host(
+    _p_client, {"sync_code": "6001"}, P_CLIENT_FOLDER, "192.168.1.20:63350",
+    restore_code_cb=lambda host_label: None)
+_p_client.close(); _p_worker.join(8)
+check("SY-P24 nobody reading the code off the host's screen is a complete answer too: the client cancels its own side, the host's screen stops showing a code nobody will use, and the host is not written into",
+      _p_ok3 is False and _p_sent3 == 0 and "Restore Host cancelled" in _p_message3
+      and "the host was left exactly as it is" in _p_message3
+      and _host_layer.pending_restore_request("6001") is None
+      and any(event[2] == "cancelled" and event[3] == "client cancelled" for event in P_EVENTS),
+      (_p_ok3, _p_message3, P_EVENTS))
+
+
+class _DecisionApp:
+    """A stand-in for the app a decision callback is built from: it answers, and remembers being asked."""
+
+    def __init__(self, answer=None, code=None):
+        self.answer = answer
+        self.code = code
+        self.titles = []
+        self.questions = []
+        self.hosts = []
+
+    def ask_sync_decision(self, title, question):
+        self.titles.append(title)
+        self.questions.append(question)
+        return self.answer
+
+    def ask_restore_code(self, title, host_label):
+        self.titles.append(title)
+        self.hosts.append(host_label)
+        return self.code
+
+
+class _DecisionOnlyApp(_DecisionApp):
+    """An app with the button on its box and no way to read the code off the host's screen."""
+    ask_restore_code = None
+
+
+check("SY-P25 the answer a window gives is read as one of the three answers this program names an answer with, and anything else - a half answer, a garbled one, a window that cannot answer - is read as the one that deletes nothing",
+      _client_layer.make_sync_decision_cb(_DecisionApp("restore"), "X")("q") == _client_layer.SYNC_DECISION_RESTORE
+      and _client_layer.make_sync_decision_cb(_DecisionApp("delete"), "X")("q") == _client_layer.SYNC_DECISION_DELETE
+      and _client_layer.make_sync_decision_cb(_DecisionApp("Keep"), "X")("q") == _client_layer.SYNC_DECISION_KEEP
+      and _client_layer.make_sync_decision_cb(_DecisionApp(None), "X")("q") == _client_layer.SYNC_DECISION_KEEP
+      and _client_layer.make_sync_decision_cb(_DecisionApp("delete them all"), "X")("q") == _client_layer.SYNC_DECISION_KEEP
+      and _client_layer.make_sync_decision_cb(_DecisionOnlyApp("restore"), "X")("q") == _client_layer.SYNC_DECISION_RESTORE
+      and _client_layer.make_sync_decision_cb(object(), "X") is None)
+_p_asked = _DecisionApp("restore", code="k7pz")
+_p_decide_asked = _client_layer.make_sync_decision_cb(_p_asked, "Rebuild Me")
+_p_code_asked = _client_layer.make_restore_code_cb(_p_asked, "Rebuild Me")
+check("SY-P26 both halves of the question are built with the chain's name in the title they hand the window and the words they were given carried through unchanged, and the code half hands the window the host it is waiting on and passes back exactly what was typed",
+      _p_decide_asked("The host has stopped offering 13 file(s)") == _client_layer.SYNC_DECISION_RESTORE
+      and _p_code_asked("192.168.1.9:63350") == "k7pz"
+      and _p_asked.titles == ["Sync Chain 'Rebuild Me' - Delete Files?", "Sync Chain 'Rebuild Me' - Restore Host"]
+      and _p_asked.questions == ["The host has stopped offering 13 file(s)"]
+      and _p_asked.hosts == ["192.168.1.9:63350"]
+      and _client_layer.make_restore_code_cb(_DecisionOnlyApp("restore"), "Rebuild Me") is None,
+      (_p_asked.titles, _p_asked.questions, _p_asked.hosts))
+check("SY-P27 a restore that was refused, mistyped or given up on is told apart from a host that could not be reached at all - a chain that reached its host and wrote nothing is not reported as one that never got there",
+      _client_layer.restore_was_left_undone("Restore Host refused by the host: no such chain. Nothing was deleted here.") is True
+      and _client_layer.restore_was_left_undone("The host did not accept that code: wrong code. Nothing was deleted here.") is True
+      and _client_layer.restore_was_left_undone("Restore Host cancelled - the host was left exactly as it is.") is True
+      and _client_layer.restore_was_left_undone("Could not find active host for Sync Code 6001 on local network.") is False
+      and _client_layer.restore_was_left_undone("Failed to connect to host at 192.168.1.9:63350") is False
+      and _client_layer.restore_was_left_undone("Synced successfully (0 updated, 11 removed).") is False
+      and _client_layer.host_was_rebuilt("Host rebuilt from this PC: 2 file(s) written to 127.0.0.1:63350") is True
+      and _client_layer.host_was_rebuilt("Deletions not confirmed - 11 track(s) left where they are") is False,
+      _client_layer.RESTORE_UNDONE_NOTES)
+
+P_KEEP_MIX = fixture("kept decision host")
+P_KEEP_DEST = fixture("kept decision folder")
+for _p_name in ("shared1.mp3", "shared2.mp3", "shared3.mp3"):
+    audio_file(P_KEEP_MIX, _p_name, body=b"a track both sides hold")
+    audio_file(P_KEEP_DEST, _p_name, body=b"a track both sides hold")
+for _p_number in range(11):
+    audio_file(P_KEEP_DEST, f"extra{_p_number}.mp3", body=f"an orphan this end still holds {_p_number}".encode("utf-8"))
+P_KEEP_HOST = _FakeHost(P_KEEP_MIX)
+
+
+def _restore_bridge(server):
+    """A listening socket on a spare port, handing every connection to this host's own handler.
+
+    A full client sync connects to an address, so a host that is driven by hand cannot be the far end
+    of one. This is the socket in between: it takes the place of the listening socket a running host
+    owns - on whatever port the operating system hands out, because the ports a real host listens on
+    belong to whatever yt-msd is genuinely running on this machine - and gives it to a chain to connect
+    to. Nothing else about the host changes.
+    """
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+
+    def _accept():
+        while True:
+            try:
+                connection, _address = listener.accept()
+            except OSError:
+                return
+            connection.settimeout(15.0)
+            threading.Thread(target=lambda: server._handle_client(connection, "127.0.0.1"),
+                             daemon=True).start()
+
+    threading.Thread(target=_accept, daemon=True).start()
+    return listener
+
+
+def _guarded_chain(dest, port):
+    """A Mirror chain holding eleven tracks its host has stopped offering, over a ceiling of ten."""
+    chain = _client_chain(dest, port)
+    chain["delete_confirm_limit"] = 10
+    return chain
+
+
+_p_app = _DecisionApp("keep")
+_p_said = []
+_p_ok, _p_message, _p_moved, _p_removed = mod.SyncClientWorker.sync_chain(
+    _guarded_chain(P_KEEP_DEST, P_KEEP_HOST.port), status_cb=lambda line: _p_said.append(line),
+    decision_cb=_client_layer.make_sync_decision_cb(_p_app, "Studio"))
+check("SY-P28 the Keep answer keeps every file the host stopped offering, says so out loud, and the rest of the sync still runs",
+      _p_ok is True and _p_removed == 0 and len(mod.filter_audio_files(P_KEEP_DEST)) == 14
+      and len(_p_app.questions) == 1 and "stopped offering 11 file(s)" in _p_app.questions[0]
+      and any("Deletions not confirmed - 11 track(s) left where they are" in line for line in _p_said),
+      (_p_ok, _p_message, _p_removed, _p_said))
+_p_app = _DecisionApp("delete")
+_p_said = []
+_p_ok, _p_message, _p_moved, _p_removed = mod.SyncClientWorker.sync_chain(
+    _guarded_chain(P_KEEP_DEST, P_KEEP_HOST.port), status_cb=lambda line: _p_said.append(line),
+    decision_cb=_client_layer.make_sync_decision_cb(_p_app, "Studio"))
+check("SY-P29 the Delete answer means what it has always meant: the same warning, the same files gone, and nothing else touched",
+      _p_ok is True and _p_removed == 11
+      and sorted(held.name for held in mod.filter_audio_files(P_KEEP_DEST))
+      == ["shared1.mp3", "shared2.mp3", "shared3.mp3"]
+      and len(_p_app.questions) == 1 and "stopped offering 11 file(s)" in _p_app.questions[0]
+      and not any("not confirmed" in line.lower() for line in _p_said), (_p_ok, _p_message, _p_removed))
+
+P_REBUILD_HOST_FOLDER = fixture("folder rebuilt by a client")
+audio_file(P_REBUILD_HOST_FOLDER, "here.mp3", body=b"the track the host still has", mtime=1600000000.0)
+P_REBUILD_CLIENT_FOLDER = fixture("folder that rebuilt a host")
+for _p_name, _p_body, _p_when in (("here.mp3", b"the track the host still has", 1600000000.0),
+                                  ("lost.mp3", b"the track the host lost", 1500000000.0),
+                                  ("gone.mp3", b"and this one too", 1400000000.0)):
+    audio_file(P_REBUILD_CLIENT_FOLDER, _p_name, body=_p_body, mtime=_p_when)
+for _p_number in range(11):
+    audio_file(P_REBUILD_CLIENT_FOLDER, f"extra{_p_number}.mp3",
+               body=f"an orphan this end still holds {_p_number}".encode("utf-8"),
+               mtime=1300000000.0 + _p_number)
+P_REBUILD_SERVER = mod.SyncHostServer(
+    lambda: [{"sync_code": "8899", "name": "Rebuild Me", "folder_path": str(P_REBUILD_HOST_FOLDER)}],
+    on_restore_event_cb=lambda code, ip, event, note: P_EVENTS.append((code, ip, event, note)))
+P_REBUILD_SERVER._running = True
+P_REBUILD_BRIDGE = _restore_bridge(P_REBUILD_SERVER)
+
+
+class _RebuildApp(_DecisionApp):
+    """A window that presses Restore Host and types back the code the host's own screen is showing."""
+
+    def ask_restore_code(self, title, host_label):
+        self.titles.append(title)
+        self.hosts.append(host_label)
+        _p_open = _host_layer.pending_restore_request("8899")
+        return _p_open["code"] if _p_open else None
+
+
+_p_app = _DecisionOnlyApp("restore")
+_p_said = []
+_p_ok, _p_message, _p_moved, _p_removed = mod.SyncClientWorker.sync_chain(
+    _guarded_chain(P_REBUILD_CLIENT_FOLDER, P_REBUILD_BRIDGE.getsockname()[1]),
+    status_cb=lambda line: _p_said.append(line),
+    decision_cb=_client_layer.make_sync_decision_cb(_p_app, "Studio"))
+check("SY-P30 a Restore Host answer the worker cannot carry out - no window to read the code off - leaves every file where it is and writes nothing anywhere",
+      _p_ok is True and _p_removed == 0 and _p_moved == 0
+      and len(mod.filter_audio_files(P_REBUILD_CLIENT_FOLDER)) == 14
+      and sorted(held.name for held in mod.filter_audio_files(P_REBUILD_HOST_FOLDER)) == ["here.mp3"]
+      and any("Restore Host not carried out" in line for line in _p_said),
+      (_p_ok, _p_message, _p_said))
+
+_p_app = _RebuildApp("restore")
+_p_said = []
+_p_ok, _p_message, _p_moved, _p_removed = mod.SyncClientWorker.sync_chain(
+    _guarded_chain(P_REBUILD_CLIENT_FOLDER, P_REBUILD_BRIDGE.getsockname()[1]),
+    status_cb=lambda line: _p_said.append(line),
+    decision_cb=_client_layer.make_sync_decision_cb(_p_app, "Studio"),
+    restore_code_cb=_client_layer.make_restore_code_cb(_p_app, "Studio"))
+_p_host_now = sorted(held.name for held in mod.filter_audio_files(P_REBUILD_HOST_FOLDER))
+check("SY-P31 answered with Restore Host and the code read off the host's own screen, a client sync turns its own folder into its host's library, deletes nothing on either machine, and stops there",
+      _p_ok is True and _p_removed == 0 and _p_moved == 13 and _client_layer.host_was_rebuilt(_p_message)
+      and len(_p_host_now) == 14 and len(mod.filter_audio_files(P_REBUILD_CLIENT_FOLDER)) == 14
+      and (P_REBUILD_HOST_FOLDER / "extra7.mp3").read_bytes() == b"an orphan this end still holds 7"
+      and abs((P_REBUILD_HOST_FOLDER / "extra7.mp3").stat().st_mtime - 1300000007.0) < 2.0
+      and not any("Downloading" in line for line in _p_said)
+      and any("Restoring [13/13]" in line for line in _p_said),
+      (_p_ok, _p_message, _p_moved, _p_removed, _p_host_now))
+check("SY-P32 the host was asked the same question the Delete and Keep answers were given, in the same words, and the code it was typed came from the host that was waiting for it",
+      len(_p_app.questions) == 1 and "stopped offering 13 file(s)" in _p_app.questions[0]
+      and _p_app.hosts == [f"127.0.0.1:{P_REBUILD_BRIDGE.getsockname()[1]}"]
+      and any(event[2] == "requested" and event[0] == "8899" for event in P_EVENTS)
+      and any(event[2] == "finished" and "13 file(s) rebuilt" in event[3] for event in P_EVENTS),
+      (_p_app.questions, _p_app.hosts, P_EVENTS))
+P_REBUILD_BRIDGE.close()
+
+# ===========================================================================
 # SY-L: the seam this suite reaches the program through
 # ===========================================================================
 _real_discovery = seam.original("discover_host_on_lan")
@@ -1480,7 +1985,13 @@ check("SY-L3 every sync name this suite drives is a module-level name the seam c
                                          "find_tagged_sync_folders_on_drive", "SyncConfigManager",
                                          "SyncHostServer", "SyncRemovableWorker",
                                          "HostFolderWatcher", "get_drive_io_lock",
-                                         "delete_confirm_limit", "make_delete_confirm_cb",
+                                         "delete_confirm_limit", "make_sync_decision_cb",
+                                         "make_restore_code_cb", "SYNC_DECISION_KEEP",
+                                         "SYNC_DECISION_DELETE", "SYNC_DECISION_RESTORE",
+                                         "restore_code_shape", "issue_restore_code",
+                                         "pending_restore_request", "take_restore_offer",
+                                         "cancel_restore_offer", "restore_target",
+                                         "host_was_rebuilt", "restore_was_left_undone",
                                          "deletions_were_declined", "_HostKeepalive",
                                          "host_chain_is_visible", "hello_reply",
                                          "advertised_chains", "probe_replies", "HostScanner",

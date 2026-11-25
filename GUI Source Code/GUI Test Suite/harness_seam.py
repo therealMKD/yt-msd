@@ -28,6 +28,7 @@ module-level one, fails loudly here instead of quietly doing nothing.
 import ast
 import importlib
 import types
+from contextlib import contextmanager
 from pathlib import Path
 
 _MISSING = object()
@@ -178,6 +179,22 @@ def restore(name):
 
 def is_patched(name):
     return name in _patched
+
+
+@contextmanager
+def patched(name, value):
+    """Hold `value` in place for the length of a block, and hand the name back afterwards.
+
+    A replacement left in place is how one check quietly changes the next one, and a patch()/restore()
+    pair can have its restore skipped by an exception raised in between. A check that needs a name
+    replaced only while it is driving it uses this. restore() still hands back what was there before
+    the first patch, so a name patched twice still comes back to the program's own value.
+    """
+    patch(name, value)
+    try:
+        yield value
+    finally:
+        restore(name)
 
 
 def read(name):
