@@ -19,21 +19,6 @@ It also has a seamless sync feature letting you sync entire folders between yt-m
 
 I don't want to deal with spotify's ads (Or pay for premium), and youtube playlists don't have working shuffle features, so I started downloading the mp3s of my playlist with yt-dlp. That was still annoying to do from the command line, so I created this. This program WILL function as a bare bones music player, but I would highly recommend using a dedicated program (I use MusicBee) that has more options. (Note, there is a plugin for MusicBee that directly integrates yt-msd into it.)
 
-> [!IMPORTANT]
-> **Changes in the upcoming 3.5 update:**\
-> The 3.5 update is currently in progress! I will most likely be finishing it in a few weeks, but I'm in no hurry since I hope for my winget package to pass before the update. That most likely won't happen due to Microsoft apparently giving zero craps about winget, but we can always hope. This update will have a decent amount of fixes, but also some notable new features. Here is the current roadmap:
->
-> - **No more python version!**\
->   Having a python version IS kind of nice, but the project is now 14,000 lines long, and an entire app in a single file is NOT best practice. 3.5 modularizes the program, and in current testing, decently improves performance. That means that a single python file will not exist anymore, and the exe version will be the only version going forward. My apologies to anyone using the python version.
-> - **New renaming features:**\
->   3.5 will have an automated check on filenames as they are downloaded. It will run the same checks the renamer does, and will append the channel name to a title that doesn't have an artist. This will be a big timesaver if you're downloading songs from the artist's channel, as most will just be the song title, nothing else.
-> - **New Sync features:**\
->   Sync is also getting a large update! First of all, I'm adding a deletion prevention system for clients, to prevent accidentally removing your library. A configurable max deletions now exists (default 10) for parity sync chains. If more than the set amount is deleted on the host, the client will ask for confirmation before deletion. Additionally, clients will now be able to rebuild the host's library, by inputting a code on the host computer. This will remake a deleted sync chain on the host, from the client's files, without having to redownload or manually copy things over.
-> - **Client side song additions:**\
->   Also, clients will now be able to add songs to the sync chain when inputting a similar code into the host. This can be a one-time addition, or a permanent permission. In this state, the client temporarily acts as the host, pushes new files to the host, and then calls the host to force sync to clients. This means that you don't have to be on your host computer to add songs. Clients can only add songs, not delete them, and by default, they can only push a limited amount of songs to the host. This addition will also HAVE to be manual, to prevent deleted songs from being re-added in a additive-only sync chain.
-> - **Performance Improvements:**\
->   Currently, yt-msd can take up to 200 mb of memory (When your system isn't memory limited). 3.5 will have memory improvements, and some speed improvements. I can't promise a massive improvement, since this is a Pyside GUI after all, but yt-msd currently can work fine at 70 mb when my system is at max memory from running AI, so there's some stuff I can probably trim off.
-
 ### Table of Contents:
 
 [GUI Version Readme](#gui-version-readme)
@@ -42,11 +27,9 @@ I don't want to deal with spotify's ads (Or pay for premium), and youtube playli
 
 # GUI Version Readme
 
-The GUI version is the main, and most advanced version of the program. It has two variants: the setup version (exe) and the python version (pyw). Both are IDENTICAL programs, the only difference is the way they are stored. For almost all cases, you will want to use the exe version, since the python version requires python and several other dependencies to be installed, while the setup version runs just like a normal windows program.
+The GUI version is the main, and most advanced version of the program. It is a windows application, that can be installed by running "yt-msd-setup.exe" from the latest release.
 
-The exe version is also significantly faster to launch over the python version, because it does not have to deal with Python to start up the dependencies. To see the full readme for both GUI versions, go to the [GUI Readme](https://github.com/therealMKD/yt-msd/tree/main/GUI%20Source%20Code#readme). If you just want to install the program, here's how to do it:
-
-## Exe version (Setup)
+## Setup
 
 Go to [the latest release](https://github.com/therealMKD/yt-msd/releases/latest) and download the file named `yt-msd-setup.exe`. Once it has finished downloading, double click to run it. If windows gives a warning, you can safely ignore it. You can verify that the file is unchanged by comparing the hashes.
 
@@ -56,34 +39,11 @@ Progress through the installer, making whatever choices you prefer. **I would re
 
 Once the program is installed, you will be able to find it in the start menu, or through windows search, using `yt-msd` as the search term. Simply launch it like you would any other program. For first launch information, read the [First Startup Guide](#first-startup-guide).
 
-## Python version (pyw)
-
-Go to [the latest release](https://github.com/therealMKD/yt-msd/releases/latest), and download the file named `yt-msd-gui.pyw`. Before you can run it, you must install the following things on your computer:
-
-- **FIRST**, install python. You can get it [here](https://www.python.org/downloads/) or through winget by using `winget install python`. The program was made with version 3.15, it may or may not work on older versions.
-
-**If you use winget to install:**
-First, run `winget install python`. This will download and install the python install manager. Run `py` and verify that Python is installed properly (It should open IDLE, after listing the Python version)
-
-- **NEXT** you must install ALL the following dependencies, with these two commands:
-  - ```
-    python -m pip install ffmpeg python-vlc pillow pyside6 mutagen watchdog
-    ```
-  - ```
-    winget install yt-dlp.ffmpeg VideoLAN.VLC
-    ```
-
-After everything is installed, read the [First Startup Guide](#first-startup-guide) to set up the program for the first time.
-
 ### Troubleshooting
-
-If the file won't start, you're probably missing a dependency. The easist way to figure this out is to navigate to the program's directory, right click on empty space, and select "Open in Terminal". Then run `py yt-msd-gui.pyw` or whatever your file is named. Read the error that occurs. If the error says `py is not a recognized command`, you don't have python installed. Uninstall, and reinstall python, using the installer from their website. 
-
-If the error is a traceback, google the error to figure out which dependency is missing. For example, if the error references `PIL.py`, then pillow isn't installed, and you need to install it via `pip install pillow`.
 
 For a few missing things, the program will launch, but error later. For these, you will get a dialogue from the program warning you. For example, if VLC doesn't exist, yt-msd will tell you to install it. If something isn't working, but the program still runs, it's a dependency problem. There is a full troubleshooting guide in the [GUI Readme](https://github.com/therealMKD/yt-msd/tree/main/GUI%20Source%20Code#readme).
 
-Once the program is running, a failure it cannot handle reports itself the same way in both versions: a dialog names the error, and the full error text is written to `yt-msd-crash.log` in the folder the program sits in (`C:\Users\[your username]\AppData\Local\Programs\yt-msd` for the setup version, `GUI Source Code` for the python version). The setup version has no console of its own, so it can also be started with `yt-msd-gui.exe --console`, which opens the window with a terminal behind it and prints errors there like `py yt-msd-gui.pyw` does.
+Once the program is running, a failure it cannot handle reports itself like this: a dialog names the error, and the full error text is written to `yt-msd-crash.log` in the folder the program sits in (`C:\Users\[your username]\AppData\Local\Programs\yt-msd`). The setup version has no console of its own, so it can also be started with `yt-msd-gui.exe --console`, which opens the window with a terminal behind it and prints errors there. If you want more details, version 3.5 and later also adds the `--trace` tag which tells EVERYTHING that is happening, not just errors.
 
 ## First Startup Guide
 
