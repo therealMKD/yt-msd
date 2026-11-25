@@ -6,13 +6,13 @@
 # added.
 
 # Internal version number - the numeric part of the latest GitHub release tag.
-# (RELEASE-3.4 is tagged as "RELEASE-3.4" and read here as "3.4":
+# (RELEASE-3.5 is tagged as "RELEASE-3.5" and read here as "3.5":
 # _extract_version_number() reduces both sides to their numbers before comparing
 # them, so a tag is still recognised as this version or as a newer one. The same
 # numbers are what build_gui_exe.py puts in the installer and in the version
 # resource of the exe, so the app, the setup program and the file's own
 # Properties dialog all report one version.)
-APP_VERSION = "3.4"
+APP_VERSION = "3.5"
 
 
 # GitHub repository whose releases page is polled for newer versions.
