@@ -30,6 +30,14 @@ SYNC_SOCKET_TIMEOUT = 12.0
 # nothing. See _HostKeepalive in yt_msd.sync.client.
 SYNC_CONFIRM_PING_INTERVAL = 10.0
 
+# How long after a machine comes up as a host it tells its clients to fetch. A chain whose host
+# and whose client are both starting - after a reboot, or after both machines are switched on
+# together - has a client whose own startup check runs long before the host is listening, and that
+# check has already been made and failed by the time the host is ready to be asked anything. This
+# is the host's side of the same moment: one message saying "I am here, run your normal sync",
+# rather than every client waiting out its own auto-sync interval to find out.
+HOST_UP_SYNC_REQUEST_DELAY_MS = 20000
+
 SYNC_CHUNK_SIZE = 1024 * 1024
 
 # How long a restore code stays good on the host that shows it. The code is meant to be read off one

@@ -25,7 +25,7 @@ from yt_msd.sync.config import (DEFAULT_DELETE_CONFIRM_LIMIT, DEFAULT_HOST_CHAIN
                                 SyncConfigManager, chain_can_push, delete_confirm_limit,
                                 host_chain_is_visible, is_client_chain_paused, push_file_limit,
                                 push_trusted_ips)
-from yt_msd.sync.discovery import HostScanThread, send_lan_update_notification
+from yt_msd.sync.discovery import HostScanThread, advertised_chains, send_lan_sync_request, send_lan_update_notification
 from yt_msd.sync.lan import (RESTORE_CODE_LENGTH, SYNC_PORT_START, get_current_wifi_ssid, get_local_ip,
                              restore_code_shape)
 
@@ -1756,10 +1756,17 @@ class SyncManagerDialog(QDialog):
         port = getattr(self.parent_app.sync_host_server, 'active_port', 0)
         if port > 0:
             codes = [str(hc.get('sync_code')) for hc in self.config_manager.hosted_chains if hc.get('sync_code')]
+            # ... and the message that says what this click means at this end: every client of these
+            # chains should run its whole normal pass. A chain update names one folder and invites a
+            # re-check of it; this button is not a re-check of one chain, it is "everything, now", and
+            # the clients of a machine hosting several chains get that in one message rather than
+            # having to guess it from several.
+            asked = [str(entry.get('sync_code')) for entry in advertised_chains(self.config_manager.hosted_chains)]
 
-            def _notify(codes=codes, port=port):
+            def _notify(codes=codes, asked=asked, port=port):
                 for code in codes:
                     send_lan_update_notification(code, port)
+                send_lan_sync_request(port, asked)
             threading.Thread(target=_notify, daemon=True).start()
         if hasattr(self.parent_app, 'status_signal'):
             self.parent_app.status_signal.emit("Force Sync initiated: syncing clients & removable drives, notified LAN peers.", False, "#1abd33")

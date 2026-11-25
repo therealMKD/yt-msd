@@ -67,10 +67,17 @@ def probe_replies(hosted_chains: List[dict], tcp_port: int, target_code: str = '
 class UDPBeaconBroadcaster:
     """Broadcaster & Listener for LAN host discovery and dynamic IP updates (runs in dedicated daemon thread)."""
     def __init__(self, get_hosted_chains_cb: Callable[[], List[dict]], get_tcp_port_cb: Callable[[], int],
-                 on_chain_updated_cb: Optional[Callable[[str], None]] = None):
+                 on_chain_updated_cb: Optional[Callable[[str], None]] = None,
+                 on_sync_request_cb: Optional[Callable[[str, List[str]], None]] = None):
         self.get_hosted_chains_cb = get_hosted_chains_cb
         self.get_tcp_port_cb = get_tcp_port_cb
         self.on_chain_updated_cb = on_chain_updated_cb
+        # A host asking this machine's clients to fetch. Kept apart from the callback above because
+        # the two messages mean different things to the machine that reads them: a chain update says
+        # "the folder you follow has changed", and a sync request says "every chain you follow has a
+        # host that is ready for you now". A broadcaster built without this one simply ignores that
+        # message, which is what every broadcaster built before it does.
+        self.on_sync_request_cb = on_sync_request_cb
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
@@ -154,6 +161,15 @@ class UDPBeaconBroadcaster:
                         target_code = str(data.get('sync_code', '')).strip()
                         if target_code and self.on_chain_updated_cb:
                             self.on_chain_updated_cb(target_code)
+                    elif msg_type == 'CHAIN_SYNC_REQUEST':
+                        # "Somebody who hosts chains here is ready, and every client of them should
+                        # fetch." The codes are what makes this worth acting on: a broadcast reaches
+                        # every machine on the network, and a machine that follows none of the chains
+                        # named in it has no reason to start a sync because of it.
+                        codes = [str(code).strip() for code in (data.get('sync_codes') or [])
+                                 if str(code).strip()]
+                        if codes and self.on_sync_request_cb:
+                            self.on_sync_request_cb(addr[0], codes)
                 except socket.timeout:
                     pass
                 except Exception:
@@ -456,3 +472,46 @@ def send_lan_update_notification(sync_code: str, host_port: int):
             sock.close()
         except Exception:
             pass
+
+
+def send_lan_sync_request(host_port: int, sync_codes: List[str]):
+    """Broadcast to the LAN that every client of these hosted chains should run its normal sync now.
+
+    The neighbour of send_lan_update_notification, and not the same message. A chain update names
+    one chain and says what happened to it, and a client reads it as "re-check that folder". This
+    one names every chain this machine hosts and says nothing about any of their files; it is the
+    host saying it is up and ready, and every machine that follows one of these chains should do
+    what it would have done had its user pressed Force Sync All. The codes are carried rather than
+    left out because a broadcast reaches the whole network, and a machine that follows none of them
+    has no business starting a sync because a stranger came online.
+    """
+    named = [str(code).strip() for code in (sync_codes or []) if str(code).strip()]
+    if not named or host_port <= 0:
+        return
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    if sys.platform == 'win32':
+        try:
+            sock.ioctl(0x9800000C, False)
+        except Exception:
+            pass
+    try:
+        payload = json.dumps({
+            'type': 'CHAIN_SYNC_REQUEST',
+            'sync_codes': named,
+            'host_ip': get_local_ip(),
+            'tcp_port': host_port
+        }).encode('utf-8')
+        for _bcast_addr in get_broadcast_addresses():
+            try:
+                sock.sendto(payload, (_bcast_addr, UDP_BEACON_PORT))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+

@@ -1,6 +1,6 @@
 """The windows regression harness.
 
-Sections WN-A..WN-K cover the windows half of `GUI Source Code/yt-msd-gui.pyw`: the settings window
+Sections WN-A..WN-M cover the windows half of `GUI Source Code/yt-msd-gui.pyw`: the settings window
 and where each of its controls writes, the three windows that build a sync chain (host, client,
 removable drive), the sync manager that lists and pauses and removes them, the playlist picker, the
 tray progress bubble, the three update windows, the rename-from-metadata window, the two things
@@ -10,7 +10,10 @@ has once Restore Host exists and the windows that carry them - the code a Host p
 the box a client types it into - and the window that searches
 the network for a host along with the once-only notice a Host is given about chains that were already
 visible when this choice existed, and the start of the main window itself - a saved search with no
-saved session behind it, which is how a new install starts.
+saved session behind it, which is how a new install starts, the box a copy shows the first time it
+starts as a version it has not reported before and the record that keeps it a once-only box, and the
+message a Host sends the clients of its chains when it comes up along with what a client does when it
+reads one.
 
 Recipe (AI Readme section 20): the `.pyw` is copied to a throwaway `.py` in this folder's `copy/` and
 imported, and the windows are driven directly against a stand-in for the main window they are opened
@@ -2501,6 +2504,407 @@ check("WN-L18 the name is taken from the host's own answers - the AUTH of a sync
       [line for line in _wl_client_src.splitlines() if 'chain_name' in line])
 
 
+
+# ===========================================================================
+# WN-M: the box that says this copy has just become a new version, and the host's
+#       "every chain, fetch now" message
+# ===========================================================================
+# Two things that both begin when a machine starts. A copy that has just become a new version says
+# so once, from a record it keeps in its own settings file; and a machine that hosts chains tells the
+# clients of those chains there is something to fetch, instead of leaving each of them to find out
+# when its own interval comes round. What is proved below is the deciding and the message: which
+# version counts as news, where the record of it lives, what its link points at, which codes go out,
+# and what a client makes of them when it reads one. No update is downloaded by any check here, and
+# no packet is put on the LAN: both senders are replaced through the seam, and the real socket traffic
+# is proved over loopback in probe_sync instead.
+version_notes_are_due = seam.original("version_notes_are_due")
+release_notes_url = seam.original("release_notes_url")
+_UPDATE_REPO = seam.original("UPDATE_REPO")
+_SYNC_REQUEST_DELAY = seam.original("HOST_UP_SYNC_REQUEST_DELAY_MS")
+
+
+class _StatusLine:
+    """Records what a handler meant to put on the window's status bar."""
+    def __init__(self):
+        self.lines = []
+
+    def emit(self, text, sticky=False, color=""):
+        self.lines.append((text, sticky, color))
+
+
+class _VersionNotesApp(AppStandIn):
+    """The main window as the version box knows it: a status bar, and a settings file it saves to."""
+    def __init__(self, **overrides):
+        super().__init__(**overrides)
+        self.status_signal = _StatusLine()
+
+
+check("WN-M1 a version this machine has never reported is news - including the first start after an update from a version that kept no record at all",
+      version_notes_are_due("3.5", "") is True and version_notes_are_due("3.5", None) is True,
+      (version_notes_are_due("3.5", ""), version_notes_are_due("3.5", None)))
+check("WN-M2 the same version never says it twice, however many times this machine is started",
+      version_notes_are_due("3.5", "3.5") is False and version_notes_are_due("3.5", "RELEASE-3.5") is False,
+      (version_notes_are_due("3.5", "3.5"), version_notes_are_due("3.5", "RELEASE-3.5")))
+check("WN-M3 an upgrade is news, a step back is not, and 3.10 is newer than 3.9 rather than a smaller number after a point",
+      version_notes_are_due("3.5", "3.4") is True and version_notes_are_due("3.4", "3.5") is False
+      and version_notes_are_due("3.10", "3.9") is True,
+      [version_notes_are_due(a, b) for a, b in (("3.5", "3.4"), ("3.4", "3.5"), ("3.10", "3.9"))])
+check("WN-M4 a build carrying no version worth reporting says nothing about a version",
+      version_notes_are_due("", "") is False and version_notes_are_due("", "3.4") is False
+      and version_notes_are_due("development", "") is False,
+      [version_notes_are_due(a, b) for a, b in (("", ""), ("", "3.4"), ("development", ""))])
+check("WN-M5 the changelog link is the release page for the version now running, named the way every release in this repository is named",
+      release_notes_url("3.5") == f"https://github.com/{_UPDATE_REPO}/releases/tag/RELEASE-3.5"
+      and release_notes_url("RELEASE-3.4") == f"https://github.com/{_UPDATE_REPO}/releases/tag/RELEASE-3.4"
+      and release_notes_url("v3.6.0") == f"https://github.com/{_UPDATE_REPO}/releases/tag/RELEASE-3.6"
+      and release_notes_url("3.5.1") == f"https://github.com/{_UPDATE_REPO}/releases/tag/RELEASE-3.5.1",
+      (release_notes_url("3.5"), release_notes_url("RELEASE-3.4"), release_notes_url("v3.6.0"),
+       release_notes_url("3.5.1")))
+check("WN-M6 a version with no number in it gets the page that lists every release, because that page always exists",
+      release_notes_url("") == f"https://github.com/{_UPDATE_REPO}/releases"
+      and release_notes_url("development") == f"https://github.com/{_UPDATE_REPO}/releases",
+      (release_notes_url(""), release_notes_url("development")))
+
+_notes_box = mod.VersionNotesDialog(None, "3.5", "3.4")
+_notes_texts = [lbl.text() for lbl in _notes_box.findChildren(QLabel)]
+check("WN-M7 the box names the version it is reporting and the one it came from, so what is reported is the change",
+      any("3.5" in text for text in _notes_texts) and any("updated from 3.4" in text for text in _notes_texts),
+      _notes_texts)
+check("WN-M8 its link is the release page for the version now running, and it is a link the desktop browser opens",
+      "tag/RELEASE-3.5" in _notes_box.link_lbl.text() and _notes_box.notes_url == release_notes_url("3.5")
+      and _notes_box.link_lbl.openExternalLinks(),
+      (_notes_box.link_lbl.text(), _notes_box.notes_url))
+_box2 = mod.VersionNotesDialog(None, "3.5", "")
+_box2_texts = [lbl.text() for lbl in _box2.findChildren(QLabel)]
+check("WN-M9 with nothing to compare against it says what this is instead of inventing the version it came from",
+      any("This is yt-msd 3.5" in text for text in _box2_texts)
+      and not any("updated from" in text for text in _box2_texts), _box2_texts)
+check("WN-M10 it is closed by its own button and does not hold the window it was opened from",
+      any(btn.text() == "Got it" for btn in _notes_box.findChildren(QPushButton)) and not _notes_box.isModal(),
+      [btn.text() for btn in _notes_box.findChildren(QPushButton)])
+
+
+# The box is built by a startup timer, so driving it means standing in for the box itself: a real one
+# on screen for every check below is what the rest of this suite avoids. What is recorded is what the
+# startup handler decided - which version it reported, which version it believed this machine had
+# already seen, and whether it put the window on screen.
+_built_boxes = []
+
+
+class _RecordedNotesDialog:
+    def __init__(self, parent_window, current_version, previous_version=""):
+        self.parent_window = parent_window
+        self.current_version = current_version
+        self.previous_version = previous_version
+        self.notes_url = release_notes_url(current_version)
+        self.shown = False
+        _built_boxes.append(self)
+
+    def show(self):
+        self.shown = True
+
+    def raise_(self):
+        pass
+
+    def activateWindow(self):
+        pass
+
+
+seam.patch("VersionNotesDialog", _RecordedNotesDialog)
+_fresh_app = _VersionNotesApp(last_seen_version="")
+mod.MainApp._show_version_notes(_fresh_app)
+check("WN-M11 the first start as a new version builds one box for the version now running, and puts it on screen",
+      len(_built_boxes) == 1 and _built_boxes[0].current_version == mod.APP_VERSION
+      and _built_boxes[0].shown, (_built_boxes, mod.APP_VERSION))
+check("WN-M12 and it records that this version has been reported before the window is ever answered, so the same upgrade is not reported again on the next start",
+      _fresh_app.last_seen_version == mod.APP_VERSION and _fresh_app.called("save_config") == 1,
+      (_fresh_app.last_seen_version, _fresh_app.calls))
+check("WN-M13 the status bar says what happened in the same breath as the box",
+      any(mod.APP_VERSION in line[0] for line in _fresh_app.status_signal.lines),
+      _fresh_app.status_signal.lines)
+mod.MainApp._show_version_notes(_fresh_app)
+check("WN-M14 starting the same version a second time builds nothing and saves nothing",
+      len(_built_boxes) == 1 and _fresh_app.called("save_config") == 1,
+      (_built_boxes, _fresh_app.calls))
+# A record older than any version this build could be, so this check says the same thing whatever
+# APP_VERSION currently holds.
+_upgrade_app = _VersionNotesApp(last_seen_version="0.1")
+mod.MainApp._show_version_notes(_upgrade_app)
+check("WN-M15 an upgrade from a version this machine did record says which one it came from",
+      len(_built_boxes) == 2 and _built_boxes[1].previous_version == "0.1"
+      and any("from 0.1" in line[0] for line in _upgrade_app.status_signal.lines),
+      (_built_boxes[-1].previous_version, _upgrade_app.status_signal.lines))
+_backwards_app = _VersionNotesApp(last_seen_version="99.0")
+mod.MainApp._show_version_notes(_backwards_app)
+check("WN-M16 a copy found running an older version than the one it reported says nothing, and keeps the record it has so the next upgrade is still reported",
+      len(_built_boxes) == 2 and _backwards_app.last_seen_version == "99.0"
+      and _backwards_app.status_signal.lines == [],
+      (_backwards_app.last_seen_version, _backwards_app.status_signal.lines))
+seam.restore("VersionNotesDialog")
+check("WN-M17 the box this section stood in for is back with the program",
+      not seam.is_patched("VersionNotesDialog") and seam.read("VersionNotesDialog") is mod.VersionNotesDialog,
+      seam.owned_by("VersionNotesDialog"))
+
+
+class _ComboText:
+    """The two boxes save_config reads their format and bitrate out of, as the two values they hold."""
+    def __init__(self, text):
+        self._text = text
+
+    def currentText(self):
+        return self._text
+
+    def text(self):
+        return self._text
+
+
+class _SavedConfigApp(QWidget):
+    """A window carrying only what save_config and load_config read out of it.
+
+    The record of what has been reported is only worth keeping if it survives the settings file, and
+    the settings file is the one thing every way of updating yt-msd leaves where it is - the installer
+    skips it, the swap helper writes beside it, and an update downloaded inside the app writes beside
+    it too. So this is the real save_config and the real load_config, driven against a file under the
+    fixture folder, rather than a check that the key appears somewhere in the source.
+    """
+    def __init__(self, config_path):
+        super().__init__(None)
+        self.config_path = str(config_path)
+        self.format_combo = _ComboText("mp3")
+        self.bitrate_combo = _ComboText("192")
+        self.appearance_mode = "Dark"
+        self.accent_color_name = "Blue"
+        self.recent_folders = [str(fixture("saved config folders"))]
+        self.local_folders = []
+        self.local_current_path = ""
+        self.volume_val = 100
+        self.minimize_to_tray = False
+        self.use_custom_args = False
+        self.custom_args = ""
+        self.recent_playlists = []
+        self.splitter_sizes = [300, 800, 300]
+        self.save_place = False
+        self.run_renamer = False
+        self.normalization_mode = "ask"
+        self.auto_rename = False
+        self.silence_pad_dur = 2.0
+        self.silence_trim = True
+        self.use_custom_norm_cmd = False
+        self.custom_norm_cmd = ""
+        self.download_threads = 3
+        self.normalization_threads = 2
+        self.search_results = []
+        self.playback_index = -1
+        self.current_video_id = ""
+        self.last_search = ""
+
+
+_VERSION_CFG_DIR = fixture("version record")
+_VERSION_CFG_FILE = _VERSION_CFG_DIR / "gui_config.json"
+_writer_app = _SavedConfigApp(_VERSION_CFG_FILE)
+_writer_app.last_seen_version = mod.APP_VERSION
+mod.MainApp.save_config(_writer_app)
+_written_cfg = json.loads(_VERSION_CFG_FILE.read_text(encoding="utf-8"))
+check("WN-M18 the record of what has been reported is written into the settings file, which is the one file every way of updating yt-msd leaves where it is",
+      _written_cfg.get("last_seen_version") == mod.APP_VERSION, _written_cfg.get("last_seen_version"))
+_reader_app = _SavedConfigApp(_VERSION_CFG_FILE)
+mod.MainApp.load_config(_reader_app)
+check("WN-M19 and the next start reads it back, which is what turns a second start on the same version into a silent one",
+      _reader_app.last_seen_version == mod.APP_VERSION
+      and version_notes_are_due(mod.APP_VERSION, _reader_app.last_seen_version) is False,
+      _reader_app.last_seen_version)
+_OLD_CFG_DIR = fixture("settings written by 3.4")
+_OLD_CFG_FILE = _OLD_CFG_DIR / "gui_config.json"
+_OLD_CFG_FILE.write_text(json.dumps({"format": "mp3", "bitrate": "192", "volume": 80,
+                                     "disable_update_checks": False}), encoding="utf-8")
+_old_reader = _SavedConfigApp(_OLD_CFG_FILE)
+mod.MainApp.load_config(_old_reader)
+check("WN-M20 a settings file written by a version that kept no such record reads as no record, which is why the upgrade out of an older build still gets its one box",
+      _old_reader.last_seen_version == ""
+      and version_notes_are_due(mod.APP_VERSION, _old_reader.last_seen_version) is True,
+      (_old_reader.last_seen_version, version_notes_are_due(mod.APP_VERSION, "")))
+check("WN-M21 and reading a file that has no such key changes nothing else about what was read from it",
+      _old_reader.volume_val == 80 and _old_reader.disable_update_checks is False
+      and _old_reader.format_var == "mp3",
+      (_old_reader.volume_val, _old_reader.disable_update_checks, _old_reader.format_var))
+_CHAINS_CFG_DIR = fixture("version record beside chains")
+_CHAINS_CFG_FILE = _CHAINS_CFG_DIR / "gui_config.json"
+_CHAINS_CFG_FILE.write_text(json.dumps({
+    "hosted_chains": [{"id": "hc_2468", "name": "Front Room", "sync_code": "2468",
+                       "folder_path": str(_CHAINS_CFG_DIR), "visible": True}],
+    "sync_settings": {"auto_sync_interval_minutes": 30},
+}), encoding="utf-8")
+_beside_app = _SavedConfigApp(_CHAINS_CFG_FILE)
+_beside_app.last_seen_version = "3.5"
+mod.MainApp.save_config(_beside_app)
+_after_save = json.loads(_CHAINS_CFG_FILE.read_text(encoding="utf-8"))
+check("WN-M22 writing it joins the file the sync chains live in instead of rewriting it, so a version note never costs anybody a chain",
+      _after_save.get("last_seen_version") == "3.5"
+      and [c["sync_code"] for c in _after_save.get("hosted_chains", [])] == ["2468"]
+      and _after_save.get("sync_settings", {}).get("auto_sync_interval_minutes") == 30,
+      _after_save)
+
+# The host's side of the moment both machines come up. The message itself - what it is shaped like on
+# the wire, and what a beacon does when it reads one - is proved over loopback sockets in probe_sync;
+# what belongs here is the deciding done by the window: which chains get named, whether a machine that
+# hosts nothing or hosts nothing anybody may be told about says nothing, and what a client does with a
+# message that names one of the chains it follows.
+sync_requests_sent = []
+chain_updates_sent = []
+
+
+class _HostServerStandIn:
+    """The host server as these two handlers know it: the port it answers on, or none at all."""
+    def __init__(self, active_port):
+        self.active_port = active_port
+
+
+ASK_CFG = mod.SyncConfigManager(str(fixture("announcement config")))
+ASK_VISIBLE = ASK_CFG.add_hosted_chain("Front Room", str(fixture("front room master")), "2468")
+ASK_PRIVATE = ASK_CFG.add_hosted_chain("Study", str(fixture("study master")), "1357")
+ASK_CFG.set_host_chain_visibility(ASK_PRIVATE["id"], False)
+
+
+def _wait_for(predicate, timeout=5.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline and not predicate():
+        time.sleep(0.02)
+    return predicate()
+
+
+seam.patch("send_lan_sync_request", lambda port, codes: sync_requests_sent.append((port, list(codes))))
+seam.patch("send_lan_update_notification", lambda code, port: chain_updates_sent.append((code, port)))
+
+_announce_app = AppStandIn(sync_config_manager=ASK_CFG, sync_host_server=_HostServerStandIn(63350),
+                           status_signal=_StatusLine())
+mod.MainApp._announce_hosted_chains_for_sync(_announce_app)
+_wait_for(lambda: sync_requests_sent)
+check("WN-M23 a machine that came up as a host says so once, naming the chains it advertises and the port its clients fetch from",
+      len(sync_requests_sent) == 1 and sync_requests_sent[0][0] == 63350
+      and sync_requests_sent[0][1] == ["2468"], sync_requests_sent)
+check("WN-M24 and the status bar names the chains it asked for, which is the only notice a host gets that its clients were told anything",
+      any("Front Room" in line[0] for line in _announce_app.status_signal.lines),
+      _announce_app.status_signal.lines)
+sync_requests_sent.clear()
+_no_server_app = AppStandIn(sync_config_manager=ASK_CFG, sync_host_server=None, status_signal=_StatusLine())
+mod.MainApp._announce_hosted_chains_for_sync(_no_server_app)
+check("WN-M25 with nothing listening on this machine it sends nobody looking for a host that is not there, and says nothing",
+      sync_requests_sent == [] and _no_server_app.status_signal.lines == [],
+      (sync_requests_sent, _no_server_app.status_signal.lines))
+_PRIVATE_ONLY_CFG = mod.SyncConfigManager(str(fixture("private only config")))
+_PRIVATE_ONLY = _PRIVATE_ONLY_CFG.add_hosted_chain("Study Only", str(fixture("study only master")), "1357")
+_PRIVATE_ONLY_CFG.set_host_chain_visibility(_PRIVATE_ONLY["id"], False)
+_private_app = AppStandIn(sync_config_manager=_PRIVATE_ONLY_CFG,
+                          sync_host_server=_HostServerStandIn(63350), status_signal=_StatusLine())
+mod.MainApp._announce_hosted_chains_for_sync(_private_app)
+check("WN-M26 a chain its owner made private is not named in it: a message sent every time somebody starts yt-msd is not how a private chain's code gets onto a network",
+      sync_requests_sent == [] and _private_app.status_signal.lines == [],
+      (sync_requests_sent, _private_app.status_signal.lines))
+_no_chains_app = AppStandIn(sync_config_manager=mod.SyncConfigManager(str(fixture("no hosted chains"))),
+                            sync_host_server=_HostServerStandIn(63350), status_signal=_StatusLine())
+mod.MainApp._announce_hosted_chains_for_sync(_no_chains_app)
+check("WN-M27 and a machine hosting no chain at all puts nothing on the network",
+      sync_requests_sent == [], sync_requests_sent)
+
+sync_requests_sent.clear()
+chain_updates_sent.clear()
+_force_all_app = AppStandIn(sync_config_manager=ASK_CFG, sync_host_server=_HostServerStandIn(63350),
+                            status_signal=_StatusLine())
+_force_all_dlg = QuietSyncDialog(_force_all_app)
+_force_all_dlg._force_sync_all()
+_wait_for(lambda: sync_requests_sent)
+check("WN-M28 Force Sync All now says the same thing to those clients in its own right: one message for every chain, beside the one it has always sent for each chain",
+      [code for code, _port in chain_updates_sent] == ["2468", "1357"]
+      and len(sync_requests_sent) == 1 and sync_requests_sent[0][1] == ["2468"],
+      (chain_updates_sent, sync_requests_sent))
+sync_requests_sent.clear()
+chain_updates_sent.clear()
+_force_no_server = AppStandIn(sync_config_manager=ASK_CFG, sync_host_server=None, status_signal=_StatusLine())
+QuietSyncDialog(_force_no_server)._force_sync_all()
+check("WN-M29 and with no host server running that button still puts nothing on the network, in either message",
+      sync_requests_sent == [] and chain_updates_sent == [],
+      (sync_requests_sent, chain_updates_sent))
+
+
+class _ClientApp(AppStandIn):
+    """A main window whose client chains record the sync pass they were asked to run."""
+    def __init__(self, **overrides):
+        super().__init__(**overrides)
+        self.status_signal = _StatusLine()
+        self.sync_passes = 0
+
+    def _auto_sync_client_chains(self):
+        self.sync_passes += 1
+
+
+REQUEST_CFG = mod.SyncConfigManager(str(fixture("requested client config")))
+JOINED_CHAIN = REQUEST_CFG.add_client_chain(name="Front Room Mirror",
+                                            folder_path=str(fixture("front room mirror")),
+                                            sync_code="2468", host_ip="192.0.2.9")
+OTHER_CHAIN = REQUEST_CFG.add_client_chain(name="Study Mirror", folder_path=str(fixture("study mirror")),
+                                           sync_code="9999", host_ip="192.0.2.10")
+
+_client_asked = _ClientApp(sync_config_manager=REQUEST_CFG, sync_host_server=None)
+mod.MainApp._on_lan_sync_request(_client_asked, "192.0.2.9", ["2468", "1357"])
+check("WN-M30 a client that follows one of the chains named in a host's message runs its normal sync pass, and says which chain and which machine asked",
+      _client_asked.sync_passes == 1
+      and any("Front Room Mirror" in line[0] and "192.0.2.9" in line[0] for line in _client_asked.status_signal.lines),
+      (_client_asked.sync_passes, _client_asked.status_signal.lines))
+_unrelated_app = _ClientApp(sync_config_manager=REQUEST_CFG, sync_host_server=None)
+mod.MainApp._on_lan_sync_request(_unrelated_app, "192.0.2.9", ["1357"])
+check("WN-M31 a message naming none of the chains this machine follows starts nothing: a broadcast reaches every machine on the network, and this one has nothing to do with the machine that sent it",
+      _unrelated_app.sync_passes == 0 and _unrelated_app.status_signal.lines == [],
+      (_unrelated_app.sync_passes, _unrelated_app.status_signal.lines))
+_no_client_app = _ClientApp(sync_config_manager=mod.SyncConfigManager(str(fixture("client no chains"))),
+                            sync_host_server=None)
+mod.MainApp._on_lan_sync_request(_no_client_app, "192.0.2.9", ["2468"])
+_empty_ask_app = _ClientApp(sync_config_manager=REQUEST_CFG, sync_host_server=None)
+mod.MainApp._on_lan_sync_request(_empty_ask_app, "192.0.2.9", [])
+check("WN-M32 a machine following no chain starts nothing, and a message naming no chain at all does not ask for one",
+      _no_client_app.sync_passes == 0 and _empty_ask_app.sync_passes == 0,
+      (_no_client_app.sync_passes, _empty_ask_app.sync_passes))
+
+_pyw_src = (Path(SRC_DIR) / "yt-msd-gui.pyw").read_text(encoding="utf-8")
+_bootstrap_src = (Path(SRC_DIR) / "yt_msd" / "ui" / "bootstrap.py").read_text(encoding="utf-8")
+_sync_handler_body = _pyw_src.split("def _on_lan_sync_request", 1)[1].split("\n    def ", 1)[0]
+check("WN-M33 what a host's message starts is the ordinary auto-sync pass - the same call the periodic timer and the startup pass make - so a paused chain stays paused and a chain bound to another wireless network stays bound",
+      "self._auto_sync_client_chains()" in _sync_handler_body
+      and "QTimer.singleShot(2500, self._auto_sync_client_chains)" in _bootstrap_src
+      and "def _auto_sync_client_chains" in _pyw_src,
+      _sync_handler_body)
+check("WN-M34 the wait before a host speaks is twenty seconds, and it lives beside the other sync timings rather than inside the window that uses it",
+      _SYNC_REQUEST_DELAY == 20000
+      and "yt_msd.sync.lan" in seam.owned_by("HOST_UP_SYNC_REQUEST_DELAY_MS"),
+      (_SYNC_REQUEST_DELAY, seam.owned_by("HOST_UP_SYNC_REQUEST_DELAY_MS")))
+check("WN-M35 the startup arms that announcement with the constant rather than a second copy of the number, and wires the beacon to read what comes back",
+      "QTimer.singleShot(HOST_UP_SYNC_REQUEST_DELAY_MS, self._announce_hosted_chains_for_sync)" in _bootstrap_src
+      and "on_sync_request_cb=self._on_lan_sync_request" in _bootstrap_src,
+      [line.strip() for line in _bootstrap_src.splitlines()
+       if "sync_request" in line or "_announce_hosted_chains_for_sync" in line])
+check("WN-M36 the version box is armed from the startup the same way - a timer, not a box that holds the window open - and the record it compares against starts out empty",
+      "QTimer.singleShot(2600, self._show_version_notes)" in _bootstrap_src
+      and "self.last_seen_version" in _bootstrap_src
+      and "c.get('last_seen_version'" in _pyw_src and "'last_seen_version': getattr(self" in _pyw_src,
+      [line.strip() for line in _bootstrap_src.splitlines() if "version" in line])
+check("WN-M37 all three handlers belong to the main window, so a beacon thread and a startup timer reach them the way they reach the chain update handler they sit beside",
+      all(hasattr(mod.MainApp, name) for name in ("_show_version_notes", "_announce_hosted_chains_for_sync",
+                                                  "_on_lan_sync_request", "_on_lan_chain_updated")),
+      [name for name in ("_show_version_notes", "_announce_hosted_chains_for_sync",
+                         "_on_lan_sync_request") if not hasattr(mod.MainApp, name)])
+_new_names = ("send_lan_sync_request", "version_notes_are_due", "release_notes_url",
+              "HOST_UP_SYNC_REQUEST_DELAY_MS", "VersionNotesDialog")
+check("WN-M38 every name this feature added is a module-level one the seam reaches, and none of them is held only by the entry point",
+      all(seam.owned_by(name) and any(owner != mod.__name__ for owner in seam.owned_by(name))
+          for name in _new_names),
+      {name: seam.owned_by(name) for name in _new_names})
+_real_sync_sender = seam.original("send_lan_sync_request")
+seam.restore("send_lan_sync_request")
+seam.restore("send_lan_update_notification")
+check("WN-M39 both senders this section stood in for are back with the program, and the copy the window reads is the real one",
+      not seam.is_patched("send_lan_sync_request") and not seam.is_patched("send_lan_update_notification")
+      and mod.send_lan_sync_request is _real_sync_sender
+      and "yt_msd.sync.discovery" in seam.owned_by("send_lan_sync_request"),
+      seam.owned_by("send_lan_sync_request"))
 
 shutil.rmtree(FIXTURE_ROOT, ignore_errors=True)
 check("WN-F9 every folder this suite wrote is gone again", not FIXTURE_ROOT.exists())

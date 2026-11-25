@@ -22,7 +22,7 @@ from yt_msd.paths import program_folder
 from yt_msd.sync.config import SyncConfigManager
 from yt_msd.sync.discovery import UDPBeaconBroadcaster
 from yt_msd.sync.host import HostFolderWatcher, SyncHostServer
-from yt_msd.sync.lan import get_current_wifi_ssid
+from yt_msd.sync.lan import HOST_UP_SYNC_REQUEST_DELAY_MS, get_current_wifi_ssid
 from yt_msd.ui.render import LOCAL_RENDER_ROW_HEIGHT_GUESS
 from yt_msd.ui.widgets import THUMB_HOVER_RECHECK_MS
 
@@ -116,6 +116,12 @@ class BootstrapMixin:
         self.normalization_threads = max(1, os.cpu_count() // 2)
         self.local_rescan_interval = 60  # minutes (default 1 hour)
         self.disable_update_checks = False  # True once the user opts out of update notifications
+        # The version this copy has already told the user it is on. Written the moment that box is
+        # shown, and read back on the next start, which is how "the first start after an upgrade" is
+        # decided from inside this machine's own settings file rather than from a guess about what
+        # was just installed. It lives in gui_config.json because that file is the one thing every
+        # way of updating yt-msd leaves where it is.
+        self.last_seen_version = ""  # "" until a version has been reported once
         self._update_check_running = False  # guards against overlapping network update checks
         self._downloaded_update_tag = None  # tag already downloaded this session (avoid re-prompting)
         self.ytdlp_version = ""  # version the system yt-dlp reported, "" until it is known
@@ -341,6 +347,13 @@ class BootstrapMixin:
         # Update check on startup (runs again with every local-folder rescan)
         QTimer.singleShot(1500, self._check_for_updates)
 
+        # The box that says this copy has just become a new version, when it has. It runs later than
+        # the update check above on purpose: an update check that finds a newer release is a box
+        # about a version this machine has not got yet, and a box about the version it is now running
+        # is worth having after that one has been answered. It is shown rather than run modally so a
+        # window nobody is looking at cannot hold up the sync pass below.
+        QTimer.singleShot(2600, self._show_version_notes)
+
         # Initialize VLC in a background thread (plugin scanning can take seconds)
         threading.Thread(target=self._init_vlc_background, daemon=True).start()
 
@@ -379,7 +392,11 @@ class BootstrapMixin:
         self.udp_beacon = UDPBeaconBroadcaster(
             lambda: self.sync_config_manager.hosted_chains,
             lambda: self.sync_host_server.active_port,
-            on_chain_updated_cb=self._on_lan_chain_updated
+            on_chain_updated_cb=self._on_lan_chain_updated,
+            # A machine down the LAN that hosts chains this PC follows, saying it is ready for them
+            # to be fetched. Read here because this is the one socket in a sync chain that is always
+            # open on a client, and a client has to be reachable to be told anything.
+            on_sync_request_cb=self._on_lan_sync_request
         )
         self.host_watcher = HostFolderWatcher(self._on_hosted_folder_changed)
 
@@ -403,6 +420,13 @@ class BootstrapMixin:
             # network has had the chance to find such a chain and surprise the user with it instead.
             QTimer.singleShot(1800, self._notify_legacy_visible_chains)
             QTimer.singleShot(2500, self._auto_sync_client_chains)
+            # And this machine's turn, from the other end of the same problem. A client of a chain
+            # hosted here started its own check 2.5 seconds ago, which is long before a host that
+            # booted at the same moment had a port open to answer it; that check has already come
+            # back saying the host is offline. So once this machine has been a host for a while, it
+            # tells every client of its chains to run their normal fetch, rather than leaving each
+            # client to find out when its own interval comes round.
+            QTimer.singleShot(HOST_UP_SYNC_REQUEST_DELAY_MS, self._announce_hosted_chains_for_sync)
 
         QTimer.singleShot(150, _deferred_sync_startup)
 

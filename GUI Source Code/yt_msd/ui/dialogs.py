@@ -17,6 +17,7 @@ from yt_msd.paths import is_packaged_build
 from yt_msd.sync.startup import is_run_on_startup_enabled, set_run_on_startup
 from yt_msd.ui.theme import THEME_COLORS, get_accent_color, get_system_accent_color, get_system_appearance_mode
 from yt_msd.util.text import _sanitize_filename, _split_artist_title
+from yt_msd.util.version import release_notes_url
 
 
 
@@ -715,6 +716,81 @@ class TrayProgressPopup(QWidget):
         self.raise_()
         self.hide_timer.start(3500)
 
+
+
+class VersionNotesDialog(QDialog):
+    """Tells the user, once, that this copy of yt-msd has just become a new version.
+
+    Nothing is being offered here. The update has already happened - by the in-app updater, by the
+    swap helper, by the setup program run by hand, or by whoever replaced the source file - and what
+    this box carries is the link to the notes for the version now running. Which version this copy
+    has already reported is kept in this machine's own settings file and written the moment the box
+    is shown, which is why the same version never says it twice and why an update nobody made through
+    this program is still noticed.
+    """
+    def __init__(self, parent_window, current_version, previous_version=""):
+        super().__init__(parent_window)
+        self.parent_window = parent_window
+        self.current_version = str(current_version or "").strip()
+        self.previous_version = str(previous_version or "").strip()
+        # The page is worked out from the version this copy carries rather than fetched, because
+        # a machine that has just been updated is not guaranteed to reach GitHub at the moment it
+        # first starts, and a box whose link is missing is a worse box than one that points at the
+        # general releases page.
+        self.notes_url = release_notes_url(self.current_version)
+        self.notes_opened = False
+        self.setWindowTitle("Updated - yt-msd")
+        self.setFixedWidth(430)
+        self.setWindowFlags(self.windowFlags() | Qt.Tool)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+
+        title_lbl = QLabel(f"YOU'RE NOW ON VERSION {self.current_version}" if self.current_version
+                           else "YOU'RE NOW ON A NEW VERSION")
+        title_lbl.setFont(QFont("Segoe UI Semibold", 11))
+        layout.addWidget(title_lbl)
+
+        if self.previous_version and self.previous_version != self.current_version:
+            desc_lbl = QLabel(
+                f"yt-msd was updated from {self.previous_version} to {self.current_version}.\n"
+                "Your download folders, playlists, sync chains and settings are exactly where they "
+                "were before the update."
+            )
+        else:
+            desc_lbl = QLabel(f"This is yt-msd {self.current_version}.")
+        desc_lbl.setWordWrap(True)
+        desc_lbl.setStyleSheet("color: #888; font-size: 11px;")
+        layout.addWidget(desc_lbl)
+
+        self.link_lbl = QLabel(
+            f'<a href="{self.notes_url}">Read the changelog for {self.current_version}</a>'
+            if self.current_version else f'<a href="{self.notes_url}">Read the changelog</a>'
+        )
+        self.link_lbl.setOpenExternalLinks(True)
+        self.link_lbl.linkActivated.connect(self._on_notes_opened)
+        layout.addWidget(self.link_lbl)
+
+        where_lbl = QLabel("The same page lists every release of yt-msd, and it is the page this "
+                           "program downloads its updates from.")
+        where_lbl.setWordWrap(True)
+        where_lbl.setStyleSheet("color: #888; font-size: 10px;")
+        layout.addWidget(where_lbl)
+
+        layout.addStretch()
+
+        btn_h = QHBoxLayout()
+        btn_h.addStretch()
+        ok_btn = QPushButton("Got it")
+        ok_btn.clicked.connect(self.accept)
+        btn_h.addWidget(ok_btn)
+        layout.addLayout(btn_h)
+
+    def _on_notes_opened(self, _link=""):
+        # The link itself opens in the browser the desktop uses. This only records that it was
+        # followed, which is the difference between a box that was read and a box that was closed.
+        self.notes_opened = True
 
 
 class UpdateAvailableDialog(QDialog):

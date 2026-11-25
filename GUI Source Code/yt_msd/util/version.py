@@ -7,6 +7,7 @@
 import os
 import re
 
+from yt_msd.constants import UPDATE_REPO
 
 
 def _release_asset_file(asset):
@@ -75,3 +76,59 @@ def _version_is_newer(latest, current):
     latest = tuple(list(latest) + [0] * (n - len(latest)))
     current = tuple(list(current) + [0] * (n - len(current)))
     return latest > current
+
+
+# How a release on GitHub is named in this repository: the version the app carries, with
+# "RELEASE-" in front of it ("RELEASE-3.4", "RELEASE-3.2"). A release page is the changelog
+# for a version of yt-msd, and the box that tells someone they are now on a new version has to
+# reach that page without asking the network what the tag is called - which is what this prefix
+# is for.
+RELEASE_TAG_PREFIX = "RELEASE-"
+
+
+def release_notes_url(version):
+    """The release page holding the notes for a version of yt-msd.
+
+    "3.5" becomes the tag page for RELEASE-3.5, because that is how every release in this repository
+    is named - RELEASE-3.0 through RELEASE-3.4, each one the version the app carries with "RELEASE-"
+    in front of it - and a version already written as "RELEASE-3.5" arrives at the same page. A
+    version padded out with a zero nobody released, "3.6.0" written where the release is 3.6, is
+    named by the parts a release is named by; a third part that is not zero is a patch release, and a
+    patch release is tagged with it. A version with no numbers in it - a build carrying no
+    APP_VERSION at all - gets the general releases page rather than a tag page that cannot exist.
+    """
+    base = f"https://github.com/{UPDATE_REPO}/releases"
+    tokens = re.findall(r"\d+(?:\.\d+)*", str(version or ""))
+    if not tokens:
+        return base
+    number = max(tokens, key=lambda s: (s.count("."), len(s)))
+    parts = number.split(".")
+    if len(parts) > 2 and parts[-1] == "0":
+        number = ".".join(parts[:-1])
+    return f"{base}/tag/{RELEASE_TAG_PREFIX}{number}"
+
+
+def version_notes_are_due(current_version, seen_version):
+    """Whether a copy running 'current_version' should say out loud that it is now on that version.
+
+    The answer is kept in this copy's own settings file rather than worked out from the network,
+    because the thing being noticed is that this machine has changed - and that happens just as
+    truly when somebody runs the setup program by hand as when the app downloads the update
+    itself. A version older than the one already recorded is answered with nothing: a copy moved
+    back to an older build has not gained anything worth a box, and nagging about it would be
+    nagging about a downgrade nobody asked about.
+
+    No recorded version at all is a yes. That is the case that matters most - a copy updated from
+    a version that predates this box has no marker to compare against, and the upgrade would go
+    unmentioned if an empty marker meant "nothing to report" - and a brand-new install gets the
+    same box once, which is the honest reading of "you are now on version X".
+    """
+    current = _extract_version_number(current_version)
+    if not re.search(r"\d", str(current_version or "")):
+        # Nothing to announce, and nothing worth recording as announced.
+        return False
+    seen_text = str(seen_version or "").strip()
+    if not seen_text:
+        return True
+    return _version_is_newer(current, _extract_version_number(seen_text))
+

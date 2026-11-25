@@ -1,6 +1,6 @@
 """The sync-chain regression harness.
 
-Sections SY-A..SY-N cover the sync half of `GUI Source Code/yt-msd-gui.pyw`: the TAG.yaml marker
+Sections SY-A..SY-R cover the sync half of `GUI Source Code/yt-msd-gui.pyw`: the TAG.yaml marker
 a chain leaves on removable media and what comes back when it is read, the two forms `last_synced`
 takes (an epoch in the chain dict, a wall-clock string in TAG.yaml) and the clock grace between
 them, the drive scan that looks for tagged folders, sync-chain persistence inside the shared
@@ -11,7 +11,8 @@ interested during that question looks like, what a host is willing to say about 
 who has not authenticated - which chains a beacon, a probe answer and a `HELLO` name, and what a
 search across this machine's own networks makes of each answer - the removable-media worker and the
 failsafe that stops a newer drive from being rolled back to an older copy, and the hosted folder
-watcher's debounce.
+watcher's debounce, and the message a host puts on the network a moment after it comes up - what it
+  is shaped like on the wire, which codes it may carry, and what a beacon does when it reads one.
 
 Recipe (AI Readme section 20): same as probe_playback - the `.pyw` is copied to a throwaway `.py`
 in this folder's `copy/` and imported, and the functions are driven directly. Every replacement
@@ -2223,6 +2224,148 @@ Q_BRIDGE.close()
 Q_SYNC_BRIDGE.close()
 
 # ===========================================================================
+# SY-R: the message a host sends when it comes up, and what a beacon does when it reads one
+# ===========================================================================
+# Twenty seconds after a machine starts as a host, it puts one message on the network naming the
+# chains it advertises, and every machine following one of them runs its normal fetch. What is proved
+# here is the message and the reading of it: what it is shaped like on the wire, which codes it is
+# allowed to carry, and what the beacon does with one - including a beacon built before this message
+# existed, which has to read one and carry on doing what it already did. Same bounds as the rest of
+# this suite: loopback sockets only, and the port this message is sent to is an ephemeral one this
+# file picked rather than the port the program uses on a real network, so no check here puts a packet
+# on the LAN.
+send_lan_sync_request = seam.original("send_lan_sync_request")
+UDPBeaconBroadcaster = seam.original("UDPBeaconBroadcaster")
+
+
+def _spare_loopback_port():
+    """A loopback port this file has just been told is free, and has just given back."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    return port
+
+
+_WIRE_PORT = _spare_loopback_port()
+_WIRE = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+_WIRE.bind(("127.0.0.1", _WIRE_PORT))
+_WIRE.settimeout(6.0)
+_EXPECTED_HOST_IP = seam.read("get_local_ip")()
+
+with seam.patched("UDP_BEACON_PORT", _WIRE_PORT), \
+     seam.patched("get_broadcast_addresses", lambda: ["127.0.0.1"]):
+    send_lan_sync_request(63350, ["2468", "  ", "1357"])
+    _wire_packet = json.loads(_WIRE.recv(2048).decode("utf-8"))
+
+check("SY-R1 the message is its own type, carries the port a client would fetch from and the address it was sent from, and drops the codes that are nothing",
+      _wire_packet.get("type") == "CHAIN_SYNC_REQUEST"
+      and _wire_packet.get("sync_codes") == ["2468", "1357"]
+      and _wire_packet.get("tcp_port") == 63350
+      and _wire_packet.get("host_ip") == _EXPECTED_HOST_IP, _wire_packet)
+check("SY-R2 it names chains rather than files: nothing about what changed, because what it says is only that a host is ready",
+      set(_wire_packet.keys()) == {"type", "sync_codes", "tcp_port", "host_ip"}, _wire_packet)
+
+_QUIET_PORT = _spare_loopback_port()
+_QUIET = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+_QUIET.bind(("127.0.0.1", _QUIET_PORT))
+_QUIET.settimeout(0.8)
+with seam.patched("UDP_BEACON_PORT", _QUIET_PORT), \
+     seam.patched("get_broadcast_addresses", lambda: ["127.0.0.1"]):
+    send_lan_sync_request(0, ["2468"])
+    send_lan_sync_request(63350, [])
+    send_lan_sync_request(63500, ["   ", ""])
+    _anything_arrived = True
+    try:
+        _QUIET.recv(2048)
+    except socket.timeout:
+        _anything_arrived = False
+_QUIET.close()
+check("SY-R3 a host with no port open, or with no chain to name, sends nothing at all - there is nothing yet for a client to fetch from",
+      not _anything_arrived, _anything_arrived)
+
+_PRIVATE_ONLY_CHAINS = [{"sync_code": "1111", "name": "Open"},
+                        {"sync_code": "2222", "name": "Study", "visible": False}]
+_ADVERTISED_PORT = _spare_loopback_port()
+_ADVERTISED = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+_ADVERTISED.bind(("127.0.0.1", _ADVERTISED_PORT))
+_ADVERTISED.settimeout(6.0)
+with seam.patched("UDP_BEACON_PORT", _ADVERTISED_PORT), \
+     seam.patched("get_broadcast_addresses", lambda: ["127.0.0.1"]):
+    send_lan_sync_request(63350, [c["sync_code"] for c in advertised_chains(_PRIVATE_ONLY_CHAINS)])
+    _advertised_packet = json.loads(_ADVERTISED.recv(2048).decode("utf-8"))
+_ADVERTISED.close()
+check("SY-R4 what the host hands this message is the same list it hands its beacon, so a private chain's code is not put on the network by a message sent every time somebody starts yt-msd",
+      _advertised_packet.get("sync_codes") == ["1111"], _advertised_packet)
+
+def _send_until_read(send_once, saw_it, attempts=20):
+    """Keep sending a packet until the beacon says it read one.
+
+    The beacon binds its socket in the thread that was just started, and a UDP packet sent to a port
+    nothing is listening on yet is simply lost. Re-sending until the answer arrives is how this check
+    waits for that bind without assuming how long it took.
+    """
+    for _ in range(attempts):
+        send_once()
+        if wait_for(saw_it, 0.4):
+            return True
+    return saw_it()
+
+
+_REQUEST_SEEN = []
+_BEACON_PORT = _spare_loopback_port()
+with seam.patched("UDP_BEACON_PORT", _BEACON_PORT):
+    _beacon = UDPBeaconBroadcaster(
+        lambda: [], lambda: 0,
+        on_chain_updated_cb=lambda code: None,
+        on_sync_request_cb=lambda host_ip, codes: _REQUEST_SEEN.append((host_ip, codes)))
+    _beacon.start()
+    _beacon_sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    def _send_request():
+        _beacon_sender.sendto(json.dumps({
+            "type": "CHAIN_SYNC_REQUEST", "sync_codes": ["2468", "  ", "1357"],
+            "host_ip": "192.0.2.9", "tcp_port": 63350}).encode("utf-8"), ("127.0.0.1", _BEACON_PORT))
+
+    _read_request = _send_until_read(_send_request, lambda: _REQUEST_SEEN)
+    _beacon_sender.close()
+    _beacon.stop()
+check("SY-R5 a beacon reads the new message and hands over the address it came from and the codes named in it, the blanks dropped on the way",
+      _read_request and _REQUEST_SEEN[0][0] == "127.0.0.1" and _REQUEST_SEEN[0][1] == ["2468", "1357"],
+      _REQUEST_SEEN)
+_beacon_init = seam.original("UDPBeaconBroadcaster").__init__
+_beacon_args = _beacon_init.__code__.co_varnames[:_beacon_init.__code__.co_argcount]
+check("SY-R6 the new answer is one optional argument added at the end of the beacon's own arguments, so nothing built the way a beacon was built before it still builds",
+      _beacon_args[-1] == "on_sync_request_cb"
+      and len(_beacon_init.__defaults__ or ()) == 2
+      and UDPBeaconBroadcaster(lambda: [], lambda: 0).on_sync_request_cb is None,
+      _beacon_args)
+
+_OLD_SEEN = []
+_OLD_PORT = _spare_loopback_port()
+with seam.patched("UDP_BEACON_PORT", _OLD_PORT):
+    _old_beacon = UDPBeaconBroadcaster(lambda: [], lambda: 0,
+                                       on_chain_updated_cb=lambda code: _OLD_SEEN.append(code))
+    _old_beacon.start()
+    _old_sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    def _send_old_pair():
+        # Both messages in one attempt, so the attempt that proves the beacon was listening is the
+        # same attempt that offered it the message it has no answer for.
+        _old_sender.sendto(json.dumps({"type": "CHAIN_SYNC_REQUEST", "sync_codes": ["2468"],
+                                       "tcp_port": 63350}).encode("utf-8"), ("127.0.0.1", _OLD_PORT))
+        _old_sender.sendto(json.dumps({"type": "CHAIN_UPDATED", "sync_code": "2468"}).encode("utf-8"),
+                           ("127.0.0.1", _OLD_PORT))
+
+    _old_update = _send_until_read(_send_old_pair, lambda: _OLD_SEEN)
+    _old_alive = _old_beacon._thread is not None and _old_beacon._thread.is_alive()
+    _old_sender.close()
+    _old_beacon.stop()
+check("SY-R7 a beacon built before this message existed reads one and carries on: it ignores what it has no answer for, and still delivers the chain updates it has always delivered",
+      _old_beacon.on_sync_request_cb is None and _old_update and _old_alive
+      and set(_OLD_SEEN) == {"2468"}, (_OLD_SEEN, _old_alive))
+
+# ===========================================================================
 # SY-L: the seam this suite reaches the program through
 # ===========================================================================
 _real_discovery = seam.original("discover_host_on_lan")
@@ -2255,7 +2398,9 @@ check("SY-L3 every sync name this suite drives is a module-level name the seam c
                                          "host_chain_is_visible", "hello_reply",
                                          "advertised_chains", "probe_replies", "HostScanner",
                                          "adapter_addresses", "local_scan_scope",
-                                         "subnet_targets")))
+                                         "subnet_targets", "send_lan_sync_request",
+                                         "UDPBeaconBroadcaster", "UDP_BEACON_PORT",
+                                         "HOST_UP_SYNC_REQUEST_DELAY_MS")))
 try:
     seam.patch("sync_chain_that_is_not_in_the_program", lambda: None)
     _refused_unowned = False

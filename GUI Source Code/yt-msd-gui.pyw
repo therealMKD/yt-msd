@@ -72,6 +72,7 @@ from yt_msd.util.version import (
     _extract_version_number,
     _version_is_newer,
     select_release_asset,
+    version_notes_are_due,
 )
 from yt_msd.util.yaml import (
     yaml_dump,
@@ -237,7 +238,9 @@ from yt_msd.sync.config import (
     push_trusted_ips,
 )
 from yt_msd.sync.discovery import (
+    advertised_chains,
     discover_host_on_lan,
+    send_lan_sync_request,
     send_lan_update_notification,
 )
 from yt_msd.sync.host import (
@@ -323,6 +326,7 @@ from yt_msd.ui.dialogs import (
     TrayProgressPopup,
     UpdateAvailableDialog,
     UpdateReadyDialog,
+    VersionNotesDialog,
     YtDlpUpdateDialog,
 )
 
@@ -607,6 +611,74 @@ class MainApp(BootstrapMixin,
                     self.status_signal.emit(f"Sync Chain '{c.get('name')}': {msg}", False, "#FF8C00")
                 self.sync_config_manager.save()
             threading.Thread(target=_bg, daemon=True).start()
+
+    def _announce_hosted_chains_for_sync(self):
+        """Tell the LAN, a moment after this machine comes up as a host, that its clients can fetch.
+
+        A client of a chain hosted here runs its own check 2.5 seconds after it starts. When the
+        host and the client come up together - after a reboot, or after both machines are switched on
+        - that check runs before this machine has a port open, and it comes back saying the host is
+        offline; the next time that client looks is whenever its own interval comes round. This is the
+        host answering that: one message naming the chains it hosts, which every machine following one
+        of them reads as its user having pressed Force Sync All.
+
+        Only the chains this machine advertises are named. A private chain's code is not put on the
+        network by anything else in this program, and it is not put there by a message that goes out
+        every time somebody starts yt-msd; a client following a private chain is still covered by its
+        own startup check and its own interval.
+        """
+        if not hasattr(self, 'sync_config_manager'):
+            return
+        hosted = list(self.sync_config_manager.hosted_chains)
+        if not hosted:
+            return
+        server = getattr(self, 'sync_host_server', None)
+        port = server.active_port if server is not None else 0
+        if port <= 0:
+            # Nothing is listening on this machine yet, so there is nothing for a client to fetch
+            # from and no reason to send anybody looking for it.
+            return
+        advertised = advertised_chains(hosted)
+        if not advertised:
+            return
+        codes = [str(entry.get('sync_code')) for entry in advertised]
+        names = ", ".join(str(entry.get('name') or 'Audio Playlist') for entry in advertised)
+
+        def _bg(codes=codes, port=port):
+            try:
+                send_lan_sync_request(port, codes)
+            except Exception:
+                pass
+
+        threading.Thread(target=_bg, daemon=True).start()
+        self.status_signal.emit(f"Hosting {names}: every client of these chains was asked to run its "
+                                "sync now.", False, "#3B8ED0")
+
+    def _on_lan_sync_request(self, host_ip: str, sync_codes):
+        """Called from the beacon thread when a machine hosting chains this PC follows says it is ready.
+
+        What follows it is the ordinary auto-sync pass - the same call the periodic timer makes - so
+        a chain that is Paused stays paused, a chain bound to a Wi-Fi network this PC is not on stays
+        bound, and each chain reports itself on its own card exactly as it does on a sync its user
+        started by hand. This is not a bypass: it is the same pass, arrived at from the other machine.
+
+        A message that names none of the chains this PC follows starts nothing. A broadcast reaches
+        every machine on the network, and the machines that have nothing to do with the one that sent
+        it have no reason to start work because of it.
+        """
+        if not hasattr(self, 'sync_config_manager') or not self.sync_config_manager.client_chains:
+            return
+        wanted = {str(code).strip() for code in (sync_codes or []) if str(code).strip()}
+        if not wanted:
+            return
+        matching = [cc for cc in self.sync_config_manager.client_chains
+                    if str(cc.get('sync_code')).strip() in wanted]
+        if not matching:
+            return
+        names = ", ".join(sorted({str(cc.get('name') or 'Sync') for cc in matching}))
+        self.status_signal.emit(f"Sync Chain '{names}': {host_ip} hosts it and asked its clients to "
+                                "fetch. Running the normal sync pass...", False, "#3B8ED0")
+        self._auto_sync_client_chains()
 
     def _check_wifi_network_change(self):
         """Monitors for Wi-Fi SSID changes and triggers auto-sync for bound sync chains."""
@@ -1575,6 +1647,44 @@ class MainApp(BootstrapMixin,
         msg.setStandardButtons(QMessageBox.Ok)
         msg.exec()
 
+    def _show_version_notes(self):
+        """The box that says this copy of yt-msd has just become a new version, when it has.
+
+        What decides it is the version this copy wrote into its own settings file the last time it
+        said this, and nothing to do with how the new version got here. An update the app downloaded
+        itself, a setup program run by hand over the top of this folder, a swap helper that put a new
+        exe where the old one was and a source file written over the one being run all leave the same
+        settings file where it was, so all four are noticed the same way: the version running is no
+        longer the version that was reported.
+
+        It is recorded before the window is shown rather than when it is closed, because a box that
+        is shown and then never answered - a machine switched off a moment later, a window pushed
+        aside - has still told the user what it told them, and a version that says it twice is a
+        version nobody believes.
+        """
+        seen = str(getattr(self, 'last_seen_version', '') or '')
+        if not version_notes_are_due(APP_VERSION, seen):
+            # Either this version has already been reported, or this build carries no version worth
+            # reporting. In the other case - a copy moved back to an older build - the older version
+            # is left recorded as it was, and the next upgrade is reported then.
+            return
+        self.last_seen_version = APP_VERSION
+        self.save_config()
+        try:
+            box = VersionNotesDialog(self, APP_VERSION, seen)
+        except Exception:
+            return
+        box.show()
+        box.raise_()
+        box.activateWindow()
+        previous = f" from {seen}" if seen and seen != APP_VERSION else ""
+        self.status_signal.emit(f"yt-msd was updated{previous} to version {APP_VERSION}. The changelog "
+                                f"is on the release page, and it is open in the box on screen.",
+                                False, "#1abd33")
+        if trace.enabled():
+            trace.note(f"first start as version {APP_VERSION}"
+                       + (f" (previous version recorded: {seen})" if seen else " (no version recorded yet)"))
+
     def _check_for_updates(self):
         """Query the GitHub releases page and notify the user if the newest release is newer than this build."""
         if getattr(self, 'disable_update_checks', False):
@@ -2012,6 +2122,11 @@ class MainApp(BootstrapMixin,
                     self.normalization_threads = c.get('normalization_threads', max(1, os.cpu_count() // 2))
                     self.local_rescan_interval = c.get('local_rescan_interval', 60)
                     self.disable_update_checks = c.get('disable_update_checks', False)
+                    # The version this copy has already told the user it is on, kept as the text it
+                    # was written as. It is the whole record of whether the box about a new version
+                    # has been shown for this version yet, and it survives an update because it sits
+                    # in the settings file the setup program leaves alone.
+                    self.last_seen_version = str(c.get('last_seen_version', '') or '')
                     self.disable_ytdlp_updates = c.get('disable_ytdlp_updates', False)
                     self.ytdlp_last_update_check = float(c.get('ytdlp_last_update_check', 0.0) or 0.0)
                     # "Stop after current" is the one playback choice that outlives the window it was
@@ -2090,6 +2205,10 @@ class MainApp(BootstrapMixin,
             'normalization_threads': self.normalization_threads,
             'local_rescan_interval': getattr(self, 'local_rescan_interval', 60),
             'disable_update_checks': getattr(self, 'disable_update_checks', False),
+            # Written back every close so a version that has been reported stays reported. Read by
+            # load_config, and written a second time by _show_version_notes the moment the box about
+            # a new version is put on screen, so a window that is never closed still counts.
+            'last_seen_version': getattr(self, 'last_seen_version', ''),
             'disable_ytdlp_updates': getattr(self, 'disable_ytdlp_updates', False),
             'ytdlp_last_update_check': getattr(self, 'ytdlp_last_update_check', 0.0),
             # The state as it stands when the window closes. "always" is read straight back by
