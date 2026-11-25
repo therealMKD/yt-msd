@@ -47,7 +47,8 @@ import time
 
 from pathlib import Path
 
-from PySide6.QtWidgets import QApplication, QDialog, QLabel, QPushButton, QWidget
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QLabel, QLineEdit,
+                               QPushButton, QSlider, QSplitter, QWidget)
 from PySide6.QtCore import QThread, Qt
 from PySide6.QtGui import QCloseEvent
 
@@ -2905,6 +2906,707 @@ check("WN-M39 both senders this section stood in for are back with the program, 
       and mod.send_lan_sync_request is _real_sync_sender
       and "yt_msd.sync.discovery" in seam.owned_by("send_lan_sync_request"),
       seam.owned_by("send_lan_sync_request"))
+
+# ===========================================================================
+# WN-N: putting another machine's config on this one
+# ===========================================================================
+# Two ways a settings file written by another copy of yt-msd arrives on this machine: the Import button
+# in the settings window taking a bare gui_config.json, and the button on a client chain's card asking
+# the host at the other end of that chain for the settings it runs with. What belongs to those two
+# windows is proved here - which keys cross from one machine to another and which do not, what a file
+# has to be before it is taken for a settings file at all, and whether a config that arrives actually
+# stays arrived once the window has taken it. Which settings a client chain may ask for, and what a host
+# is willing to hand over, is proved over loopback sockets in probe_sync's SY-S.
+build_host_config_import = mod.build_host_config_import
+read_settings_file = mod.read_settings_file
+
+OURS = {
+    "format": "mp3", "bitrate": "192", "mode": "Dark", "accent": "Blue", "volume": 100,
+    "last_search": "my own search", "recent_playlists": [{"name": "My playlist"}],
+    "normalization_mode": "ask", "silence_pad_dur": 2.0, "download_threads": 3,
+    "disable_update_checks": False, "save_place": False, "splitter_sizes": [300, 800, 300],
+    "hosted_chains": [{"id": "hc_1111", "sync_code": "1111", "name": "This PC Hosts"}],
+    "client_chains": [{"id": "cc_2468", "sync_code": "2468", "name": "This PC Follows",
+                       "folder_path": "C:\\Our Music"}],
+    "sync_settings": {"auto_sync_interval_mins": 30},
+    "folders": ["C:\\Our Downloads"], "local_folders": ["C:\\Our Music"],
+    "local_current_path": "C:\\Our Music", "renamer_path": "C:\\Our Tools\\renamer.py",
+    "custom_script_path": "C:\\Our Tools\\script.py", "last_seen_version": "3.4",
+    "session_data": {"search_results": [{"video_id": "ours"}], "playback_index": 1,
+                     "local_current_path": "C:\\Our Music", "local_playback_index": 3},
+}
+THEIRS = {
+    "format": "m4a", "bitrate": "320", "mode": "Light", "accent": "Green", "volume": 42,
+    "last_search": "their search", "recent_playlists": [{"name": "Their playlist"}],
+    "normalization_mode": "on", "silence_pad_dur": 5.0, "download_threads": 7,
+    "disable_update_checks": True, "save_place": True, "splitter_sizes": [200, 700, 400],
+    "hosted_chains": [{"id": "hc_7002", "sync_code": "7002", "name": "Their PC Hosts"}],
+    "client_chains": [{"id": "cc_8888", "sync_code": "8888", "name": "Their PC Follows",
+                       "folder_path": "D:\\Their Music"}],
+    "sync_settings": {"auto_sync_interval_mins": 11},
+    "folders": ["D:\\Their Downloads"], "local_folders": ["D:\\Their Music"],
+    "local_current_path": "D:\\Their Music", "renamer_path": "D:\\Their Tools\\renamer.py",
+    "custom_script_path": "D:\\Their Tools\\script.py", "last_seen_version": "3.5",
+    "session_data": {"search_results": [{"video_id": "theirs"}], "playback_index": 6,
+                     "local_current_path": "D:\\Their Music", "local_playback_index": 8},
+    "a_setting_this_build_has_never_heard_of": "carried across anyway",
+}
+MERGED_HOST = build_host_config_import(OURS, THEIRS)
+
+_MERGED_KEYS = ("format", "bitrate", "mode", "accent", "volume", "last_search", "recent_playlists",
+                "normalization_mode", "silence_pad_dur", "download_threads", "disable_update_checks",
+                "save_place", "splitter_sizes")
+check("WN-N1 a host's settings land here for everything that is a setting: the theme, the accent, the volume, the format and bitrate, the saved playlist, the saved search, the normalisation, the thread counts, the update opt-out, the layout-save choice and the panel widths",
+      [MERGED_HOST[key] for key in _MERGED_KEYS] == [THEIRS[key] for key in _MERGED_KEYS],
+      {key: MERGED_HOST.get(key) for key in ("format", "mode", "volume", "download_threads")})
+check("WN-N2 the chains stay this machine's own: the chains it hosts, the chains it follows, and the interval and options it syncs them on are read back out of its own settings and not out of the host's",
+      MERGED_HOST["hosted_chains"] == OURS["hosted_chains"]
+      and MERGED_HOST["client_chains"] == OURS["client_chains"]
+      and MERGED_HOST["sync_settings"] == OURS["sync_settings"],
+      (MERGED_HOST["client_chains"], THEIRS["client_chains"]))
+check("WN-N3 so do the local file paths: the download folders, the file-browser folders, the folder open in it, and the renamer and custom-script paths this machine runs",
+      MERGED_HOST["folders"] == OURS["folders"]
+      and MERGED_HOST["local_folders"] == OURS["local_folders"]
+      and MERGED_HOST["local_current_path"] == OURS["local_current_path"]
+      and MERGED_HOST["renamer_path"] == OURS["renamer_path"]
+      and MERGED_HOST["custom_script_path"] == OURS["custom_script_path"],
+      {key: MERGED_HOST.get(key) for key in ("folders", "local_current_path", "renamer_path")})
+check("WN-N4 no path belonging to the other machine is left anywhere in the settings this machine ends up with",
+      "Their Downloads" not in json.dumps(MERGED_HOST) and "Their Music" not in json.dumps(MERGED_HOST)
+      and "Their Tools" not in json.dumps(MERGED_HOST),
+      [key for key, value in MERGED_HOST.items() if "Their" in json.dumps(value)])
+check("WN-N5 the record of which version this copy has already told its user about is its own, because what a host has already reported about itself is nothing this machine can learn from",
+      MERGED_HOST["last_seen_version"] == "3.4", MERGED_HOST["last_seen_version"])
+check("WN-N6 the host's saved session comes across with its search results and where in them it stopped, and loses the two entries that named places on the host's own disk",
+      MERGED_HOST["session_data"]["search_results"] == [{"video_id": "theirs"}]
+      and MERGED_HOST["session_data"]["playback_index"] == 6
+      and "local_current_path" not in MERGED_HOST["session_data"]
+      and "local_playback_index" not in MERGED_HOST["session_data"],
+      MERGED_HOST["session_data"])
+check("WN-N7 a setting the host's file does not name is missing from the result rather than kept from the file it replaces - which is how this program already reads a settings file, since load_config() takes a key it cannot find as the value it would have started with, so a setting from before the import cannot survive behind a config that claims to be the host's",
+      build_host_config_import({"volume": 11, "accent": "Red"}, {"accent": "Green"}) == {"accent": "Green"}
+      and "volume" not in build_host_config_import({"volume": 11}, {"accent": "Green"}),
+      build_host_config_import({"volume": 11, "accent": "Red"}, {"accent": "Green"}))
+check("WN-N8 a key this build has never heard of travels with the settings that carried it, so a config written by a newer copy is not quietly edited down by an older one",
+      MERGED_HOST["a_setting_this_build_has_never_heard_of"] == "carried across anyway",
+      sorted(MERGED_HOST))
+check("WN-N9 neither side's settings are edited on the way through: the settings that arrived and the settings this machine already had are the same as they were afterwards as before",
+      THEIRS["session_data"]["local_current_path"] == "D:\\Their Music"
+      and OURS["client_chains"][0]["folder_path"] == "C:\\Our Music"
+      and THEIRS["hosted_chains"][0]["name"] == "Their PC Hosts",
+      (THEIRS["session_data"], OURS["client_chains"]))
+check("WN-N10 what an import refuses to copy across is written down in one list, beside the sync-chain keys the export already owned",
+      set(mod.MACHINE_OWN_CONFIG_KEYS) == {"hosted_chains", "client_chains", "sync_settings", "folders",
+                                           "local_folders", "local_current_path", "renamer_path",
+                                           "custom_script_path", "last_seen_version"}
+      and all(key in mod.MACHINE_OWN_CONFIG_KEYS for key in mod.SYNC_ONLY_CONFIG_KEYS)
+      and set(mod.SESSION_LOCAL_PATH_KEYS) == {"local_current_path", "local_playback_index"},
+      (mod.MACHINE_OWN_CONFIG_KEYS, mod.SESSION_LOCAL_PATH_KEYS))
+
+# What a file has to be before it is taken for a settings file at all. An import throws away every
+# setting this machine has, so the reading is where a file that is not one is stopped.
+_READ_DIR = fixture("settings file readings")
+_READ_GOOD = _READ_DIR / "gui_config.json"
+_READ_GOOD.write_text(json.dumps(THEIRS), encoding="utf-8")
+check("WN-N11 a settings file written by another copy reads back whole, including the chains and folders that this import will go on to copy across",
+      read_settings_file(_READ_GOOD) == THEIRS, sorted(read_settings_file(_READ_GOOD)))
+(_READ_DIR / "not-json.json").write_text("{this is not json", encoding="utf-8")
+(_READ_DIR / "list.json").write_text(json.dumps([1, 2, 3]), encoding="utf-8")
+(_READ_DIR / "empty.json").write_text("{}", encoding="utf-8")
+(_READ_DIR / "somebody-else-s-data.json").write_text(json.dumps({"dependencies": {"left-pad": "1.0"}}),
+                                                     encoding="utf-8")
+_READ_REFUSALS = {}
+for _refusal_name in ("not-json.json", "list.json", "empty.json", "somebody-else-s-data.json"):
+    try:
+        read_settings_file(_READ_DIR / _refusal_name)
+        _READ_REFUSALS[_refusal_name] = "accepted it"
+    except ValueError as exc:
+        _READ_REFUSALS[_refusal_name] = str(exc)
+check("WN-N12 a file that is not JSON, not an object, empty, or an object naming nothing this program writes, is refused with the reason a confirmation box could show",
+      all(reason != "accepted it" for reason in _READ_REFUSALS.values())
+      and "not JSON" in _READ_REFUSALS["not-json.json"]
+      and "not a settings object" in _READ_REFUSALS["list.json"]
+      and "empty" in _READ_REFUSALS["empty.json"]
+      and "not a yt-msd settings file" in _READ_REFUSALS["somebody-else-s-data.json"],
+      _READ_REFUSALS)
+try:
+    read_settings_file(_READ_DIR / "no-such-file.json")
+    _READ_MISSING = "accepted it"
+except ValueError as exc:
+    _READ_MISSING = str(exc)
+check("WN-N13 a file that is not there is reported as that rather than as an empty settings file",
+      "could not be read" in _READ_MISSING, _READ_MISSING)
+
+
+# Now the arrival: an imported config put onto a window, and read back out of the file that window
+# writes. This is the part the reset-to-defaults once got wrong - a file written, and every setting the
+# window was still holding written straight back over it - so it is proved with the real save_config and
+# the real load_config against a real settings file, and with the real controls save_config reads its
+# format, its bitrate, its search text, its ticks and its panel widths out of.
+class _TuningStandIn:
+    """The renamer's shared tuning settings, recorded instead of changed."""
+    pushed = []
+
+    @classmethod
+    def from_settings(cls, trim, pad, custom_cmd_on, custom_cmd):
+        cls.pushed.append((trim, pad, custom_cmd_on, custom_cmd))
+
+    @classmethod
+    def reset(cls):
+        cls.pushed.append(("reset",))
+
+
+class _ImportApp(_SavedConfigApp):
+    """A main window holding a real settings file, the real save_config and load_config, and the real
+    controls those two read - which is what a settings import has to leave in agreement."""
+
+    def __init__(self, config_path, **overrides):
+        super().__init__(config_path)
+        from PySide6.QtWidgets import QCheckBox, QComboBox, QLineEdit, QSlider, QSplitter
+        self.format_combo = QComboBox()
+        self.format_combo.addItems([str(item) for item in mod.DOWNLOAD_FORMATS])
+        self.bitrate_combo = QComboBox()
+        self.bitrate_combo.addItems(["128", "192", "256", "320"])
+        self.path_combo = QComboBox()
+        self.search_entry = QLineEdit()
+        self.vol_slider = QSlider(Qt.Horizontal)
+        self.vol_slider.setRange(0, 100)
+        self.local_meta_cb = QCheckBox()
+        self.run_renamer_cb = QCheckBox()
+        self.channel_prefix_cb = QCheckBox()
+        self.main_splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter.addWidget(QWidget())
+        self.main_splitter.addWidget(QWidget())
+        self.content_splitter = QSplitter(Qt.Horizontal)
+        self.content_splitter.addWidget(QWidget())
+        self.content_splitter.addWidget(QWidget())
+        self.recent_playlists = [{"name": "My playlist"}]
+        self.accent_color_name = "Blue"
+        self.appearance_mode = "Dark"
+        self.last_search = "my own search"
+        self.volume_val = 100
+        self.recent_folders = ["C:\\Our Downloads"]
+        self.download_path = "C:\\Our Downloads"
+        self.local_folders = ["C:\\Our Music"]
+        self.local_current_path = "C:\\Our Music"
+        self.renamer_path = "C:\\Our Tools\\renamer.py"
+        self.custom_script_path = "C:\\Our Tools\\script.py"
+        self.show_local_metadata = False
+        self.channel_prefix_rename = True
+        self.splitter_sizes = [300, 800, 300]
+        self.normalization_mode = "ask"
+        self.silence_pad_dur = 2.0
+        self.download_threads = 3
+        self.disable_update_checks = False
+        self.save_place = False
+        self.last_seen_version = "3.4"
+        self.format_combo.setCurrentText("mp3")
+        self.bitrate_combo.setCurrentText("192")
+        self.search_entry.setText(self.last_search)
+        self.vol_slider.setValue(100)
+        self.calls = []
+        self.status_lines = []
+        self.sync_threads = {}
+        self.sync_progress_state = {}
+        self.sync_manager_dialog = None
+        self.sync_host_server = None
+        self._config_import_busy = False
+        self._export_import_busy = False
+        self.sync_config_manager = None
+        for key, value in overrides.items():
+            setattr(self, key, value)
+
+    def _note(self, name):
+        self.calls.append(name)
+
+    def _on_status_update(self, text, sticky=False, color=""):
+        self.status_lines.append((text, sticky, color))
+
+    def apply_theme(self):
+        self._note("apply_theme")
+
+    def set_local_explorer_address(self, path, add_to_recent=False):
+        self._note("set_local_explorer_address")
+        self.local_explorer_shown = path
+
+    def refresh_local_list(self):
+        self._note("refresh_local_list")
+
+    def _update_local_rescan_timer(self):
+        self._note("_update_local_rescan_timer")
+
+    def _update_sync_timer(self):
+        self._note("_update_sync_timer")
+
+    def refresh_sync_watchers(self):
+        self._note("refresh_sync_watchers")
+
+    def save_config(self):
+        mod.MainApp.save_config(self)
+
+    def load_config(self):
+        mod.MainApp.load_config(self)
+
+    def _config_payload_for_host(self):
+        return mod.MainApp._config_payload_for_host(self)
+
+    def _current_config_snapshot(self):
+        return mod.MainApp._current_config_snapshot(self)
+
+    def _write_settings_file(self, payload):
+        return mod.MainApp._write_settings_file(self, payload)
+
+    def _reload_settings_into_ui(self):
+        mod.MainApp._reload_settings_into_ui(self)
+
+    def _start_bare_config_import(self, json_path):
+        mod.MainApp._start_bare_config_import(self, json_path)
+
+    def _bare_config_worker(self, json_path):
+        mod.MainApp._bare_config_worker(self, json_path)
+
+    def _on_config_file_read(self, json_path, payload):
+        mod.MainApp._on_config_file_read(self, json_path, payload)
+
+    def import_config_from_host(self, chain_config):
+        mod.MainApp.import_config_from_host(self, chain_config)
+
+    def _on_host_config_fetched(self, ok, message, payload, chain_config):
+        mod.MainApp._on_host_config_fetched(self, ok, message, payload, chain_config)
+
+    def _apply_whole_config_import(self, payload, source_label, keep_own_keys):
+        return mod.MainApp._apply_whole_config_import(self, dict(payload), source_label, keep_own_keys)
+
+
+class _RunningSync:
+    """A chain mid-sync: the one thing that makes an import wait."""
+
+    def __init__(self, running=True):
+        self._running = running
+
+    def isRunning(self):
+        return self._running
+
+
+def _import_config_dir(name):
+    """A settings file to import onto, in its own folder, with this machine's own settings in it."""
+    folder = fixture(name)
+    cfg = dict(OURS)
+    (folder / "gui_config.json").write_text(json.dumps(cfg), encoding="utf-8")
+    return folder, folder / "gui_config.json"
+
+
+class _RecordingSplitter(QSplitter):
+    """A panel divider that remembers the arrangement it was given.
+
+    A real QSplitter that has never been shown rescales what it is asked for, so the check below is
+    about what the import asked the window for and what the window kept privately afterwards - not
+    about how Qt lays out two empty panels.
+    """
+
+    def __init__(self):
+        super().__init__(Qt.Horizontal)
+        self.requested_sizes = []
+        self._last_custom_sizes = [999, 999]
+
+    def setSizes(self, sizes):
+        self.requested_sizes.append(list(sizes))
+
+    def sizes(self):
+        # save_config() reads the panel widths straight back off these two, so a divider that never
+        # showed has to answer with the widths it was last asked for rather than with nothing.
+        return list(self.requested_sizes[-1]) if self.requested_sizes else list(self._last_custom_sizes)
+
+
+class _ConfigImportApp(_ImportApp):
+    """A window with a settings file of its own, and the two import paths wired the way the real one is."""
+
+    def __init__(self, name, **overrides):
+        _folder, _cfg_path = _import_config_dir(name)
+        super().__init__(_cfg_path, **overrides)
+        self.settings_dir = _folder
+        self.config_file = _cfg_path
+        self.main_splitter = _RecordingSplitter()
+        self.content_splitter = _RecordingSplitter()
+        self.import_failed_signal = _RecordingEmit()
+        self.config_file_ready_signal = _RecordingEmit()
+        self.status_signal = _RecordingEmit()
+        # A settings import rearms the local pane's auto-rescan through this attribute, exactly the way
+        # load_config does: without it the window simply has no timer to rearm, and the check below
+        # would be about a stand-in rather than about what the import asked for.
+        self.local_rescan_timer = object()
+        self.settings_dialog = None
+        self.fetched = []
+        self.fetch_started = []
+
+    def read_file(self):
+        return json.loads(self.config_file.read_text(encoding="utf-8"))
+
+    def imported(self, payload, source, keep_own_keys):
+        """One whole-config import onto this window, with the renamer's tuning settings recorded."""
+        with seam.patched("TUNING", _TuningStandIn):
+            return mod.MainApp._apply_whole_config_import(self, dict(payload), source, keep_own_keys)
+
+
+# The settings file a client-chain import produces. This is the check that matters most here, because
+# it is the one the reset-to-defaults once failed: a settings file written, and every setting the window
+# was still holding written straight back over it by the next save.
+_CHECKED_SETTINGS = ("format", "mode", "accent", "volume", "download_threads", "silence_pad_dur",
+                     "recent_playlists", "last_search", "disable_update_checks", "normalization_mode",
+                     "save_place", "bitrate")
+_host_import_app = _ConfigImportApp("host config import")
+with seam.patched("TUNING", _TuningStandIn):
+    mod.MainApp._apply_whole_config_import(_host_import_app, dict(THEIRS),
+                                           "the host of sync chain 'Front Room'", True)
+_after_host_import = _host_import_app.read_file()
+check("WN-N14 a host's settings are written into this machine's settings file, whole, while this machine's own chains and paths are still in there",
+      all(_after_host_import[key] == THEIRS[key] for key in _CHECKED_SETTINGS)
+      and _after_host_import["hosted_chains"] == OURS["hosted_chains"]
+      and _after_host_import["client_chains"] == OURS["client_chains"]
+      and _after_host_import["sync_settings"] == OURS["sync_settings"]
+      and _after_host_import["folders"] == OURS["folders"]
+      and _after_host_import["local_folders"] == OURS["local_folders"]
+      and _after_host_import["local_current_path"] == OURS["local_current_path"]
+      and _after_host_import["renamer_path"] == OURS["renamer_path"]
+      and _after_host_import["custom_script_path"] == OURS["custom_script_path"]
+      and _after_host_import["last_seen_version"] == "3.4",
+      _after_host_import)
+check("WN-N15 and they stay written: this window is asked to save its settings again straight afterwards - the thing every settings window, every download and every close does - and the file still says what the host's settings said. A reset to defaults once failed in exactly this way, and it is why the file is written first and then read back into the window and into the controls the window saves out of",
+      (_host_import_app.save_config(), all(_host_import_app.read_file()[key] == THEIRS[key]
+                                           for key in _CHECKED_SETTINGS))[1],
+      {key: (_after_host_import[key], _host_import_app.read_file()[key]) for key in _CHECKED_SETTINGS})
+check("WN-N16 and the settings that stayed this machine's own are still its own after that save, because the controls holding them were filled from them and not from the host",
+      _host_import_app.read_file()["folders"] == OURS["folders"]
+      and _host_import_app.read_file()["local_folders"] == OURS["local_folders"]
+      and _host_import_app.read_file()["local_current_path"] == OURS["local_current_path"]
+      and _host_import_app.read_file()["renamer_path"] == OURS["renamer_path"]
+      and _host_import_app.read_file()["last_seen_version"] == "3.4",
+      _host_import_app.read_file())
+check("WN-N17 the window itself took the imported settings and not only the file: the attributes load_config owns, the controls save_config reads its format, bitrate and saved search out of, and the widths each panel divider is asked for",
+      _host_import_app.format_var == "m4a" and _host_import_app.bitrate_var == "320"
+      and _host_import_app.appearance_mode == "Light" and _host_import_app.accent_color_name == "Green"
+      and _host_import_app.volume_val == 42 and _host_import_app.download_threads == 7
+      and _host_import_app.silence_pad_dur == 5.0 and _host_import_app.normalization_mode == "on"
+      and _host_import_app.disable_update_checks is True
+      and _host_import_app.format_combo.currentText() == "m4a"
+      and _host_import_app.bitrate_combo.currentText() == "320"
+      and _host_import_app.search_entry.text() == "their search"
+      and _host_import_app.vol_slider.value() == 42
+      and _host_import_app.main_splitter.requested_sizes == [[200, 1100]]
+      and _host_import_app.content_splitter.requested_sizes == [[700, 400]],
+      (_host_import_app.format_combo.currentText(), _host_import_app.search_entry.text(),
+       _host_import_app.main_splitter.requested_sizes))
+check("WN-N18 the arrangement the host's config named is what each panel divider keeps from then on: the widths this machine had arranged for itself privately are dropped, so a double-click on a handle cannot bring the old layout back over the imported one",
+      _host_import_app.main_splitter._last_custom_sizes == []
+      and _host_import_app.content_splitter._last_custom_sizes == [],
+      (_host_import_app.main_splitter._last_custom_sizes,
+       _host_import_app.content_splitter._last_custom_sizes))
+check("WN-N19 the theme was re-applied, the local pane was re-pointed at this machine's own folder and re-scanned, the auto-rescan timer was rearmed, and the sync timer and the hosted-folder watchers were re-made from the chains this machine kept",
+      all(name in _host_import_app.calls for name in ("apply_theme", "set_local_explorer_address",
+                                                      "refresh_local_list", "_update_local_rescan_timer",
+                                                      "_update_sync_timer", "refresh_sync_watchers"))
+      and _host_import_app.local_explorer_shown == OURS["local_current_path"],
+      _host_import_app.calls)
+check("WN-N20 and the renamer's half of the program is told: an imported pad or trim reaches the shared tuning settings the renamer reads, and not only the window that downloaded the file",
+      _TuningStandIn.pushed[-1] == (True, 5.0, False, ""), _TuningStandIn.pushed)
+check("WN-N21 the status line says what was imported and which things were left alone, because a config that changed underneath somebody is the sort of thing they have to be told about",
+      any("Imported settings from the host of sync chain 'Front Room'" in line[0]
+          and "sync chains" in line[0] and "left exactly as they were" in line[0]
+          for line in _host_import_app.status_lines),
+      _host_import_app.status_lines)
+
+# The settings-file import: the same arrival with nothing held back. A file picked out of a folder
+# becomes this machine's settings, its chains included.
+_bare_app = _ConfigImportApp("bare config import")
+# The manager the real window is given: the same folder, so the same gui_config.json the import writes.
+# A chain list kept in some other file would let this check pass while the live window kept the old one.
+_bare_manager = mod.SyncConfigManager(str(_bare_app.settings_dir))
+_bare_before = ([chain["sync_code"] for chain in _bare_manager.hosted_chains],
+                [chain["sync_code"] for chain in _bare_manager.client_chains])
+_bare_app.sync_config_manager = _bare_manager
+_bare_result = _bare_app.imported(THEIRS, "gui_config.json", False)
+_after_bare = _bare_app.read_file()
+check("WN-N22 a bare settings file is taken exactly as it stands: every setting in it lands here, the chains it named are now this machine's chains, and its paths are now this machine's paths",
+      _bare_result is True and _after_bare["format"] == "m4a" and _after_bare["volume"] == 42
+      and _after_bare["folders"] == ["D:\\Their Downloads"]
+      and _after_bare["local_current_path"] == "D:\\Their Music"
+      and _after_bare["renamer_path"] == "D:\\Their Tools\\renamer.py"
+      and _after_bare["session_data"]["local_current_path"] == "D:\\Their Music"
+      and [chain["sync_code"] for chain in _after_bare["hosted_chains"]] == ["7002"]
+      and [chain["sync_code"] for chain in _after_bare["client_chains"]] == ["8888"]
+      and _after_bare["sync_settings"] == {"auto_sync_interval_mins": 11},
+      _after_bare)
+check("WN-N23 the chains this machine had are gone from the file and from the manager that runs them: the live copies are emptied before the new file is read back, which is the other way a reset to defaults once left behind every chain it claimed to remove",
+      _bare_before == (["1111"], ["2468"])
+      and [chain["sync_code"] for chain in _bare_manager.hosted_chains] == ["7002"]
+      and [chain["sync_code"] for chain in _bare_manager.client_chains] == ["8888"]
+      and "This PC Hosts" not in json.dumps([_bare_manager.hosted_chains,
+                                             _bare_manager.client_chains]),
+      (_bare_before, _bare_manager.hosted_chains, _bare_manager.client_chains))
+_bare_app.save_config()
+_after_bare_save = _bare_app.read_file()
+check("WN-N24 and it reads as this machine's own settings afterwards: the window saves, and the folders and chains that came with the imported file are still the ones on disk - the local pane was re-pointed at the folder the imported file named, because that is the folder this machine now runs on",
+      _after_bare_save["folders"] == ["D:\\Their Downloads"]
+      and _after_bare_save["local_current_path"] == "D:\\Their Music"
+      and _after_bare_save["format"] == "m4a" and _after_bare_save["volume"] == 42
+      and _after_bare_save["last_seen_version"] == "3.5"
+      and [chain["sync_code"] for chain in _after_bare_save["hosted_chains"]] == ["7002"]
+      and _bare_app.local_explorer_shown == "D:\\Their Music",
+      _after_bare_save)
+check("WN-N25 its status line names the file and says the chains came with it, since a machine that suddenly hosts somebody else's chain has to be told that happened",
+      any("Imported settings from gui_config.json" in line[0] and "now this machine's chains" in line[0]
+          for line in _bare_app.status_lines),
+      _bare_app.status_lines)
+
+
+# The asking: what a user is told before any of the above is allowed to happen, and what is not written
+# until somebody says yes. The fetch itself is proved over loopback sockets in probe_sync's SY-S; what
+# belongs here is the confirmation and the guards around it.
+_FETCH_STARTED = []
+
+
+class _FetchSignal:
+    """A signal on a fetch thread, wired the way a real one is: connections, then emissions."""
+
+    def __init__(self):
+        self.handlers = []
+        self.emitted = []
+
+    def connect(self, handler):
+        self.handlers.append(handler)
+
+    def emit(self, *args):
+        self.emitted.append(args)
+        for handler in list(self.handlers):
+            handler(*args)
+
+
+class _FetchStandIn:
+    """The chain's host, asked for its settings, as this suite runs it: nothing on the network at all."""
+
+    def __init__(self, chain_config):
+        self.chain_config = chain_config
+        self.status_signal = _FetchSignal()
+        self.finished_signal = _FetchSignal()
+
+    def start(self):
+        _FETCH_STARTED.append(dict(self.chain_config))
+
+    def answer(self, ok, message, payload):
+        """Hand this fetch the answer a host gave, and let the window take it the way it really would."""
+        self.finished_signal.emit(ok, message, payload)
+
+
+HOST_CHAIN_RECORD = {"id": "cc_2468", "sync_code": "2468", "name": "Front Room",
+                     "folder_path": "C:\\Our Music", "last_known_host_ip": "192.0.2.9"}
+
+
+def _asking(answer_yes, drive):
+    """Run `drive` with the fetch thread stood in for, and every confirmation answered `answer_yes`."""
+    with seam.patched("HostConfigFetchThread", _FetchStandIn):
+        return answering(answer_yes, drive)
+
+
+_refused_app = _ConfigImportApp("host import refused")
+_refused_app.sync_threads = {"cc_2468": _RunningSync()}
+_asking(True, lambda: mod.MainApp.import_config_from_host(_refused_app, dict(HOST_CHAIN_RECORD)))
+check("WN-N26 with a sync running there is no question to answer and nothing is fetched: a chain mid-sync is working from the chain record and the folder rule an import is about to replace",
+      _FETCH_STARTED == [] and _refused_app._config_import_busy is False
+      and any("a sync is running" in line[0] for line in _refused_app.status_lines)
+      and _refused_app.read_file() == OURS,
+      (_FETCH_STARTED, _refused_app.status_lines))
+
+_answered_app = _ConfigImportApp("host import asked")
+_asking(False, lambda: mod.MainApp.import_config_from_host(_answered_app,
+                                                           dict(HOST_CHAIN_RECORD)))
+_what_it_asked = _Answers.asked[0] if _Answers.asked else ("", "", ())
+check("WN-N27 a client chain's button asks first, defaults to No, and says in the question itself that it overwrites the entire config and that there is no undoing it - the two things a button on a chain card cannot be trusted to be obvious about",
+      bool(_Answers.asked) and _what_it_asked[2] == (_Answers.Yes | _Answers.No, _Answers.No)
+      and _FETCH_STARTED == []
+      and "Import Settings From Host" in _what_it_asked[0]
+      and "overwrites your entire config" in _what_it_asked[1]
+      and "no undoing it" in _what_it_asked[1]
+      and _answered_app.read_file() == OURS and _answered_app._config_import_busy is False,
+      (_Answers.asked, _FETCH_STARTED, _answered_app.status_lines))
+check("WN-N28 and the same question names the two things that will not be overwritten, because somebody deciding whether to press Yes has to be able to tell what they are keeping",
+      "sync chains" in _what_it_asked[1] and "local file paths" in _what_it_asked[1]
+      and "Front Room" in _what_it_asked[1] and "192.0.2.9" in _what_it_asked[1],
+      _what_it_asked[1])
+
+_yes_app = _ConfigImportApp("host import accepted")
+_asking(True, lambda: mod.MainApp.import_config_from_host(_yes_app, dict(HOST_CHAIN_RECORD)))
+check("WN-N29 said yes, the fetch is what runs: the chain as this machine holds it, handed to the client half of a chain, and nothing written to this machine's settings out of the answer alone",
+      _FETCH_STARTED == [HOST_CHAIN_RECORD] and _yes_app._config_import_busy is True
+      and _yes_app.read_file() == OURS,
+      (_FETCH_STARTED, _yes_app.read_file()))
+mod.MainApp._on_host_config_fetched(_yes_app, False, "Settings refused by the host: this host does not "
+                                    "offer its settings. Nothing here was changed.", None,
+                                    dict(HOST_CHAIN_RECORD))
+check("WN-N30 a host that refuses is reported as refusing, the import is over rather than left waiting, and this machine's settings file is exactly what it was",
+      _yes_app.read_file() == OURS and _yes_app._config_import_busy is False
+      and any("Settings not imported from Front Room" in line[0]
+              and "does not offer its settings" in line[0] for line in _yes_app.status_lines),
+      (_yes_app.read_file(), _yes_app.status_lines))
+
+# The settings-file path: read first, ask second, write last.
+_bad_dir = fixture("a file that is not settings")
+_bad_file = _bad_dir / "package.json"
+_bad_file.write_text(json.dumps({"name": "somebody-else-s-project"}), encoding="utf-8")
+_good_file = _bad_dir / "gui_config.json"
+_good_file.write_text(json.dumps(THEIRS), encoding="utf-8")
+
+_read_failed_app = _ConfigImportApp("bare import bad file")
+mod.MainApp._bare_config_worker(_read_failed_app, str(_bad_file))
+check("WN-N31 a file that is not a yt-msd settings file is refused on the reading thread before anything is asked about it, and the reason it is not one is what the user is told",
+      _read_failed_app.read_file() == OURS and _read_failed_app._config_import_busy is False
+      and _read_failed_app.config_file_ready_signal.emitted == []
+      and len(_read_failed_app.import_failed_signal.emitted) == 1
+      and "not a yt-msd settings file" in _read_failed_app.import_failed_signal.emitted[0][0]
+      and "names none of the settings" in _read_failed_app.import_failed_signal.emitted[0][0],
+      (_read_failed_app.import_failed_signal.emitted, _read_failed_app.read_file()))
+
+_read_ready_app = _ConfigImportApp("bare import good file")
+mod.MainApp._bare_config_worker(_read_ready_app, str(_good_file))
+check("WN-N32 a settings file that does read all right comes back through the signal the window confirms on, with the path it came from and the settings it named, and nothing has been written yet - the confirmation comes before the writing",
+      _read_ready_app.config_file_ready_signal.emitted == [(str(_good_file), THEIRS)]
+      and _read_ready_app.read_file() == OURS and _read_ready_app.import_failed_signal.emitted == [],
+      (_read_ready_app.config_file_ready_signal.emitted, _read_ready_app.read_file()))
+
+_said_no_app = _ConfigImportApp("bare import said no")
+answering(False, lambda: mod.MainApp._on_config_file_read(_said_no_app, str(_good_file), dict(THEIRS)))
+_what_it_asked_about = _Answers.asked[0] if _Answers.asked else ("", "")
+check("WN-N33 a settings file is written only once somebody has said yes to the file that was actually found, and the question names what is about to be replaced and what a file with chains in it will do to this machine",
+      _said_no_app.read_file() == OURS and _said_no_app._config_import_busy is False
+      and "Overwrite Settings With This File" in _what_it_asked_about[0]
+      and "no undoing it" in _what_it_asked_about[1],
+      (_Answers.asked, _said_no_app.read_file()))
+
+_no_chains_file = _bad_dir / "no-chains.json"
+_no_chains_file.write_text(json.dumps({"format": "m4a", "volume": 9}), encoding="utf-8")
+_said_yes_app = _ConfigImportApp("bare import said yes")
+mod.MainApp._bare_config_worker(_said_yes_app, str(_no_chains_file))
+answering(True, lambda: mod.MainApp._on_config_file_read(_said_yes_app, str(_no_chains_file),
+                                                         read_settings_file(_no_chains_file)))
+check("WN-N34 a settings file naming no chains says so in the question and leaves this machine hosting none and following none afterwards, because a machine that silently loses its chains is the thing an import has to warn about",
+      any("names no sync chains" in asked[1] for asked in _Answers.asked)
+      and _said_yes_app.read_file()["format"] == "m4a"
+      and _said_yes_app.read_file().get("hosted_chains") is None
+      and _said_yes_app.read_file().get("client_chains") is None,
+      (_Answers.asked, _said_yes_app.read_file()))
+
+_busy_app = _ConfigImportApp("import while busy")
+_busy_app._export_import_busy = True
+_fetches_before_this_one = len(_FETCH_STARTED)
+_asking(True, lambda: mod.MainApp.import_config_from_host(_busy_app, dict(HOST_CHAIN_RECORD)))
+check("WN-N35 a settings import and a package import or export take turns with each other: a settings file picked out of a folder and a settings file fetched off a chain both write over the same settings, so only one of them runs at a time",
+      len(_FETCH_STARTED) == _fetches_before_this_one and _busy_app.read_file() == OURS
+      and _busy_app._config_import_busy is False
+      and any("import or export is already running" in line[0] for line in _busy_app.status_lines),
+      _busy_app.status_lines)
+
+_blocked_app = _ConfigImportApp("import onto a running sync")
+_blocked_app.sync_threads = {"cc_other": _RunningSync()}
+_bare_blocked = _blocked_app.imported(THEIRS, "gui_config.json", False)
+check("WN-N36 and an import that has already been agreed is refused at the last moment if a sync started in the meantime - the file is not written, and the window says that it stopped rather than saying it finished",
+      _bare_blocked is False and _blocked_app.read_file() == OURS
+      and any("A sync is running. Nothing was imported." in line[0]
+              for line in _blocked_app.status_lines),
+      (_blocked_app.read_file(), _blocked_app.status_lines))
+
+_settings_open_app = _ConfigImportApp("import with settings window open")
+_settings_open_app.settings_dialog = QWidget()
+_settings_open_app.imported(THEIRS, "gui_config.json", False)
+check("WN-N37 a settings window left open while its own settings are replaced is closed, because the cached one reads these values only when it is built and would go on writing the settings it still shows back into the file",
+      _settings_open_app.settings_dialog is None
+      and _settings_open_app.read_file()["format"] == "m4a",
+      _settings_open_app.settings_dialog)
+
+# The Import button in the settings window takes a bare gui_config.json beside a package, and hands it
+# to the main window rather than to the package reader.
+_import_choice_app = _ConfigImportApp("import dialog choice")
+_picked_filters = []
+with seam.patched("QFileDialog", type("QFileDialogStandIn", (), {
+        "getOpenFileName": staticmethod(lambda parent, title, start, filters=None:
+                                       (_picked_filters.append((title, filters)),
+                                        (str(_good_file), filters))[1])})):
+    mod.MainApp.open_import_dialog(_import_choice_app)
+_waits_for_read = _wait_for(lambda: _import_choice_app.config_file_ready_signal.emitted
+                            or _import_choice_app.import_failed_signal.emitted, 4.0)
+check("WN-N38 the Import button offers a settings file beside a package, and a .json goes to the settings import rather than to the package reader - and what that path does first is read the file and hand it back for the confirmation, with nothing on this machine changed yet",
+      _picked_filters and "yt-msd Settings (*.json)" in _picked_filters[0][1]
+      and "yt-msd Package (*.zip)" in _picked_filters[0][1]
+      and _picked_filters[0][1].index("yt-msd Package (*.zip)") < _picked_filters[0][1].index("yt-msd Settings (*.json)")
+      and _waits_for_read
+      and _import_choice_app.config_file_ready_signal.emitted == [(str(_good_file), THEIRS)]
+      and _import_choice_app.import_failed_signal.emitted == []
+      and _import_choice_app._export_import_busy is False
+      and _import_choice_app.read_file() == OURS,
+      (_picked_filters, _import_choice_app.config_file_ready_signal.emitted))
+_package_choice_app = _ConfigImportApp("import dialog package")
+_package_worker_saw = []
+_package_choice_app._import_worker = lambda path: _package_worker_saw.append(path)
+with seam.patched("QFileDialog", type("QFileDialogStandIn", (), {
+        "getOpenFileName": staticmethod(lambda parent, title, start, filters=None:
+                                        (r"C:\Exported\yt-msd-package.zip", filters))})):
+    mod.MainApp.open_import_dialog(_package_choice_app)
+_waits_for_package = _wait_for(lambda: _package_worker_saw, 4.0)
+check("WN-N39 and a .zip still goes the way it has always gone, with the settings file offered beside it and not in front of it",
+      _waits_for_package and _package_worker_saw == [r"C:\Exported\yt-msd-package.zip"]
+      and _package_choice_app._config_import_busy is False,
+      (_package_worker_saw, _package_choice_app._config_import_busy))
+_pyw_source = (Path(SRC_DIR) / "yt-msd-gui.pyw").read_text(encoding="utf-8")
+_bootstrap_source = (Path(SRC_DIR) / "yt_msd" / "ui" / "bootstrap.py").read_text(encoding="utf-8")
+_sync_client_source = (Path(SRC_DIR) / "yt_msd" / "sync" / "client.py").read_text(encoding="utf-8")
+_sync_host_source = (Path(SRC_DIR) / "yt_msd" / "sync" / "host.py").read_text(encoding="utf-8")
+check("WN-N40 the card's button hands the chain to the main window and nothing else: a chain that has lent its settings out is still the same chain, and the settings are written in exactly one place in the program",
+      all(hasattr(mod.SyncManagerDialog, name) for name in ("_import_config_from_host",
+                                                            "_sync_single_client_chain",
+                                                            "_push_client_chain"))
+      and "import_settings = getattr(self.parent_app, 'import_config_from_host', None)"
+          in (Path(SRC_DIR) / "yt_msd" / "sync" / "dialogs.py").read_text(encoding="utf-8")
+      and _pyw_source.count("def import_config_from_host") == 1,
+      _pyw_source.count("def import_config_from_host"))
+
+_sync_dialog_app = AppStandIn(sync_config_manager=SYNC_CM, sync_host_server=None,
+                              status_signal=_StatusLine())
+_dlg_for_import = QuietSyncDialog(_sync_dialog_app)
+_forwarded = []
+_sync_dialog_app.import_config_from_host = lambda cc: _forwarded.append(dict(cc))
+_client_card = _card_for(_dlg_for_import, CLIENT_CHAIN["id"])
+_import_buttons = [btn for btn in _client_card.findChildren(QPushButton)
+                   if btn.text() == "Import Config From Host"]
+if _import_buttons:
+    _import_buttons[0].click()
+check("WN-N41 every client chain's card carries the button, and pressing it hands this chain to the window that writes settings - the card itself neither warns nor writes",
+      len(_import_buttons) == 1 and _forwarded == [CLIENT_CHAIN]
+      and _sync_dialog_app.status_signal.lines == [],
+      (_forwarded, _sync_dialog_app.status_signal.lines))
+
+check("WN-N42 the main window is the one that answers a client asking for its settings, and it is handed to the host server the same way the hosted chains and the restore events are",
+      "get_config_cb=self._config_payload_for_host" in _bootstrap_source
+      and "def _config_payload_for_host" in _pyw_source
+      and "_CONFIG_WRITE_LOCK" in _pyw_source.split("def _config_payload_for_host", 1)[1]
+          .split("def ", 1)[0],
+      [line.strip() for line in _bootstrap_source.splitlines() if "get_config_cb" in line])
+check("WN-N43 a settings import is wired to the window the way every other worker is wired: a signal on the main window, connected in the startup beside the import and export signals it sits next to",
+      "config_file_ready_signal = Signal(str, object)" in _pyw_source
+      and "self.config_file_ready_signal.connect(self._on_config_file_read)" in _bootstrap_source
+      and "self._config_import_busy = False" in _bootstrap_source,
+      [line.strip() for line in _bootstrap_source.splitlines()
+       if "config" in line and "signal" in line])
+_new_names = ("build_host_config_import", "read_settings_file", "MACHINE_OWN_CONFIG_KEYS",
+              "SESSION_LOCAL_PATH_KEYS", "SETTINGS_FILE_MARKERS", "HostConfigFetchThread",
+              "MAX_CONFIG_PAYLOAD_BYTES")
+check("WN-N44 every name this added is a module-level one the seam reaches, and none of them is held only by the entry point",
+      all(seam.owned_by(name) and any(owner != mod.__name__ for owner in seam.owned_by(name))
+          for name in _new_names),
+      {name: seam.owned_by(name) for name in _new_names})
+check("WN-N45 both whole-config imports finish by making the window, the file and the next save say the same thing - the file written, the settings read back into the attributes that own them, and every control save_config reads out of refilled - and that is the order the reset to defaults got wrong",
+      "_apply_whole_config_import" in _pyw_source and "_reload_settings_into_ui" in _pyw_source
+      and "_write_settings_file" in _pyw_source and "self.load_config()" in _pyw_source
+      and "GET_CONFIG" in _sync_client_source and "GET_CONFIG" in _sync_host_source,
+      [name for name in ("_apply_whole_config_import", "_reload_settings_into_ui",
+                         "_write_settings_file") if name not in _pyw_source])
 
 shutil.rmtree(FIXTURE_ROOT, ignore_errors=True)
 check("WN-F9 every folder this suite wrote is gone again", not FIXTURE_ROOT.exists())

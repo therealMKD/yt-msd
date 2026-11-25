@@ -260,6 +260,10 @@ class BootstrapMixin:
         self._drive_probe_pending = False
         # Only one import or export at a time: both do heavy filesystem work.
         self._export_import_busy = False
+        # And one settings import at a time. Both whole-config imports - the one that asks a chain's host
+        # and the one that reads a gui_config.json - write over this machine's settings file, so they
+        # take turns with each other and with the export.
+        self._config_import_busy = False
         # Guards the cached drive/chain state above: the probe thread reads it,
         # the GUI thread writes it.
         self._runtime_state_lock = threading.RLock()
@@ -316,6 +320,9 @@ class BootstrapMixin:
         self.missing_deps_signal.connect(self._show_missing_dependencies)
         self.import_finished_signal.connect(self._apply_import_results)
         self.import_failed_signal.connect(self._on_import_failed)
+        # A settings file that read all right, brought back from the thread that read it and put in front
+        # of the user before it is allowed to replace anything.
+        self.config_file_ready_signal.connect(self._on_config_file_read)
         self.ytdlp_missing_signal.connect(self._show_ytdlp_missing_dialog)
         self.ytdlp_update_signal.connect(self._show_ytdlp_update_dialog)
         self.ytdlp_version_signal.connect(self._apply_ytdlp_version)
@@ -387,7 +394,12 @@ class BootstrapMixin:
             # A restore is the one thing a hosted chain does that this window has to take part in: the
             # code is made on the server's thread and shown on this one, and the folder watcher has to
             # be told to hold its tongue while the folder is being written into.
-            on_restore_event_cb=self.host_restore_signal.emit
+            on_restore_event_cb=self.host_restore_signal.emit,
+            # A client asking this machine for its settings is answered with the file, read the way the
+            # export reads it: under the lock the other two writers of that file hold, on the thread
+            # that was asked. Which of the settings in it belong on the machine that asked is decided
+            # there, and not here.
+            get_config_cb=self._config_payload_for_host
         )
         self.udp_beacon = UDPBeaconBroadcaster(
             lambda: self.sync_config_manager.hosted_chains,

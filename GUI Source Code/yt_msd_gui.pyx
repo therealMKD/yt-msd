@@ -94,6 +94,7 @@ from yt_msd.util.version import (
     _extract_version_number,
     _version_is_newer,
     select_release_asset,
+    version_notes_are_due,
 )
 from yt_msd.util.yaml import (
     yaml_dump,
@@ -223,35 +224,52 @@ from yt_msd.ui.render import (
 # still reads them by name. Wave 5h checked the group and dropped whatever nothing read.
 from yt_msd.sync.client import (
     HOST_REBUILT_NOTE,
+    NOTHING_TO_PUSH_NOTE,
+    PUSHED_NOTE,
     SYNC_DECISION_DELETE,
     SYNC_DECISION_KEEP,
     SYNC_DECISION_RESTORE,
+    HostConfigFetchThread,
     SyncClientWorker,
     _HostKeepalive,
     deletions_were_declined,
+    files_were_pushed,
     host_was_rebuilt,
+    make_push_code_cb,
+    make_push_confirm_cb,
     make_restore_code_cb,
     make_sync_decision_cb,
+    nothing_to_push,
+    push_was_left_undone,
     restore_was_left_undone,
 )
 from yt_msd.sync.config import (
     DEFAULT_DELETE_CONFIRM_LIMIT,
+    DEFAULT_PUSH_FILE_LIMIT,
     DEFAULT_SYNC_SETTINGS,
     DELETE_CONFIRM_LIMIT_MAX,
+    PUSH_FILE_LIMIT_MAX,
     SYNC_CONFIRM_WAIT_LIMIT,
     VISIBILITY_NOTICE_SETTING,
     SyncConfigManager,
     _CONFIG_WRITE_LOCK,
+    chain_can_push,
+    client_is_push_trusted,
     delete_confirm_limit,
     is_client_chain_paused,
+    push_file_limit,
+    push_trusted_ips,
 )
 from yt_msd.sync.discovery import (
+    advertised_chains,
     discover_host_on_lan,
+    send_lan_sync_request,
     send_lan_update_notification,
 )
 from yt_msd.sync.host import (
     HostFolderWatcher,
     SyncHostServer,
+    pending_push_request,
     pending_restore_request,
 )
 from yt_msd.sync.lan import (
@@ -294,7 +312,9 @@ from yt_msd.sync.transfer import (
 from yt_msd.sync.dialogs import (
     ConnectClientChainDialog,
     CreateHostChainDialog,
+    HostPushTrustDialog,
     HostRestoreCodeDialog,
+    PushToHostDialog,
     RestoreHostCodeDialog,
     SyncDeleteDecisionDialog,
     SyncManagerDialog,
@@ -307,15 +327,20 @@ from yt_msd.export import (
     EXPORT_MANIFEST_NAME,
     EXPORT_SKIP_DIRS,
     EXPORT_SYNC_ENTRY,
+    MACHINE_OWN_CONFIG_KEYS,
+    SESSION_LOCAL_PATH_KEYS,
+    SETTINGS_FILE_MARKERS,
     ExportDialog,
     SYNC_ONLY_CONFIG_KEYS,
     build_export_manifest_text,
     build_exported_config,
+    build_host_config_import,
     default_export_config,
     extract_package_music,
     iter_folder_files,
     music_import_destination,
     read_import_package,
+    read_settings_file,
     sanitize_archive_name,
     unique_music_archive_name,
     zip_folder_into,
@@ -329,6 +354,7 @@ from yt_msd.ui.dialogs import (
     TrayProgressPopup,
     UpdateAvailableDialog,
     UpdateReadyDialog,
+    VersionNotesDialog,
     YtDlpUpdateDialog,
 )
 
@@ -372,8 +398,11 @@ class MainApp(BootstrapMixin,
     sync_confirm_signal = Signal(str, str, str)  # (request id, window title, question) from a sync worker - parked until _on_sync_confirm answers
     sync_decision_signal = Signal(str, str, str)  # (request id, window title, question) from a client sync at its delete limit - parked until _on_sync_decision answers
     restore_code_signal = Signal(str, str, str)  # (request id, window title, "host ip:port" whose copy is being rebuilt) - parked until _on_restore_code answers
+    push_confirm_signal = Signal(str, str, str)  # (request id, window title, question) from a Mirror client sync holding files its host has never seen - parked until _on_push_confirm answers
+    push_code_signal = Signal(str, str, str)  # (request id, window title, "host ip:port" being pushed to) - parked until _on_push_code answers
     host_restore_signal = Signal(str, str, str, str)  # (sync code, client ip, event, note) from the host server, at each point of a rebuild this PC is the receiving end of
     chain_visibility_signal = Signal(str, str)  # (title, body) naming the hosted chains that are visible on the network - a box on the main window, from the startup check
+    config_file_ready_signal = Signal(str, object)  # (path, settings read out of it) from the settings-file import thread - confirmed on the GUI thread before anything is written
 
     def _on_host_activity(self, sync_code: str, client_ip: str, activity: str):
         """Called when a client connects or pulls files from our hosted sync chain."""
@@ -444,6 +473,13 @@ class MainApp(BootstrapMixin,
             # it, and the host itself refuses GET_INDEX and PULL_FILE for the same reason. The one
             # notification this owed is sent once, by _after_host_restore, with the folder complete.
             return
+        if server is not None and server.is_pushing(sync_code):
+            # A push writes a handful of files and the watcher fires for each one. A client told about a
+            # folder mid-push cannot lose anything to it - a push only adds, so an index read halfway
+            # through is missing files rather than offering the wrong ones - but it would be told five
+            # times about one push. The one notification a push owes is sent once, by _after_host_push,
+            # with every file down.
+            return
         port = self.sync_host_server.active_port if hasattr(self, 'sync_host_server') else 63350
         send_lan_update_notification(sync_code, port)
         # Emitted, not called directly: this runs on a watcher thread.
@@ -492,7 +528,12 @@ class MainApp(BootstrapMixin,
                     status_cb=_status,
                     progress_cb=_prog,
                     decision_cb=make_sync_decision_cb(self, chain_name),
-                    restore_code_cb=make_restore_code_cb(self, chain_name)
+                    restore_code_cb=make_restore_code_cb(self, chain_name),
+                    # The two halves of the push question, so the periodic check is the one that finds
+                    # files this machine made since its last sync and offers them to the host before it
+                    # deletes them to match.
+                    push_confirm_cb=make_push_confirm_cb(self, chain_name),
+                    push_code_cb=make_push_code_cb(self, chain_name)
                 )
                 if hasattr(self, 'dl_progress_signal'):
                     self.dl_progress_signal.emit("")
@@ -505,6 +546,13 @@ class MainApp(BootstrapMixin,
                         # this one, so there is nothing here to refresh and nothing to count as updated:
                         # what was written is on the host, and how much of it was needed is in the message.
                         self.status_signal.emit(f"Sync Chain '{cc.get('name')}': {msg}", False, "#1abd33")
+                    elif files_were_pushed(msg):
+                        # The same reason: this sync wrote into the host, and the local counts are the
+                        # smaller half of what happened. What the host took, and what it refused, is in
+                        # the message.
+                        self.status_signal.emit(f"Sync Chain '{cc.get('name')}': {msg}", False, "#1abd33")
+                        if self.local_current_path == cc.get('folder_path'):
+                            self.local_list_refresh_signal.emit()
                     elif transferred > 0 or deleted > 0:
                         self.status_signal.emit(f"Sync Chain '{cc.get('name')}': {transferred} updated, {deleted} removed.", False, "#1abd33")
                         if self.local_current_path == cc.get('folder_path'):
@@ -517,6 +565,12 @@ class MainApp(BootstrapMixin,
                     # A restore that did not happen is not a host that is offline. This PC reached its
                     # host, asked for a rebuild and did not get one; the chain is exactly as up to date
                     # as it was before, and what happened is in the message rather than in the status.
+                    self.status_signal.emit(f"Sync Chain '{cc.get('name')}': {msg}", False, "#FF8C00")
+                elif push_was_left_undone(msg):
+                    # The same for a push that did not happen, for the same reason: this PC reached its
+                    # host and the host said no, or nobody read the code out. Nothing here was changed,
+                    # and the files the push was about are still in this folder waiting for the next
+                    # sync to ask about them again.
                     self.status_signal.emit(f"Sync Chain '{cc.get('name')}': {msg}", False, "#FF8C00")
                 else:
                     cc['status'] = f"Host Offline"
@@ -556,7 +610,13 @@ class MainApp(BootstrapMixin,
                         f"[Sync: {c.get('name', 'Sync')}] [{idx}/{total_items}] ({int(done/total*100) if total > 0 else 0}%) {fname}"
                     ) if hasattr(self, 'dl_progress_signal') else None,
                     decision_cb=make_sync_decision_cb(self, c.get('name', 'Sync')),
-                    restore_code_cb=make_restore_code_cb(self, c.get('name', 'Sync'))
+                    restore_code_cb=make_restore_code_cb(self, c.get('name', 'Sync')),
+                    # A sync this PC was told to run by its host is still a sync of this folder: the
+                    # files it holds that are newer than its last sync and that the host has never seen
+                    # are the same files its deletion pass is about to take, whether the host asked for
+                    # this sync or the clock did.
+                    push_confirm_cb=make_push_confirm_cb(self, c.get('name', 'Sync')),
+                    push_code_cb=make_push_code_cb(self, c.get('name', 'Sync'))
                 )
                 if hasattr(self, 'dl_progress_signal'):
                     self.dl_progress_signal.emit("")
@@ -574,8 +634,80 @@ class MainApp(BootstrapMixin,
                         self.status_signal.emit(f"Sync Chain '{c.get('name')}': {msg}", False, "#FF8C00")
                 elif restore_was_left_undone(msg):
                     self.status_signal.emit(f"Sync Chain '{c.get('name')}': {msg}", False, "#FF8C00")
+                elif push_was_left_undone(msg):
+                    # A push that the host refused or that nobody authorised is not a host that went
+                    # away mid-sync: this chain is exactly as up to date here as it was a moment ago.
+                    self.status_signal.emit(f"Sync Chain '{c.get('name')}': {msg}", False, "#FF8C00")
                 self.sync_config_manager.save()
             threading.Thread(target=_bg, daemon=True).start()
+
+    def _announce_hosted_chains_for_sync(self):
+        """Tell the LAN, a moment after this machine comes up as a host, that its clients can fetch.
+
+        A client of a chain hosted here runs its own check 2.5 seconds after it starts. When the
+        host and the client come up together - after a reboot, or after both machines are switched on
+        - that check runs before this machine has a port open, and it comes back saying the host is
+        offline; the next time that client looks is whenever its own interval comes round. This is the
+        host answering that: one message naming the chains it hosts, which every machine following one
+        of them reads as its user having pressed Force Sync All.
+
+        Only the chains this machine advertises are named. A private chain's code is not put on the
+        network by anything else in this program, and it is not put there by a message that goes out
+        every time somebody starts yt-msd; a client following a private chain is still covered by its
+        own startup check and its own interval.
+        """
+        if not hasattr(self, 'sync_config_manager'):
+            return
+        hosted = list(self.sync_config_manager.hosted_chains)
+        if not hosted:
+            return
+        server = getattr(self, 'sync_host_server', None)
+        port = server.active_port if server is not None else 0
+        if port <= 0:
+            # Nothing is listening on this machine yet, so there is nothing for a client to fetch
+            # from and no reason to send anybody looking for it.
+            return
+        advertised = advertised_chains(hosted)
+        if not advertised:
+            return
+        codes = [str(entry.get('sync_code')) for entry in advertised]
+        names = ", ".join(str(entry.get('name') or 'Audio Playlist') for entry in advertised)
+
+        def _bg(codes=codes, port=port):
+            try:
+                send_lan_sync_request(port, codes)
+            except Exception:
+                pass
+
+        threading.Thread(target=_bg, daemon=True).start()
+        self.status_signal.emit(f"Hosting {names}: every client of these chains was asked to run its "
+                                "sync now.", False, "#3B8ED0")
+
+    def _on_lan_sync_request(self, host_ip: str, sync_codes):
+        """Called from the beacon thread when a machine hosting chains this PC follows says it is ready.
+
+        What follows it is the ordinary auto-sync pass - the same call the periodic timer makes - so
+        a chain that is Paused stays paused, a chain bound to a Wi-Fi network this PC is not on stays
+        bound, and each chain reports itself on its own card exactly as it does on a sync its user
+        started by hand. This is not a bypass: it is the same pass, arrived at from the other machine.
+
+        A message that names none of the chains this PC follows starts nothing. A broadcast reaches
+        every machine on the network, and the machines that have nothing to do with the one that sent
+        it have no reason to start work because of it.
+        """
+        if not hasattr(self, 'sync_config_manager') or not self.sync_config_manager.client_chains:
+            return
+        wanted = {str(code).strip() for code in (sync_codes or []) if str(code).strip()}
+        if not wanted:
+            return
+        matching = [cc for cc in self.sync_config_manager.client_chains
+                    if str(cc.get('sync_code')).strip() in wanted]
+        if not matching:
+            return
+        names = ", ".join(sorted({str(cc.get('name') or 'Sync') for cc in matching}))
+        self.status_signal.emit(f"Sync Chain '{names}': {host_ip} hosts it and asked its clients to "
+                                "fetch. Running the normal sync pass...", False, "#3B8ED0")
+        self._auto_sync_client_chains()
 
     def _check_wifi_network_change(self):
         """Monitors for Wi-Fi SSID changes and triggers auto-sync for bound sync chains."""
@@ -1062,6 +1194,103 @@ class MainApp(BootstrapMixin,
         waiter["answer"] = typed
         waiter["event"].set()
 
+    def ask_push_confirm(self, title: str, question: str) -> bool:
+        """Ask a client sync whether to offer its own new files to its host, from the worker's thread.
+
+        The same gate as the delete question above and the same waiter bookkeeping, because it is the
+        same kind of question: a worker parked mid-sync with its host connection kept warm, a window on
+        the GUI thread, and an answer that has to come back as a yes or a no rather than as a button.
+
+        An answer that never arrives is "don't push". A window nobody read, a window left open while this
+        PC goes to sleep, and a window closed by its own X all leave this machine's folder alone, which
+        is what every other unanswered question in this program does - and here it is the answer that
+        keeps a stranger out of somebody else's library.
+        """
+        waiter = {"event": threading.Event(), "answer": False}
+        with self._sync_confirm_lock:
+            self._sync_confirm_counter += 1
+            request_id = f"pc_{int(time.time() * 1000)}_{self._sync_confirm_counter}"
+            self.sync_confirm_waiters[request_id] = waiter
+        try:
+            self.push_confirm_signal.emit(request_id, title, question)
+            deadline = time.time() + SYNC_CONFIRM_WAIT_LIMIT
+            while time.time() < deadline:
+                if waiter["event"].wait(timeout=0.5):
+                    return bool(waiter["answer"])
+            return False
+        except Exception:
+            return False
+        finally:
+            with self._sync_confirm_lock:
+                self.sync_confirm_waiters.pop(request_id, None)
+
+    def _on_push_confirm(self, request_id: str, title: str, question: str):
+        """Main-thread slot for a Mirror client sync holding files its host has never seen.
+
+        The window is asked before the deletion pass rather than after it, which is the only reason the
+        warning on it is worth printing: these are the files this sync is about to delete, and pushing is
+        the one answer that keeps them anywhere at all.
+        """
+        waiter = self.sync_confirm_waiters.get(request_id)
+        if waiter is None:
+            return
+        try:
+            box = PushToHostDialog(self._sync_question_parent(), title, question)
+            box.exec()
+            answer = box.confirmed
+        except Exception:
+            answer = False
+        waiter["answer"] = answer
+        waiter["event"].set()
+
+    def ask_push_code(self, title: str, host_label: str) -> Optional[str]:
+        """Ask for the code the host is showing for a push, from the worker holding its connection open.
+
+        The same four characters as a Restore Host and the same arrangement - the code never travels down
+        the connection, so somebody has to read it off the other machine's screen - reached only when the
+        host has not already given this address leave to push. It is the longest wait in the program, and
+        the host, not this PC, is the one that gives up on it.
+
+        None means nothing was typed, and a None from here closes the offer from this end so the host's
+        screen stops showing a code nobody is going to read.
+        """
+        waiter = {"event": threading.Event(), "answer": None}
+        with self._sync_confirm_lock:
+            self._sync_confirm_counter += 1
+            request_id = f"pk_{int(time.time() * 1000)}_{self._sync_confirm_counter}"
+            self.sync_confirm_waiters[request_id] = waiter
+        try:
+            self.push_code_signal.emit(request_id, title, host_label)
+            deadline = time.time() + SYNC_CONFIRM_WAIT_LIMIT
+            while time.time() < deadline:
+                if waiter["event"].wait(timeout=0.5):
+                    return waiter["answer"]
+            return None
+        except Exception:
+            return None
+        finally:
+            with self._sync_confirm_lock:
+                self.sync_confirm_waiters.pop(request_id, None)
+
+    def _on_push_code(self, request_id: str, title: str, host_label: str):
+        """Main-thread slot for a client push that is holding a host's push offer open.
+
+        `host_label` is the host's 'ip:port', the only name this PC has for the machine it is about to
+        write into, and it is printed on the window so a person with two chains open can tell which
+        machine they are being asked to walk over to.
+        """
+        waiter = self.sync_confirm_waiters.get(request_id)
+        if waiter is None:
+            return
+        try:
+            box = RestoreHostCodeDialog(self._sync_question_parent(), title, host_label, purpose='push')
+            box.exec()
+            typed = box.code
+        except Exception:
+            typed = None
+        waiter["answer"] = typed
+        waiter["event"].set()
+
     def _host_chain_for_code(self, sync_code) -> Optional[dict]:
         """The hosted chain on this PC that a sync code belongs to, or nothing."""
         manager = getattr(self, 'sync_config_manager', None)
@@ -1155,9 +1384,15 @@ class MainApp(BootstrapMixin,
         Emitted by the host server from its own connection thread, which is why nothing in here reaches
         for a window except from this thread: the socket thread is not allowed to build a Qt window.
         Whatever the rebuild does to this machine's folder has already happened, or is about to, between
-        the two sockets - what arrives here is only what somebody at this screen has to know, and the
-        one window that has to appear on it.
+        the two sockets - what arrives here is only what somebody at this screen has to know, and the one
+        window that has to appear on it.
+
+        A push arrives on the same pump with 'push_' in front of its event names, and is handed to
+        _on_host_push_event: same thread, same rule about who may build a window, different windows.
         """
+        if event.startswith('push_'):
+            self._on_host_push_event(sync_code, client_ip, event[len('push_'):], note)
+            return
         if event == 'requested':
             self._open_host_restore_dialog(sync_code, client_ip, note)
             return
@@ -1197,6 +1432,153 @@ class MainApp(BootstrapMixin,
         folder = str((chain or {}).get('folder_path') or '')
         if folder and folder == getattr(self, 'local_current_path', ''):
             self.local_list_refresh_signal.emit()
+
+    def _host_push_dialog(self, sync_code):
+        """The push code window this host is showing for this chain, if it is showing one."""
+        return getattr(self, '_host_push_dialogs', {}).get(str(sync_code))
+
+    def _settle_host_push_dialog(self, sync_code, reason: str):
+        """Take this chain's push code window off the screen because the offer behind it is over."""
+        dialog = getattr(self, '_host_push_dialogs', {}).pop(str(sync_code), None)
+        if dialog is None:
+            return
+        try:
+            dialog.settled_elsewhere(reason)
+        except Exception:
+            pass
+
+    def _open_host_push_dialog(self, sync_code: str, client_ip: str, code: str):
+        """Put the code a client is waiting for, to push into this folder, on this machine's own screen.
+
+        The same arrangement as a restore code, and for the same reason: the code is read out of this
+        host's own registry rather than out of what arrived over the wire, because this window and the
+        offer behind it have to be showing the same thing, and a window is not something a socket thread
+        is allowed to build.
+        """
+        session = pending_push_request(sync_code)
+        chain = self._host_chain_for_code(sync_code)
+        chain_name = str((chain or {}).get('name') or f"Code {sync_code}")
+        if session is None:
+            # The offer closed between the socket making it and this window being raised - another client
+            # asked about the same chain, or nothing was keeping it alive. Showing a code that nothing
+            # would accept is worse than showing nothing.
+            self._settle_host_push_dialog(sync_code, 'the offer closed')
+            self.status_signal.emit(f"Sync Chain '{chain_name}': push request from {client_ip} closed before "
+                                    "a code could be shown. Nothing was changed here.", False, "#FF8C00")
+            return
+        self._settle_host_push_dialog(sync_code, 'a newer request replaced it')
+        seconds_left = float(session.get('expires_at', 0.0)) - time.time()
+        dialog = HostRestoreCodeDialog(
+            self._sync_question_parent(), str(sync_code), chain_name, client_ip,
+            str(session.get('code') or code),
+            seconds_left if seconds_left > 0 else SYNC_RESTORE_CODE_TIMEOUT,
+            on_cancel=self._cancel_host_push_offer,
+            purpose='push',
+        )
+        self._host_push_dialogs[str(sync_code)] = dialog
+        dialog.finished.connect(lambda _result=0, _key=str(sync_code): self._host_push_dialogs.pop(_key, None))
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        self.status_signal.emit(f"Sync Chain '{chain_name}': {client_ip} is asking to push files into this "
+                                "host. Read the code on the Push To Host window to whoever is at that machine.",
+                                False, "#FF8C00")
+
+    def _cancel_host_push_offer(self, sync_code: str, code: str):
+        """Close a push code from this machine's screen, and say what that did to the client waiting on it."""
+        server = getattr(self, 'sync_host_server', None)
+        chain = self._host_chain_for_code(sync_code)
+        chain_name = str((chain or {}).get('name') or f"Code {sync_code}")
+        closed = bool(server.cancel_push_request(sync_code, code)) if server is not None else False
+        if not closed:
+            self.status_signal.emit(f"Sync Chain '{chain_name}': that push had already been accepted or closed, "
+                                    "so there was nothing here to cancel.", False, "#d9822b")
+            return
+        self.status_signal.emit(f"Sync Chain '{chain_name}': push code closed here. The client waiting on it "
+                                "was told, and nothing on this host was changed.", False, "#FF8C00")
+
+    def _on_host_push_event(self, sync_code: str, client_ip: str, event: str, note: str):
+        """Main-thread slot for the points of a push that this PC is the receiving end of."""
+        if event == 'requested':
+            self._open_host_push_dialog(sync_code, client_ip, note)
+            return
+        if event == 'started':
+            self._settle_host_push_dialog(sync_code, 'the code was named and the files are on their way')
+            self.status_signal.emit(f"Sync Chain (Code {sync_code}) is taking files from {client_ip}: nothing "
+                                    "here is being deleted, and only what this host is missing is being written.",
+                                    False, "#3B8ED0")
+            return
+        if event == 'cancelled':
+            self._settle_host_push_dialog(sync_code, f"the push was cancelled ({note})")
+            self.status_signal.emit(f"Sync Chain (Code {sync_code}) push not carried out ({note}). Nothing on "
+                                    "this host was changed.", False, "#FF8C00")
+            return
+        if event == 'finished':
+            self._settle_host_push_dialog(sync_code, 'the push finished')
+            self._after_host_push(sync_code, client_ip, note)
+
+    def _after_host_push(self, sync_code: str, client_ip: str, note: str):
+        """Tell the rest of the chain about a folder that has just taken a push, then ask about the next one.
+
+        The folder watcher was held off for the length of the push - it fires per file, and the whole
+        point of holding it off is that a client syncing against a half-written folder is a client making
+        worse decisions - so this is the one notification it owed, sent once, with every file down. That
+        is the force-sync half: the pushing client, the other clients on this chain and any drive on them
+        all hear about the new tracks in the same moment.
+
+        The question after it is only asked of a client that needed a code to do this. An address this
+        host has already said "no code" to has been asked already, and asking it again would be asking a
+        person to decide something they have decided.
+        """
+        server = getattr(self, 'sync_host_server', None)
+        port = server.active_port if server is not None else 63350
+        try:
+            send_lan_update_notification(sync_code, port)
+        except Exception:
+            pass
+
+        chain = self._host_chain_for_code(sync_code)
+        if chain is None:
+            return
+        folder = str(chain.get('folder_path') or '')
+        if folder and folder == getattr(self, 'local_current_path', ''):
+            self.local_list_refresh_signal.emit()
+
+        # Said before anything else, because the two answers that follow it - a window asking about the
+        # next push, or a trusted client that is not being asked - both happen after this folder has
+        # already been written into, and a host that has taken files and said nothing about them is a
+        # host whose library grew from somewhere else with nobody noticing.
+        received, refused = server.last_push_counts(sync_code) if server is not None else (0, 0)
+        refused_note = f", {refused} refused" if refused else ""
+        self.status_signal.emit(f"Sync Chain (Code {sync_code}) took files from {client_ip}: {received} "
+                                f"file(s) added{refused_note}. Clients on the LAN have been told.",
+                                False, "#1abd33")
+
+        if client_is_push_trusted(chain, client_ip):
+            return
+
+        chain_name = str(chain.get('name') or f"Code {sync_code}")
+        try:
+            box = HostPushTrustDialog(self._sync_question_parent(), chain_name, client_ip, note)
+            box.exec()
+            trust = box.trust
+        except Exception:
+            trust = False
+
+        if not trust:
+            self.status_signal.emit(f"Sync Chain '{chain_name}': {client_ip} was allowed to push once. Its next "
+                                    "push needs a code from this screen again.", False, "#888")
+            return
+
+        if self.sync_config_manager.trust_push_client(chain.get('id'), client_ip):
+            self.status_signal.emit(f"Sync Chain '{chain_name}': {client_ip} can push here without a code from "
+                                    "now on. Take that back from the card in Sync Chains.", False, "#1abd33")
+            manager_dialog = getattr(self, 'sync_manager_dialog', None)
+            try:
+                if manager_dialog is not None and manager_dialog.isVisible():
+                    QTimer.singleShot(0, manager_dialog.refresh_cards)
+            except RuntimeError:
+                pass
 
 
 
@@ -1293,6 +1675,44 @@ class MainApp(BootstrapMixin,
         )
         msg.setStandardButtons(QMessageBox.Ok)
         msg.exec()
+
+    def _show_version_notes(self):
+        """The box that says this copy of yt-msd has just become a new version, when it has.
+
+        What decides it is the version this copy wrote into its own settings file the last time it
+        said this, and nothing to do with how the new version got here. An update the app downloaded
+        itself, a setup program run by hand over the top of this folder, a swap helper that put a new
+        exe where the old one was and a source file written over the one being run all leave the same
+        settings file where it was, so all four are noticed the same way: the version running is no
+        longer the version that was reported.
+
+        It is recorded before the window is shown rather than when it is closed, because a box that
+        is shown and then never answered - a machine switched off a moment later, a window pushed
+        aside - has still told the user what it told them, and a version that says it twice is a
+        version nobody believes.
+        """
+        seen = str(getattr(self, 'last_seen_version', '') or '')
+        if not version_notes_are_due(APP_VERSION, seen):
+            # Either this version has already been reported, or this build carries no version worth
+            # reporting. In the other case - a copy moved back to an older build - the older version
+            # is left recorded as it was, and the next upgrade is reported then.
+            return
+        self.last_seen_version = APP_VERSION
+        self.save_config()
+        try:
+            box = VersionNotesDialog(self, APP_VERSION, seen)
+        except Exception:
+            return
+        box.show()
+        box.raise_()
+        box.activateWindow()
+        previous = f" from {seen}" if seen and seen != APP_VERSION else ""
+        self.status_signal.emit(f"yt-msd was updated{previous} to version {APP_VERSION}. The changelog "
+                                f"is on the release page, and it is open in the box on screen.",
+                                False, "#1abd33")
+        if trace.enabled():
+            trace.note(f"first start as version {APP_VERSION}"
+                       + (f" (previous version recorded: {seen})" if seen else " (no version recorded yet)"))
 
     def _check_for_updates(self):
         """Query the GitHub releases page and notify the user if the newest release is newer than this build."""
@@ -1731,6 +2151,11 @@ class MainApp(BootstrapMixin,
                     self.normalization_threads = c.get('normalization_threads', max(1, os.cpu_count() // 2))
                     self.local_rescan_interval = c.get('local_rescan_interval', 60)
                     self.disable_update_checks = c.get('disable_update_checks', False)
+                    # The version this copy has already told the user it is on, kept as the text it
+                    # was written as. It is the whole record of whether the box about a new version
+                    # has been shown for this version yet, and it survives an update because it sits
+                    # in the settings file the setup program leaves alone.
+                    self.last_seen_version = str(c.get('last_seen_version', '') or '')
                     self.disable_ytdlp_updates = c.get('disable_ytdlp_updates', False)
                     self.ytdlp_last_update_check = float(c.get('ytdlp_last_update_check', 0.0) or 0.0)
                     # "Stop after current" is the one playback choice that outlives the window it was
@@ -1809,6 +2234,10 @@ class MainApp(BootstrapMixin,
             'normalization_threads': self.normalization_threads,
             'local_rescan_interval': getattr(self, 'local_rescan_interval', 60),
             'disable_update_checks': getattr(self, 'disable_update_checks', False),
+            # Written back every close so a version that has been reported stays reported. Read by
+            # load_config, and written a second time by _show_version_notes the moment the box about
+            # a new version is put on screen, so a window that is never closed still counts.
+            'last_seen_version': getattr(self, 'last_seen_version', ''),
             'disable_ytdlp_updates': getattr(self, 'disable_ytdlp_updates', False),
             'ytdlp_last_update_check': getattr(self, 'ytdlp_last_update_check', 0.0),
             # The state as it stands when the window closes. "always" is read straight back by
@@ -2242,18 +2671,30 @@ class MainApp(BootstrapMixin,
         self.status_signal.emit(f"Exported {file_count} files to {zip_path}", False, "#1abd33")
 
     def open_import_dialog(self):
-        """Pick a .zip export package; everything else follows export.yaml."""
+        """Pick a .zip export package or a bare gui_config.json; the choice decides which import runs.
+
+        A .zip is read by export.yaml and restores only what its manifest says it holds. A settings file
+        has no manifest and no parts: it is this machine's settings replaced whole, which is why it gets
+        its own worker and its own confirmation rather than being folded into the package path.
+        """
         if self._export_import_busy:
             self._on_status_update("Please wait: an import or export is already running.", False, "#d9822b")
             return
+        if getattr(self, '_config_import_busy', False):
+            self._on_status_update("Please wait: a settings import is already running.", False, "#d9822b")
+            return
         start_dir = getattr(self, 'download_path', '') or os.path.expanduser("~")
-        zip_path, _ = QFileDialog.getOpenFileName(self, "Import yt-msd Package", start_dir,
-                                                  "yt-msd Package (*.zip);;All Files (*)")
-        if not zip_path:
+        chosen, _ = QFileDialog.getOpenFileName(self, "Import yt-msd Package Or Settings", start_dir,
+                                                "yt-msd Package (*.zip);;yt-msd Settings (*.json);;"
+                                                "All Files (*)")
+        if not chosen:
+            return
+        if chosen.lower().endswith(".json"):
+            self._start_bare_config_import(chosen)
             return
         self._export_import_busy = True
         self._on_status_update("Importing package...", False, "#3B8ED0")
-        threading.Thread(target=self._import_worker, args=(zip_path,), daemon=True).start()
+        threading.Thread(target=self._import_worker, args=(chosen,), daemon=True).start()
 
     def _import_worker(self, zip_path: str):
         """Read the manifest and unpack any music off the GUI thread."""
@@ -2284,6 +2725,10 @@ class MainApp(BootstrapMixin,
 
     def _on_import_failed(self, message: str):
         self._export_import_busy = False
+        # The settings-file import reports its failures through this signal too, and it holds its own
+        # guard: left closed, the failed import would keep the Import button and the card button waiting
+        # on a run that had already ended.
+        self._config_import_busy = False
         self._on_status_update(message, False, "#d9822b")
 
     def _apply_import_results(self, plan: dict):
@@ -2508,6 +2953,341 @@ class MainApp(BootstrapMixin,
         # The caller refreshes the local list once everything the package carries
         # has been restored, so the scan sees the imported files too.
         return touched_local and os.path.isdir(self.local_current_path or "")
+
+    # ── WHOLE-CONFIG IMPORT (from a chain's host, or from a gui_config.json) ──
+    def _config_payload_for_host(self) -> dict:
+        """This machine's settings, in the shape the host half of a chain sends them.
+
+        Read from the file and not out of this window, under the lock the file's other two writers
+        hold: what a client asks for is this machine's settings file, and it must not be able to catch
+        that file half-written. Every settings change this program makes writes the file as the change
+        happens, so the file is the current settings rather than a copy of yesterday's. A corrupt or
+        unreadable file raises, and the host answers that request with the reason instead of with half
+        a config.
+        """
+        with _CONFIG_WRITE_LOCK:
+            if not os.path.exists(self.config_path):
+                return {}
+            with open(self.config_path, 'r', encoding='utf-8') as handle:
+                return json.load(handle)
+
+    def _current_config_snapshot(self) -> dict:
+        """What this machine's settings are at this moment, in the shape a settings file holds them.
+
+        The file first, and then the keys this window is holding live on top of it. A folder picked
+        since this window opened, a chain whose host was just found at a new address, a sync interval
+        changed a minute ago - each is in memory before it is in the file, and an import that read only
+        the file would write an older machine than the one it is running on.
+        """
+        try:
+            snapshot = dict(self._config_payload_for_host() or {})
+        except Exception:
+            snapshot = {}
+        manager = getattr(self, 'sync_config_manager', None)
+        if manager is not None:
+            snapshot['hosted_chains'] = [dict(chain) for chain in manager.hosted_chains]
+            snapshot['client_chains'] = [dict(chain) for chain in manager.client_chains]
+            snapshot['sync_settings'] = dict(manager.settings)
+        snapshot['folders'] = list(getattr(self, 'recent_folders', []) or [])
+        snapshot['local_folders'] = list(getattr(self, 'local_folders', []) or [])
+        snapshot['local_current_path'] = str(getattr(self, 'local_current_path', '') or '')
+        snapshot['renamer_path'] = str(getattr(self, 'renamer_path', '') or '')
+        snapshot['custom_script_path'] = str(getattr(self, 'custom_script_path', '') or '')
+        snapshot['last_seen_version'] = str(getattr(self, 'last_seen_version', '') or '')
+        return snapshot
+
+    def _write_settings_file(self, payload: dict) -> bool:
+        """Make `payload` this machine's settings file, whole.
+
+        Written to a side name and moved into place rather than written over the live file: a write
+        that stopped half way would leave this machine with half a settings file, and half a settings
+        file is the settings it starts with next time. Held under the same lock MainApp.save_config and
+        SyncConfigManager.save write under, so this cannot interleave with either of them.
+        """
+        try:
+            with _CONFIG_WRITE_LOCK:
+                temp_path = f"{self.config_path}.importing"
+                with open(temp_path, 'w', encoding='utf-8') as handle:
+                    json.dump(payload, handle, indent=4)
+                os.replace(temp_path, self.config_path)
+            return True
+        except Exception:
+            return False
+
+    def import_config_from_host(self, chain_config: dict):
+        """The button on a client chain's card: take that host's settings and put them on this PC.
+
+        The question comes first, because what follows replaces everything this window has been set to.
+        The fetch is the ordinary client half of a chain - the address it already syncs to, the same
+        AUTH, the same name it answers with - and nothing on this machine is written to until the host
+        has actually answered with its settings.
+        """
+        if getattr(self, '_config_import_busy', False):
+            self._on_status_update("Please wait: a settings import is already running.", False, "#d9822b")
+            return
+        if getattr(self, '_export_import_busy', False):
+            self._on_status_update("Please wait: an import or export is already running.", False, "#d9822b")
+            return
+        if any(thread is not None and thread.isRunning()
+               for thread in list(getattr(self, 'sync_threads', {}).values())):
+            self._on_status_update("Please wait: a sync is running. Import the settings once it has "
+                                   "finished.", False, "#d9822b")
+            return
+
+        chain_name = str(chain_config.get('name') or 'this chain')
+        host_label = str(chain_config.get('last_known_host_ip') or '').strip() or 'its host'
+        answer = QMessageBox.question(
+            self, "Import Settings From Host",
+            f"Take the settings of {chain_name} ({host_label}) onto this PC?\n\n"
+            "This overwrites your entire config. Everything this machine is set to - the theme and "
+            "accent, the saved playlist, the saved search, the download format, bitrate, threads, "
+            "normalisation, renaming, custom arguments, the local pane's options, the update opt-outs - "
+            "becomes what that machine has, and there is no undoing it. Export a package first if you "
+            "want yours back.\n\n"
+            "Two things are left as they are, because they describe this machine and not its settings: "
+            "your sync chains (the chains this PC hosts, the ones it follows, and how it syncs them) "
+            "and your local file paths (your download folders, your file-browser folders, and the "
+            "renamer and script paths you set).\n\n"
+            "Nothing here changes until the host answers.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            self._on_status_update(f"Nothing imported from {host_label}.", False, "#3B8ED0")
+            return
+
+        self._config_import_busy = True
+        thread = HostConfigFetchThread(chain_config)
+        self._host_config_thread = thread
+
+        def _on_status(txt):
+            self.status_signal.emit(txt, False, "#3B8ED0")
+
+        def _on_finished(ok, message, payload):
+            self._on_host_config_fetched(ok, message, payload, chain_config)
+
+        thread.status_signal.connect(_on_status)
+        thread.finished_signal.connect(_on_finished)
+        thread.start()
+        self._on_status_update(f"Asking {host_label} for its settings...", False, "#3B8ED0")
+
+    def _on_host_config_fetched(self, ok: bool, message: str, payload, chain_config: dict):
+        """What a host's answer about its settings does to this machine, on the GUI thread."""
+        self._config_import_busy = False
+        chain_name = str(chain_config.get('name') or 'the chain')
+        if not ok:
+            # The attempt may still have found this chain's host at a new address, and learned what the
+            # host calls the chain, on its way to being refused. Those are the chain's own facts and
+            # they are worth keeping; nothing else about this machine was touched.
+            manager = getattr(self, 'sync_config_manager', None)
+            if manager is not None:
+                manager.save()
+            self._on_status_update(f"Settings not imported from {chain_name}: {message}", False, "#d9822b")
+            return
+        self._apply_whole_config_import(payload, f"the host of sync chain '{chain_name}'",
+                                        keep_own_keys=True)
+
+    def _apply_whole_config_import(self, payload: dict, source_label: str, keep_own_keys: bool) -> bool:
+        """Make imported settings this machine's settings - the file, the memory, and the window.
+
+        That order is the whole of it. save_config() writes a settings file out of what this window's
+        attributes and widgets hold rather than out of the file, so an import that wrote the file and
+        stopped there would have the previous settings written straight back over it by the next save -
+        which is exactly how a "reset to defaults" once failed to take. The file is written first,
+        load_config() then reads it back into the attributes it owns, and _reload_settings_into_ui()
+        puts each of those onto the control that displays it, so the window, the file and the next save
+        all say the same thing.
+
+        `keep_own_keys` says which import this is: a host's settings arrive with this machine's chains,
+        folders and paths left as they are, and a settings file picked out of a folder arrives with
+        everything in it, chains included.
+        """
+        if any(thread is not None and thread.isRunning()
+               for thread in list(getattr(self, 'sync_threads', {}).values())):
+            # A chain mid-sync is working from a chain record this import is about to replace, and it
+            # is writing files under that record's rule. Nothing is changed while one is running.
+            self._config_import_busy = False
+            self._on_status_update("A sync is running. Nothing was imported.", False, "#d9822b")
+            return False
+
+        written = (build_host_config_import(self._current_config_snapshot(), payload)
+                   if keep_own_keys else dict(payload))
+        if not self._write_settings_file(written):
+            self._config_import_busy = False
+            self._on_status_update(f"The settings from {source_label} could not be written. Nothing was "
+                                   "changed.", False, "#d9822b")
+            return False
+
+        self.load_config()
+        manager = getattr(self, 'sync_config_manager', None)
+        if not keep_own_keys and manager is not None:
+            # The file this import wrote is this machine's chain list now. SyncConfigManager holds the
+            # live copies of that list - the sync window's cards, the auto-sync timer, the hosted folder
+            # watchers and the host server all read the manager and not the file - so the old copies
+            # are emptied before the new file is read back. Left in place they would be written straight
+            # back into the file by the next chain operation, which is the same way the reset to
+            # defaults once left every chain it claimed to remove.
+            manager.hosted_chains.clear()
+            manager.client_chains.clear()
+            manager.settings = dict(DEFAULT_SYNC_SETTINGS)
+            manager.load()
+        self._reload_settings_into_ui()
+        self._update_sync_timer()
+        self.refresh_sync_watchers()
+        sync_dialog = getattr(self, 'sync_manager_dialog', None)
+        if sync_dialog is not None:
+            try:
+                sync_dialog.refresh_cards(force=True)
+            except Exception:
+                pass
+        kept = (" Your sync chains, download folders, file-browser folders and tool paths were left "
+                "exactly as they were." if keep_own_keys else
+                " The chains that file named are now this machine's chains.")
+        self._on_status_update(f"Imported settings from {source_label}: theme, saved playlist, saved "
+                               f"search, download settings - everything that config named.{kept}",
+                               False, "#1abd33")
+        return True
+
+    def _reload_settings_into_ui(self):
+        """Push everything load_config() has just read back out into the window that shows it.
+
+        save_config() reads the format, the bitrate, the search text, the run-renamer tick and the panel
+        widths straight off these controls, so a control left holding the old value puts the old setting
+        back into the new file the next time anything is saved. Signals are held while the controls are
+        set: a handler firing against a value that has already been changed underneath it writes the
+        settings back over the import, which is the other way this kind of change used to come undone.
+        """
+        if hasattr(self, 'format_combo'):
+            self.format_combo.blockSignals(True)
+            self.format_combo.setCurrentText(self.format_var)
+            self.format_combo.blockSignals(False)
+        if hasattr(self, 'bitrate_combo'):
+            self.bitrate_combo.blockSignals(True)
+            self.bitrate_combo.setCurrentText(self.bitrate_var)
+            self.bitrate_combo.blockSignals(False)
+        if hasattr(self, 'path_combo'):
+            # The download bar shows one folder and remembers the rest in this combo, and save_config()
+            # writes the list back out of recent_folders - which the combo is the way the user changes.
+            self.path_combo.blockSignals(True)
+            self.path_combo.clear()
+            self.path_combo.addItems([str(folder) for folder in self.recent_folders])
+            self.path_combo.setCurrentText(self.download_path)
+            self.path_combo.blockSignals(False)
+        if hasattr(self, 'search_entry'):
+            self.search_entry.blockSignals(True)
+            self.search_entry.setText(self.last_search)
+            self.search_entry.blockSignals(False)
+        if hasattr(self, 'vol_slider'):
+            self.vol_slider.setValue(self.volume_val)
+        if hasattr(self, 'local_meta_cb'):
+            self.local_meta_cb.blockSignals(True)
+            self.local_meta_cb.setChecked(bool(getattr(self, 'show_local_metadata', False)))
+            self.local_meta_cb.blockSignals(False)
+        if hasattr(self, 'run_renamer_cb'):
+            self.run_renamer_cb.blockSignals(True)
+            self.run_renamer_cb.setChecked(bool(getattr(self, 'run_renamer', False)))
+            self.run_renamer_cb.blockSignals(False)
+        if hasattr(self, 'channel_prefix_cb'):
+            self.channel_prefix_cb.blockSignals(True)
+            self.channel_prefix_cb.setChecked(bool(getattr(self, 'channel_prefix_rename', True)))
+            self.channel_prefix_cb.blockSignals(False)
+        if (hasattr(self, 'main_splitter') and hasattr(self, 'content_splitter')
+                and len(self.splitter_sizes) == 3):
+            self.main_splitter.setSizes([self.splitter_sizes[0],
+                                         self.splitter_sizes[1] + self.splitter_sizes[2]])
+            self.content_splitter.setSizes([self.splitter_sizes[1], self.splitter_sizes[2]])
+            # The widths that arrived with the imported config are somebody's arrangement. The one each
+            # splitter kept privately belongs to the settings this import replaced, and a double-click
+            # on a handle must not put those back.
+            for splitter in (self.main_splitter, self.content_splitter):
+                splitter._last_custom_sizes = []
+        # The local pane's folder list and the folder open in it, whether or not this import named
+        # them: the address bar was filled once at startup, so it is filled again from the settings this
+        # window now holds, and the list is re-scanned so it shows that folder and not the last one.
+        self.set_local_explorer_address(self.local_current_path,
+                                        add_to_recent=os.path.isdir(self.local_current_path or ""))
+        self.refresh_local_list()
+        # The renamer half is a second copy of this program, and it reads these settings from TUNING
+        # rather than from this window. Left un-pushed, an imported pad or trim would apply to the next
+        # download here and not to a single file the renamer touched.
+        TUNING.from_settings(self.silence_trim, self.silence_pad_dur,
+                             self.use_custom_norm_cmd, self.custom_norm_cmd)
+        if hasattr(self, 'local_rescan_timer'):
+            self._update_local_rescan_timer()
+        self.apply_theme()
+        # The Settings window is cached on MainApp and reused, and it reads these attributes only when
+        # it is first built. Left open, it goes on showing - and the next toggle writes back - the
+        # settings this import replaced. reset_to_defaults() drops it for the same reason.
+        settings_dialog = getattr(self, 'settings_dialog', None)
+        if settings_dialog is not None:
+            try:
+                settings_dialog.close()
+            except Exception:
+                pass
+            self.settings_dialog = None
+
+    def _start_bare_config_import(self, json_path: str):
+        """A gui_config.json picked out of a folder: read it first, ask second.
+
+        The reading is what tells this window whether the file is a settings file at all, and a question
+        about overwriting everything is only worth asking once there is something to overwrite. The read
+        runs on a worker thread because the file may be on a slow drive or a share, and nothing on this
+        machine is touched until somebody says yes to what was found in it.
+        """
+        if any(thread is not None and thread.isRunning()
+               for thread in list(getattr(self, 'sync_threads', {}).values())):
+            self._on_status_update("Please wait: a sync is running. Import the settings once it has "
+                                   "finished.", False, "#d9822b")
+            return
+        self._config_import_busy = True
+        threading.Thread(target=self._bare_config_worker, args=(json_path,), daemon=True).start()
+        self._on_status_update(f"Reading {os.path.basename(json_path)}...", False, "#3B8ED0")
+
+    def _bare_config_worker(self, json_path: str):
+        """Read a settings file off whatever device it is on, and report what it was."""
+        name = os.path.basename(json_path)
+        try:
+            payload = read_settings_file(json_path)
+        except ValueError as exc:
+            self.import_failed_signal.emit(f"{name} is not a yt-msd settings file: {exc}")
+            return
+        except Exception as exc:
+            self.import_failed_signal.emit(f"Could not read {name}: {exc}")
+            return
+        self.config_file_ready_signal.emit(json_path, payload)
+
+    def _on_config_file_read(self, json_path: str, payload):
+        """The file that read all right, put in front of the user before it replaces anything.
+
+        A straight overwrite, exactly as the file stands: every setting in it becomes this machine's,
+        and its chains come with it. What a settings file does not name is missing from this machine
+        afterwards rather than left over from before it, which is how this program already reads a
+        settings file it cannot fully recognise.
+        """
+        self._config_import_busy = False
+        name = os.path.basename(json_path)
+        if not isinstance(payload, dict) or not payload:
+            self._on_status_update(f"{name} had nothing in it to import.", False, "#d9822b")
+            return
+        names_chains = bool(payload.get('hosted_chains') or payload.get('client_chains'))
+        chain_line = ("Its sync chains come with it: the chains this file names become the chains this "
+                      "machine hosts and follows, and how it syncs them becomes the way that file "
+                      "syncs them."
+                      if names_chains else
+                      "It names no sync chains, so this machine will host none and follow none once "
+                      "this is done. If that is not what you meant, say no and import the machine's "
+                      "whole .zip package instead.")
+        answer = QMessageBox.question(
+            self, "Overwrite Settings With This File",
+            f"Make {name} this machine's settings?\n\n"
+            f"{len(payload)} settings will replace everything this window is set to now - theme and "
+            "accent, saved playlist, saved search, download format, bitrate, threads, normalisation, "
+            "renaming, custom arguments, the local pane's options, the update opt-outs - and there is "
+            "no undoing it. Export a package first if you want your current settings back.\n\n"
+            + chain_line,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            self._on_status_update("Nothing was imported.", False, "#3B8ED0")
+            return
+        self._apply_whole_config_import(payload, name, keep_own_keys=False)
 
     def toggle_local_pane(self):
         sizes = self.main_splitter.sizes()

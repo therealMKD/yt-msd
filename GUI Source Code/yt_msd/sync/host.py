@@ -5,6 +5,7 @@
 # moved here is unchanged; only the imports needed to reach the rest of the program were
 # added.
 import os
+import json
 import random
 import threading
 import time
@@ -15,9 +16,10 @@ from yt_msd.audio.tags import read_metadata_tags
 from yt_msd.constants import AUDIO_EXTENSIONS
 from yt_msd.deps import FileSystemEventHandler, Observer, _WATCHDOG_AVAILABLE
 from yt_msd.sync.config import client_is_push_trusted, host_chain_is_visible, push_file_limit
-from yt_msd.sync.lan import (DISCOVERY_APP_NAME, RESTORE_CODE_ALPHABET, RESTORE_CODE_LENGTH,
-                             SYNC_PORT_END, SYNC_PORT_START, SYNC_RESTORE_CODE_TIMEOUT,
-                             SYNC_RESTORE_HANDSHAKE_TIMEOUT, SYNC_SOCKET_TIMEOUT, restore_code_shape)
+from yt_msd.sync.lan import (DISCOVERY_APP_NAME, MAX_CONFIG_PAYLOAD_BYTES, RESTORE_CODE_ALPHABET,
+                             RESTORE_CODE_LENGTH, SYNC_PORT_END, SYNC_PORT_START,
+                             SYNC_RESTORE_CODE_TIMEOUT, SYNC_RESTORE_HANDSHAKE_TIMEOUT,
+                             SYNC_SOCKET_TIMEOUT, restore_code_shape)
 
 from yt_msd.sync.transfer import (compute_file_sha256, filter_audio_files, recv_file_from_socket,
                                   recv_json_msg, send_json_msg, stream_file_to_socket)
@@ -372,7 +374,8 @@ class SyncHostServer:
     """TCP Server serving hosted sync chains to connected clients."""
     def __init__(self, get_hosted_chains_cb: Callable[[], List[dict]],
                  on_client_activity_cb: Optional[Callable[[str, str, str], None]] = None,
-                 on_restore_event_cb: Optional[Callable[[str, str, str, str], None]] = None):
+                 on_restore_event_cb: Optional[Callable[[str, str, str, str], None]] = None,
+                 get_config_cb: Optional[Callable[[], Optional[dict]]] = None):
         self.get_hosted_chains_cb = get_hosted_chains_cb
         self.on_client_activity_cb = on_client_activity_cb
         # Called as (sync_code, client_ip, event, note) at each point of a rebuild or a push the window
@@ -384,6 +387,12 @@ class SyncHostServer:
         # one machine can be asked to rebuild itself and asked to take a handful of new files in the
         # same minute. Everything else about either happens between the two sockets.
         self.on_restore_event_cb = on_restore_event_cb
+        # What this machine answers a client that asks for its settings. A callback rather than a path,
+        # for the same reason the hosted chains and the port are callbacks: this class is the protocol
+        # end of a sync chain, and where a settings file lives belongs to the window that owns it. A
+        # server built without one - a test harness, a probe, an older caller - answers that request
+        # with a refusal and carries on serving everything else it always served.
+        self.get_config_cb = get_config_cb
         self.server_sock: Optional[socket.socket] = None
         self.active_port: int = 0
         self._running = False
@@ -807,6 +816,40 @@ class SyncHostServer:
                     send_json_msg(sock, {'status': 'CANCELLED'})
                     self._push_event('cancelled', sync_code, client_ip, 'client cancelled')
                     break
+
+                elif cmd == 'GET_CONFIG':
+                    # "Send me your settings." This client has already been through AUTH for one of this
+                    # machine's chains, so it is a machine this host has been sharing a folder with all
+                    # along; what it is asking for now is the settings file rather than another track.
+                    # What goes back is this machine's settings as they stand on its own disk, keys and
+                    # all - which of them belong to the machine receiving them is decided at that end,
+                    # and a host that started guessing about another machine's folders would be guessing
+                    # about a folder it has never seen. It is reported on the host's own card, because a
+                    # settings file is the one thing a client can take from this machine whole.
+                    host_config = None
+                    read_problem = ''
+                    if self.get_config_cb is None:
+                        read_problem = 'This host does not offer its settings'
+                    else:
+                        try:
+                            host_config = self.get_config_cb()
+                        except Exception as exc:
+                            read_problem = f"This host's settings could not be read: {exc}"
+                    if host_config is None:
+                        send_json_msg(sock, {'status': 'ERROR', 'reason': read_problem})
+                    elif not isinstance(host_config, dict):
+                        send_json_msg(sock, {'status': 'ERROR',
+                                             'reason': 'This host did not answer with a settings object'})
+                    elif not host_config:
+                        send_json_msg(sock, {'status': 'ERROR',
+                                             'reason': 'This host has no settings written yet'})
+                    elif len(json.dumps(host_config)) > MAX_CONFIG_PAYLOAD_BYTES:
+                        send_json_msg(sock, {'status': 'ERROR',
+                                             'reason': 'This host\'s settings are too large to send over a sync chain'})
+                    else:
+                        send_json_msg(sock, {'status': 'CONFIG', 'config': host_config})
+                        if self.on_client_activity_cb:
+                            self.on_client_activity_cb(sync_code, client_ip, 'Sent its settings')
 
                 else:
                     send_json_msg(sock, {'status': 'ERROR', 'reason': f'Unknown command: {cmd}'})

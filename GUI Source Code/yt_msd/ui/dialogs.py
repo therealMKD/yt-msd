@@ -370,7 +370,8 @@ class SettingsDialog(QDialog):
         footer.addWidget(self.export_btn)
 
         self.import_btn = QPushButton("Import...")
-        self.import_btn.setToolTip("Restore a yt-msd export package from a .zip file")
+        self.import_btn.setToolTip("Restore a yt-msd export package (.zip), or overwrite this machine's "
+                                   "whole config from a bare gui_config.json")
         self.import_btn.clicked.connect(self._open_import_package)
         footer.addWidget(self.import_btn)
 

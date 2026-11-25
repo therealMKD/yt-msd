@@ -104,6 +104,97 @@ def build_exported_config(current_config: dict, include_config: bool,
     return base
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# WHOLE-CONFIG IMPORT
+#
+# Two ways a settings file written by another copy of this program arrives on this
+# one: picked out of a folder by the Import button, or fetched off the host of a
+# client chain over the sync link. The picked file replaces this machine's settings
+# outright - the file chosen becomes this machine's settings file, everything in it
+# included - and the fetched one is the same arrival with the parts that belong to
+# the machine holding them left behind. Both produce one whole file rather than a
+# patch of one: a key the incoming settings do not name is missing from the result
+# instead of carried over from the file it replaces, which is how this program reads
+# a settings file in the first place - load_config() takes a key it cannot find as
+# the value it would have started with. Carrying the old value behind an imported
+# config would leave a setting from before the import standing in a file that claims
+# to be another machine's.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# The keys of a settings file that belong to the machine holding it rather than to
+# the settings themselves: which chains this machine hosts and follows and how it
+# syncs them, the folders its download bar and its file browser are pointed at, the
+# script its renamer and its custom script run, and the record of which version this
+# copy has already told its user it is on. A copy of another machine's settings
+# arrives carrying that machine's answer to each of them, and not one of those
+# answers describes this one.
+MACHINE_OWN_CONFIG_KEYS = SYNC_ONLY_CONFIG_KEYS + (
+    'folders', 'local_folders', 'local_current_path',
+    'renamer_path', 'custom_script_path', 'last_seen_version',
+)
+
+# The part of a saved session that names a place on the machine holding it rather
+# than a place in its results list. A session imported from another machine keeps its
+# search results and where in them it stopped, and leaves this machine's own local
+# folder and the track it stopped on where they are.
+SESSION_LOCAL_PATH_KEYS = ('local_current_path', 'local_playback_index')
+
+# What a file has to name before it is taken for a yt-msd settings file at all. An
+# import throws away every setting this machine has, so a file that is not one - a
+# manifest, somebody's data pasted into JSON, an object that names nothing this
+# program knows - is refused here instead of being allowed to blank the settings out.
+SETTINGS_FILE_MARKERS = ('format', 'bitrate', 'folders', 'mode', 'accent', 'volume',
+                         'local_folders', 'local_current_path', 'last_search',
+                         'recent_playlists', 'normalization_mode', 'download_threads',
+                         'splitter_sizes', 'session_data', 'hosted_chains',
+                         'client_chains', 'sync_settings')
+
+
+def read_settings_file(path) -> dict:
+    """Read a settings file written by yt-msd, or say what it is that makes this one not that.
+
+    Raises ValueError with the reason in it, because the caller is a confirmation box about to offer a
+    destructive overwrite and the reason is what the user is told.
+    """
+    try:
+        with open(path, 'r', encoding='utf-8') as handle:
+            data = json.load(handle)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"it is not JSON: {exc}") from exc
+    except OSError as exc:
+        raise ValueError(f"it could not be read: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError("its contents are not a settings object")
+    if not data:
+        raise ValueError("it is empty")
+    if not any(key in data for key in SETTINGS_FILE_MARKERS):
+        raise ValueError("it names none of the settings yt-msd writes, so it is not a yt-msd settings file")
+    return data
+
+
+def build_host_config_import(current_config: dict, host_config: dict) -> dict:
+    """The settings file a host's settings produce when they are put onto this machine.
+
+    `current_config` is this machine's own settings as they stand right now - read from its file and
+    topped up with what its windows are holding live - and `host_config` is what the host sent. Every
+    key the host names lands here except the ones that belong to the machine holding them, and those
+    come back out of `current_config` untouched. The host's saved session keeps its results and loses
+    the two entries in it that name a place on the host's own disk.
+    """
+    imported: dict = {}
+    for key, value in (host_config or {}).items():
+        if key in MACHINE_OWN_CONFIG_KEYS:
+            continue
+        if key == 'session_data' and isinstance(value, dict):
+            value = {entry: held for entry, held in value.items()
+                     if entry not in SESSION_LOCAL_PATH_KEYS}
+        imported[key] = value
+    for key in MACHINE_OWN_CONFIG_KEYS:
+        if key in (current_config or {}):
+            imported[key] = current_config[key]
+    return imported
+
+
 
 def build_export_manifest_text(include_config: bool, include_chains: bool, include_music: bool,
                               music_entries: List[dict]) -> str:

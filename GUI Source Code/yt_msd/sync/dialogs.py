@@ -1372,6 +1372,24 @@ class SyncManagerDialog(QDialog):
             push_btn.clicked.connect(lambda chk=False, c=cc: self._push_client_chain(c))
             header.addWidget(push_btn)
 
+        # Import Config From Host, on every client chain. It goes the other way from everything else on
+        # this card: a sync pulls tracks and a push offers them, and this asks the machine at the other
+        # end of the chain for the settings it runs with. It is on every client chain and not only the
+        # Mirror ones because it has nothing to do with what the chain does to files - a chain whose host
+        # has been rebuilt from a stick is still a chain whose theme and download settings somebody may
+        # want on this PC. The warning about what it overwrites is put on the way to the button, and the
+        # one that stops anything being written is the confirmation the main window asks for.
+        import_cfg_btn = QPushButton("Import Config From Host")
+        import_cfg_btn.setToolTip("Ask this chain's host for its yt-msd settings and put them on this "
+                                  "PC. It overwrites this machine's entire config - theme, saved "
+                                  "playlist, saved search, download settings - and cannot be undone. "
+                                  "This machine's own sync chains and local file paths are left alone.")
+        import_cfg_btn.setStyleSheet("font-size: 11px; padding: 3px 8px;"
+                                     " background: rgba(59, 142, 208, 0.22);"
+                                     " border: 1px solid rgba(59, 142, 208, 0.5); border-radius: 4px;")
+        import_cfg_btn.clicked.connect(lambda chk=False, c=cc: self._import_config_from_host(c))
+        header.addWidget(import_cfg_btn)
+
         del_btn = QPushButton("✕")
         del_btn.setFixedSize(26, 26)
         del_btn.setToolTip("Remove this client sync chain")
@@ -1624,6 +1642,22 @@ class SyncManagerDialog(QDialog):
         nothing is deleted: this is the half of a chain that adds.
         """
         self._sync_single_client_chain(cc, mode='push')
+
+    def _import_config_from_host(self, cc: dict):
+        """The button on a client chain's card: this chain's host, asked for its settings.
+
+        Handed straight to the main window, which is where a settings file is written and where the
+        confirmation that keeps a card click from quietly replacing somebody's whole config belongs -
+        the same place the settings window's Import button writes to. Nothing else is taken from this
+        card but the chain it is about, and nothing about the card changes: a chain that has lent its
+        settings out is still the same chain, and no chain is written to this machine before the host
+        has answered.
+        """
+        import_settings = getattr(self.parent_app, 'import_config_from_host', None)
+        if callable(import_settings):
+            import_settings(cc)
+        elif hasattr(self.parent_app, '_on_status_update'):
+            self.parent_app._on_status_update("This window cannot import settings.", False, "#d9822b")
 
     def _sync_single_client_chain(self, cc: dict, mode: str = 'sync'):
         cid = cc.get('id')

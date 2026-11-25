@@ -207,6 +207,7 @@ from yt_msd.sync.client import (
     SYNC_DECISION_DELETE,
     SYNC_DECISION_KEEP,
     SYNC_DECISION_RESTORE,
+    HostConfigFetchThread,
     SyncClientWorker,
     _HostKeepalive,
     deletions_were_declined,
@@ -304,15 +305,20 @@ from yt_msd.export import (
     EXPORT_MANIFEST_NAME,
     EXPORT_SKIP_DIRS,
     EXPORT_SYNC_ENTRY,
+    MACHINE_OWN_CONFIG_KEYS,
+    SESSION_LOCAL_PATH_KEYS,
+    SETTINGS_FILE_MARKERS,
     ExportDialog,
     SYNC_ONLY_CONFIG_KEYS,
     build_export_manifest_text,
     build_exported_config,
+    build_host_config_import,
     default_export_config,
     extract_package_music,
     iter_folder_files,
     music_import_destination,
     read_import_package,
+    read_settings_file,
     sanitize_archive_name,
     unique_music_archive_name,
     zip_folder_into,
@@ -374,6 +380,7 @@ class MainApp(BootstrapMixin,
     push_code_signal = Signal(str, str, str)  # (request id, window title, "host ip:port" being pushed to) - parked until _on_push_code answers
     host_restore_signal = Signal(str, str, str, str)  # (sync code, client ip, event, note) from the host server, at each point of a rebuild this PC is the receiving end of
     chain_visibility_signal = Signal(str, str)  # (title, body) naming the hosted chains that are visible on the network - a box on the main window, from the startup check
+    config_file_ready_signal = Signal(str, object)  # (path, settings read out of it) from the settings-file import thread - confirmed on the GUI thread before anything is written
 
     def _on_host_activity(self, sync_code: str, client_ip: str, activity: str):
         """Called when a client connects or pulls files from our hosted sync chain."""
@@ -2642,18 +2649,30 @@ class MainApp(BootstrapMixin,
         self.status_signal.emit(f"Exported {file_count} files to {zip_path}", False, "#1abd33")
 
     def open_import_dialog(self):
-        """Pick a .zip export package; everything else follows export.yaml."""
+        """Pick a .zip export package or a bare gui_config.json; the choice decides which import runs.
+
+        A .zip is read by export.yaml and restores only what its manifest says it holds. A settings file
+        has no manifest and no parts: it is this machine's settings replaced whole, which is why it gets
+        its own worker and its own confirmation rather than being folded into the package path.
+        """
         if self._export_import_busy:
             self._on_status_update("Please wait: an import or export is already running.", False, "#d9822b")
             return
+        if getattr(self, '_config_import_busy', False):
+            self._on_status_update("Please wait: a settings import is already running.", False, "#d9822b")
+            return
         start_dir = getattr(self, 'download_path', '') or os.path.expanduser("~")
-        zip_path, _ = QFileDialog.getOpenFileName(self, "Import yt-msd Package", start_dir,
-                                                  "yt-msd Package (*.zip);;All Files (*)")
-        if not zip_path:
+        chosen, _ = QFileDialog.getOpenFileName(self, "Import yt-msd Package Or Settings", start_dir,
+                                                "yt-msd Package (*.zip);;yt-msd Settings (*.json);;"
+                                                "All Files (*)")
+        if not chosen:
+            return
+        if chosen.lower().endswith(".json"):
+            self._start_bare_config_import(chosen)
             return
         self._export_import_busy = True
         self._on_status_update("Importing package...", False, "#3B8ED0")
-        threading.Thread(target=self._import_worker, args=(zip_path,), daemon=True).start()
+        threading.Thread(target=self._import_worker, args=(chosen,), daemon=True).start()
 
     def _import_worker(self, zip_path: str):
         """Read the manifest and unpack any music off the GUI thread."""
@@ -2684,6 +2703,10 @@ class MainApp(BootstrapMixin,
 
     def _on_import_failed(self, message: str):
         self._export_import_busy = False
+        # The settings-file import reports its failures through this signal too, and it holds its own
+        # guard: left closed, the failed import would keep the Import button and the card button waiting
+        # on a run that had already ended.
+        self._config_import_busy = False
         self._on_status_update(message, False, "#d9822b")
 
     def _apply_import_results(self, plan: dict):
@@ -2908,6 +2931,341 @@ class MainApp(BootstrapMixin,
         # The caller refreshes the local list once everything the package carries
         # has been restored, so the scan sees the imported files too.
         return touched_local and os.path.isdir(self.local_current_path or "")
+
+    # ── WHOLE-CONFIG IMPORT (from a chain's host, or from a gui_config.json) ──
+    def _config_payload_for_host(self) -> dict:
+        """This machine's settings, in the shape the host half of a chain sends them.
+
+        Read from the file and not out of this window, under the lock the file's other two writers
+        hold: what a client asks for is this machine's settings file, and it must not be able to catch
+        that file half-written. Every settings change this program makes writes the file as the change
+        happens, so the file is the current settings rather than a copy of yesterday's. A corrupt or
+        unreadable file raises, and the host answers that request with the reason instead of with half
+        a config.
+        """
+        with _CONFIG_WRITE_LOCK:
+            if not os.path.exists(self.config_path):
+                return {}
+            with open(self.config_path, 'r', encoding='utf-8') as handle:
+                return json.load(handle)
+
+    def _current_config_snapshot(self) -> dict:
+        """What this machine's settings are at this moment, in the shape a settings file holds them.
+
+        The file first, and then the keys this window is holding live on top of it. A folder picked
+        since this window opened, a chain whose host was just found at a new address, a sync interval
+        changed a minute ago - each is in memory before it is in the file, and an import that read only
+        the file would write an older machine than the one it is running on.
+        """
+        try:
+            snapshot = dict(self._config_payload_for_host() or {})
+        except Exception:
+            snapshot = {}
+        manager = getattr(self, 'sync_config_manager', None)
+        if manager is not None:
+            snapshot['hosted_chains'] = [dict(chain) for chain in manager.hosted_chains]
+            snapshot['client_chains'] = [dict(chain) for chain in manager.client_chains]
+            snapshot['sync_settings'] = dict(manager.settings)
+        snapshot['folders'] = list(getattr(self, 'recent_folders', []) or [])
+        snapshot['local_folders'] = list(getattr(self, 'local_folders', []) or [])
+        snapshot['local_current_path'] = str(getattr(self, 'local_current_path', '') or '')
+        snapshot['renamer_path'] = str(getattr(self, 'renamer_path', '') or '')
+        snapshot['custom_script_path'] = str(getattr(self, 'custom_script_path', '') or '')
+        snapshot['last_seen_version'] = str(getattr(self, 'last_seen_version', '') or '')
+        return snapshot
+
+    def _write_settings_file(self, payload: dict) -> bool:
+        """Make `payload` this machine's settings file, whole.
+
+        Written to a side name and moved into place rather than written over the live file: a write
+        that stopped half way would leave this machine with half a settings file, and half a settings
+        file is the settings it starts with next time. Held under the same lock MainApp.save_config and
+        SyncConfigManager.save write under, so this cannot interleave with either of them.
+        """
+        try:
+            with _CONFIG_WRITE_LOCK:
+                temp_path = f"{self.config_path}.importing"
+                with open(temp_path, 'w', encoding='utf-8') as handle:
+                    json.dump(payload, handle, indent=4)
+                os.replace(temp_path, self.config_path)
+            return True
+        except Exception:
+            return False
+
+    def import_config_from_host(self, chain_config: dict):
+        """The button on a client chain's card: take that host's settings and put them on this PC.
+
+        The question comes first, because what follows replaces everything this window has been set to.
+        The fetch is the ordinary client half of a chain - the address it already syncs to, the same
+        AUTH, the same name it answers with - and nothing on this machine is written to until the host
+        has actually answered with its settings.
+        """
+        if getattr(self, '_config_import_busy', False):
+            self._on_status_update("Please wait: a settings import is already running.", False, "#d9822b")
+            return
+        if getattr(self, '_export_import_busy', False):
+            self._on_status_update("Please wait: an import or export is already running.", False, "#d9822b")
+            return
+        if any(thread is not None and thread.isRunning()
+               for thread in list(getattr(self, 'sync_threads', {}).values())):
+            self._on_status_update("Please wait: a sync is running. Import the settings once it has "
+                                   "finished.", False, "#d9822b")
+            return
+
+        chain_name = str(chain_config.get('name') or 'this chain')
+        host_label = str(chain_config.get('last_known_host_ip') or '').strip() or 'its host'
+        answer = QMessageBox.question(
+            self, "Import Settings From Host",
+            f"Take the settings of {chain_name} ({host_label}) onto this PC?\n\n"
+            "This overwrites your entire config. Everything this machine is set to - the theme and "
+            "accent, the saved playlist, the saved search, the download format, bitrate, threads, "
+            "normalisation, renaming, custom arguments, the local pane's options, the update opt-outs - "
+            "becomes what that machine has, and there is no undoing it. Export a package first if you "
+            "want yours back.\n\n"
+            "Two things are left as they are, because they describe this machine and not its settings: "
+            "your sync chains (the chains this PC hosts, the ones it follows, and how it syncs them) "
+            "and your local file paths (your download folders, your file-browser folders, and the "
+            "renamer and script paths you set).\n\n"
+            "Nothing here changes until the host answers.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            self._on_status_update(f"Nothing imported from {host_label}.", False, "#3B8ED0")
+            return
+
+        self._config_import_busy = True
+        thread = HostConfigFetchThread(chain_config)
+        self._host_config_thread = thread
+
+        def _on_status(txt):
+            self.status_signal.emit(txt, False, "#3B8ED0")
+
+        def _on_finished(ok, message, payload):
+            self._on_host_config_fetched(ok, message, payload, chain_config)
+
+        thread.status_signal.connect(_on_status)
+        thread.finished_signal.connect(_on_finished)
+        thread.start()
+        self._on_status_update(f"Asking {host_label} for its settings...", False, "#3B8ED0")
+
+    def _on_host_config_fetched(self, ok: bool, message: str, payload, chain_config: dict):
+        """What a host's answer about its settings does to this machine, on the GUI thread."""
+        self._config_import_busy = False
+        chain_name = str(chain_config.get('name') or 'the chain')
+        if not ok:
+            # The attempt may still have found this chain's host at a new address, and learned what the
+            # host calls the chain, on its way to being refused. Those are the chain's own facts and
+            # they are worth keeping; nothing else about this machine was touched.
+            manager = getattr(self, 'sync_config_manager', None)
+            if manager is not None:
+                manager.save()
+            self._on_status_update(f"Settings not imported from {chain_name}: {message}", False, "#d9822b")
+            return
+        self._apply_whole_config_import(payload, f"the host of sync chain '{chain_name}'",
+                                        keep_own_keys=True)
+
+    def _apply_whole_config_import(self, payload: dict, source_label: str, keep_own_keys: bool) -> bool:
+        """Make imported settings this machine's settings - the file, the memory, and the window.
+
+        That order is the whole of it. save_config() writes a settings file out of what this window's
+        attributes and widgets hold rather than out of the file, so an import that wrote the file and
+        stopped there would have the previous settings written straight back over it by the next save -
+        which is exactly how a "reset to defaults" once failed to take. The file is written first,
+        load_config() then reads it back into the attributes it owns, and _reload_settings_into_ui()
+        puts each of those onto the control that displays it, so the window, the file and the next save
+        all say the same thing.
+
+        `keep_own_keys` says which import this is: a host's settings arrive with this machine's chains,
+        folders and paths left as they are, and a settings file picked out of a folder arrives with
+        everything in it, chains included.
+        """
+        if any(thread is not None and thread.isRunning()
+               for thread in list(getattr(self, 'sync_threads', {}).values())):
+            # A chain mid-sync is working from a chain record this import is about to replace, and it
+            # is writing files under that record's rule. Nothing is changed while one is running.
+            self._config_import_busy = False
+            self._on_status_update("A sync is running. Nothing was imported.", False, "#d9822b")
+            return False
+
+        written = (build_host_config_import(self._current_config_snapshot(), payload)
+                   if keep_own_keys else dict(payload))
+        if not self._write_settings_file(written):
+            self._config_import_busy = False
+            self._on_status_update(f"The settings from {source_label} could not be written. Nothing was "
+                                   "changed.", False, "#d9822b")
+            return False
+
+        self.load_config()
+        manager = getattr(self, 'sync_config_manager', None)
+        if not keep_own_keys and manager is not None:
+            # The file this import wrote is this machine's chain list now. SyncConfigManager holds the
+            # live copies of that list - the sync window's cards, the auto-sync timer, the hosted folder
+            # watchers and the host server all read the manager and not the file - so the old copies
+            # are emptied before the new file is read back. Left in place they would be written straight
+            # back into the file by the next chain operation, which is the same way the reset to
+            # defaults once left every chain it claimed to remove.
+            manager.hosted_chains.clear()
+            manager.client_chains.clear()
+            manager.settings = dict(DEFAULT_SYNC_SETTINGS)
+            manager.load()
+        self._reload_settings_into_ui()
+        self._update_sync_timer()
+        self.refresh_sync_watchers()
+        sync_dialog = getattr(self, 'sync_manager_dialog', None)
+        if sync_dialog is not None:
+            try:
+                sync_dialog.refresh_cards(force=True)
+            except Exception:
+                pass
+        kept = (" Your sync chains, download folders, file-browser folders and tool paths were left "
+                "exactly as they were." if keep_own_keys else
+                " The chains that file named are now this machine's chains.")
+        self._on_status_update(f"Imported settings from {source_label}: theme, saved playlist, saved "
+                               f"search, download settings - everything that config named.{kept}",
+                               False, "#1abd33")
+        return True
+
+    def _reload_settings_into_ui(self):
+        """Push everything load_config() has just read back out into the window that shows it.
+
+        save_config() reads the format, the bitrate, the search text, the run-renamer tick and the panel
+        widths straight off these controls, so a control left holding the old value puts the old setting
+        back into the new file the next time anything is saved. Signals are held while the controls are
+        set: a handler firing against a value that has already been changed underneath it writes the
+        settings back over the import, which is the other way this kind of change used to come undone.
+        """
+        if hasattr(self, 'format_combo'):
+            self.format_combo.blockSignals(True)
+            self.format_combo.setCurrentText(self.format_var)
+            self.format_combo.blockSignals(False)
+        if hasattr(self, 'bitrate_combo'):
+            self.bitrate_combo.blockSignals(True)
+            self.bitrate_combo.setCurrentText(self.bitrate_var)
+            self.bitrate_combo.blockSignals(False)
+        if hasattr(self, 'path_combo'):
+            # The download bar shows one folder and remembers the rest in this combo, and save_config()
+            # writes the list back out of recent_folders - which the combo is the way the user changes.
+            self.path_combo.blockSignals(True)
+            self.path_combo.clear()
+            self.path_combo.addItems([str(folder) for folder in self.recent_folders])
+            self.path_combo.setCurrentText(self.download_path)
+            self.path_combo.blockSignals(False)
+        if hasattr(self, 'search_entry'):
+            self.search_entry.blockSignals(True)
+            self.search_entry.setText(self.last_search)
+            self.search_entry.blockSignals(False)
+        if hasattr(self, 'vol_slider'):
+            self.vol_slider.setValue(self.volume_val)
+        if hasattr(self, 'local_meta_cb'):
+            self.local_meta_cb.blockSignals(True)
+            self.local_meta_cb.setChecked(bool(getattr(self, 'show_local_metadata', False)))
+            self.local_meta_cb.blockSignals(False)
+        if hasattr(self, 'run_renamer_cb'):
+            self.run_renamer_cb.blockSignals(True)
+            self.run_renamer_cb.setChecked(bool(getattr(self, 'run_renamer', False)))
+            self.run_renamer_cb.blockSignals(False)
+        if hasattr(self, 'channel_prefix_cb'):
+            self.channel_prefix_cb.blockSignals(True)
+            self.channel_prefix_cb.setChecked(bool(getattr(self, 'channel_prefix_rename', True)))
+            self.channel_prefix_cb.blockSignals(False)
+        if (hasattr(self, 'main_splitter') and hasattr(self, 'content_splitter')
+                and len(self.splitter_sizes) == 3):
+            self.main_splitter.setSizes([self.splitter_sizes[0],
+                                         self.splitter_sizes[1] + self.splitter_sizes[2]])
+            self.content_splitter.setSizes([self.splitter_sizes[1], self.splitter_sizes[2]])
+            # The widths that arrived with the imported config are somebody's arrangement. The one each
+            # splitter kept privately belongs to the settings this import replaced, and a double-click
+            # on a handle must not put those back.
+            for splitter in (self.main_splitter, self.content_splitter):
+                splitter._last_custom_sizes = []
+        # The local pane's folder list and the folder open in it, whether or not this import named
+        # them: the address bar was filled once at startup, so it is filled again from the settings this
+        # window now holds, and the list is re-scanned so it shows that folder and not the last one.
+        self.set_local_explorer_address(self.local_current_path,
+                                        add_to_recent=os.path.isdir(self.local_current_path or ""))
+        self.refresh_local_list()
+        # The renamer half is a second copy of this program, and it reads these settings from TUNING
+        # rather than from this window. Left un-pushed, an imported pad or trim would apply to the next
+        # download here and not to a single file the renamer touched.
+        TUNING.from_settings(self.silence_trim, self.silence_pad_dur,
+                             self.use_custom_norm_cmd, self.custom_norm_cmd)
+        if hasattr(self, 'local_rescan_timer'):
+            self._update_local_rescan_timer()
+        self.apply_theme()
+        # The Settings window is cached on MainApp and reused, and it reads these attributes only when
+        # it is first built. Left open, it goes on showing - and the next toggle writes back - the
+        # settings this import replaced. reset_to_defaults() drops it for the same reason.
+        settings_dialog = getattr(self, 'settings_dialog', None)
+        if settings_dialog is not None:
+            try:
+                settings_dialog.close()
+            except Exception:
+                pass
+            self.settings_dialog = None
+
+    def _start_bare_config_import(self, json_path: str):
+        """A gui_config.json picked out of a folder: read it first, ask second.
+
+        The reading is what tells this window whether the file is a settings file at all, and a question
+        about overwriting everything is only worth asking once there is something to overwrite. The read
+        runs on a worker thread because the file may be on a slow drive or a share, and nothing on this
+        machine is touched until somebody says yes to what was found in it.
+        """
+        if any(thread is not None and thread.isRunning()
+               for thread in list(getattr(self, 'sync_threads', {}).values())):
+            self._on_status_update("Please wait: a sync is running. Import the settings once it has "
+                                   "finished.", False, "#d9822b")
+            return
+        self._config_import_busy = True
+        threading.Thread(target=self._bare_config_worker, args=(json_path,), daemon=True).start()
+        self._on_status_update(f"Reading {os.path.basename(json_path)}...", False, "#3B8ED0")
+
+    def _bare_config_worker(self, json_path: str):
+        """Read a settings file off whatever device it is on, and report what it was."""
+        name = os.path.basename(json_path)
+        try:
+            payload = read_settings_file(json_path)
+        except ValueError as exc:
+            self.import_failed_signal.emit(f"{name} is not a yt-msd settings file: {exc}")
+            return
+        except Exception as exc:
+            self.import_failed_signal.emit(f"Could not read {name}: {exc}")
+            return
+        self.config_file_ready_signal.emit(json_path, payload)
+
+    def _on_config_file_read(self, json_path: str, payload):
+        """The file that read all right, put in front of the user before it replaces anything.
+
+        A straight overwrite, exactly as the file stands: every setting in it becomes this machine's,
+        and its chains come with it. What a settings file does not name is missing from this machine
+        afterwards rather than left over from before it, which is how this program already reads a
+        settings file it cannot fully recognise.
+        """
+        self._config_import_busy = False
+        name = os.path.basename(json_path)
+        if not isinstance(payload, dict) or not payload:
+            self._on_status_update(f"{name} had nothing in it to import.", False, "#d9822b")
+            return
+        names_chains = bool(payload.get('hosted_chains') or payload.get('client_chains'))
+        chain_line = ("Its sync chains come with it: the chains this file names become the chains this "
+                      "machine hosts and follows, and how it syncs them becomes the way that file "
+                      "syncs them."
+                      if names_chains else
+                      "It names no sync chains, so this machine will host none and follow none once "
+                      "this is done. If that is not what you meant, say no and import the machine's "
+                      "whole .zip package instead.")
+        answer = QMessageBox.question(
+            self, "Overwrite Settings With This File",
+            f"Make {name} this machine's settings?\n\n"
+            f"{len(payload)} settings will replace everything this window is set to now - theme and "
+            "accent, saved playlist, saved search, download format, bitrate, threads, normalisation, "
+            "renaming, custom arguments, the local pane's options, the update opt-outs - and there is "
+            "no undoing it. Export a package first if you want your current settings back.\n\n"
+            + chain_line,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            self._on_status_update("Nothing was imported.", False, "#3B8ED0")
+            return
+        self._apply_whole_config_import(payload, name, keep_own_keys=False)
 
     def toggle_local_pane(self):
         sizes = self.main_splitter.sizes()

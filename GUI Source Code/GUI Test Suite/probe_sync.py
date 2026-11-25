@@ -1,6 +1,6 @@
 """The sync-chain regression harness.
 
-Sections SY-A..SY-R cover the sync half of `GUI Source Code/yt-msd-gui.pyw`: the TAG.yaml marker
+Sections SY-A..SY-S cover the sync half of `GUI Source Code/yt-msd-gui.pyw`: the TAG.yaml marker
 a chain leaves on removable media and what comes back when it is read, the two forms `last_synced`
 takes (an epoch in the chain dict, a wall-clock string in TAG.yaml) and the clock grace between
 them, the drive scan that looks for tagged folders, sync-chain persistence inside the shared
@@ -2022,12 +2022,17 @@ mod.send_json_msg(_q_client, {"cmd": "PUSH_REQUEST", "sync_code": "7711", "clien
                               "count": 3})
 _q_waiting = mod.recv_json_msg(_q_client, timeout=8.0)
 _q_offer = _host_layer.pending_push_request("7711")
+# The host puts its 'someone has asked for a push' report on the wire a moment after it sends the answer
+# that tells the client to wait, so this waits for the report to arrive rather than reading the list the
+# instant the answer does. What is proved is the same report; only the moment it is looked for moves.
+_q_push_reported = wait_for(lambda: any(event[2] == "push_requested" and event[1] == "192.168.1.40"
+                                        for event in Q_EVENTS), 2.0)
 check("SY-Q3 an address this host has never let push gets a wait and not a way in: the answer names the chain, this chain's own limit and how long the wait lasts, and the code it is waiting for stays on the host's side of the wire",
       _q_waiting.get("status") == "WAITING_FOR_PUSH_CODE" and _q_waiting.get("chain_name") == "Push Me"
       and _q_waiting.get("limit") == 2 and _q_waiting.get("expires_in") == int(_lan_layer.SYNC_RESTORE_CODE_TIMEOUT)
       and _q_offer is not None and _q_offer["code"] not in json.dumps(_q_waiting)
-      and any(event[2] == "push_requested" and event[1] == "192.168.1.40" for event in Q_EVENTS),
-      (_q_waiting, _q_offer))
+      and _q_push_reported,
+      (_q_waiting, _q_offer, Q_EVENTS))
 check("SY-Q3b and the address that was asked about is the one the connection arrived from and not the one the client chose to name in its own message - a push is permitted to a machine, and a machine is its address",
       _q_offer is not None and _q_offer["client_ip"] == "192.168.1.40"
       and all(event[1] != "192.168.1.99" for event in Q_EVENTS), (_q_offer, Q_EVENTS))
@@ -2364,6 +2369,214 @@ with seam.patched("UDP_BEACON_PORT", _OLD_PORT):
 check("SY-R7 a beacon built before this message existed reads one and carries on: it ignores what it has no answer for, and still delivers the chain updates it has always delivered",
       _old_beacon.on_sync_request_cb is None and _old_update and _old_alive
       and set(_OLD_SEEN) == {"2468"}, (_OLD_SEEN, _old_alive))
+
+# ===========================================================================
+# SY-S: a client asking its host for its settings, and the host answering
+# ===========================================================================
+# Every other command a chain speaks moves tracks. This one moves the settings the machine at the other
+# end runs with, and it is proved here at the wire and nowhere else: that a settings request is answered
+# only for a client that has already authenticated for a chain this machine hosts; that a host with no
+# settings, or with no answer for this command at all, says which it is instead of sending something
+# empty; that a config grown past the size a settings message is meant to be is refused rather than
+# streamed; that the client half brings the settings back without reading or writing a single file here;
+# and that none of this disturbs the commands a chain has always spoken. Which of the settings that
+# arrive belong on the machine that received them is decided by the window that asked, and probe_windows
+# proves those rules against a settings file of its own.
+S_HOST_FOLDER = fixture("settings borrowed from")
+audio_file(S_HOST_FOLDER, "one.mp3", body=b"a track on the machine being copied from")
+
+S_SETTINGS = {"format": "m4a", "bitrate": "320", "mode": "Light", "accent": "Green", "volume": 42,
+              "last_search": "keyboard sonata", "recent_playlists": [{"name": "Morning"}],
+              "download_threads": 7, "normalization_mode": "on",
+              "folders": ["D:\\Host Downloads"], "local_folders": ["D:\\Host Music"],
+              "local_current_path": "D:\\Host Music",
+              "hosted_chains": [{"id": "hc_7002", "sync_code": "7002", "name": "Bedroom"}],
+              "client_chains": [], "sync_settings": {"auto_sync_interval_mins": 11},
+              "session_data": {"search_results": [{"video_id": "abc"}], "playback_index": 2,
+                               "local_current_path": "D:\\Host Music", "local_playback_index": 4}}
+
+S_ACTIVITY = []
+S_SERVER = mod.SyncHostServer(
+    lambda: [{"sync_code": "5150", "name": "Settings Host", "folder_path": str(S_HOST_FOLDER)}],
+    on_client_activity_cb=lambda code, ip, note: S_ACTIVITY.append((code, note)),
+    get_config_cb=lambda: dict(S_SETTINGS))
+# The handler is driven over a connected loopback pair, as every other host in this suite is: start()
+# would bind SYNC_PORT_START..END, and a yt-msd genuinely running is already listening there.
+S_SERVER._running = True
+
+
+def _s_round(server, requests, expecting, client_ip="192.168.1.50"):
+    """Send these commands to a host's own handler and read back the answers it gives.
+
+    A host that turns a client away answers once and then closes, which is what it has always done at
+    the door: the reading below records that as no answer at all rather than treating it as a failure
+    of the test, because a refused machine that could still knock a second time is the thing worth
+    knowing about.
+    """
+    client, server_side = _loopback_pair()
+    worker = threading.Thread(target=lambda: server._handle_client(server_side, client_ip), daemon=True)
+    worker.start()
+    for message in requests:
+        try:
+            mod.send_json_msg(client, message)
+        except OSError:
+            break
+    answers = []
+    for _ in range(expecting):
+        try:
+            answers.append(mod.recv_json_msg(client, timeout=8.0))
+        except OSError:
+            answers.append(None)
+    client.close()
+    worker.join(8)
+    return answers
+
+
+answers = _s_round(S_SERVER, [{"cmd": "GET_CONFIG"}], 1)
+check("SY-S1 a settings request from a machine that never said which chain it belongs to is turned away before it is told anything about this one",
+      answers[0] == {"status": "ERROR", "reason": "Expected AUTH command"}, answers)
+
+answers = _s_round(S_SERVER, [{"cmd": "AUTH", "sync_code": "5150"},
+                              {"cmd": "GET_CONFIG", "sync_code": "5150"}], 2)
+check("SY-S2 a client that authenticated for a hosted chain is answered with the host's settings whole, keys and all - including the host's own chains and folders, because which of them describe the machine that asked is that machine's decision and not this one's",
+      answers[1].get("status") == "CONFIG" and answers[1].get("config") == S_SETTINGS, answers[1])
+check("SY-S3 a host says out loud that its settings were taken, which is the only notice the machine being copied from ever gets",
+      ("5150", "Sent its settings") in S_ACTIVITY, S_ACTIVITY)
+
+answers = _s_round(S_SERVER, [{"cmd": "AUTH", "sync_code": "9999"}], 1)
+check("SY-S4 a sync code this machine does not host is refused at the door, by name, before anything about this machine is said",
+      answers[0] is not None and answers[0].get("status") == "ERROR"
+      and "9999" in answers[0].get("reason", ""), answers)
+answers = _s_round(S_SERVER, [{"cmd": "AUTH", "sync_code": "9999"},
+                              {"cmd": "GET_CONFIG", "sync_code": "9999"}], 2)
+check("SY-S4b and the settings behind that door are never reached: a client turned away at the AUTH is answered once and then let go, so it is not left free to keep asking for what it was refused",
+      not any((answer or {}).get("status") == "CONFIG" for answer in answers), answers)
+
+S_NO_CALLBACK = mod.SyncHostServer(lambda: [{"sync_code": "5150", "name": "Old Host",
+                                             "folder_path": str(S_HOST_FOLDER)}])
+S_NO_CALLBACK._running = True
+S_EMPTY = mod.SyncHostServer(lambda: [{"sync_code": "5150", "name": "Blank Host",
+                                       "folder_path": str(S_HOST_FOLDER)}],
+                             get_config_cb=lambda: {})
+S_EMPTY._running = True
+S_RAISING = mod.SyncHostServer(lambda: [{"sync_code": "5150", "name": "Broken Host",
+                                         "folder_path": str(S_HOST_FOLDER)}],
+                               get_config_cb=lambda: (_ for _ in ()).throw(OSError("settings unreadable")))
+S_RAISING._running = True
+S_OVERSIZED = mod.SyncHostServer(lambda: [{"sync_code": "5150", "name": "Huge Host",
+                                           "folder_path": str(S_HOST_FOLDER)}],
+                                 get_config_cb=lambda: {"folders": ["x" * 4096] * (
+                                     _lan_layer.MAX_CONFIG_PAYLOAD_BYTES // 4096 + 2)})
+S_OVERSIZED._running = True
+
+answers = _s_round(S_NO_CALLBACK, [{"cmd": "AUTH", "sync_code": "5150"}, {"cmd": "GET_CONFIG"},
+                                   {"cmd": "GET_INDEX"}], 3)
+check("SY-S5 a host built without anything to answer with - a harness, a probe, a window from before this command existed - refuses it by name and carries on serving every command it always served",
+      answers[1].get("status") == "ERROR" and "does not offer its settings" in answers[1].get("reason", "")
+      and answers[2].get("status") == "OK" and [f["name"] for f in answers[2].get("files") or []] == ["one.mp3"],
+      answers)
+
+answers = _s_round(S_EMPTY, [{"cmd": "AUTH", "sync_code": "5150"}, {"cmd": "GET_CONFIG"}], 2)
+check("SY-S6 a host with nothing written yet says it has no settings, rather than sending an empty config that would read at the other end as a machine with no settings at all",
+      answers[1].get("status") == "ERROR" and "no settings written yet" in answers[1].get("reason", ""),
+      answers)
+
+answers = _s_round(S_RAISING, [{"cmd": "AUTH", "sync_code": "5150"}, {"cmd": "GET_CONFIG"},
+                               {"cmd": "PING"}], 3)
+check("SY-S7 settings this machine cannot read are reported as that, and the chain is left open: a settings request that fails is not a way to close a client out",
+      answers[1].get("status") == "ERROR" and "could not be read" in answers[1].get("reason", "")
+      and answers[2].get("status") == "PONG", answers)
+
+answers = _s_round(S_OVERSIZED, [{"cmd": "AUTH", "sync_code": "5150"}, {"cmd": "GET_CONFIG"}], 2)
+check("SY-S8 a settings file past the size a settings message is meant to be is refused instead of put on the wire, so a config that has swallowed something enormous costs nobody a stalled connection",
+      answers[1].get("status") == "ERROR" and "too large" in answers[1].get("reason", ""), answers)
+
+# The client half, end to end: a host kept on a spare loopback port, and a chain record that knows
+# nothing about it but the address and the port to knock on. This is the ordinary door a sync walks
+# through and the ordinary name it says, with one more question after them - so the check worth having
+# is that a fetch leaves this machine's own disk exactly as it found it.
+S_FOLDER = fixture("settings arriving at")
+audio_file(S_FOLDER, "mine.mp3", body=b"a track this machine already had")
+S_LISTENER = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+S_LISTENER.bind(("127.0.0.1", 0))
+S_LISTENER.listen(4)
+S_PORT = S_LISTENER.getsockname()[1]
+S_STOP = threading.Event()
+
+
+def _s_accept(server, listener):
+    while not S_STOP.is_set():
+        try:
+            connection, (peer_ip, _peer_port) = listener.accept()
+        except OSError:
+            break
+        threading.Thread(target=lambda c=connection, ip=peer_ip: server._handle_client(c, ip),
+                         daemon=True).start()
+
+
+S_ACCEPT_THREAD = threading.Thread(target=lambda: _s_accept(S_SERVER, S_LISTENER), daemon=True)
+S_ACCEPT_THREAD.start()
+
+S_CHAIN = {"id": "cc_5150", "sync_code": "5150", "name": "Settings Host Mirror",
+           "folder_path": str(S_FOLDER), "last_known_host_ip": "127.0.0.1", "host_port": S_PORT}
+_ok, _note, _payload = _client_layer.SyncClientWorker.fetch_config(S_CHAIN)
+check("SY-S9 the client half reaches its host and brings its settings back whole, saying where they came from",
+      _ok is True and _payload == S_SETTINGS and "Settings received from 127.0.0.1:" in _note,
+      (_ok, _note, _payload))
+check("SY-S10 and it learns what the host calls this chain on the way in, the same way a sync does, because a settings request is answered by the same AUTH a sync makes",
+      S_CHAIN.get("host_chain_name") == "Settings Host", S_CHAIN)
+check("SY-S11 a settings import reads no file and writes no file on the machine that asked for it",
+      sorted(held.name for held in S_FOLDER.iterdir()) == ["mine.mp3"]
+      and (S_FOLDER / "mine.mp3").read_bytes() == b"a track this machine already had",
+      [held.name for held in S_FOLDER.iterdir()])
+
+S_ORPHAN = {"id": "cc_9999", "sync_code": "9999", "name": "Nowhere Chain",
+            "folder_path": str(S_FOLDER), "last_known_host_ip": "127.0.0.1", "host_port": S_PORT}
+_ok2, _note2, _payload2 = _client_layer.SyncClientWorker.fetch_config(S_ORPHAN)
+check("SY-S12 a host that does not know the code asked about says so, and the answer is that refusal rather than a set of empty settings",
+      _ok2 is False and "9999" in _note2 and _payload2 is None, (_ok2, _note2))
+
+S_LISTENER2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+S_LISTENER2.bind(("127.0.0.1", 0))
+S_LISTENER2.listen(4)
+S_PORT2 = S_LISTENER2.getsockname()[1]
+S_ACCEPT_THREAD2 = threading.Thread(target=lambda: _s_accept(S_NO_CALLBACK, S_LISTENER2), daemon=True)
+S_ACCEPT_THREAD2.start()
+S_NO_CB_CHAIN = {"id": "cc_5150", "sync_code": "5150", "name": "Old Host Mirror",
+                 "folder_path": str(S_FOLDER), "last_known_host_ip": "127.0.0.1", "host_port": S_PORT2}
+_ok3, _note3, _payload3 = _client_layer.SyncClientWorker.fetch_config(S_NO_CB_CHAIN)
+S_STOP.set()
+S_LISTENER.close()
+S_LISTENER2.close()
+check("SY-S13 a host that will not hand its settings over is reported as refusing, and nothing is handed back to be written anywhere",
+      _ok3 is False and "refused" in _note3.lower() and "Nothing here was changed" in _note3
+      and _payload3 is None, (_ok3, _note3))
+
+answers = _s_round(S_SERVER, [{"cmd": "AUTH", "sync_code": "5150"}, {"cmd": "GET_CONFIG"},
+                              {"cmd": "GET_INDEX"},
+                              {"cmd": "PULL_FILE", "filename": "one.mp3"}], 4)
+check("SY-S14 asking for settings in the middle of a chain's ordinary conversation leaves that conversation exactly as it was: the index still arrives, and the track after it still arrives",
+      answers[1].get("status") == "CONFIG" and answers[2].get("status") == "OK"
+      and answers[3].get("status") == "SENDING" and answers[3].get("filename") == "one.mp3", answers)
+
+S_THREAD_INIT = seam.original("HostConfigFetchThread").__init__
+S_THREAD_ARGS = S_THREAD_INIT.__code__.co_varnames[:S_THREAD_INIT.__code__.co_argcount]
+check("SY-S15 the fetch runs on a thread of its own and not as another mode of a sync, so a chain's card is never asked to show the progress of something that moves no files",
+      S_THREAD_ARGS == ("self", "chain_config") and "mode" not in S_THREAD_ARGS
+      and hasattr(_client_layer.SyncClientWorker, "fetch_config")
+      and "yt_msd.sync.client" in seam.owned_by("HostConfigFetchThread"),
+      (S_THREAD_ARGS, seam.owned_by("HostConfigFetchThread")))
+check("SY-S16 every name this added is a module-level one the seam reaches, and the size a settings message may reach lives beside the other sync timings",
+      all(seam.owned_by(name) and any(owner != mod.__name__ for owner in seam.owned_by(name))
+          for name in ("MAX_CONFIG_PAYLOAD_BYTES", "HostConfigFetchThread", "SyncHostServer",
+                       "SyncClientWorker")),
+      {name: seam.owned_by(name) for name in ("MAX_CONFIG_PAYLOAD_BYTES", "HostConfigFetchThread")})
+S_HOST_INIT = seam.original("SyncHostServer").__init__
+S_HOST_ARGS = S_HOST_INIT.__code__.co_varnames[:S_HOST_INIT.__code__.co_argcount]
+check("SY-S17 the answer is one optional argument added at the end of the host's own arguments, so a host built the way a host was built before it still builds - and answers a settings request with a refusal",
+      S_HOST_ARGS[-1] == "get_config_cb" and len(S_HOST_INIT.__defaults__ or ()) == 3
+      and all(server.get_config_cb is None for server in (HOST_SERVER, P_SERVER, Q_SERVER)),
+      (S_HOST_ARGS, S_HOST_INIT.__defaults__))
 
 # ===========================================================================
 # SY-L: the seam this suite reaches the program through

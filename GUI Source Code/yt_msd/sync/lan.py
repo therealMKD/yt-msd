@@ -38,6 +38,14 @@ SYNC_CONFIRM_PING_INTERVAL = 10.0
 # rather than every client waiting out its own auto-sync interval to find out.
 HOST_UP_SYNC_REQUEST_DELAY_MS = 20000
 
+# How large a settings file a host is willing to put on the wire. A gui_config.json is a few
+# kilobytes of settings and lists, so this is nowhere near a real one; what it is near is a config
+# that has gone wrong - a saved session that has swallowed a whole search's worth of results, a file
+# somebody has pasted something into. A settings transfer is a JSON message rather than a streamed
+# file because there is nothing to stream, and a message has to arrive in memory whole before either
+# end can read it.
+MAX_CONFIG_PAYLOAD_BYTES = 2_000_000
+
 SYNC_CHUNK_SIZE = 1024 * 1024
 
 # How long a restore code stays good on the host that shows it. The code is meant to be read off one

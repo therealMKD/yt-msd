@@ -727,6 +727,52 @@ class SyncClientWorker:
         return index_resp.get('files', []), ''
 
     @staticmethod
+    def fetch_config(chain_config: dict,
+                     status_cb: Optional[Callable[[str], None]] = None
+                     ) -> Tuple[bool, str, Optional[dict]]:
+        """Ask the host this chain follows for its settings, and bring them back.
+
+        The shortest exchange a chain has. It walks through the same door as a sync (_open_host, which
+        is also the half that relearns the host's address when it has moved) and says the same name
+        (_authenticate, which is the half that learns what the host calls this chain), and then asks one
+        question. Nothing in here reads or writes a single track, and nothing in here touches this
+        machine's own settings: what arrives is handed back to the window that asked, which is the only
+        place that can tell which of another machine's settings belong on this one.
+
+        Returns (ok, what to report, what arrived).
+        """
+        sync_code = str(chain_config.get('sync_code', ''))
+        sock, host_ip, host_port, connect_error = SyncClientWorker._open_host(chain_config, status_cb)
+        if sock is None:
+            return False, connect_error, None
+        try:
+            sock.settimeout(SYNC_SOCKET_TIMEOUT)
+            auth_ok, auth_error = SyncClientWorker._authenticate(sock, chain_config, sync_code)
+            if not auth_ok:
+                return False, auth_error, None
+
+            if status_cb:
+                status_cb("Asking the host for its settings...")
+            send_json_msg(sock, {'cmd': 'GET_CONFIG', 'sync_code': sync_code, 'client_ip': get_local_ip()})
+            answer = recv_json_msg(sock, timeout=SYNC_SOCKET_TIMEOUT)
+            if not answer:
+                return False, "The host did not answer the settings request.", None
+            if answer.get('status') != 'CONFIG':
+                reason = answer.get('reason') or 'the host refused without a reason'
+                return False, f"Settings refused by the host: {reason}. Nothing here was changed.", None
+            payload = answer.get('config')
+            if not isinstance(payload, dict) or not payload:
+                return False, "The host answered with no settings. Nothing here was changed.", None
+            return True, f"Settings received from {host_ip}:{host_port}.", payload
+        except Exception as exc:
+            return False, f"Settings import error: {exc}", None
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    @staticmethod
     def sync_chain(chain_config: dict,
                    status_cb: Optional[Callable[[str], None]] = None,
                    progress_cb: Optional[Callable[[int, int, str, int, int], None]] = None,
@@ -1118,4 +1164,27 @@ class ClientSyncThread(QThread):
                 push_code_cb=self.push_code_cb
             )
         self.finished_signal.emit(ok, msg, transferred, deleted)
+
+
+class HostConfigFetchThread(QThread):
+    """One chain's host, asked for its settings, on a thread of its own.
+
+    Deliberately not a mode of ClientSyncThread. A sync moves tracks, reports counts of what it moved
+    and deletes, and finishes the chain's own record; this moves no files, writes nothing to this
+    machine, and hands back one machine's settings for a window to decide about. Keeping them apart is
+    also what keeps a settings import out of the bookkeeping a running sync needs - a card showing
+    "[12/40] (30%)" is a card about files, and nothing here moves one.
+    """
+    status_signal = Signal(str)
+    # (ok, what to report, the settings that arrived). The third is None whenever the first is False.
+    finished_signal = Signal(bool, str, object)
+
+    def __init__(self, chain_config: dict):
+        super().__init__()
+        self.chain_config = chain_config
+
+    def run(self):
+        ok, message, payload = SyncClientWorker.fetch_config(
+            self.chain_config, status_cb=lambda txt: self.status_signal.emit(txt))
+        self.finished_signal.emit(ok, message, payload)
 
