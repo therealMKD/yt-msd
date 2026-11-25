@@ -2504,6 +2504,26 @@ check("WN-L18 the name is taken from the host's own answers - the AUTH of a sync
       and "host_ip, host_port, host_chain = found" in _wl_client_src,
       [line for line in _wl_client_src.splitlines() if 'chain_name' in line])
 
+# What every one of these windows needs to be wide enough for. A control that lands past the right edge
+# of the area it is in is a control nobody using the window ever sees, and the only way to catch that is
+# to measure the window against the rows it holds.
+_wl_mgr.show()
+_wl_mgr.resize(920, 620)
+QApplication.processEvents()
+_wl_viewport = _wl_mgr.cards_scroll.viewport().width()
+_wl_client_card = _card_for(_wl_mgr, _wl_named['id'])
+_wl_past_the_edge = [btn.text() for btn in _wl_client_card.findChildren(QPushButton)
+                     if btn.geometry().x() + btn.geometry().width() > _wl_viewport]
+check("WN-L19 every button on a client chain's card lands inside the part of the window that can be seen - a control past the right edge of the card area is a control nobody using the window finds, and a card that needs more width than the window gives it is exactly that",
+      _wl_viewport >= _wl_client_card.sizeHint().width() and _wl_past_the_edge == [],
+      (_wl_viewport, _wl_client_card.sizeHint().width(), _wl_past_the_edge))
+_wl_host_dlg = mod.CreateHostChainDialog(None, _wl_cm)
+_wl_host_dlg.show()
+QApplication.processEvents()
+check("WN-L20 the window that makes a hosted chain keeps its own rows inside the width it is pinned to, because a row wider than a fixed-size window has its number box squeezed out of it",
+      _wl_host_dlg.layout().totalMinimumSize().width() <= _wl_host_dlg.width(),
+      (_wl_host_dlg.layout().totalMinimumSize().width(), _wl_host_dlg.width()))
+
 
 
 # ===========================================================================
@@ -3420,7 +3440,7 @@ _answered_app = _ConfigImportApp("host import asked")
 _asking(False, lambda: mod.MainApp.import_config_from_host(_answered_app,
                                                            dict(HOST_CHAIN_RECORD)))
 _what_it_asked = _Answers.asked[0] if _Answers.asked else ("", "", ())
-check("WN-N27 a client chain's button asks first, defaults to No, and says in the question itself that it overwrites the entire config and that there is no undoing it - the two things a button on a chain card cannot be trusted to be obvious about",
+check("WN-N27 a host chosen from the Sync window's menu asks first, defaults to No, and says in the question itself that it overwrites the entire config and that there is no undoing it - the two things a menu entry on a chain window cannot be trusted to be obvious about",
       bool(_Answers.asked) and _what_it_asked[2] == (_Answers.Yes | _Answers.No, _Answers.No)
       and _FETCH_STARTED == []
       and "Import Settings From Host" in _what_it_asked[0]
@@ -3558,7 +3578,7 @@ _pyw_source = (Path(SRC_DIR) / "yt-msd-gui.pyw").read_text(encoding="utf-8")
 _bootstrap_source = (Path(SRC_DIR) / "yt_msd" / "ui" / "bootstrap.py").read_text(encoding="utf-8")
 _sync_client_source = (Path(SRC_DIR) / "yt_msd" / "sync" / "client.py").read_text(encoding="utf-8")
 _sync_host_source = (Path(SRC_DIR) / "yt_msd" / "sync" / "host.py").read_text(encoding="utf-8")
-check("WN-N40 the card's button hands the chain to the main window and nothing else: a chain that has lent its settings out is still the same chain, and the settings are written in exactly one place in the program",
+check("WN-N40 the host menu hands the chain to the main window and nothing else: a chain that has lent its host's settings out is still the same chain, and the settings are written in exactly one place in the program",
       all(hasattr(mod.SyncManagerDialog, name) for name in ("_import_config_from_host",
                                                             "_sync_single_client_chain",
                                                             "_push_client_chain"))
@@ -3567,28 +3587,101 @@ check("WN-N40 the card's button hands the chain to the main window and nothing e
       and _pyw_source.count("def import_config_from_host") == 1,
       _pyw_source.count("def import_config_from_host"))
 
+
 _sync_dialog_app = AppStandIn(sync_config_manager=SYNC_CM, sync_host_server=None,
                               status_signal=_StatusLine())
 _dlg_for_import = QuietSyncDialog(_sync_dialog_app)
 _forwarded = []
 _sync_dialog_app.import_config_from_host = lambda cc: _forwarded.append(dict(cc))
 _client_card = _card_for(_dlg_for_import, CLIENT_CHAIN["id"])
-_import_buttons = [btn for btn in _client_card.findChildren(QPushButton)
-                   if btn.text() == "Import Config From Host"]
-if _import_buttons:
-    _import_buttons[0].click()
-check("WN-N41 every client chain's card carries the button, and pressing it hands this chain to the window that writes settings - the card itself neither warns nor writes",
-      len(_import_buttons) == 1 and _forwarded == [CLIENT_CHAIN]
-      and _sync_dialog_app.status_signal.lines == [],
-      (_forwarded, _sync_dialog_app.status_signal.lines))
+_card_import_buttons = [btn for btn in _client_card.findChildren(QPushButton)
+                        if "Import" in btn.text()]
+_top_import_buttons = [btn for btn in _dlg_for_import.findChildren(QPushButton)
+                       if btn.text().startswith("Import Settings From Host")]
+check("WN-N41 the import lives at the top of the window with the buttons that make and join chains: one button for the whole window and no client card carrying one of its own - a control that overwrites somebody's entire config does not belong in a card header already holding six",
+      len(_top_import_buttons) == 1 and _top_import_buttons[0] is _dlg_for_import.import_host_btn
+      and _card_import_buttons == [] and _forwarded == [],
+      ([btn.text() for btn in _dlg_for_import.findChildren(QPushButton)], _card_import_buttons))
 
-check("WN-N42 the main window is the one that answers a client asking for its settings, and it is handed to the host server the same way the hosted chains and the restore events are",
+# The menu of machines. Five chains reach one host, one chain reaches another, and one has never found
+# its host at all: what the menu says about that machine-count is the whole of the design.
+_MENU_CFG = fixture("host import menu chains")
+_MENU_CM = mod.SyncConfigManager(str(_MENU_CFG))
+_MENU_OTHER = _MENU_CM.add_client_chain(name="Other", folder_path=str(_MENU_CFG / "other"),
+                                        sync_code="5001", host_ip="192.0.2.44", deletion_mode="additive")
+_MENU_CHRISTIAN = _MENU_CM.add_client_chain(name="Christian", folder_path=str(_MENU_CFG / "christian"),
+                                            sync_code="5002", host_ip="192.0.2.44", deletion_mode="additive")
+_MENU_COMMUTE = _MENU_CM.add_client_chain(name="Commute", folder_path=str(_MENU_CFG / "commute"),
+                                          sync_code="5003", host_ip="192.0.2.44", deletion_mode="mirror")
+_MENU_FOCUS = _MENU_CM.add_client_chain(name="Focus", folder_path=str(_MENU_CFG / "focus"),
+                                        sync_code="5004", host_ip="192.0.2.44", deletion_mode="mirror")
+_MENU_SLEEP = _MENU_CM.add_client_chain(name="Sleep", folder_path=str(_MENU_CFG / "sleep"),
+                                        sync_code="5005", host_ip="192.0.2.44", deletion_mode="mirror")
+_MENU_NIGHT = _MENU_CM.add_client_chain(name="Night Drive", folder_path=str(_MENU_CFG / "night"),
+                                        sync_code="5006", host_ip="192.0.2.77", deletion_mode="mirror")
+_MENU_NOWHERE = _MENU_CM.add_client_chain(name="Nowhere", folder_path=str(_MENU_CFG / "nowhere"),
+                                          sync_code="5007", host_ip="", deletion_mode="mirror")
+# The pairing proven most recently, on the host with five chains and on the host with one. Every other
+# chain on this fixture has never synced.
+_MENU_CHRISTIAN["last_synced"] = 1730000000.0
+_MENU_NIGHT["last_synced"] = 1700000000.0
+
+_MENU_FORWARD = []
+_MENU_APP = AppStandIn(sync_config_manager=_MENU_CM, sync_host_server=None, status_signal=_StatusLine())
+_MENU_APP.import_config_from_host = lambda cc: _MENU_FORWARD.append(dict(cc))
+_MENU_DLG = QuietSyncDialog(_MENU_APP)
+_MENU_DLG._rebuild_import_host_menu()
+_MENU_ACTIONS = _MENU_DLG.import_host_menu.actions()
+_MENU_TEXTS = [act.text() for act in _MENU_ACTIONS]
+check("WN-N42 the menu names machines and not chains: five chains reaching one host are one entry naming the chains that host reaches, a second host is its own entry, and the entries come in address order with a host nobody has reached last",
+      _MENU_TEXTS == ["192.0.2.44 - Host of Other, Christian, Commute, etc.",
+                      "192.0.2.77 - Host of Night Drive",
+                      "Host address not known yet - Host of Nowhere"],
+      _MENU_TEXTS)
+check("WN-N43 every entry can actually be chosen, and each one says on its tooltip which machine it asks and which chain it asks through - somebody choosing from this menu has to be able to tell that a five-chain host is one machine with one settings file",
+      all(act.isEnabled() for act in _MENU_ACTIONS)
+      and "192.0.2.44" in _MENU_ACTIONS[0].toolTip() and "Christian" in _MENU_ACTIONS[0].toolTip()
+      and "192.0.2.77" in _MENU_ACTIONS[1].toolTip(),
+      [act.toolTip() for act in _MENU_ACTIONS])
+_MENU_ACTIONS[0].trigger()
+check("WN-N44 choosing a host hands one of that host's chains to the window that writes settings - the chain whose pairing was proven most recently, because a host answers for any chain it hosts and the most recently synced is the least likely to have been removed on the host - and the sync window itself neither warns nor writes",
+      len(_MENU_FORWARD) == 1 and _MENU_FORWARD[0]["sync_code"] == "5002"
+      and _MENU_FORWARD[0]["last_known_host_ip"] == "192.0.2.44"
+      and _MENU_APP.status_signal.lines == [],
+      (_MENU_FORWARD, _MENU_APP.status_signal.lines))
+_MENU_CM.add_client_chain(name="Morning", folder_path=str(_MENU_CFG / "morning"),
+                          sync_code="5008", host_ip="192.0.2.88", deletion_mode="additive")
+_MENU_DLG._rebuild_import_host_menu()
+check("WN-N45 the menu is filled from the chains as they stand when it is opened and not from the chains as they were when the window was built, so a machine this PC started following while the window was open is offered and no machine is offered twice",
+      [act.text() for act in _MENU_DLG.import_host_menu.actions()] ==
+      ["192.0.2.44 - Host of Other, Christian, Commute, etc.",
+       "192.0.2.77 - Host of Night Drive",
+       "192.0.2.88 - Host of Morning",
+       "Host address not known yet - Host of Nowhere"],
+      [act.text() for act in _MENU_DLG.import_host_menu.actions()])
+
+_EMPTY_CFG = fixture("no chains to import from")
+_EMPTY_CM = mod.SyncConfigManager(str(_EMPTY_CFG))
+_EMPTY_FORWARD = []
+_EMPTY_APP = AppStandIn(sync_config_manager=_EMPTY_CM, sync_host_server=None, status_signal=_StatusLine())
+_EMPTY_APP.import_config_from_host = lambda cc: _EMPTY_FORWARD.append(dict(cc))
+_EMPTY_DLG = QuietSyncDialog(_EMPTY_APP)
+_EMPTY_DLG._rebuild_import_host_menu()
+_EMPTY_ACTIONS = _EMPTY_DLG.import_host_menu.actions()
+check("WN-N46 a PC following no chain still opens the menu and is told there is nothing to import from, in a line that cannot be chosen, rather than being given a button that does nothing when pressed",
+      len(_EMPTY_ACTIONS) == 1 and _EMPTY_ACTIONS[0].text() == "No chain on this PC follows another machine"
+      and _EMPTY_ACTIONS[0].isEnabled() is False and _EMPTY_FORWARD == [],
+      [act.text() for act in _EMPTY_ACTIONS])
+check("WN-N47 what a host's entry sends is one of its own chains as this machine holds it: the fetch is the client half of a chain, so it travels on a chain this machine already has, which is the only reason a host answers it at all",
+      _MENU_FORWARD[0] == {key: value for key, value in _MENU_CHRISTIAN.items()},
+      (_MENU_FORWARD[0], _MENU_CHRISTIAN))
+check("WN-N48 the main window is the one that answers a client asking for its settings, and it is handed to the host server the same way the hosted chains and the restore events are",
       "get_config_cb=self._config_payload_for_host" in _bootstrap_source
       and "def _config_payload_for_host" in _pyw_source
       and "_CONFIG_WRITE_LOCK" in _pyw_source.split("def _config_payload_for_host", 1)[1]
           .split("def ", 1)[0],
       [line.strip() for line in _bootstrap_source.splitlines() if "get_config_cb" in line])
-check("WN-N43 a settings import is wired to the window the way every other worker is wired: a signal on the main window, connected in the startup beside the import and export signals it sits next to",
+check("WN-N49 a settings import is wired to the window the way every other worker is wired: a signal on the main window, connected in the startup beside the import and export signals it sits next to",
       "config_file_ready_signal = Signal(str, object)" in _pyw_source
       and "self.config_file_ready_signal.connect(self._on_config_file_read)" in _bootstrap_source
       and "self._config_import_busy = False" in _bootstrap_source,
@@ -3597,11 +3690,11 @@ check("WN-N43 a settings import is wired to the window the way every other worke
 _new_names = ("build_host_config_import", "read_settings_file", "MACHINE_OWN_CONFIG_KEYS",
               "SESSION_LOCAL_PATH_KEYS", "SETTINGS_FILE_MARKERS", "HostConfigFetchThread",
               "MAX_CONFIG_PAYLOAD_BYTES")
-check("WN-N44 every name this added is a module-level one the seam reaches, and none of them is held only by the entry point",
+check("WN-N50 every name this added is a module-level one the seam reaches, and none of them is held only by the entry point",
       all(seam.owned_by(name) and any(owner != mod.__name__ for owner in seam.owned_by(name))
           for name in _new_names),
       {name: seam.owned_by(name) for name in _new_names})
-check("WN-N45 both whole-config imports finish by making the window, the file and the next save say the same thing - the file written, the settings read back into the attributes that own them, and every control save_config reads out of refilled - and that is the order the reset to defaults got wrong",
+check("WN-N51 both whole-config imports finish by making the window, the file and the next save say the same thing - the file written, the settings read back into the attributes that own them, and every control save_config reads out of refilled - and that is the order the reset to defaults got wrong",
       "_apply_whole_config_import" in _pyw_source and "_reload_settings_into_ui" in _pyw_source
       and "_write_settings_file" in _pyw_source and "self.load_config()" in _pyw_source
       and "GET_CONFIG" in _sync_client_source and "GET_CONFIG" in _sync_host_source,

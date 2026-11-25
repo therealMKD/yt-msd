@@ -2993,7 +2993,7 @@ class MainApp(BootstrapMixin,
             return False
 
     def import_config_from_host(self, chain_config: dict):
-        """The button on a client chain's card: take that host's settings and put them on this PC.
+        """One machine named in the Sync window's Import Settings From Host menu: its settings, onto this PC.
 
         The question comes first, because what follows replaces everything this window has been set to.
         The fetch is the ordinary client half of a chain - the address it already syncs to, the same

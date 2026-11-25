@@ -16,7 +16,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont
 from yt_msd.sync.client import (ClientSyncThread, NOTHING_TO_PUSH_NOTE, SYNC_DECISION_DELETE,
                                 SYNC_DECISION_KEEP, SYNC_DECISION_RESTORE, deletions_were_declined,
-                                files_were_pushed, host_was_rebuilt, make_push_code_cb,
+                                files_were_pushed, host_was_rebuilt, last_sync_moment, make_push_code_cb,
                                 make_push_confirm_cb, make_restore_code_cb, make_sync_decision_cb,
                                 nothing_to_push)
 
@@ -78,32 +78,47 @@ class CreateHostChainDialog(QDialog):
 
         self.count_lbl = QLabel("0 audio files detected (subfolders/zips ignored)")
         self.count_lbl.setStyleSheet("color: #3B8ED0; font-size: 11px;")
+        # Word-wrapped: the sentence is what it says once a folder is chosen, and at its full length it is
+        # wider than this window is pinned to.
+        self.count_lbl.setWordWrap(True)
         layout.addWidget(self.count_lbl)
 
-        options_h = QHBoxLayout()
-        options_h.addWidget(QLabel("Sync Code (4-digit):"))
+        # The sync code and the notify delay each get a row of their own. Side by side the two labels and
+        # the two boxes want 714 pixels, and this window is pinned to 520 - a row wider than the window it
+        # is in has both of its labels cut off, which is how a code gets mistyped.
+        code_h = QHBoxLayout()
+        code_h.addWidget(QLabel("Sync Code (4-digit):"))
         self.code_edit = QLineEdit(self.config_manager.generate_unique_sync_code())
         self.code_edit.setFixedWidth(70)
-        options_h.addWidget(self.code_edit)
+        code_h.addWidget(self.code_edit)
+        code_h.addStretch()
+        layout.addLayout(code_h)
 
-        options_h.addSpacing(20)
-        options_h.addWidget(QLabel("Change Notify Delay:"))
+        delay_h = QHBoxLayout()
+        delay_h.addWidget(QLabel("Change Notify Delay:"))
         self.delay_spin = QSpinBox()
         self.delay_spin.setRange(1, 60)
         self.delay_spin.setValue(5)
         self.delay_spin.setSuffix(" min")
-        options_h.addWidget(self.delay_spin)
-        options_h.addStretch()
-        layout.addLayout(options_h)
+        delay_h.addWidget(self.delay_spin)
+        delay_h.addStretch()
+        layout.addLayout(delay_h)
 
         # Whether this chain tells the network it exists. Visible is the default, for the same reason
         # it is the default for a chain saved by an older build: a hosted chain's code has been
         # broadcast on the LAN by the beacon since 3.0, so a chain nobody can find is a change in
         # behaviour the user did not ask for - and a chain nobody can find is a chain nobody joins.
-        self.visible_check = QCheckBox("Visible chain - clients on my network can find it without the code")
+        self.visible_check = QCheckBox("Visible chain")
         self.visible_check.setChecked(DEFAULT_HOST_CHAIN_VISIBLE)
         self.visible_check.setToolTip("Unset means this chain names itself in nothing and answers no search. A client can still sync it, but only one that was already given the 4-digit sync code.")
+        # The sentence the box used to carry in its own label, in a line under it. A check box cannot wrap
+        # its label, and that sentence on its own was 816 pixels wide - wider than this window is pinned
+        # to by 296 - so the box and the word "code" at the end of its sentence were off the window.
+        visible_lbl = QLabel("Clients on my network can find this chain without the code.")
+        visible_lbl.setWordWrap(True)
+        visible_lbl.setStyleSheet("color: #888; font-size: 11px;")
         layout.addWidget(self.visible_check)
+        layout.addWidget(visible_lbl)
 
         # How much a client may add to this folder in one push. Asked here rather than left to the
         # card, because the alternative is a host finding out about it from a client: a chain that
@@ -111,7 +126,11 @@ class CreateHostChainDialog(QDialog):
         # grown from anywhere on the network. 0 is offered on purpose - it means this chain takes
         # nothing, which is the answer for a host that only ever wants to hand files out.
         push_h = QHBoxLayout()
-        push_h.addWidget(QLabel("Accept pushed files (max per push):"))
+        push_lbl = QLabel("Accept pushed files (max per push):")
+        # Word-wrapped, because this window is held at a fixed 520 and the row's three parts side by side
+        # want 856 - a row wider than the window it is inside is a row whose spin box gets squeezed.
+        push_lbl.setWordWrap(True)
+        push_h.addWidget(push_lbl)
         self.push_spin = QSpinBox()
         self.push_spin.setRange(0, PUSH_FILE_LIMIT_MAX)
         self.push_spin.setValue(DEFAULT_PUSH_FILE_LIMIT)
@@ -192,6 +211,15 @@ CLIENT_HOST_LIST_HEIGHT = 118
 CLIENT_HOST_LIST_MAX_HEIGHT = 148
 CLIENT_HOST_LIST_MIN_HEIGHT = 64
 CLIENT_HOST_LIST_STEP = 18
+
+# What each sync mode does, said in full once. The mode box names the two shortly and this is the line
+# under it and the tooltip on each entry, because a combo box item's whole text counts towards that
+# box's minimum width - and a window that asks for more width than it was designed at is a window whose
+# own rows get cut off on the screen it opens on.
+MIRROR_MODE_MEANING = ("Mirror Mode: sync every file the host has, take the edits it made, and delete "
+                       "the files this folder no longer has on the host's list.")
+ADDITIVE_MODE_MEANING = ("Additive Mode: only download new and updated files, and keep every file this "
+                         "folder already has whatever the host does.")
 
 
 class ConnectClientChainDialog(QDialog):
@@ -274,7 +302,12 @@ class ConnectClientChainDialog(QDialog):
         self.host_list.currentItemChanged.connect(self._apply_scan_choice)
         layout.addWidget(self.host_list)
 
-        layout.addWidget(QLabel("Local Base Folder where files should be synced:"))
+        base_folder_lbl = QLabel("Local Base Folder where files should be synced:")
+        # Word-wrapped. This sentence wanted 564 pixels on its own, and a row that wants more than the
+        # 560 this window is built at is the row that decides how wide the window has to open - so the
+        # window opened 44 pixels wider than it was designed to, on a screen that may not have them.
+        base_folder_lbl.setWordWrap(True)
+        layout.addWidget(base_folder_lbl)
         folder_h = QHBoxLayout()
         self.folder_edit = QLineEdit()
         self.folder_edit.setPlaceholderText("Base folder (e.g. C:\\Music)...")
@@ -293,9 +326,20 @@ class ConnectClientChainDialog(QDialog):
 
         layout.addWidget(QLabel("Sync / Deletion Mode:"))
         self.del_mode_combo = QComboBox()
-        self.del_mode_combo.addItem("Mirror Mode (Default: Sync all files, update edits & delete removed files)", "mirror")
-        self.del_mode_combo.addItem("Additive Mode (Only download new/updated files, keep local files)", "additive")
+        # The box names the two modes and stops there, and the line under it says what the one chosen
+        # does. A combo box counts every item's whole text towards its own minimum width, and these two
+        # sentences sitting inside the box made this window ask for 958 pixels - 398 more than the width
+        # it is built at - so a window that cannot shrink to the size it asks for is a window that gets
+        # its own bottom row cut off on a small screen.
+        self.del_mode_combo.addItem("Mirror Mode (default)", "mirror")
+        self.del_mode_combo.addItem("Additive Mode", "additive")
+        self.del_mode_combo.setItemData(0, MIRROR_MODE_MEANING, Qt.ToolTipRole)
+        self.del_mode_combo.setItemData(1, ADDITIVE_MODE_MEANING, Qt.ToolTipRole)
         layout.addWidget(self.del_mode_combo)
+        self.del_mode_hint = QLabel(MIRROR_MODE_MEANING)
+        self.del_mode_hint.setWordWrap(True)
+        self.del_mode_hint.setStyleSheet("color: #888; font-size: 11px;")
+        layout.addWidget(self.del_mode_hint)
 
         # How many files this chain may delete before it asks. It lives beside the mode choice
         # because it is a rule about deleting, and the row is hidden for Additive - a chain that
@@ -304,7 +348,12 @@ class ConnectClientChainDialog(QDialog):
         limit_row = QHBoxLayout(self.delete_limit_row)
         limit_row.setContentsMargins(0, 0, 0, 0)
         limit_row.setSpacing(8)
-        limit_row.addWidget(QLabel("Ask before deleting more than:"))
+        limit_ask_lbl = QLabel("Ask before deleting more than:")
+        # Word-wrapped, because these three parts side by side want 651 pixels and this window is built
+        # at 560: a row that cannot fit is the row that decides how wide the window has to open, and the
+        # window then opens wider than the screen it is meant to fit on.
+        limit_ask_lbl.setWordWrap(True)
+        limit_row.addWidget(limit_ask_lbl)
         self.delete_limit_spin = QSpinBox()
         self.delete_limit_spin.setRange(0, DELETE_CONFIRM_LIMIT_MAX)
         self.delete_limit_spin.setValue(DEFAULT_DELETE_CONFIRM_LIMIT)
@@ -515,15 +564,17 @@ class ConnectClientChainDialog(QDialog):
             self.folder_edit.setText(f)
 
     def _sync_delete_limit_row(self):
-        """Show the deletion limit only for a Mirror chain.
+        """Show the deletion limit only for a Mirror chain, and say what the mode chosen does.
 
         The limit is a rule about deleting files this PC no longer has on its host's list. An
         Additive chain keeps every file it holds whatever the host does, so there is nothing for it
-        to be asked about and no number for it to be given.
+        to be asked about and no number for it to be given. The sentence naming the mode follows the
+        same reaction because it is the mode that decides both.
         """
         is_mirror = self.del_mode_combo.currentData() == 'mirror'
         self.delete_limit_row.setVisible(is_mirror)
         self.delete_limit_spin.setEnabled(is_mirror)
+        self.del_mode_hint.setText(MIRROR_MODE_MEANING if is_mirror else ADDITIVE_MODE_MEANING)
 
     def _connect_chain(self):
         ip = self.ip_edit.text().strip()
@@ -772,6 +823,12 @@ class ConnectRemovableMediaDialog(QDialog):
 
 
 
+# How many of one host's chains its menu entry names before it says "etc.". The entry has to be
+# readable across the window, and its job is to let the person opening the menu recognise the machine
+# they are about to overwrite their settings with - not to list every chain that machine serves.
+HOST_IMPORT_CHAIN_NAMES_SHOWN = 3
+
+
 class SyncManagerDialog(QDialog):
     """Main Sync Chains Management Dialog with Host, Client, and Removable Drive cards and live transfer tracking."""
     def __init__(self, parent_app):
@@ -842,6 +899,27 @@ class SyncManagerDialog(QDialog):
         settings_bar.addWidget(self.host_port_lbl)
 
         settings_bar.addStretch()
+
+        # Import Settings From Host, at the right end of the window's top rows and above every chain
+        # card. It is a menu of machines rather than a button on each chain because the settings belong to
+        # a machine: the PC that hosts three of this one's chains has one settings file, and three entries
+        # for it would read like three places to import from and ask the same host the same question three
+        # times. It sits on this row rather than on the row of chain buttons because that row's five
+        # buttons already decide how wide this window has to open, and a sixth one on it would push the
+        # window 350 pixels wider than the cards below it need. The menu is filled the moment it is opened,
+        # so a chain joined or a host found at a new address while this window was closed is in it without
+        # rebuilding anything.
+        self.import_host_btn = QPushButton("Import Settings From Host ▾")
+        self.import_host_btn.setToolTip("Ask one of the machines this PC syncs from for the settings it "
+                                        "runs with, and put them on this PC. It overwrites this machine's "
+                                        "entire config - theme, saved playlist, saved search, download "
+                                        "settings - and cannot be undone. This machine's own sync chains "
+                                        "and local file paths are left alone.")
+        self.import_host_menu = QMenu(self)
+        self.import_host_menu.aboutToShow.connect(self._rebuild_import_host_menu)
+        self.import_host_btn.setMenu(self.import_host_menu)
+        settings_bar.addWidget(self.import_host_btn)
+
         main_layout.addLayout(settings_bar)
 
         self.cards_scroll = QScrollArea()
@@ -1231,6 +1309,11 @@ class SyncManagerDialog(QDialog):
         info_h = QHBoxLayout()
         path_lbl = QLabel(f"Path: {folder_str}{cnt_str}")
         path_lbl.setStyleSheet("color: #888; font-size: 11px;")
+        # Word-wrapped, on every card's path line. A chain's folder is as long as the folder its owner
+        # chose - nested under a Music folder under a user profile it wants more width than this window
+        # has - and a path line that cannot shrink is the line that pushes a card past the right edge of
+        # the card area, which is where the Open Folder button and the delete box go.
+        path_lbl.setWordWrap(True)
         info_h.addWidget(path_lbl, 1)
 
         open_btn = QPushButton("Open Folder")
@@ -1271,6 +1354,12 @@ class SyncManagerDialog(QDialog):
         l.setSpacing(6)
 
         header = QHBoxLayout()
+        # What this chain can be made to do - pause, the Wi-Fi binding, a sync now, a push - goes on a row
+        # of its own under the title row. All four of them in the title row, beside the chain's name and
+        # its code and host and the delete box, made the card ask for 1,728 pixels; a card wider than the
+        # window holding it is a card whose Sync Now and Push to Host sit past the edge nobody scrolls to.
+        actions = QHBoxLayout()
+        actions.setSpacing(6)
         badge = QLabel("CLIENT")
         badge.setStyleSheet("background: #1abd33; color: white; padding: 2px 6px; border-radius: 3px; font-weight: bold; font-size: 10px;")
         header.addWidget(badge)
@@ -1300,7 +1389,7 @@ class SyncManagerDialog(QDialog):
             resume_btn.setToolTip("Resume syncing for this chain")
             resume_btn.setStyleSheet("background: #3B8ED0; color: white; font-size: 11px; padding: 3px 8px; border-radius: 4px;")
             resume_btn.clicked.connect(lambda chk=False, cid=cid_val: self._resume_chain_sync(cid))
-            header.addWidget(resume_btn)
+            actions.addWidget(resume_btn)
         else:
             pause_btn = QPushButton("Pause Sync ▾")
             pause_btn.setToolTip("Pause syncing for this chain")
@@ -1326,7 +1415,7 @@ class SyncManagerDialog(QDialog):
                 act = pause_menu.addAction(label)
                 act.triggered.connect(lambda chk=False, cid=cid_val, s=secs: self._pause_chain_sync(cid, s))
             pause_btn.setMenu(pause_menu)
-            header.addWidget(pause_btn)
+            actions.addWidget(pause_btn)
 
         # Wi-Fi SSID Auto-Sync Binding Control
         wifi_ssid = cc.get('wifi_ssid', '')
@@ -1349,12 +1438,12 @@ class SyncManagerDialog(QDialog):
             act_clear = wifi_menu.addAction("Unbind Wi-Fi (Sync on any network)")
             act_clear.triggered.connect(lambda chk=False, cid=cid_val: self._bind_chain_wifi(cid, ""))
         wifi_btn.setMenu(wifi_menu)
-        header.addWidget(wifi_btn)
+        actions.addWidget(wifi_btn)
 
         sync_btn = QPushButton("Sync Now")
         sync_btn.setToolTip("Sync this chain now")
         sync_btn.clicked.connect(lambda chk=False, c=cc: self._sync_single_client_chain(c))
-        header.addWidget(sync_btn)
+        actions.addWidget(sync_btn)
 
         # Push to Host, on the chains that have a use for it. Only a Mirror chain gets the button: a
         # push exists because the next sync of a Mirror chain deletes whatever its host does not offer,
@@ -1370,25 +1459,7 @@ class SyncManagerDialog(QDialog):
                                    " background: rgba(26, 189, 51, 0.22);"
                                    " border: 1px solid rgba(26, 189, 51, 0.5); border-radius: 4px;")
             push_btn.clicked.connect(lambda chk=False, c=cc: self._push_client_chain(c))
-            header.addWidget(push_btn)
-
-        # Import Config From Host, on every client chain. It goes the other way from everything else on
-        # this card: a sync pulls tracks and a push offers them, and this asks the machine at the other
-        # end of the chain for the settings it runs with. It is on every client chain and not only the
-        # Mirror ones because it has nothing to do with what the chain does to files - a chain whose host
-        # has been rebuilt from a stick is still a chain whose theme and download settings somebody may
-        # want on this PC. The warning about what it overwrites is put on the way to the button, and the
-        # one that stops anything being written is the confirmation the main window asks for.
-        import_cfg_btn = QPushButton("Import Config From Host")
-        import_cfg_btn.setToolTip("Ask this chain's host for its yt-msd settings and put them on this "
-                                  "PC. It overwrites this machine's entire config - theme, saved "
-                                  "playlist, saved search, download settings - and cannot be undone. "
-                                  "This machine's own sync chains and local file paths are left alone.")
-        import_cfg_btn.setStyleSheet("font-size: 11px; padding: 3px 8px;"
-                                     " background: rgba(59, 142, 208, 0.22);"
-                                     " border: 1px solid rgba(59, 142, 208, 0.5); border-radius: 4px;")
-        import_cfg_btn.clicked.connect(lambda chk=False, c=cc: self._import_config_from_host(c))
-        header.addWidget(import_cfg_btn)
+            actions.addWidget(push_btn)
 
         del_btn = QPushButton("✕")
         del_btn.setFixedSize(26, 26)
@@ -1397,7 +1468,9 @@ class SyncManagerDialog(QDialog):
         del_btn.clicked.connect(lambda chk=False, cid=cid_val: self._delete_chain(cid))
         header.addWidget(del_btn)
 
+        actions.addStretch()
         l.addLayout(header)
+        l.addLayout(actions)
 
         folder_str = cc.get('folder_path', '')
         last_sync = cc.get('last_synced', 0)
@@ -1455,6 +1528,7 @@ class SyncManagerDialog(QDialog):
         info_h = QHBoxLayout()
         path_lbl = QLabel(f"Path: {folder_str}")
         path_lbl.setStyleSheet("color: #888; font-size: 11px;")
+        path_lbl.setWordWrap(True)  # Same reason as on the host card: a long folder must not widen the card.
         info_h.addWidget(path_lbl, 1)
 
         open_btn = QPushButton("Open Folder")
@@ -1532,6 +1606,7 @@ class SyncManagerDialog(QDialog):
         info_h = QHBoxLayout()
         path_lbl = QLabel(f"Path: {folder_str}")
         path_lbl.setStyleSheet("color: #888; font-size: 11px;")
+        path_lbl.setWordWrap(True)  # Same reason as on the host card: a long folder must not widen the card.
         info_h.addWidget(path_lbl, 1)
 
         open_btn = QPushButton("Open Folder")
@@ -1643,15 +1718,79 @@ class SyncManagerDialog(QDialog):
         """
         self._sync_single_client_chain(cc, mode='push')
 
+    def _host_import_groups(self) -> list:
+        """The machines this PC follows, each one with the chains that reach it.
+
+        Grouped by the address at the other end of a chain rather than by the chain, because a settings
+        file belongs to a machine: the host of three of this PC's chains has one settings file, and an
+        entry per chain would read like three places to import from and ask the same machine the same
+        question three times. The chains keep the order the cards show them in, so one host's entry names
+        its chains the way this window's cards name them.
+        """
+        groups: list = []
+        by_addr: dict = {}
+        for cc in self.config_manager.client_chains:
+            addr = str(cc.get('last_known_host_ip') or '').strip()
+            if addr not in by_addr:
+                by_addr[addr] = (addr, [])
+                groups.append(by_addr[addr])
+            by_addr[addr][1].append(cc)
+        # A chain whose host has never been reached is still a chain with a host - a settings request
+        # finds that host by its code the way a sync does - but a menu that leads with a blank address
+        # looks broken, so those come last.
+        groups.sort(key=lambda group: (group[0] == '', group[0]))
+        return groups
+
+    @staticmethod
+    def _host_import_chain(chains: list) -> dict:
+        """The chain a host's menu entry hands to the main window.
+
+        Every chain in the group reaches the same machine, and a host answers AUTH for any chain it hosts,
+        so any one of them opens the door. The one worth sending is the one whose pairing was proven most
+        recently, because that is the one least likely to have been removed on the host since - and a
+        chain that has never synced sits behind every chain that has. Chains that tie stay in the order
+        this window lists them.
+        """
+        return max(chains, key=lambda cc: last_sync_moment(cc) or 0.0)
+
+    def _rebuild_import_host_menu(self):
+        """Fill the host menu the moment it is opened, from the chains as they stand then.
+
+        Chains change while this window is closed - one joined, one deleted, a host found at a new address
+        - and a menu built when the window was built would go on naming machines this PC no longer
+        follows, and miss the one it just started following.
+        """
+        self.import_host_menu.clear()
+        groups = self._host_import_groups()
+        if not groups:
+            # The button is still there to open, because the answer to "which machine can I import
+            # settings from here?" is a sentence rather than a button that does nothing.
+            nowhere = self.import_host_menu.addAction("No chain on this PC follows another machine")
+            nowhere.setEnabled(False)
+            return
+        for addr, chains in groups:
+            chain_for_fetch = self._host_import_chain(chains)
+            names = [str(cc.get('name') or 'unnamed chain') for cc in chains]
+            shown = ", ".join(names[:HOST_IMPORT_CHAIN_NAMES_SHOWN])
+            if len(names) > HOST_IMPORT_CHAIN_NAMES_SHOWN:
+                shown += ", etc."
+            where = addr or "Host address not known yet"
+            entry = self.import_host_menu.addAction(f"{where} - Host of {shown}")
+            entry.setToolTip(f"Ask {where} for its yt-msd settings and put them on this PC. It "
+                             "overwrites this machine's entire config - theme, saved playlist, saved "
+                             "search, download settings - and cannot be undone. This machine's own sync "
+                             f"chains and local file paths are left alone. Asked through the chain "
+                             f"'{chain_for_fetch.get('name') or 'unnamed chain'}'.")
+            entry.triggered.connect(lambda chk=False, c=chain_for_fetch: self._import_config_from_host(c))
+
     def _import_config_from_host(self, cc: dict):
-        """The button on a client chain's card: this chain's host, asked for its settings.
+        """One entry of the host menu: the machine that chain reaches, asked for its settings.
 
         Handed straight to the main window, which is where a settings file is written and where the
-        confirmation that keeps a card click from quietly replacing somebody's whole config belongs -
-        the same place the settings window's Import button writes to. Nothing else is taken from this
-        card but the chain it is about, and nothing about the card changes: a chain that has lent its
-        settings out is still the same chain, and no chain is written to this machine before the host
-        has answered.
+        confirmation that keeps a menu click from quietly replacing somebody's whole config belongs - the
+        same place the settings window's Import button writes to. Nothing else is taken from the chain
+        this entry was built from, and nothing about it changes: a chain that has lent its host's settings
+        out is still the same chain, and no chain is written to this machine before the host has answered.
         """
         import_settings = getattr(self.parent_app, 'import_config_from_host', None)
         if callable(import_settings):
