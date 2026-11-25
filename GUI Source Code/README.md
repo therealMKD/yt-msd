@@ -3,7 +3,7 @@
 This is the full readme for the GUI version, with information on every single feature inside of yt-msd. For the CLI readme, go back to the main readme, at the bottom.
 
 >[!WARNING]
->I'm currently in the process of a few minor updates, along with other stuff. Because of that, this readme is not complete, and some information may be subject to change. This warning will be removed once the readme is finished. I'm writing this readme by hand, because I refuse to use AI for my docs (ironic since the program is vibe coded), so bear with me. I'm also currently waiting on my winget package to be accepted (So far it's been 2 weeks) and I won't be making any changes to this readme until that happens.
+>I'm currently in the process of a few minor updates, along with other stuff. Because of that, this readme is not complete, and some information may be subject to change. This warning will be removed once the readme is finished. I'm writing this readme by hand, because I refuse to use AI for my docs (ironic since the program is vibe coded), so bear with me. I'm also currently waiting on my winget package to be accepted (So far it's been 2 weeks) and I won't be making any changes to this readme until that happens. This HAS been updated for the 3.5 update. 
 
 ## Table of Contents
 This is the main table of contents, these main sections also have their own tables of contents for subsections.
@@ -19,7 +19,6 @@ This is the main table of contents, these main sections also have their own tabl
 # Installation
 
 [Exe Version](#exe-version)\
-[Python Version](#python-version)\
 [Musicbee Plugin](#musicbee-plugin)
 
 ## Exe Version
@@ -37,37 +36,6 @@ To uninstall the program, find it in Program Files, or in Settings, and click un
 Because of this, I would recommend against manually installing yt-dlp, and let the program manage it automatically. On each start, it will also check yt-dlp's github repo, and update yt-dlp if necessary.
 
 If something isn't working, check [Troubleshooting](#troubleshooting).
-
-## Python Version
-Go to [releases](https://github.com/therealMKD/yt-msd/releases/latest) and download `yt-msd-gui.pyw`.\
-Before you can run it, you must have Python installed on your system, as well as a few dependencies.
-
-### To install Python: 
-I recommend using winget, but if you've tried winget and it isn't working for whatever reason, download the python install manager from python's website. I would recommend version 3.15.0, but any version newer than 3.14.6 should work.
-
-If you use winget, first run `winget install python`, and wait for it to finish. This will install python's download manager. Next, run `py` to ensure that python has been downloaded. (It should output "Installing Python 3.15", and start IDLE.)
-
-The following commands for dependencies use pip. Installing python with winget will NOT create a python bin directory, and by default, you will not be able to just run `pip` in terminal. Instead, you will have to use `py -m pip`.\
-There is a way to fix this, by running `py install --configure` and accepting the dialogue, then restarting your terminal. This will let you use `pip` directly, as well as a few other python commands. If you don't want to do this, just add `py -m` before all the following install commands.
-
-### Installing the Dependencies
-The following dependencies will need to be installed before the program will run:
-- **ffmpeg** through `pip install ffmpeg` AND `winget install ffmpeg` - Both must be present
-- **vlc** through `pip install python-vlc` AND `winget install vlc` - Both must be present (If you already have the vlc application, you do not need to install it with winget)
-- **pillow** through `pip install pillow`
-- **pyside6** through `pip install pyside6`
-- **mutagen** through `pip install mutagen`
-- **watchdog** through `pip install watchdog`
-
-If you get an error saying `pip is not a recognized command`, refer to the last paragraph of [Installing Python](#to-install-python).
-
-For Ffmpeg and VLC, the normal application is required, since the python dependencies are just wrappers. In the case of VLC, you need the entire desktop VLC player to be installed. If you already have it installed, you do not need to run the winget command.
-
-If the program won't start, refer to [Troubleshooting](#troubleshooting). You've probably forgotten a dependency.
-
-**On first run**, yt-msd will ask you to allow it through firewall. This is necessary for sync to work, and you will ALWAYS receive that popup on program start if the firewall rule doesn't exist. Additionally, yt-msd will also use `winget` to install yt-dlp, which is required for Youtube searching and downloading. If you have yt-dlp installed somewhere else, (e.g. chocolatey) yt-msd will not find it, and will install a duplicate version with winget.
-
-Because of this, I would recommend against manually installing yt-dlp, and let the program manage it automatically. On each start, it will also check yt-dlp's github repo, and update yt-dlp if necessary.
 
 ## Musicbee Plugin
 Reference the [Plugin's Readme](https://github.com/therealMKD/yt-msd/tree/main/MusicBee%20Plugin#readme) 
@@ -211,44 +179,11 @@ All of that happens almost instantly, to give you the suggested title. If you us
 # Settings and Config
 
 # Troubleshooting
-[Python Version Specific Troubleshooting](#python-version-specific-troubleshooting)\
 [General Troubleshooting (Both python and exe versions)](#general-troubleshooting)\
 [Known Issues](#known-issues)
 
 > [!WARNING]
 Before doing ANY of these troubleshooting steps, check for a newer yt-msd version! If the problem is related to yt-msd itself, chances are that I've found and fixed it already! Also, CLOSE yt-msd and reopen it! If you've had it running for a long time, it could start acting weird.
-
-
-## Python Version Specific Troubleshooting
-If the program won't start, pretty much the ONLY thing that could be wrong is a missing dependency. Follow this checklist:
-
-1. Make sure Python is installed. Open terminal, and run `py --version`. You should get an output like `Python 3.15.0`. If your Python version is LOWER than 3.14.8, you need to (update it)[#to-install-python].
-2. Make sure all required dependencies exist. Open terminal, and run `py -m pip list`. You will get an output listing all installed packages. That list should look like this, with equivalent, or higher version numbers:
-```
-Package            Version
------------------- ----------
-ffmpeg             1.4
-mutagen            1.48.1
-pillow             13.0.0
-pip                26.2.1
-PySide6            6.12.0
-PySide6_Addons     6.12.0
-PySide6_Essentials 6.12.0
-PySide6_Pdf        6.12.0.140
-PySide6_WebEngine  6.12.0.140
-python-vlc         3.0.21203
-watchdog           6.0.0
-```
-If anything is missing, run `py -m pip install [missing dependency]`
-
-3. Make sure VLC and Ffmpeg are installed normally. Open terminal, and run `winget list ffmpeg`. You should see a result. Next, run `winget list vlc`. Again, you should see a result. If you see `No installed package found matching input criteria`, then you must install that package with `winget install`.
-4. If it STILL won't start, go to the directory where `yt-msd-gui.pyw` is located, and right click on blank space.\
-   Select "Open In Terminal", and run `py yt-msd-gui.pyw`. If you renamed the file, substitute the filename for your new one. When you run this command, look at the error that occurs.\
-   If the error is `No such file or directory`, you typed the name wrong. Double check it, or enclose it in quotes.\
-   If the error is `py is not a recognized as an internal or external command`, you don't have python [installed correctly](#to-install-python).\
-   If the error contains `ModuleNotFoundError` or `ImportError`, you have a missing dependency, and you didn't follow the previous steps. Start over.\
-   If the error does not match any of these cases, re-download the pyw file, and try again.\
-   If the errors persist, create an issue report here, and attach the exact error you get when trying to run the program.
 
 ## General Troubleshooting
 If the instructions listed don't fix the issue, create an issue report in this repository. **Please note that the only supported operating system is Windows 11. Linux, MacOS, and older Windows versions are NOT tested!**
@@ -271,9 +206,10 @@ Yt-dlp is outdated.
 ### Program freezes, or crashes (After successfully starting)
 1. If it's the python version, refer to [python troubleshooting](#python-version-specific-troubleshooting). 99% of problems on the python version are due to missing dependencies. Since the issue occurs after start, my recommendation is to follow step 4, opening the program in terminal. Do whatever it takes to crash or freeze the program, and look at the error that is generated.
 2. If it's the exe version, it will attempt to generate a `yt-msd-crash.log` file in the same directory as the exe. It will also attempt to create a dialogue box detailing the error. This log will only keep the newest crashes. When you make an error report, include the contents of this log, if one is generated. 
-3. The exe version can be run with `--console` to show the same information as running the python version in the console. (Run it by opening terminal in the same folder and using `.\yt-msd-gui.exe --console`)
-4. No dialog, no log entry, and no traceback means the copy died before it could write one - which probably means yt-msd itself isn't the issue, and something else is the problem. Windows records those events in Event Viewer (Windows Logs > Application, look for an "Application Error" entry for `yt-msd-gui.exe` at that time). If you don't have a log file, look for that entry and put that in your issue report. 
-5. Uninstall, redownload, and reinstall if the log points at yt-msd itself, and make sure yt-dlp is updated (follow the instructions in [Youtube Search or playback fails](#youtube-search-or-playback-fails)).
+3. The exe version can be run with `--console` to show errors in the background. (Run it by opening terminal in the same folder and using `.\yt-msd-gui.exe --console`)
+4. As of 3.5, you can also add the `--trace` tag (You can use both or just one, either way works the same `.\yt-msd-gui.exe --trace` or `.\yt-msd-gui.exe --console --trace`) which shows non-error details. This probably won't help with many issues though, since `--console` already shows errors.
+5. No dialog, no log entry, and no traceback means the copy died before it could write one - which probably means yt-msd itself isn't the issue, and something else is the problem. Windows records those events in Event Viewer (Windows Logs > Application, look for an "Application Error" entry for `yt-msd-gui.exe` at that time). If you don't have a log file, look for that entry and put that in your issue report. 
+6. Uninstall, redownload, and reinstall if the log points at yt-msd itself, and make sure yt-dlp is updated (follow the instructions in [Youtube Search or playback fails](#youtube-search-or-playback-fails)).
 
 ### Renamer errors
 If you rename a file, and get a syntax error or similar (Not a `a file named [name] already exists` error), the original video title, or your new title, has an illegal character. Reminder: `?*<>":/\|` are illegal characters for filenames in windows. If the video title has an illegal character, yt-dlp changes it into a different UTF encoding, that looks the same, but doesn't cause a windows error.
@@ -307,6 +243,17 @@ This is caused by windows audio drivers getting messed up. Check your audio devi
 
 ### Stream is fetched, and starts playing, but you can't hear anything
 This seems to be caused by something else stealing your audio device and failing to give it back. It also could be a yt-msd bug, but I cannot consistently reproduce it. Stop anything else that is playing audio, then restart yt-msd. If it still doesn't work, make an issue.
+
+### A video says "Search Failed. Check your connection or URL"
+This is either two things:
+1. Your internet temporarily dropped. Just try again and it will probably work.
+2. The video is age restricted. Yt-msd is basically browsing YouTube as a guest, and just like a guest, it cannot fetch or play age restricted videos. Find a different video of the song that isn't age restricted.
+
+### Search returns 0 results.
+Your search terms are age restricted. Modify your search terms so that they aren't. 
+
+### Search Failed. Check your connection or URL
+If this is on a search, your internet temporarily dropped. Run the search again. If this is on a URL, check your URL by putting it into a browser. It's probably a 404 page. If this is on a playlist, your playlist is private, and yt-msd cannot see it. Playlists have to be either public or unlisted.
 
 ## Known Issues
 
