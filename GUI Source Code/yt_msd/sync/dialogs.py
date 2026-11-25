@@ -14,13 +14,17 @@ from typing import Callable, Optional
 from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QComboBox, QScrollArea, QFileDialog, QMessageBox, QDialog, QMenu, QFrame, QSpinBox, QInputDialog, QCheckBox, QListWidget, QListWidgetItem
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont
-from yt_msd.sync.client import (ClientSyncThread, SYNC_DECISION_DELETE, SYNC_DECISION_KEEP,
-                                SYNC_DECISION_RESTORE, deletions_were_declined, host_was_rebuilt,
-                                make_restore_code_cb, make_sync_decision_cb)
+from yt_msd.sync.client import (ClientSyncThread, NOTHING_TO_PUSH_NOTE, SYNC_DECISION_DELETE,
+                                SYNC_DECISION_KEEP, SYNC_DECISION_RESTORE, deletions_were_declined,
+                                files_were_pushed, host_was_rebuilt, make_push_code_cb,
+                                make_push_confirm_cb, make_restore_code_cb, make_sync_decision_cb,
+                                nothing_to_push)
 
 from yt_msd.sync.config import (DEFAULT_DELETE_CONFIRM_LIMIT, DEFAULT_HOST_CHAIN_VISIBLE,
-                                DELETE_CONFIRM_LIMIT_MAX, SyncConfigManager, delete_confirm_limit,
-                                host_chain_is_visible, is_client_chain_paused)
+                                DEFAULT_PUSH_FILE_LIMIT, DELETE_CONFIRM_LIMIT_MAX, PUSH_FILE_LIMIT_MAX,
+                                SyncConfigManager, chain_can_push, delete_confirm_limit,
+                                host_chain_is_visible, is_client_chain_paused, push_file_limit,
+                                push_trusted_ips)
 from yt_msd.sync.discovery import HostScanThread, send_lan_update_notification
 from yt_msd.sync.lan import (RESTORE_CODE_LENGTH, SYNC_PORT_START, get_current_wifi_ssid, get_local_ip,
                              restore_code_shape)
@@ -38,7 +42,7 @@ class CreateHostChainDialog(QDialog):
         self.parent_window = parent_window
         self.config_manager = config_manager
         self.setWindowTitle("Create Sync Chain (Host)")
-        self.setFixedSize(520, 410)
+        self.setFixedSize(520, 470)
         self.setWindowFlags(self.windowFlags() | Qt.Tool)
 
         layout = QVBoxLayout(self)
@@ -101,6 +105,23 @@ class CreateHostChainDialog(QDialog):
         self.visible_check.setToolTip("Unset means this chain names itself in nothing and answers no search. A client can still sync it, but only one that was already given the 4-digit sync code.")
         layout.addWidget(self.visible_check)
 
+        # How much a client may add to this folder in one push. Asked here rather than left to the
+        # card, because the alternative is a host finding out about it from a client: a chain that
+        # silently takes whatever a client happens to have just made is a chain whose library can be
+        # grown from anywhere on the network. 0 is offered on purpose - it means this chain takes
+        # nothing, which is the answer for a host that only ever wants to hand files out.
+        push_h = QHBoxLayout()
+        push_h.addWidget(QLabel("Accept pushed files (max per push):"))
+        self.push_spin = QSpinBox()
+        self.push_spin.setRange(0, PUSH_FILE_LIMIT_MAX)
+        self.push_spin.setValue(DEFAULT_PUSH_FILE_LIMIT)
+        self.push_spin.setSuffix(" files")
+        self.push_spin.setFixedWidth(110)
+        self.push_spin.setToolTip("How many new files a client may add to this folder in one push. Whatever it offers beyond that stays on the client. 0 means this chain accepts no pushed files at all.")
+        push_h.addWidget(self.push_spin)
+        push_h.addStretch()
+        layout.addLayout(push_h)
+
         layout.addStretch()
 
         btn_h = QHBoxLayout()
@@ -150,7 +171,8 @@ class CreateHostChainDialog(QDialog):
             return
 
         self.config_manager.add_hosted_chain(name, folder, code, notify_delay_mins=delay,
-                                             visible=self.visible_check.isChecked())
+                                             visible=self.visible_check.isChecked(),
+                                             max_pushed_files=self.push_spin.value())
         self.accept()
 
 
@@ -948,7 +970,13 @@ class SyncManagerDialog(QDialog):
         counts = getattr(self.parent_app, 'chain_track_counts', {}) or {}
         hosted = tuple(
             (hc.get('id'), hc.get('name'), str(hc.get('sync_code', '')), hc.get('folder_path'),
-             counts.get(hc.get('id')), host_chain_is_visible(hc))
+             counts.get(hc.get('id')), host_chain_is_visible(hc), tuple(push_trusted_ips(hc)))
+            # max_pushed_files is left out for the reason delete_confirm_limit is left out below: the
+            # card carries a live spin box for it, and a signature that moved with every keystroke in
+            # that box would rebuild the card - and the box - out from under the user mid-edit. The
+            # list of trusted addresses is in, because it has no box: it is a row of buttons, and the
+            # only way it changes is by a push being approved or a button being pressed, both of which
+            # have to put new buttons on the card.
             for hc in self.config_manager.hosted_chains
         )
         clients = tuple(
@@ -1140,6 +1168,54 @@ class SyncManagerDialog(QDialog):
         vis_hint.setStyleSheet("color: #888; font-size: 11px;")
         l.addWidget(vis_hint)
 
+        # How much a client may add to this folder in one push, and who may push into it without a
+        # code. Both live on this card because both are this machine's decisions: the number is the
+        # ceiling this host puts on somebody else's files, and the list under it is the record of every
+        # address it has told "you do not have to ask me again" - which is why each one is on show, and
+        # why each one is clickable out of the list.
+        push_row = QHBoxLayout()
+        push_row.setSpacing(8)
+        push_lbl = QLabel("Accept pushed files (max per push):")
+        push_lbl.setStyleSheet("color: #888; font-size: 11px;")
+        push_row.addWidget(push_lbl)
+        push_spin = QSpinBox()
+        push_spin.setRange(0, PUSH_FILE_LIMIT_MAX)
+        push_spin.setValue(push_file_limit(hc))
+        push_spin.setSuffix(" files")
+        push_spin.setFixedWidth(110)
+        push_spin.setToolTip("How many new files one client may add to this folder in a single push. Whatever it offers beyond that stays on the client. 0 means this chain accepts no pushed files.")
+        push_spin.valueChanged.connect(lambda val, cid=hc.get('id'): self._update_push_limit(cid, val))
+        push_row.addWidget(push_spin)
+        push_hint = QLabel("(0 = accept none)")
+        push_hint.setStyleSheet("color: #666; font-size: 10px;")
+        push_row.addWidget(push_hint)
+        push_row.addStretch()
+        card.setProperty("push_limit_spin", push_spin)
+        l.addLayout(push_row)
+
+        trusted_ips = push_trusted_ips(hc)
+        if trusted_ips:
+            trusted_lbl = QLabel("Clients that may push here without a code:")
+            trusted_lbl.setStyleSheet("color: #888; font-size: 11px;")
+            l.addWidget(trusted_lbl)
+            trusted_row = QHBoxLayout()
+            trusted_row.setSpacing(6)
+            for trusted_ip in trusted_ips:
+                trust_btn = QPushButton(f"{trusted_ip} ✕")
+                trust_btn.setStyleSheet("background: rgba(255, 140, 0, 0.22); color: #ffb04a;"
+                                        " border: 1px solid rgba(255, 140, 0, 0.5);"
+                                        " padding: 3px 8px; border-radius: 4px; font-size: 11px;")
+                trust_btn.setToolTip("This address may push files into this folder without a code. Click to take that back.")
+                trust_btn.clicked.connect(lambda chk=False, cid=hc.get('id'), ip=trusted_ip:
+                                          self._revoke_push_client(cid, ip))
+                trusted_row.addWidget(trust_btn)
+            trusted_row.addStretch()
+            l.addLayout(trusted_row)
+        else:
+            no_trust_lbl = QLabel("No client may push files into this folder without typing its code first.")
+            no_trust_lbl.setStyleSheet("color: #666; font-size: 10px;")
+            l.addWidget(no_trust_lbl)
+
         folder_str = hc.get('folder_path', '')
         # Track counts come from the background probe's cache: counting files
         # here would scan the folder on the GUI thread.
@@ -1279,6 +1355,22 @@ class SyncManagerDialog(QDialog):
         sync_btn.setToolTip("Sync this chain now")
         sync_btn.clicked.connect(lambda chk=False, c=cc: self._sync_single_client_chain(c))
         header.addWidget(sync_btn)
+
+        # Push to Host, on the chains that have a use for it. Only a Mirror chain gets the button: a
+        # push exists because the next sync of a Mirror chain deletes whatever its host does not offer,
+        # and what this button sends is exactly those files. An Additive chain keeps them whatever its
+        # host does, so a button here would offer to move files nobody was at risk of losing - and ask
+        # its host for a code for nothing.
+        if chain_can_push(cc):
+            push_btn = QPushButton("Push to Host")
+            push_btn.setToolTip("Send the files in this folder that are newer than the last sync up to "
+                                "the host. The host decides how many it takes, and nothing the host "
+                                "already has is changed or removed.")
+            push_btn.setStyleSheet("font-size: 11px; padding: 3px 8px;"
+                                   " background: rgba(26, 189, 51, 0.22);"
+                                   " border: 1px solid rgba(26, 189, 51, 0.5); border-radius: 4px;")
+            push_btn.clicked.connect(lambda chk=False, c=cc: self._push_client_chain(c))
+            header.addWidget(push_btn)
 
         del_btn = QPushButton("✕")
         del_btn.setFixedSize(26, 26)
@@ -1498,13 +1590,48 @@ class SyncManagerDialog(QDialog):
         """
         self.config_manager.set_client_delete_limit(chain_id, value)
 
-    def _sync_single_client_chain(self, cc: dict):
+    def _update_push_limit(self, chain_id: str, value):
+        """Store how many files one push may add to a hosted chain, and stop there.
+
+        The same arrangement as the delete number above, for the same reason: this box is being typed
+        into, and rebuilding the card out from under it would drop the keystroke. The host reads the
+        number straight out of the chain when the next client asks to push.
+        """
+        self.config_manager.set_host_chain_push_limit(chain_id, value)
+
+    def _revoke_push_client(self, chain_id: str, client_ip: str):
+        """Take a client's leave to push without a code, from the card that shows it.
+
+        Reported whatever the answer was, because the difference matters to the person reading it: an
+        address that is no longer on the list is an address that was already gone, and a host that said
+        "taken back" when nothing was taken back is a host that has just lied about a permission.
+        """
+        took_back = self.config_manager.revoke_push_client(chain_id, client_ip)
+        if hasattr(self.parent_app, 'status_signal'):
+            if took_back:
+                self.parent_app.status_signal.emit(f"Push permission for {client_ip} taken back. That "
+                                                   "machine needs its host's code again.", False, "#FF8C00")
+            else:
+                self.parent_app.status_signal.emit(f"{client_ip} was not on this chain's list of clients "
+                                                   "that may push without a code.", False, "#d9822b")
+        self.refresh_cards(force=True)
+
+    def _push_client_chain(self, cc: dict):
+        """The button on a Mirror chain's card: send this folder's own new files up to its host.
+
+        The same worker, the same card bookkeeping and the same code window as a sync that decides to
+        push mid-flight - only asked for by hand, and only going one way. Nothing is pulled here and
+        nothing is deleted: this is the half of a chain that adds.
+        """
+        self._sync_single_client_chain(cc, mode='push')
+
+    def _sync_single_client_chain(self, cc: dict, mode: str = 'sync'):
         cid = cc.get('id')
         if cid in self.sync_threads and self.sync_threads[cid].isRunning():
             return
 
-        cc['status'] = "Syncing..."
-        self.parent_app.sync_progress_state[cid] = {'status': 'Syncing...', 'progress': ''}
+        cc['status'] = "Pushing..." if mode == 'push' else "Syncing..."
+        self.parent_app.sync_progress_state[cid] = {'status': cc['status'], 'progress': ''}
         self.refresh_cards()
 
         chain_name = cc.get('name', 'Sync')
@@ -1514,7 +1641,12 @@ class SyncManagerDialog(QDialog):
             # None when the app this dialog belongs to cannot put a question on screen, which is
             # how the harness drives these windows; the worker then syncs the way it always did.
             decision_cb=make_sync_decision_cb(self.parent_app, chain_name),
-            restore_code_cb=make_restore_code_cb(self.parent_app, chain_name)
+            restore_code_cb=make_restore_code_cb(self.parent_app, chain_name),
+            # The two halves of the push question, built the same way: a window that can ask on this
+            # machine's screen, or nothing at all for a sync that has nobody to ask.
+            push_confirm_cb=make_push_confirm_cb(self.parent_app, chain_name),
+            push_code_cb=make_push_code_cb(self.parent_app, chain_name),
+            mode=mode
         )
 
         self.sync_threads[cid] = thread
@@ -1536,7 +1668,12 @@ class SyncManagerDialog(QDialog):
         def _on_finish(ok, msg, transferred, deleted):
             cc['status'] = "Up to date" if ok else f"Failed: {msg}"
             if ok:
-                cc['last_synced'] = time.time()
+                # A push on its own does not move this chain's last-synced moment. It wrote to another
+                # machine and it changed nothing here, and the files that machine refused to take are
+                # still newer than the last sync - which is exactly what the next sync needs to be able
+                # to find them and ask about them again before it deletes them.
+                if mode != 'push':
+                    cc['last_synced'] = time.time()
                 if deletions_were_declined(msg):
                     # Say so on the status bar too: the card will read "Up to date" while the
                     # files the host stopped offering are still sitting in the folder.
@@ -1546,6 +1683,13 @@ class SyncManagerDialog(QDialog):
                     # And the other way round: the card will read "Up to date" here as well, while
                     # what actually happened is that the other end of the chain was rebuilt from this
                     # folder. Nothing on this PC changed, so the card is not where that shows up.
+                    if hasattr(self.parent_app, 'status_signal'):
+                        self.parent_app.status_signal.emit(f"Sync Chain '{chain_name}': {msg}", False, "#1abd33")
+                elif files_were_pushed(msg) or nothing_to_push(msg):
+                    # The same reason as the two above. "Up to date" on the card is true of this machine
+                    # and says nothing about the other one: a push wrote files onto a host, and a push
+                    # that found nothing to write is worth saying out loud rather than going unmentioned
+                    # behind a card that looks like a sync that did something.
                     if hasattr(self.parent_app, 'status_signal'):
                         self.parent_app.status_signal.emit(f"Sync Chain '{chain_name}': {msg}", False, "#1abd33")
             self.config_manager.save()
@@ -1723,11 +1867,18 @@ class RestoreHostCodeDialog(QDialog):
     host is left exactly as it is.
     """
 
-    def __init__(self, parent_window, title: str, host_label: str, chain_name: str = ''):
+    def __init__(self, parent_window, title: str, host_label: str, chain_name: str = '',
+                 purpose: str = 'restore'):
         super().__init__(parent_window)
         self.parent_window = parent_window
         self.host_label = str(host_label)
         self.chain_name = str(chain_name or '')
+        # Which question this box is the second half of. A Restore Host and a Push ask for the same four
+        # characters off the same host's screen, and the only thing that differs is what the person
+        # typing them is being told they are agreeing to - so it is one window with two headings rather
+        # than two windows that could drift apart on the wording that matters most.
+        self.purpose = 'push' if str(purpose) == 'push' else 'restore'
+        pushing = self.purpose == 'push'
         # What was accepted, or None for "nobody typed anything". The sync reads anything else - a
         # cancelled window, a half-typed one - the same way.
         self.code: Optional[str] = None
@@ -1739,11 +1890,16 @@ class RestoreHostCodeDialog(QDialog):
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(12)
 
-        heading = QLabel("REBUILD THE HOST FROM THIS PC")
+        heading = QLabel("SEND THESE FILES TO THE HOST" if pushing else "REBUILD THE HOST FROM THIS PC")
         heading.setFont(QFont("Segoe UI Semibold", 11))
         layout.addWidget(heading)
 
-        body = QLabel(f"{'This chain is being restored from this PC to ' + self.host_label}.\n\n"
+        body = QLabel(f"{'This chain is pushing its own new files to ' + self.host_label}.\n\n"
+                      "Nothing in this folder is deleted. The host decides which of these files it takes and how "
+                      "many it will take at all, it keeps everything it already holds, and nothing on it is "
+                      "changed or removed."
+                      if pushing else
+                      f"{'This chain is being restored from this PC to ' + self.host_label}.\n\n"
                       "Nothing in this folder is deleted. Files are copied from here onto the host, which keeps "
                       "anything it already holds and takes only what it is missing.")
         body.setWordWrap(True)
@@ -1775,8 +1931,11 @@ class RestoreHostCodeDialog(QDialog):
         self.cancel_btn.setToolTip("Leave the host exactly as it is. Nothing on either PC is changed.")
         self.cancel_btn.clicked.connect(self.reject)
         buttons.addWidget(self.cancel_btn)
-        self.restore_btn = QPushButton("Restore The Host")
-        self.restore_btn.setToolTip("Send this PC's copy to the host. Nothing on this PC is deleted.")
+        self.restore_btn = QPushButton("Push To The Host" if pushing else "Restore The Host")
+        self.restore_btn.setToolTip("Send these files to the host. Nothing on this PC is deleted, and nothing "
+                                    "the host already has is replaced."
+                                    if pushing else
+                                    "Send this PC's copy to the host. Nothing on this PC is deleted.")
         self.restore_btn.clicked.connect(self._accept_code)
         # Nothing to accept yet, so nothing to press. The button becomes the default once there is.
         self.restore_btn.setEnabled(False)
@@ -1832,7 +1991,8 @@ class HostRestoreCodeDialog(QDialog):
     """
 
     def __init__(self, parent_window, sync_code: str, chain_name: str, client_ip: str, code: str,
-                 expires_in: float, on_cancel: Optional[Callable[[str, str], None]] = None):
+                 expires_in: float, on_cancel: Optional[Callable[[str, str], None]] = None,
+                 purpose: str = 'restore'):
         super().__init__(parent_window)
         self.parent_window = parent_window
         self.sync_code = str(sync_code)
@@ -1840,6 +2000,11 @@ class HostRestoreCodeDialog(QDialog):
         self.client_ip = str(client_ip)
         self.code = str(code)
         self.on_cancel_cb = on_cancel
+        # Which offer this window is showing a code for. A host can be asked to rebuild itself and asked
+        # to take a handful of new files in the same minute, and the person reading these four characters
+        # out loud has to know which of the two they are handing over.
+        self.purpose = 'push' if str(purpose) == 'push' else 'restore'
+        pushing = self.purpose == 'push'
         # Whether this window has already closed the offer, and whether it is going away for a reason
         # decided elsewhere (the client backed out, the rebuild started) rather than by somebody here
         # pressing Cancel. Those have to be told apart: a window that closes after its offer was
@@ -1847,7 +2012,8 @@ class HostRestoreCodeDialog(QDialog):
         self.cancelled = False
         self.settled_by_program = False
         self.closed_reason = ''
-        self.setWindowTitle(f"Restore Host - Code for {self.chain_name}")
+        self.setWindowTitle(f"Push To Host - Code for {self.chain_name}" if pushing
+                            else f"Restore Host - Code for {self.chain_name}")
         self.setFixedSize(540, 400)
         self.setWindowFlags(self.windowFlags() | Qt.Tool)
 
@@ -1855,11 +2021,17 @@ class HostRestoreCodeDialog(QDialog):
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(12)
 
-        heading = QLabel("A CLIENT IS ASKING TO REBUILD THIS HOST")
+        heading = QLabel("A CLIENT IS SENDING FILES TO THIS HOST" if pushing
+                         else "A CLIENT IS ASKING TO REBUILD THIS HOST")
         heading.setFont(QFont("Segoe UI Semibold", 11))
         layout.addWidget(heading)
 
-        body = QLabel(f"{self.client_ip} is waiting to restore Sync Chain '{self.chain_name}' from its own copy.\n\n"
+        body = QLabel(f"{self.client_ip} is waiting to push its own new files into Sync Chain '{self.chain_name}'.\n\n"
+                      "Read these four characters to whoever is at that machine and type them in on it. Until they "
+                      "are typed nothing here is written to, and this host takes only the files it does not already "
+                      "hold and only up to the number its card allows."
+                      if pushing else
+                      f"{self.client_ip} is waiting to restore Sync Chain '{self.chain_name}' from its own copy.\n\n"
                       "Read these four characters to whoever is at that machine and type them in on it. Until they "
                       "are typed nothing here is written to and nothing here is deleted, and this host takes only "
                       "the files it does not already hold.")
@@ -1893,7 +2065,7 @@ class HostRestoreCodeDialog(QDialog):
         self.copy_btn.clicked.connect(self._copy_code)
         buttons.addWidget(self.copy_btn)
         buttons.addStretch()
-        self.cancel_btn = QPushButton("Cancel Restore")
+        self.cancel_btn = QPushButton("Cancel Push" if pushing else "Cancel Restore")
         self.cancel_btn.setToolTip("Close this code. The client waiting on it is told it is no longer open.")
         self.cancel_btn.clicked.connect(lambda: self._close_offer("cancelled here"))
         buttons.addWidget(self.cancel_btn)
@@ -1925,7 +2097,8 @@ class HostRestoreCodeDialog(QDialog):
         self.closed_reason = reason
         self.count_timer.stop()
         self.code_lbl.setStyleSheet("color: #888; letter-spacing: 6px; padding: 10px;")
-        self.count_lbl.setText(f"Restore not carried out - {reason}. Nothing was written to this host.")
+        self.count_lbl.setText(f"{'Push' if self.purpose == 'push' else 'Restore'} not carried out - "
+                               f"{reason}. Nothing was written to this host.")
         self.cancel_btn.setEnabled(False)
         self.copy_btn.setEnabled(False)
         if self.on_cancel_cb is not None:
@@ -1960,6 +2133,164 @@ class HostRestoreCodeDialog(QDialog):
         # out, and an offer nobody is looking at is an offer nobody should be able to use.
         self._close_offer("the window was closed")
         super().closeEvent(event)
+
+
+class PushToHostDialog(QDialog):
+    """The box a Mirror sync shows before offering its own new files to its host.
+
+    Asked in the middle of a sync, and asked *before* the deletion pass rather than after it, which is
+    the whole point of the window: the files it names are the ones this sync is about to delete from this
+    folder because its host does not have them, and they are on this machine because somebody made them
+    here. Both answers cost something - pushing gives a share of them to the host, keeping them leaves
+    them here to be deleted - so the window says what each one costs instead of dressing one of them up
+    as the safe button.
+
+    Nothing is decided here except which answer is handed back. The sync that asked is parked on its own
+    thread until this window closes, and it is the one that touches any file.
+    """
+
+    def __init__(self, parent_window, title: str, question: str):
+        super().__init__(parent_window)
+        self.parent_window = parent_window
+        # What this window was closed with. It starts as "don't push" and stays that way if the window is
+        # closed by its own X, by Escape, or by nobody reading it at all: writing into another machine's
+        # folder is not the default answer to a question nobody answered.
+        self.confirmed = False
+        self.setWindowTitle(title)
+        self.setFixedSize(640, 470)
+        self.setWindowFlags(self.windowFlags() | Qt.Tool)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+
+        heading = QLabel("THE HOST DOES NOT HAVE THESE FILES")
+        heading.setFont(QFont("Segoe UI Semibold", 11))
+        layout.addWidget(heading)
+
+        self.question_lbl = QLabel(question)
+        self.question_lbl.setWordWrap(True)
+        layout.addWidget(self.question_lbl)
+
+        self.push_note = QLabel("Pushing copies these files onto the host. The host keeps everything it already "
+                                "holds, chooses which of these it takes and how many, and nothing on it is changed "
+                                "or removed. It may need the code on its own screen first.")
+        self.push_note.setWordWrap(True)
+        self.push_note.setStyleSheet("color: #1abd33; font-size: 11px;")
+        layout.addWidget(self.push_note)
+
+        self.dont_note = QLabel("Not pushing leaves them here - and this is a Mirror chain, so the rest of this "
+                                "sync deletes them from this folder to match the host. Whatever the host refuses to "
+                                "take is deleted here too.")
+        self.dont_note.setWordWrap(True)
+        self.dont_note.setStyleSheet("color: #C0392B; font-size: 11px;")
+        layout.addWidget(self.dont_note)
+
+        layout.addStretch()
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        self.dont_btn = QPushButton("Don't Push")
+        self.dont_btn.setToolTip("Leave these files here and let this sync finish. A Mirror chain will delete them.")
+        self.dont_btn.clicked.connect(lambda: self._choose(False))
+        buttons.addWidget(self.dont_btn)
+        self.push_btn = QPushButton("Push To Host")
+        self.push_btn.setMinimumWidth(140)
+        self.push_btn.setToolTip("Offer these files to the host. Nothing on this PC is deleted by the push itself.")
+        self.push_btn.clicked.connect(lambda: self._choose(True))
+        buttons.addWidget(self.push_btn)
+        layout.addLayout(buttons)
+
+        # The safe answer is the one the window opens with, and the one Escape gives. A box a sync is
+        # waiting on has to be safe to walk away from.
+        self.dont_btn.setDefault(True)
+        self.dont_btn.setFocus()
+
+    def _choose(self, confirmed: bool):
+        self.confirmed = confirmed
+        self.accept()
+
+
+class HostPushTrustDialog(QDialog):
+    """The box a host shows after a client has pushed files into it: this time, or from now on?
+
+    The code was the permission for this push - somebody at this machine read it out, and the files are
+    already down the wire and in the folder by the time this window appears. What is left to decide is the
+    next one. "Trust" means this address is never shown a code again, which is a decision about a machine
+    rather than about a batch of files, so it is asked here with the address named - and answered by the
+    card row that lists every address this host has trusted.
+
+    "One time only" is the button this window opens with, and the answer a window nobody read gives.
+    """
+
+    def __init__(self, parent_window, chain_name: str, client_ip: str, what_happened: str = ''):
+        super().__init__(parent_window)
+        self.parent_window = parent_window
+        self.chain_name = str(chain_name or 'Sync')
+        self.client_ip = str(client_ip)
+        self.what_happened = str(what_happened or '')
+        # Whether this address is to be trusted for future pushes. False until somebody at this machine
+        # says otherwise, which is the same answer a window closed without being read gives.
+        self.trust = False
+        self.setWindowTitle(f"Pushed Files - {self.chain_name}")
+        self.setFixedSize(620, 440)
+        self.setWindowFlags(self.windowFlags() | Qt.Tool)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+
+        heading = QLabel("A CLIENT HAS ADDED FILES TO THIS HOST")
+        heading.setFont(QFont("Segoe UI Semibold", 11))
+        layout.addWidget(heading)
+
+        detail = self.what_happened or "its new files were written"
+        body = QLabel(f"{self.client_ip} pushed into Sync Chain '{self.chain_name}': {detail}.\n\n"
+                      "Everything it sent is already in the folder, and everything this host already had is "
+                      "untouched - a push can only add.")
+        body.setWordWrap(True)
+        layout.addWidget(body)
+
+        ask = QLabel("Should this PC be able to push here without typing a code again?")
+        ask.setWordWrap(True)
+        ask.setFont(QFont("Segoe UI Semibold", 10))
+        layout.addWidget(ask)
+
+        self.trust_note = QLabel("Trusting it means its next push writes into this folder with no code on this "
+                                 "screen at all. Take that back from the \"Clients that may push without a code\" row "
+                                 "on this chain's card.")
+        self.trust_note.setWordWrap(True)
+        self.trust_note.setStyleSheet("color: #888; font-size: 11px;")
+        layout.addWidget(self.trust_note)
+
+        self.once_note = QLabel("One time only means this push stands and nothing else does: the next time this "
+                                "machine wants to push, it needs a code from this screen again.")
+        self.once_note.setWordWrap(True)
+        self.once_note.setStyleSheet("color: #888; font-size: 11px;")
+        layout.addWidget(self.once_note)
+
+        layout.addStretch()
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        self.once_btn = QPushButton("One Time Only")
+        self.once_btn.setToolTip("Leave this client needing a code for its next push.")
+        self.once_btn.clicked.connect(lambda: self._choose(False))
+        buttons.addWidget(self.once_btn)
+        self.trust_btn = QPushButton("Trust This Client")
+        self.trust_btn.setMinimumWidth(150)
+        self.trust_btn.setToolTip("Let this address push into this chain without a code, until its permission is "
+                                  "taken back on the chain's card.")
+        self.trust_btn.clicked.connect(lambda: self._choose(True))
+        buttons.addWidget(self.trust_btn)
+        layout.addLayout(buttons)
+
+        self.once_btn.setDefault(True)
+        self.once_btn.setFocus()
+
+    def _choose(self, trust: bool):
+        self.trust = trust
+        self.accept()
 
 
 

@@ -201,27 +201,40 @@ from yt_msd.ui.render import (
 # still reads them by name. Wave 5h checked the group and dropped whatever nothing read.
 from yt_msd.sync.client import (
     HOST_REBUILT_NOTE,
+    NOTHING_TO_PUSH_NOTE,
+    PUSHED_NOTE,
     SYNC_DECISION_DELETE,
     SYNC_DECISION_KEEP,
     SYNC_DECISION_RESTORE,
     SyncClientWorker,
     _HostKeepalive,
     deletions_were_declined,
+    files_were_pushed,
     host_was_rebuilt,
+    make_push_code_cb,
+    make_push_confirm_cb,
     make_restore_code_cb,
     make_sync_decision_cb,
+    nothing_to_push,
+    push_was_left_undone,
     restore_was_left_undone,
 )
 from yt_msd.sync.config import (
     DEFAULT_DELETE_CONFIRM_LIMIT,
+    DEFAULT_PUSH_FILE_LIMIT,
     DEFAULT_SYNC_SETTINGS,
     DELETE_CONFIRM_LIMIT_MAX,
+    PUSH_FILE_LIMIT_MAX,
     SYNC_CONFIRM_WAIT_LIMIT,
     VISIBILITY_NOTICE_SETTING,
     SyncConfigManager,
     _CONFIG_WRITE_LOCK,
+    chain_can_push,
+    client_is_push_trusted,
     delete_confirm_limit,
     is_client_chain_paused,
+    push_file_limit,
+    push_trusted_ips,
 )
 from yt_msd.sync.discovery import (
     discover_host_on_lan,
@@ -230,6 +243,7 @@ from yt_msd.sync.discovery import (
 from yt_msd.sync.host import (
     HostFolderWatcher,
     SyncHostServer,
+    pending_push_request,
     pending_restore_request,
 )
 from yt_msd.sync.lan import (
@@ -272,7 +286,9 @@ from yt_msd.sync.transfer import (
 from yt_msd.sync.dialogs import (
     ConnectClientChainDialog,
     CreateHostChainDialog,
+    HostPushTrustDialog,
     HostRestoreCodeDialog,
+    PushToHostDialog,
     RestoreHostCodeDialog,
     SyncDeleteDecisionDialog,
     SyncManagerDialog,
@@ -350,6 +366,8 @@ class MainApp(BootstrapMixin,
     sync_confirm_signal = Signal(str, str, str)  # (request id, window title, question) from a sync worker - parked until _on_sync_confirm answers
     sync_decision_signal = Signal(str, str, str)  # (request id, window title, question) from a client sync at its delete limit - parked until _on_sync_decision answers
     restore_code_signal = Signal(str, str, str)  # (request id, window title, "host ip:port" whose copy is being rebuilt) - parked until _on_restore_code answers
+    push_confirm_signal = Signal(str, str, str)  # (request id, window title, question) from a Mirror client sync holding files its host has never seen - parked until _on_push_confirm answers
+    push_code_signal = Signal(str, str, str)  # (request id, window title, "host ip:port" being pushed to) - parked until _on_push_code answers
     host_restore_signal = Signal(str, str, str, str)  # (sync code, client ip, event, note) from the host server, at each point of a rebuild this PC is the receiving end of
     chain_visibility_signal = Signal(str, str)  # (title, body) naming the hosted chains that are visible on the network - a box on the main window, from the startup check
 
@@ -422,6 +440,13 @@ class MainApp(BootstrapMixin,
             # it, and the host itself refuses GET_INDEX and PULL_FILE for the same reason. The one
             # notification this owed is sent once, by _after_host_restore, with the folder complete.
             return
+        if server is not None and server.is_pushing(sync_code):
+            # A push writes a handful of files and the watcher fires for each one. A client told about a
+            # folder mid-push cannot lose anything to it - a push only adds, so an index read halfway
+            # through is missing files rather than offering the wrong ones - but it would be told five
+            # times about one push. The one notification a push owes is sent once, by _after_host_push,
+            # with every file down.
+            return
         port = self.sync_host_server.active_port if hasattr(self, 'sync_host_server') else 63350
         send_lan_update_notification(sync_code, port)
         # Emitted, not called directly: this runs on a watcher thread.
@@ -470,7 +495,12 @@ class MainApp(BootstrapMixin,
                     status_cb=_status,
                     progress_cb=_prog,
                     decision_cb=make_sync_decision_cb(self, chain_name),
-                    restore_code_cb=make_restore_code_cb(self, chain_name)
+                    restore_code_cb=make_restore_code_cb(self, chain_name),
+                    # The two halves of the push question, so the periodic check is the one that finds
+                    # files this machine made since its last sync and offers them to the host before it
+                    # deletes them to match.
+                    push_confirm_cb=make_push_confirm_cb(self, chain_name),
+                    push_code_cb=make_push_code_cb(self, chain_name)
                 )
                 if hasattr(self, 'dl_progress_signal'):
                     self.dl_progress_signal.emit("")
@@ -483,6 +513,13 @@ class MainApp(BootstrapMixin,
                         # this one, so there is nothing here to refresh and nothing to count as updated:
                         # what was written is on the host, and how much of it was needed is in the message.
                         self.status_signal.emit(f"Sync Chain '{cc.get('name')}': {msg}", False, "#1abd33")
+                    elif files_were_pushed(msg):
+                        # The same reason: this sync wrote into the host, and the local counts are the
+                        # smaller half of what happened. What the host took, and what it refused, is in
+                        # the message.
+                        self.status_signal.emit(f"Sync Chain '{cc.get('name')}': {msg}", False, "#1abd33")
+                        if self.local_current_path == cc.get('folder_path'):
+                            self.local_list_refresh_signal.emit()
                     elif transferred > 0 or deleted > 0:
                         self.status_signal.emit(f"Sync Chain '{cc.get('name')}': {transferred} updated, {deleted} removed.", False, "#1abd33")
                         if self.local_current_path == cc.get('folder_path'):
@@ -495,6 +532,12 @@ class MainApp(BootstrapMixin,
                     # A restore that did not happen is not a host that is offline. This PC reached its
                     # host, asked for a rebuild and did not get one; the chain is exactly as up to date
                     # as it was before, and what happened is in the message rather than in the status.
+                    self.status_signal.emit(f"Sync Chain '{cc.get('name')}': {msg}", False, "#FF8C00")
+                elif push_was_left_undone(msg):
+                    # The same for a push that did not happen, for the same reason: this PC reached its
+                    # host and the host said no, or nobody read the code out. Nothing here was changed,
+                    # and the files the push was about are still in this folder waiting for the next
+                    # sync to ask about them again.
                     self.status_signal.emit(f"Sync Chain '{cc.get('name')}': {msg}", False, "#FF8C00")
                 else:
                     cc['status'] = f"Host Offline"
@@ -534,7 +577,13 @@ class MainApp(BootstrapMixin,
                         f"[Sync: {c.get('name', 'Sync')}] [{idx}/{total_items}] ({int(done/total*100) if total > 0 else 0}%) {fname}"
                     ) if hasattr(self, 'dl_progress_signal') else None,
                     decision_cb=make_sync_decision_cb(self, c.get('name', 'Sync')),
-                    restore_code_cb=make_restore_code_cb(self, c.get('name', 'Sync'))
+                    restore_code_cb=make_restore_code_cb(self, c.get('name', 'Sync')),
+                    # A sync this PC was told to run by its host is still a sync of this folder: the
+                    # files it holds that are newer than its last sync and that the host has never seen
+                    # are the same files its deletion pass is about to take, whether the host asked for
+                    # this sync or the clock did.
+                    push_confirm_cb=make_push_confirm_cb(self, c.get('name', 'Sync')),
+                    push_code_cb=make_push_code_cb(self, c.get('name', 'Sync'))
                 )
                 if hasattr(self, 'dl_progress_signal'):
                     self.dl_progress_signal.emit("")
@@ -551,6 +600,10 @@ class MainApp(BootstrapMixin,
                     elif deletions_were_declined(msg):
                         self.status_signal.emit(f"Sync Chain '{c.get('name')}': {msg}", False, "#FF8C00")
                 elif restore_was_left_undone(msg):
+                    self.status_signal.emit(f"Sync Chain '{c.get('name')}': {msg}", False, "#FF8C00")
+                elif push_was_left_undone(msg):
+                    # A push that the host refused or that nobody authorised is not a host that went
+                    # away mid-sync: this chain is exactly as up to date here as it was a moment ago.
                     self.status_signal.emit(f"Sync Chain '{c.get('name')}': {msg}", False, "#FF8C00")
                 self.sync_config_manager.save()
             threading.Thread(target=_bg, daemon=True).start()
@@ -1040,6 +1093,103 @@ class MainApp(BootstrapMixin,
         waiter["answer"] = typed
         waiter["event"].set()
 
+    def ask_push_confirm(self, title: str, question: str) -> bool:
+        """Ask a client sync whether to offer its own new files to its host, from the worker's thread.
+
+        The same gate as the delete question above and the same waiter bookkeeping, because it is the
+        same kind of question: a worker parked mid-sync with its host connection kept warm, a window on
+        the GUI thread, and an answer that has to come back as a yes or a no rather than as a button.
+
+        An answer that never arrives is "don't push". A window nobody read, a window left open while this
+        PC goes to sleep, and a window closed by its own X all leave this machine's folder alone, which
+        is what every other unanswered question in this program does - and here it is the answer that
+        keeps a stranger out of somebody else's library.
+        """
+        waiter = {"event": threading.Event(), "answer": False}
+        with self._sync_confirm_lock:
+            self._sync_confirm_counter += 1
+            request_id = f"pc_{int(time.time() * 1000)}_{self._sync_confirm_counter}"
+            self.sync_confirm_waiters[request_id] = waiter
+        try:
+            self.push_confirm_signal.emit(request_id, title, question)
+            deadline = time.time() + SYNC_CONFIRM_WAIT_LIMIT
+            while time.time() < deadline:
+                if waiter["event"].wait(timeout=0.5):
+                    return bool(waiter["answer"])
+            return False
+        except Exception:
+            return False
+        finally:
+            with self._sync_confirm_lock:
+                self.sync_confirm_waiters.pop(request_id, None)
+
+    def _on_push_confirm(self, request_id: str, title: str, question: str):
+        """Main-thread slot for a Mirror client sync holding files its host has never seen.
+
+        The window is asked before the deletion pass rather than after it, which is the only reason the
+        warning on it is worth printing: these are the files this sync is about to delete, and pushing is
+        the one answer that keeps them anywhere at all.
+        """
+        waiter = self.sync_confirm_waiters.get(request_id)
+        if waiter is None:
+            return
+        try:
+            box = PushToHostDialog(self._sync_question_parent(), title, question)
+            box.exec()
+            answer = box.confirmed
+        except Exception:
+            answer = False
+        waiter["answer"] = answer
+        waiter["event"].set()
+
+    def ask_push_code(self, title: str, host_label: str) -> Optional[str]:
+        """Ask for the code the host is showing for a push, from the worker holding its connection open.
+
+        The same four characters as a Restore Host and the same arrangement - the code never travels down
+        the connection, so somebody has to read it off the other machine's screen - reached only when the
+        host has not already given this address leave to push. It is the longest wait in the program, and
+        the host, not this PC, is the one that gives up on it.
+
+        None means nothing was typed, and a None from here closes the offer from this end so the host's
+        screen stops showing a code nobody is going to read.
+        """
+        waiter = {"event": threading.Event(), "answer": None}
+        with self._sync_confirm_lock:
+            self._sync_confirm_counter += 1
+            request_id = f"pk_{int(time.time() * 1000)}_{self._sync_confirm_counter}"
+            self.sync_confirm_waiters[request_id] = waiter
+        try:
+            self.push_code_signal.emit(request_id, title, host_label)
+            deadline = time.time() + SYNC_CONFIRM_WAIT_LIMIT
+            while time.time() < deadline:
+                if waiter["event"].wait(timeout=0.5):
+                    return waiter["answer"]
+            return None
+        except Exception:
+            return None
+        finally:
+            with self._sync_confirm_lock:
+                self.sync_confirm_waiters.pop(request_id, None)
+
+    def _on_push_code(self, request_id: str, title: str, host_label: str):
+        """Main-thread slot for a client push that is holding a host's push offer open.
+
+        `host_label` is the host's 'ip:port', the only name this PC has for the machine it is about to
+        write into, and it is printed on the window so a person with two chains open can tell which
+        machine they are being asked to walk over to.
+        """
+        waiter = self.sync_confirm_waiters.get(request_id)
+        if waiter is None:
+            return
+        try:
+            box = RestoreHostCodeDialog(self._sync_question_parent(), title, host_label, purpose='push')
+            box.exec()
+            typed = box.code
+        except Exception:
+            typed = None
+        waiter["answer"] = typed
+        waiter["event"].set()
+
     def _host_chain_for_code(self, sync_code) -> Optional[dict]:
         """The hosted chain on this PC that a sync code belongs to, or nothing."""
         manager = getattr(self, 'sync_config_manager', None)
@@ -1133,9 +1283,15 @@ class MainApp(BootstrapMixin,
         Emitted by the host server from its own connection thread, which is why nothing in here reaches
         for a window except from this thread: the socket thread is not allowed to build a Qt window.
         Whatever the rebuild does to this machine's folder has already happened, or is about to, between
-        the two sockets - what arrives here is only what somebody at this screen has to know, and the
-        one window that has to appear on it.
+        the two sockets - what arrives here is only what somebody at this screen has to know, and the one
+        window that has to appear on it.
+
+        A push arrives on the same pump with 'push_' in front of its event names, and is handed to
+        _on_host_push_event: same thread, same rule about who may build a window, different windows.
         """
+        if event.startswith('push_'):
+            self._on_host_push_event(sync_code, client_ip, event[len('push_'):], note)
+            return
         if event == 'requested':
             self._open_host_restore_dialog(sync_code, client_ip, note)
             return
@@ -1175,6 +1331,153 @@ class MainApp(BootstrapMixin,
         folder = str((chain or {}).get('folder_path') or '')
         if folder and folder == getattr(self, 'local_current_path', ''):
             self.local_list_refresh_signal.emit()
+
+    def _host_push_dialog(self, sync_code):
+        """The push code window this host is showing for this chain, if it is showing one."""
+        return getattr(self, '_host_push_dialogs', {}).get(str(sync_code))
+
+    def _settle_host_push_dialog(self, sync_code, reason: str):
+        """Take this chain's push code window off the screen because the offer behind it is over."""
+        dialog = getattr(self, '_host_push_dialogs', {}).pop(str(sync_code), None)
+        if dialog is None:
+            return
+        try:
+            dialog.settled_elsewhere(reason)
+        except Exception:
+            pass
+
+    def _open_host_push_dialog(self, sync_code: str, client_ip: str, code: str):
+        """Put the code a client is waiting for, to push into this folder, on this machine's own screen.
+
+        The same arrangement as a restore code, and for the same reason: the code is read out of this
+        host's own registry rather than out of what arrived over the wire, because this window and the
+        offer behind it have to be showing the same thing, and a window is not something a socket thread
+        is allowed to build.
+        """
+        session = pending_push_request(sync_code)
+        chain = self._host_chain_for_code(sync_code)
+        chain_name = str((chain or {}).get('name') or f"Code {sync_code}")
+        if session is None:
+            # The offer closed between the socket making it and this window being raised - another client
+            # asked about the same chain, or nothing was keeping it alive. Showing a code that nothing
+            # would accept is worse than showing nothing.
+            self._settle_host_push_dialog(sync_code, 'the offer closed')
+            self.status_signal.emit(f"Sync Chain '{chain_name}': push request from {client_ip} closed before "
+                                    "a code could be shown. Nothing was changed here.", False, "#FF8C00")
+            return
+        self._settle_host_push_dialog(sync_code, 'a newer request replaced it')
+        seconds_left = float(session.get('expires_at', 0.0)) - time.time()
+        dialog = HostRestoreCodeDialog(
+            self._sync_question_parent(), str(sync_code), chain_name, client_ip,
+            str(session.get('code') or code),
+            seconds_left if seconds_left > 0 else SYNC_RESTORE_CODE_TIMEOUT,
+            on_cancel=self._cancel_host_push_offer,
+            purpose='push',
+        )
+        self._host_push_dialogs[str(sync_code)] = dialog
+        dialog.finished.connect(lambda _result=0, _key=str(sync_code): self._host_push_dialogs.pop(_key, None))
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        self.status_signal.emit(f"Sync Chain '{chain_name}': {client_ip} is asking to push files into this "
+                                "host. Read the code on the Push To Host window to whoever is at that machine.",
+                                False, "#FF8C00")
+
+    def _cancel_host_push_offer(self, sync_code: str, code: str):
+        """Close a push code from this machine's screen, and say what that did to the client waiting on it."""
+        server = getattr(self, 'sync_host_server', None)
+        chain = self._host_chain_for_code(sync_code)
+        chain_name = str((chain or {}).get('name') or f"Code {sync_code}")
+        closed = bool(server.cancel_push_request(sync_code, code)) if server is not None else False
+        if not closed:
+            self.status_signal.emit(f"Sync Chain '{chain_name}': that push had already been accepted or closed, "
+                                    "so there was nothing here to cancel.", False, "#d9822b")
+            return
+        self.status_signal.emit(f"Sync Chain '{chain_name}': push code closed here. The client waiting on it "
+                                "was told, and nothing on this host was changed.", False, "#FF8C00")
+
+    def _on_host_push_event(self, sync_code: str, client_ip: str, event: str, note: str):
+        """Main-thread slot for the points of a push that this PC is the receiving end of."""
+        if event == 'requested':
+            self._open_host_push_dialog(sync_code, client_ip, note)
+            return
+        if event == 'started':
+            self._settle_host_push_dialog(sync_code, 'the code was named and the files are on their way')
+            self.status_signal.emit(f"Sync Chain (Code {sync_code}) is taking files from {client_ip}: nothing "
+                                    "here is being deleted, and only what this host is missing is being written.",
+                                    False, "#3B8ED0")
+            return
+        if event == 'cancelled':
+            self._settle_host_push_dialog(sync_code, f"the push was cancelled ({note})")
+            self.status_signal.emit(f"Sync Chain (Code {sync_code}) push not carried out ({note}). Nothing on "
+                                    "this host was changed.", False, "#FF8C00")
+            return
+        if event == 'finished':
+            self._settle_host_push_dialog(sync_code, 'the push finished')
+            self._after_host_push(sync_code, client_ip, note)
+
+    def _after_host_push(self, sync_code: str, client_ip: str, note: str):
+        """Tell the rest of the chain about a folder that has just taken a push, then ask about the next one.
+
+        The folder watcher was held off for the length of the push - it fires per file, and the whole
+        point of holding it off is that a client syncing against a half-written folder is a client making
+        worse decisions - so this is the one notification it owed, sent once, with every file down. That
+        is the force-sync half: the pushing client, the other clients on this chain and any drive on them
+        all hear about the new tracks in the same moment.
+
+        The question after it is only asked of a client that needed a code to do this. An address this
+        host has already said "no code" to has been asked already, and asking it again would be asking a
+        person to decide something they have decided.
+        """
+        server = getattr(self, 'sync_host_server', None)
+        port = server.active_port if server is not None else 63350
+        try:
+            send_lan_update_notification(sync_code, port)
+        except Exception:
+            pass
+
+        chain = self._host_chain_for_code(sync_code)
+        if chain is None:
+            return
+        folder = str(chain.get('folder_path') or '')
+        if folder and folder == getattr(self, 'local_current_path', ''):
+            self.local_list_refresh_signal.emit()
+
+        # Said before anything else, because the two answers that follow it - a window asking about the
+        # next push, or a trusted client that is not being asked - both happen after this folder has
+        # already been written into, and a host that has taken files and said nothing about them is a
+        # host whose library grew from somewhere else with nobody noticing.
+        received, refused = server.last_push_counts(sync_code) if server is not None else (0, 0)
+        refused_note = f", {refused} refused" if refused else ""
+        self.status_signal.emit(f"Sync Chain (Code {sync_code}) took files from {client_ip}: {received} "
+                                f"file(s) added{refused_note}. Clients on the LAN have been told.",
+                                False, "#1abd33")
+
+        if client_is_push_trusted(chain, client_ip):
+            return
+
+        chain_name = str(chain.get('name') or f"Code {sync_code}")
+        try:
+            box = HostPushTrustDialog(self._sync_question_parent(), chain_name, client_ip, note)
+            box.exec()
+            trust = box.trust
+        except Exception:
+            trust = False
+
+        if not trust:
+            self.status_signal.emit(f"Sync Chain '{chain_name}': {client_ip} was allowed to push once. Its next "
+                                    "push needs a code from this screen again.", False, "#888")
+            return
+
+        if self.sync_config_manager.trust_push_client(chain.get('id'), client_ip):
+            self.status_signal.emit(f"Sync Chain '{chain_name}': {client_ip} can push here without a code from "
+                                    "now on. Take that back from the card in Sync Chains.", False, "#1abd33")
+            manager_dialog = getattr(self, 'sync_manager_dialog', None)
+            try:
+                if manager_dialog is not None and manager_dialog.isVisible():
+                    QTimer.singleShot(0, manager_dialog.refresh_cards)
+            except RuntimeError:
+                pass
 
 
 

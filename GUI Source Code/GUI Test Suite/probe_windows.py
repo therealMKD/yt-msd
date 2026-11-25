@@ -68,12 +68,14 @@ import harness_seam as seam
 
 seam.install(mod, SRC_DIR)
 
-# The shape a restore code has belongs to the layer that checks a code against, and the entry point
-# does not re-export it, so this is the one place this suite names a package name directly. The two
-# host functions are the host's own restore registry: a check about a code on a host's screen is worth
-# running against the thing that hands out codes rather than against a hand-written copy of one.
+# The shape a code has belongs to the layer that checks a code against, and the entry point does not
+# re-export it, so this is the one place this suite names a package name directly. The four host
+# functions are the host's own restore and push registries: a check about a code on a host's screen is
+# worth running against the thing that hands out codes rather than against a hand-written copy of one.
 from yt_msd.sync.lan import RESTORE_CODE_LENGTH
+from yt_msd.sync.host import cancel_push_offer as _close_push_offer
 from yt_msd.sync.host import cancel_restore_offer as _close_restore_offer
+from yt_msd.sync.host import issue_push_code as _issue_push_offer
 from yt_msd.sync.host import issue_restore_code as _issue_restore_offer
 
 CHECKS = 0
@@ -1620,20 +1622,29 @@ class _RecordingEmit:
 
 
 class _HostChainManagerStandIn:
-    """The hosted chains the main window looks a chain up out of."""
+    """The hosted chains the main window looks a chain up out of, and the two write-backs a push makes."""
 
-    def __init__(self, hosted):
+    def __init__(self, hosted, trust_returns=True):
         self.hosted_chains = [dict(chain) for chain in hosted]
+        self.trust_returns = trust_returns
+        self.trusts = []
+
+    def trust_push_client(self, chain_id, client_ip):
+        self.trusts.append((chain_id, str(client_ip)))
+        return self.trust_returns
 
 
 class _HostServerStandIn:
-    """The host server as the main window talks to it: which chains are mid-rebuild, and what a cancel
-    call is answered with."""
+    """The host server as the main window talks to it: which chains are mid-rebuild or mid-push, what
+    the last push to each one did, and what a cancel call is answered with."""
 
-    def __init__(self, restoring=(), cancel_returns=True):
+    def __init__(self, restoring=(), cancel_returns=True, pushing=(), last_counts=()):
         self.restoring = {str(code) for code in restoring}
+        self.pushing = {str(code): str(ip) for code, ip in pushing}
+        self.last_counts = {str(code): tuple(counts) for code, counts in last_counts}
         self.cancel_returns = cancel_returns
         self.cancels = []
+        self.push_cancels = []
         self.active_port = 63351
 
     def is_restoring(self, sync_code):
@@ -1641,6 +1652,19 @@ class _HostServerStandIn:
 
     def cancel_restore_request(self, sync_code, code=None):
         self.cancels.append((str(sync_code), str(code)))
+        return self.cancel_returns
+
+    def is_pushing(self, sync_code):
+        return str(sync_code) in self.pushing
+
+    def pushing_from(self, sync_code):
+        return self.pushing.get(str(sync_code))
+
+    def last_push_counts(self, sync_code):
+        return self.last_counts.get(str(sync_code), (0, 0))
+
+    def cancel_push_request(self, sync_code, code=None):
+        self.push_cancels.append((str(sync_code), str(code)))
         return self.cancel_returns
 
 
@@ -1656,16 +1680,25 @@ class _HostRestoreApp(AppStandIn):
     _cancel_host_restore_offer = mod.MainApp._cancel_host_restore_offer
     _on_host_restore_event = mod.MainApp._on_host_restore_event
     _after_host_restore = mod.MainApp._after_host_restore
+    _host_push_dialog = mod.MainApp._host_push_dialog
+    _settle_host_push_dialog = mod.MainApp._settle_host_push_dialog
+    _open_host_push_dialog = mod.MainApp._open_host_push_dialog
+    _cancel_host_push_offer = mod.MainApp._cancel_host_push_offer
+    _on_host_push_event = mod.MainApp._on_host_push_event
+    _after_host_push = mod.MainApp._after_host_push
     _on_hosted_folder_changed = mod.MainApp._on_hosted_folder_changed
     _sync_question_parent = mod.MainApp._sync_question_parent
 
-    def __init__(self, hosted, restoring=(), cancel_returns=True, current_path=""):
-        super().__init__(sync_config_manager=_HostChainManagerStandIn(hosted),
-                         sync_host_server=_HostServerStandIn(restoring, cancel_returns),
+    def __init__(self, hosted, restoring=(), cancel_returns=True, current_path="",
+                 pushing=(), last_counts=(), trust_returns=True):
+        super().__init__(sync_config_manager=_HostChainManagerStandIn(hosted, trust_returns),
+                         sync_host_server=_HostServerStandIn(restoring, cancel_returns, pushing,
+                                                             last_counts),
                          local_current_path=current_path)
         self.status_signal = _RecordingEmit()
         self.local_list_refresh_signal = _RecordingEmit()
         self._host_restore_dialogs = {}
+        self._host_push_dialogs = {}
 
     def said(self, words):
         return any(words in str(entry[0]) for entry in self.status_signal.emitted)
@@ -1677,7 +1710,8 @@ class _HostCodeWindowStandIn(QDialog):
     one, because a host's code window stays open for minutes and this suite does not put windows on the
     desktop."""
 
-    def __init__(self, parent_window, sync_code, chain_name, client_ip, code, expires_in, on_cancel=None):
+    def __init__(self, parent_window, sync_code, chain_name, client_ip, code, expires_in, on_cancel=None,
+                 purpose='restore'):
         super().__init__(None)
         self.parent_window = parent_window
         self.sync_code = str(sync_code)
@@ -1686,6 +1720,9 @@ class _HostCodeWindowStandIn(QDialog):
         self.code = str(code)
         self.expires_in = expires_in
         self.on_cancel_cb = on_cancel
+        # Which of the two questions this window is asking. A restore code and a push code are the same
+        # window with different words on it, and a check has to be able to tell which one was raised.
+        self.purpose = str(purpose)
         self.settled_with = None
         self.shown = 0
 
@@ -1818,6 +1855,170 @@ with seam.patched("send_lan_update_notification",
           _notifications == [("4999", 63351)]
           and _host_restore_app.said("Notified clients on LAN"),
           (_notifications, _host_restore_app.status_signal.emitted))
+
+class _TrustQuestionStandIn(QDialog):
+    """The host's push-permission question without a window on the desktop.
+
+    `asked` records every question this section caused, in the order it was asked, and `answers` is what
+    the harness chose for each address before the window was raised. A real window here would block the
+    suite on a person who is not there.
+    """
+
+    asked = []
+    answers = {}
+
+    def __init__(self, parent_window, chain_name, client_ip, what_happened=''):
+        super().__init__(None)
+        self.parent_window = parent_window
+        self.chain_name = chain_name
+        self.client_ip = str(client_ip)
+        self.what_happened = what_happened
+        self.trust = bool(_TrustQuestionStandIn.answers.get(self.client_ip, False))
+
+    def exec(self):
+        _TrustQuestionStandIn.asked.append((self.chain_name, self.client_ip, self.what_happened))
+        return 0
+
+
+_HOST_PUSH_FOLDER = str(FIXTURE_ROOT / "host_push_folder")
+# An offer genuinely open in the host's own push registry, for the same chain the rebuild section above
+# used. The two registries are separate, and this is the check that a code on a push window is the push
+# registry's code and not the rebuild one sitting beside it.
+_push_offer_open = _issue_push_offer("4999", "192.168.1.7")
+_host_push_app = _HostRestoreApp([{"id": "chain-4999", "sync_code": "4999", "name": "Studio",
+                                   "folder_path": _HOST_PUSH_FOLDER}],
+                                 current_path=_HOST_PUSH_FOLDER,
+                                 pushing=[("4999", "192.168.1.7")],
+                                 last_counts=[("4999", (3, 1))])
+
+with seam.patched("HostRestoreCodeDialog", _HostCodeWindowStandIn):
+    _host_push_app._on_host_push_event("4999", "192.168.1.7", "requested", "ZZZZ")
+    _push_window = _host_push_app._host_push_dialog("4999")
+    check("WN-I36 a client offering its own new files to this host puts a code on this machine's screen too, under the chain it belongs to, asking the push question rather than the rebuild one",
+          _push_window is not None and _push_window.chain_name == "Studio"
+          and _push_window.purpose == "push" and _push_window.shown == 1,
+          None if _push_window is None else (_push_window.chain_name, _push_window.purpose,
+                                             _push_window.shown))
+    check("WN-I36b the code on it is the one this host's own push registry is holding, and it is not the code the rebuild offer for the same chain is holding - two windows on one screen must never show the same word",
+          _push_window is not None and _push_window.code == _push_offer_open['code']
+          and _push_window.code != "ZZZZ" and _push_window.code != _restore_offer['code'],
+          None if _push_window is None else (_push_window.code, _push_offer_open['code']))
+    check("WN-I36c and a push code window and a rebuild code window are kept apart, because one chain can be asked both at the same moment and each window cancels only the offer it is showing",
+          _host_push_app._host_push_dialog("4999") is not None
+          and "4999" not in _host_push_app._host_restore_dialogs
+          and _host_push_app._host_restore_dialog("4999") is None,
+          (list(_host_push_app._host_push_dialogs), list(_host_push_app._host_restore_dialogs)))
+    check("WN-I36d the person sitting at this machine is told to read it out, in the chain's own name, and told which window to read it from",
+          _host_push_app.said("Sync Chain 'Studio': 192.168.1.7 is asking to push files into this host")
+          and _host_push_app.said("Read the code on the Push To Host window"),
+          _host_push_app.status_signal.emitted)
+
+    _host_push_app.status_signal.emitted.clear()
+    _host_push_app._on_host_push_event("4999", "192.168.1.7", "started", "")
+    check("WN-I37 the moment the code is named the window is off the screen, and this machine is told what is about to happen to its folder: files are arriving, and nothing this host already has is touched",
+          _host_push_app._host_push_dialog("4999") is None
+          and _push_window.settled_with == "the code was named and the files are on their way"
+          and _host_push_app.said("is taking files from 192.168.1.7")
+          and _host_push_app.said("nothing here is being deleted")
+          and _host_push_app.said("only what this host is missing is being written"),
+          (_push_window.settled_with, _host_push_app.status_signal.emitted))
+
+    _host_push_app._on_host_push_event("4999", "192.168.1.7", "cancelled", "the code was wrong")
+    check("WN-I38 a push that did not happen is said out loud on this machine too, with the reason the host was given, and it says nothing here was changed",
+          _host_push_app.said("Sync Chain (Code 4999) push not carried out (the code was wrong)")
+          and _host_push_app.said("Nothing on this host was changed"),
+          _host_push_app.status_signal.emitted)
+
+    _close_push_offer("4999", None)
+    check("WN-I38b and nothing is left open in the host's own push registry when this section is done",
+          mod.pending_push_request("4999") is None, mod.pending_push_request("4999"))
+
+_host_push_app.sync_host_server.push_cancels.clear()
+_host_push_app.status_signal.emitted.clear()
+with seam.patched("HostRestoreCodeDialog", _HostCodeWindowStandIn):
+    _host_push_app._cancel_host_push_offer("4999", "QD54")
+check("WN-I39 Cancel on this machine's own push window closes the offer behind it, and says what that did to the machine waiting on it",
+      _host_push_app.sync_host_server.push_cancels == [("4999", "QD54")]
+      and _host_push_app.said("push code closed here")
+      and _host_push_app.said("nothing on this host was changed"),
+      (_host_push_app.sync_host_server.push_cancels, _host_push_app.status_signal.emitted))
+
+_late_push_cancel_app = _HostRestoreApp([{"id": "chain-8123", "sync_code": "8123", "name": "Kitchen",
+                                          "folder_path": _HOST_PUSH_FOLDER}], cancel_returns=False)
+_late_push_cancel_app._cancel_host_push_offer("8123", "QD54")
+check("WN-I39b a Cancel that arrives after that push was already accepted or closed says so, instead of reporting a cancellation that never happened",
+      _late_push_cancel_app.said("already been accepted or closed"), _late_push_cancel_app.status_signal.emitted)
+
+_TrustQuestionStandIn.asked.clear()
+_TrustQuestionStandIn.answers = {"192.168.1.7": True}
+_notifications.clear()
+with seam.patched("send_lan_update_notification",
+                  lambda code, port: _notifications.append((str(code), int(port)))), \
+     seam.patched("HostPushTrustDialog", _TrustQuestionStandIn):
+    _host_push_app.status_signal.emitted.clear()
+    _host_push_app._on_host_push_event("4999", "192.168.1.7", "finished", "3 file(s) written")
+    check("WN-I40 a push that finished is said out loud here with what it added and what it refused, and the rest of the chain is told about a folder that is bigger now",
+          _host_push_app.said("took files from 192.168.1.7: 3 file(s) added, 1 refused")
+          and _host_push_app.said("Clients on the LAN have been told.")
+          and _notifications == [("4999", 63351)],
+          (_host_push_app.status_signal.emitted, _notifications))
+    check("WN-I40b and the machine that just wrote into this folder is asked about the next time - by address, with what it did named on the window",
+          _TrustQuestionStandIn.asked == [("Studio", "192.168.1.7", "3 file(s) written")],
+          _TrustQuestionStandIn.asked)
+    check("WN-I40c answering that question the trusting way writes the address against this chain, and says so where the card that takes it back can be pointed at",
+          _host_push_app.sync_config_manager.trusts == [("chain-4999", "192.168.1.7")]
+          and _host_push_app.said("can push here without a code from now on")
+          and _host_push_app.said("Take that back from the card in Sync Chains"),
+          (_host_push_app.sync_config_manager.trusts, _host_push_app.status_signal.emitted))
+
+    # The same folder, the same address, and an answer of "one time only" - which is also the answer a
+    # window nobody read gives. Nothing is written to the chain, and the next push needs a code again.
+    _TrustQuestionStandIn.asked.clear()
+    _TrustQuestionStandIn.answers = {}
+    _once_app = _HostRestoreApp([{"id": "chain-4999", "sync_code": "4999", "name": "Studio",
+                                  "folder_path": _HOST_PUSH_FOLDER}],
+                                current_path=_HOST_PUSH_FOLDER,
+                                pushing=[("4999", "192.168.1.7")],
+                                last_counts=[("4999", (2, 0))])
+    _once_app._on_host_push_event("4999", "192.168.1.7", "finished", "2 file(s) written")
+    check("WN-I41 answering it the other way writes nothing to the chain and says out loud that the next push needs a code again - the question is asked once per push, not answered forever",
+          _once_app.sync_config_manager.trusts == []
+          and _TrustQuestionStandIn.asked == [("Studio", "192.168.1.7", "2 file(s) written")]
+          and _once_app.said("was allowed to push once")
+          and _once_app.said("Its next push needs a code from this screen again"),
+          (_once_app.sync_config_manager.trusts, _TrustQuestionStandIn.asked,
+           _once_app.status_signal.emitted))
+
+    # An address this host has already said "no code" to is not asked again: that decision has been
+    # made, and asking it twice is a person being pushed to change their mind by repetition.
+    _TrustQuestionStandIn.asked.clear()
+    _notifications.clear()
+    _trusted_app = _HostRestoreApp([{"id": "chain-4999", "sync_code": "4999", "name": "Studio",
+                                     "folder_path": _HOST_PUSH_FOLDER,
+                                     "push_trusted_ips": ["192.168.1.7"]}],
+                                   current_path=_HOST_PUSH_FOLDER,
+                                   pushing=[("4999", "192.168.1.7")],
+                                   last_counts=[("4999", (1, 0))])
+    _trusted_app._on_host_push_event("4999", "192.168.1.7", "finished", "1 file(s) written")
+    check("WN-I42 an address this host has already trusted is not asked again - the rest of the chain is still told, the folder list is still refreshed, and no window appears",
+          _TrustQuestionStandIn.asked == [] and _notifications == [("4999", 63351)]
+          and _trusted_app.said("took files from 192.168.1.7: 1 file(s) added")
+          and len(_trusted_app.local_list_refresh_signal.emitted) == 1,
+          (_TrustQuestionStandIn.asked, _notifications,
+           _trusted_app.local_list_refresh_signal.emitted))
+
+    _notifications.clear()
+    _host_push_app.sync_host_server.pushing["4999"] = "192.168.1.7"
+    _host_push_app.status_signal.emitted.clear()
+    _host_push_app._on_hosted_folder_changed("4999")
+    check("WN-I43 a hosted folder that is mid-push tells the clients nothing, because the one notification a push owes is the one sent with every file down - not one per file written",
+          _notifications == [] and _host_push_app.status_signal.emitted == [],
+          (_notifications, _host_push_app.status_signal.emitted))
+    _host_push_app.sync_host_server.pushing.pop("4999", None)
+    _host_push_app._on_hosted_folder_changed("4999")
+    check("WN-I43b and the same folder once the push is over tells them - the watcher is let back in the moment the folder stops being half-written",
+          _notifications == [("4999", 63351)] and _host_push_app.said("Notified clients on LAN"),
+          (_notifications, _host_push_app.status_signal.emitted))
 
 # ===========================================================================
 # WN-J: finding a host without being told where it is

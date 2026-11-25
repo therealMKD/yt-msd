@@ -237,6 +237,10 @@ class BootstrapMixin:
         # it. A client asking this PC to rebuild itself gets one window and one code, and the window is
         # the thing that cancels it. See _on_host_restore_event.
         self._host_restore_dialogs: dict = {}
+        # The same for a push: sync_code -> the window showing that code. Kept apart from the rebuild
+        # windows above because a host can be asked to rebuild itself and asked to take new files at the
+        # same moment, and each window cancels only the offer it is showing. See _on_host_push_event.
+        self._host_push_dialogs: dict = {}
         # Runtime-only registry of currently connected removable drives (not persisted)
         self.active_removable_drives: dict = {}  # folder_path_str -> rc dict
         # Cached answers about the filesystem. Only the background probe thread
@@ -288,6 +292,8 @@ class BootstrapMixin:
         self.sync_confirm_signal.connect(self._on_sync_confirm)
         self.sync_decision_signal.connect(self._on_sync_decision)
         self.restore_code_signal.connect(self._on_restore_code)
+        self.push_confirm_signal.connect(self._on_push_confirm)
+        self.push_code_signal.connect(self._on_push_code)
         self.host_restore_signal.connect(self._on_host_restore_event)
         self.chain_visibility_signal.connect(self._on_chain_visibility_notice)
         self.queue_update_signal.connect(self._refresh_queue_display)

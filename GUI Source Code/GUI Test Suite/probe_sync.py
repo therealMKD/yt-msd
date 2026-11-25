@@ -1964,6 +1964,265 @@ check("SY-P32 the host was asked the same question the Delete and Keep answers w
 P_REBUILD_BRIDGE.close()
 
 # ===========================================================================
+# SY-Q: Push To Host - a client offering its own new files to its host before its own next sync deletes them
+# ===========================================================================
+# Restore Host hands a host a whole library it has lost. A push is the narrower thing next door: a Mirror
+# client has made tracks since the two machines last spoke, its host has never seen them, and this chain's
+# own next sync is the thing that would delete them out of this folder to match the host. The offer is made
+# before that deletion pass rather than after it, and the host decides what it takes. What is proved here is
+# what counts as "newer than the last sync", the host's own rule for what it will accept (never a name it
+# already holds, never more than its card allows, newest first), that an address it has not let push before
+# needs a code read off this machine's screen, and that nothing on either machine is deleted by any of it.
+Q_HOST_FOLDER = fixture("host pushed into")
+audio_file(Q_HOST_FOLDER, "here.mp3", body=b"the track both machines hold", mtime=1600000000.0)
+audio_file(Q_HOST_FOLDER, "same.mp3", body=b"the host's own copy of that name", mtime=1610000000.0)
+Q_CLIENT_FOLDER = fixture("folder that pushed")
+audio_file(Q_CLIENT_FOLDER, "here.mp3", body=b"the track both machines hold", mtime=1600000000.0)
+audio_file(Q_CLIENT_FOLDER, "same.mp3", body=b"this end's different copy of that name", mtime=1615000000.0)
+audio_file(Q_CLIENT_FOLDER, "new1.mp3", body=b"the first new track", mtime=1700000001.0)
+audio_file(Q_CLIENT_FOLDER, "new2.mp3", body=b"the second new track", mtime=1700000002.0)
+audio_file(Q_CLIENT_FOLDER, "new3.mp3", body=b"the third new track", mtime=1700000003.0)
+audio_file(Q_CLIENT_FOLDER, "old.mp3", body=b"here longer than this chain has been syncing", mtime=1200000000.0)
+
+Q_EVENTS = []
+Q_CHAINS = [{"sync_code": "7711", "name": "Push Me", "folder_path": str(Q_HOST_FOLDER),
+             "max_pushed_files": 2}]
+Q_SERVER = mod.SyncHostServer(lambda: Q_CHAINS,
+                              on_restore_event_cb=lambda code, ip, event, note: Q_EVENTS.append((code, ip,
+                                                                                                 event, note)))
+Q_SERVER._running = True
+
+
+def _q_held(folder):
+    return sorted(held.name for held in mod.filter_audio_files(folder))
+
+
+_q_local = {held.name: held for held in mod.filter_audio_files(Q_CLIENT_FOLDER)}
+check("SY-Q1 \"the moment this chain last finished a sync\" is read the same way from the number a sync writes and the date a card or a TAG file writes, and a chain that has never finished one has no moment at all rather than a moment older than everything it holds",
+      _client_layer.last_sync_moment({"last_synced": 1500000000}) == 1500000000.0
+      and _client_layer.last_sync_moment({"last_synced": mod.format_sync_timestamp(1650000000)}) == 1650000000.0
+      and _client_layer.last_sync_moment({}) is None
+      and _client_layer.last_sync_moment({"last_synced": 0}) is None
+      and _client_layer.last_sync_moment({"last_synced": ""}) is None
+      and _client_layer.last_sync_moment({"last_synced": None}) is None,
+      _client_layer.last_sync_moment({"last_synced": mod.format_sync_timestamp(1650000000)}))
+check("SY-Q2 \"newer than the last sync\" is decided by the date on the file itself: everything made after that moment is offered, everything that was already here when this chain started syncing is not, a chain with no last sync offers nothing, and a file that has gone away since it was listed is not offered either",
+      _client_layer.files_since_last_sync({"last_synced": 1650000000.0}, _q_local) == ["new1.mp3", "new2.mp3", "new3.mp3"]
+      and _client_layer.files_since_last_sync({"last_synced": 1700000002.0}, _q_local) == ["new3.mp3"]
+      and _client_layer.files_since_last_sync({}, _q_local) == []
+      and _client_layer.files_since_last_sync({"last_synced": 1650000000.0},
+                                              dict(_q_local, **{"vanished.mp3": Q_CLIENT_FOLDER / "vanished.mp3"}))
+      == ["new1.mp3", "new2.mp3", "new3.mp3"],
+      _client_layer.files_since_last_sync({"last_synced": 1650000000.0}, _q_local))
+
+_q_client, _q_worker = _restore_pair(Q_SERVER, "192.168.1.40")
+_authenticate(_q_client, "7711")
+mod.send_json_msg(_q_client, {"cmd": "PUSH_REQUEST", "sync_code": "7711", "client_ip": "192.168.1.99",
+                              "count": 3})
+_q_waiting = mod.recv_json_msg(_q_client, timeout=8.0)
+_q_offer = _host_layer.pending_push_request("7711")
+check("SY-Q3 an address this host has never let push gets a wait and not a way in: the answer names the chain, this chain's own limit and how long the wait lasts, and the code it is waiting for stays on the host's side of the wire",
+      _q_waiting.get("status") == "WAITING_FOR_PUSH_CODE" and _q_waiting.get("chain_name") == "Push Me"
+      and _q_waiting.get("limit") == 2 and _q_waiting.get("expires_in") == int(_lan_layer.SYNC_RESTORE_CODE_TIMEOUT)
+      and _q_offer is not None and _q_offer["code"] not in json.dumps(_q_waiting)
+      and any(event[2] == "push_requested" and event[1] == "192.168.1.40" for event in Q_EVENTS),
+      (_q_waiting, _q_offer))
+check("SY-Q3b and the address that was asked about is the one the connection arrived from and not the one the client chose to name in its own message - a push is permitted to a machine, and a machine is its address",
+      _q_offer is not None and _q_offer["client_ip"] == "192.168.1.40"
+      and all(event[1] != "192.168.1.99" for event in Q_EVENTS), (_q_offer, Q_EVENTS))
+_q_wrong = "AAAA" if _q_offer["code"] != "AAAA" else "BBBB"
+mod.send_json_msg(_q_client, {"cmd": "PUSH_START", "sync_code": "7711", "code": _q_wrong})
+_q_wrong_answer = mod.recv_json_msg(_q_client, timeout=8.0)
+_q_client.close(); _q_worker.join(8)
+check("SY-Q4 a push code typed wrong closes the offer instead of leaving it open to be guessed at, and writes nothing into the hosted folder",
+      _q_wrong_answer.get("status") == "ERROR" and "not the code" in _q_wrong_answer.get("reason", "")
+      and _host_layer.pending_push_request("7711") is None
+      and _q_held(Q_HOST_FOLDER) == ["here.mp3", "same.mp3"]
+      and any(event[2] == "push_cancelled" and event[3] == "wrong code" for event in Q_EVENTS),
+      (_q_wrong_answer, _q_wrong))
+
+_q_client, _q_worker = _restore_pair(Q_SERVER, "192.168.1.41")
+_authenticate(_q_client, "7711")
+_q_ok, _q_note, _q_sent, _q_refused_count = _client_layer.SyncClientWorker._push_to_host(
+    _q_client, {"sync_code": "7711"}, Q_CLIENT_FOLDER, ["new1.mp3", "new2.mp3", "new3.mp3"],
+    "192.168.1.41:63350", push_code_cb=lambda host_label: None)
+_q_client.close(); _q_worker.join(8)
+check("SY-Q5 a push nobody authorised is cancelled from the client's own side, which takes the code off the host's screen as well as off this machine's, and it ends with the sentence a window reports a refused push with",
+      _q_ok is False and _q_sent == 0 and _q_note == "Push cancelled - nothing was written to the host."
+      and _client_layer.push_was_left_undone(_q_note) is True
+      and _client_layer.push_was_left_undone("Could not find active host for Sync Code 7711 on local network.") is False
+      and _host_layer.pending_push_request("7711") is None
+      and _q_held(Q_HOST_FOLDER) == ["here.mp3", "same.mp3"]
+      and any(event[2] == "push_cancelled" and event[3] == "client cancelled" for event in Q_EVENTS),
+      (_q_ok, _q_note))
+
+Q_CHAINS[0]["max_pushed_files"] = 0
+_q_client, _q_worker = _restore_pair(Q_SERVER, "192.168.1.42")
+_authenticate(_q_client, "7711")
+mod.send_json_msg(_q_client, {"cmd": "PUSH_REQUEST", "sync_code": "7711", "count": 3})
+_q_zero = mod.recv_json_msg(_q_client, timeout=8.0)
+_q_client.close(); _q_worker.join(8)
+Q_CHAINS[0]["max_pushed_files"] = 2
+check("SY-Q6 a chain set to take none says so before any of this work happens: the offer is refused at the request, no code is opened on either screen, and nobody measures and hashes files for nothing",
+      _q_zero.get("status") == "ERROR" and "does not accept pushed files" in _q_zero.get("reason", "")
+      and _host_layer.pending_push_request("7711") is None
+      and not any(event[2] == "push_requested" and event[1] == "192.168.1.42" for event in Q_EVENTS),
+      _q_zero)
+
+_q_here = Q_HOST_FOLDER / "here.mp3"
+_q_offered = [{"name": "same.mp3", "size": 31, "mtime": 1700000100.0, "sha256": "z" * 64},
+              {"name": "here.mp3", "size": _q_here.stat().st_size, "mtime": 1700000101.0,
+               "sha256": mod.compute_file_sha256(_q_here)},
+              {"name": "../escape.mp3", "size": 5, "mtime": 1700000102.0, "sha256": "y" * 64},
+              {"name": "notes.txt", "size": 5, "mtime": 1700000103.0, "sha256": "x" * 64},
+              {"name": "made1.mp3", "size": 6, "mtime": 1700000200.0, "sha256": "w" * 64},
+              {"name": "made2.mp3", "size": 6, "mtime": 1700000300.0, "sha256": "v" * 64}]
+_q_taken, _q_refused_all, _q_already = Q_SERVER._push_shortlist(Q_HOST_FOLDER, _q_offered, 2)
+_q_taken_cut, _q_refused_cut, _q_already_cut = Q_SERVER._push_shortlist(Q_HOST_FOLDER, _q_offered, 1)
+check("SY-Q7 what a host will take from a push is decided before a single byte arrives, and it is narrower than what a rebuild takes: a name this folder already holds is never overwritten on a stranger's word for it however different the two copies are, a name the folder cannot hold is refused, an identical file is not a push at all, and what is left is cut to this chain's limit newest first",
+      _q_taken == ["made2.mp3", "made1.mp3"] and _q_refused_all == 3 and _q_already == 1
+      and _q_taken_cut == ["made2.mp3"] and _q_refused_cut == 4 and _q_already_cut == 1
+      and _q_held(Q_HOST_FOLDER) == ["here.mp3", "same.mp3"],
+      (_q_taken, _q_refused_all, _q_already, _q_taken_cut, _q_refused_cut))
+
+# The same chain, now with this machine's own address on its list of addresses that need no code, over a
+# bridge so that a whole client push - open the connection, name the chain, read the host's index, decide
+# what is new, offer it - runs the way a card runs it.
+Q_BRIDGE = _restore_bridge(Q_SERVER)
+Q_CHAINS[0]["push_trusted_ips"] = ["127.0.0.1"]
+_q_chain = _client_chain(Q_CLIENT_FOLDER, Q_BRIDGE.getsockname()[1], last_synced=1650000000.0)
+_q_chain["sync_code"] = "7711"
+_q_said = []
+_q_ok, _q_note, _q_sent, _q_refused_now = mod.SyncClientWorker.push_chain(
+    _q_chain, status_cb=lambda line: _q_said.append(line), push_code_cb=lambda host_label: None)
+check("SY-Q8 a push from an address this host has let through writes its newest files into the host's folder up to that chain's limit, keeps the dates the tracks were made on, and leaves everything the host already held exactly as it was - and leaves every file on this machine where it is",
+      _q_ok is True and _q_sent == 2 and _q_refused_now == 1
+      and _q_held(Q_HOST_FOLDER) == ["here.mp3", "new2.mp3", "new3.mp3", "same.mp3"]
+      and (Q_HOST_FOLDER / "new3.mp3").read_bytes() == b"the third new track"
+      and abs((Q_HOST_FOLDER / "new3.mp3").stat().st_mtime - 1700000003.0) < 2.0
+      and (Q_HOST_FOLDER / "same.mp3").read_bytes() == b"the host's own copy of that name"
+      and _q_held(Q_CLIENT_FOLDER) == ["here.mp3", "new1.mp3", "new2.mp3", "new3.mp3", "old.mp3", "same.mp3"],
+      (_q_ok, _q_sent, _q_refused_now, _q_held(Q_HOST_FOLDER)))
+check("SY-Q8b and it is reported in words a card can print without guessing: which host it wrote into, what landed, what was refused, and that nothing was deleted here",
+      _client_layer.files_were_pushed(_q_note) is True
+      and _client_layer.nothing_to_push(_q_note) is False
+      and f"Pushed to host: 2 file(s) added to 127.0.0.1:{Q_BRIDGE.getsockname()[1]}, 0 already there, 1 refused" in _q_note
+      and _q_note.endswith("Nothing was deleted here.")
+      and any("leave to push - no code needed" in line for line in _q_said)
+      and any("Pushing [2/2] onto the host" in line for line in _q_said),
+      (_q_note, _q_said))
+check("SY-Q8c an address this host trusts is never asked for a code: no offer was opened on either screen, the host's own events say a trusted client was let through, and the host knows what that push did",
+      not any(event[2] == "push_requested" and event[1] == "127.0.0.1" for event in Q_EVENTS)
+      and any(event[2] == "push_started" and event[3] == "trusted client" for event in Q_EVENTS)
+      and any(event[2] == "push_finished" and "2 file(s) written" in event[3] and "1 refused" in event[3]
+              for event in Q_EVENTS)
+      and Q_SERVER.last_push_counts("7711") == (2, 1)
+      and Q_SERVER.is_pushing("7711") is False and Q_SERVER.pushing_from("7711") is None,
+      Q_EVENTS)
+
+_q_additive = dict(_q_chain)
+_q_additive["deletion_mode"] = "additive"
+_q_ok2, _q_note2, _q_sent2, _q_refused2 = mod.SyncClientWorker.push_chain(_q_additive)
+check("SY-Q9 an Additive chain is turned away at the door: it keeps what it holds whatever its host does, so it has nothing it would lose and no reason to be writing into another machine's folder",
+      _q_ok2 is False and _q_sent2 == 0 and "Only a Mirror chain can push" in _q_note2
+      and mod.chain_can_push(_q_additive) is False and mod.chain_can_push({"deletion_mode": "mirror"}) is True
+      and _q_held(Q_HOST_FOLDER) == ["here.mp3", "new2.mp3", "new3.mp3", "same.mp3"],
+      (_q_ok2, _q_note2))
+
+_q_later = dict(_q_chain)
+_q_later["last_synced"] = 1750000000.0
+_q_ok3, _q_note3, _q_sent3, _q_refused3 = mod.SyncClientWorker.push_chain(_q_later)
+check("SY-Q9b a push that found nothing newer than the last sync says exactly that rather than calling a push of nothing a success - the button that asked has to be able to say why it did nothing",
+      _q_ok3 is True and _q_sent3 == 0 and _client_layer.nothing_to_push(_q_note3) is True
+      and _client_layer.nothing_to_push("Synced successfully (0 updated, 0 removed).") is False
+      and _client_layer.nothing_to_push("Pushed to host: 2 file(s) added") is False,
+      (_q_ok3, _q_note3))
+
+
+class _PushApp(_DecisionApp):
+    """A window that answers the question a Mirror sync asks before its deletion pass."""
+
+    def __init__(self, answer, code=None):
+        super().__init__(answer, code)
+        self.push_questions = []
+
+    def ask_push_confirm(self, title, question):
+        self.titles.append(title)
+        self.push_questions.append(question)
+        return self.answer
+
+    def ask_push_code(self, title, host_label):
+        self.titles.append(title)
+        self.hosts.append(host_label)
+        return None
+
+
+Q_SYNC_HOST = fixture("host taken mid-sync")
+audio_file(Q_SYNC_HOST, "shared.mp3", body=b"a track both machines hold", mtime=1600000000.0)
+Q_SYNC_DEST = fixture("mirror folder pushed before it was matched")
+audio_file(Q_SYNC_DEST, "shared.mp3", body=b"a track both machines hold", mtime=1600000000.0)
+audio_file(Q_SYNC_DEST, "justmade.mp3", body=b"made here after the last sync", mtime=1700000000.0)
+Q_SYNC_CHAINS = [{"sync_code": "7722", "name": "Mirror Me", "folder_path": str(Q_SYNC_HOST),
+                  "max_pushed_files": 5, "push_trusted_ips": ["127.0.0.1"]}]
+Q_SYNC_SERVER = mod.SyncHostServer(lambda: Q_SYNC_CHAINS,
+                                   on_restore_event_cb=lambda code, ip, event, note: Q_EVENTS.append((code,
+                                                                                                      ip, event,
+                                                                                                      note)))
+Q_SYNC_SERVER._running = True
+Q_SYNC_BRIDGE = _restore_bridge(Q_SYNC_SERVER)
+_q_sync_chain = _client_chain(Q_SYNC_DEST, Q_SYNC_BRIDGE.getsockname()[1], last_synced=1650000000.0)
+_q_sync_chain["sync_code"] = "7722"
+
+_q_app = _PushApp(True)
+_q_said = []
+_q_ok4, _q_note4, _q_moved4, _q_removed4 = mod.SyncClientWorker.sync_chain(
+    _q_sync_chain, status_cb=lambda line: _q_said.append(line),
+    push_confirm_cb=_client_layer.make_push_confirm_cb(_q_app, "Mirror Me"),
+    push_code_cb=_client_layer.make_push_code_cb(_q_app, "Mirror Me"))
+check("SY-Q10 a Mirror sync that is told to push offers the files its own next deletion pass was about to take, re-reads both folders before it deletes anything, and finishes with the file kept at both ends instead of lost at one",
+      _q_ok4 is True and _q_removed4 == 0 and _q_moved4 == 0
+      and _q_held(Q_SYNC_HOST) == ["justmade.mp3", "shared.mp3"]
+      and _q_held(Q_SYNC_DEST) == ["justmade.mp3", "shared.mp3"]
+      and _client_layer.files_were_pushed(_q_note4) is True and "1 file(s) added" in _q_note4
+      and any("Re-reading the host's index after the push" in line for line in _q_said),
+      (_q_ok4, _q_note4, _q_removed4, _q_said))
+check("SY-Q10b and the question asked was the one that says what is at stake: which files, in which folder, that the host does not have, and that not answering means this sync deletes them",
+      _q_app.titles == ["Sync Chain 'Mirror Me' - Push Files To Host?"]
+      and len(_q_app.push_questions) == 1
+      and "1 file(s) in this folder are newer than this chain's last sync, and the host does not have them" in _q_app.push_questions[0]
+      and "justmade.mp3" in _q_app.push_questions[0]
+      and "this sync deletes them from this folder to match the host" in _q_app.push_questions[0]
+      and "A push can only add files to a host" in _q_app.push_questions[0],
+      (_q_app.titles, _q_app.push_questions))
+
+(Q_SYNC_HOST / "justmade.mp3").unlink()
+audio_file(Q_SYNC_DEST, "justmade.mp3", body=b"made here after the last sync", mtime=1700000000.0)
+_q_app2 = _PushApp(False)
+_q_ok5, _q_note5, _q_moved5, _q_removed5 = mod.SyncClientWorker.sync_chain(
+    dict(_q_sync_chain), push_confirm_cb=_client_layer.make_push_confirm_cb(_q_app2, "Mirror Me"))
+check("SY-Q10c answering no leaves the sync to do what a Mirror sync has always done - the file this machine made is deleted out of it to match the host - and says nothing about a push that never happened",
+      _q_ok5 is True and _q_removed5 == 1
+      and _q_held(Q_SYNC_DEST) == ["shared.mp3"] and _q_held(Q_SYNC_HOST) == ["shared.mp3"]
+      and _client_layer.files_were_pushed(_q_note5) is False and "added" not in _q_note5
+      and len(_q_app2.push_questions) == 1,
+      (_q_ok5, _q_note5, _q_removed5))
+
+audio_file(Q_SYNC_DEST, "justmade.mp3", body=b"made here after the last sync", mtime=1700000000.0)
+_q_app3 = _PushApp(True)
+_q_add_sync = dict(_q_sync_chain)
+_q_add_sync["deletion_mode"] = "additive"
+_q_ok6, _q_note6, _q_moved6, _q_removed6 = mod.SyncClientWorker.sync_chain(
+    _q_add_sync, push_confirm_cb=_client_layer.make_push_confirm_cb(_q_app3, "Mirror Me"))
+check("SY-Q10d an Additive sync is never interrupted with this question at all: it keeps the file whatever its host does, so there is nothing here it would lose and no reason to stop a sync asking about it",
+      _q_app3.push_questions == [] and _q_ok6 is True and _q_removed6 == 0
+      and "justmade.mp3" in _q_held(Q_SYNC_DEST) and "justmade.mp3" not in _q_held(Q_SYNC_HOST)
+      and _client_layer.files_were_pushed(_q_note6) is False,
+      (_q_app3.push_questions, _q_held(Q_SYNC_DEST), _q_held(Q_SYNC_HOST)))
+
+Q_BRIDGE.close()
+Q_SYNC_BRIDGE.close()
+
+# ===========================================================================
 # SY-L: the seam this suite reaches the program through
 # ===========================================================================
 _real_discovery = seam.original("discover_host_on_lan")
