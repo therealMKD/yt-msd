@@ -4,10 +4,6 @@
 # Finding the yt-dlp this system already has, driving winget to install or update
 # it, and asking GitHub what the newest release is. Nothing here runs yt-dlp to
 # answer a question about a video - that is yt_msd.ytdlp.runner.
-#
-# Extracted from yt-msd-gui.pyw during the 3.5 modularisation. The wording of everything
-# moved here is unchanged; only the imports needed to reach the rest of the program were
-# added.
 import os
 import sys
 import json

@@ -1,9 +1,5 @@
 # Open Source Software under the Apache License, Version 2.0
 # Part of the yt-msd GUI package (yt_msd.playback.stream).
-#
-# Extracted from yt-msd-gui.pyw during the 3.5 modularisation. The wording of everything
-# moved here is unchanged; only the imports needed to reach the rest of the program were
-# added.
 
 # Keeping one track playing. A YouTube stream URL is a signed link with a lifetime rather
 # than a file: partway through a long track - or after a track has been paused for an hour -

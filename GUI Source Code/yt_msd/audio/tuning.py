@@ -1,10 +1,6 @@
 # Open Source Software under the Apache License, Version 2.0
 # Part of the yt-msd GUI package (yt_msd.audio.tuning).
 #
-# Extracted from yt-msd-gui.pyw during the 3.5 modularisation. The wording of everything
-# moved here is unchanged; only the imports needed to reach the rest of the program were
-# added.
-#
 # WHY THE FOUR SETTINGS ARE AN OBJECT AND NOT FOUR MODULE GLOBALS
 # ---------------------------------------------------------------------------------------
 # The loudness numbers below are genuinely fixed. Four of them never were: the silence-pad

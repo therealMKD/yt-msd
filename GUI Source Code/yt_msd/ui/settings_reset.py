@@ -1,10 +1,6 @@
 # Open Source Software under the Apache License, Version 2.0
 # Part of the yt-msd GUI package (yt_msd.ui.settings_reset).
 #
-# Extracted from yt-msd-gui.pyw during the 3.5 modularisation. The wording of everything
-# moved here is unchanged; only the imports needed to reach the rest of the program were
-# added.
-#
 # A mixin, not a standalone module: MainApp inherits from this class, so what is written here
 # are ordinary methods and `self` is the MainApp instance. They were lifted out of the class
 # body in wave 6 with their text unchanged - only the imports needed to reach the rest of the
