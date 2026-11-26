@@ -183,11 +183,15 @@ from yt_msd.ui.theme import (
 from yt_msd.ui.widgets import (
     DoubleClickButton,
     DraggableQueueWidget,
+    THUMBNAIL_CACHE_MAX_BYTES,
+    THUMB_BOX_H,
+    THUMB_BOX_W,
     THUMB_HOVER_RECHECK_MS,
     ThumbnailWidget,
     _ElideTextFilter,
     cover_thumbnail,
     pil_to_qpixmap,
+    thumbnail_pixmap_bytes,
 )
 # Wave 5g: moved into yt_msd.ui.render and imported back because this file or the GUI Test Suite
 # still reads them by name. Wave 5h checked the group and dropped whatever nothing read.
@@ -2458,6 +2462,15 @@ class MainApp(BootstrapMixin,
         # shown. silence_crash_dialogs() stops only the dialogs.
         silence_crash_dialogs()
 
+        # A thumbnail fetch queued for a list that is going away has no row left to paint into, and
+        # the interpreter joins a ThreadPoolExecutor's workers when it exits: cancelling what is
+        # still queued is what keeps closing the window from standing behind downloads it no longer
+        # needs. The generation goes up with them, for the same reason a new search raises it.
+        _thumb_pool = getattr(self, '_thumb_fetch_pool', None)
+        if _thumb_pool is not None:
+            self._thumb_generation = getattr(self, '_thumb_generation', 0) + 1
+            _thumb_pool.shutdown(wait=False, cancel_futures=True)
+
         # A background thread that is still working when this window goes away
         # reaches for a signal on an object Qt has already deleted. The hard
         # exit used to cut those threads off before they could say so; now the
@@ -4587,6 +4600,9 @@ class MainApp(BootstrapMixin,
             self.invalidate_next_track_prefetch()
             self._reset_results_scroll()
             search_armed_stop_after = self._arm_stop_after_for_new_search()
+            # A new search is a new set of tracks, so the thumbnails of the list being thrown away
+            # are not in the one on screen. A redraw of the list that stays does not do this.
+            self._drop_thumbnail_cache()
         if search_armed_stop_after:
             self._on_status_update(f"Found {len(res)} results - Stop after current", False, "#FF8C00")
         else:
@@ -4677,7 +4693,17 @@ class MainApp(BootstrapMixin,
         box = getattr(self, '_playback_box', None)
         if box is not None and box[0] == "search" and box[1] == video.get('id', ''):
             tw.set_highlight(box[2])
-        threading.Thread(target=self._fetch_thumbnail, args=(video,), daemon=True).start()
+        # A row's picture is a download, so it goes to the app's shared fetch pool: a scroll over a
+        # long playlist asks for a burst of them, and one thread per row made that burst a thread
+        # per row. A harness driving this method off a stand-in has no pool, and asks for nothing.
+        # The pool is shut down on the way out, and a row built in that moment must not take the
+        # window's shutdown down with it: a pool that will not take work means a row with no picture.
+        _thumb_pool = getattr(self, '_thumb_fetch_pool', None)
+        if _thumb_pool is not None:
+            try:
+                _thumb_pool.submit(self._fetch_thumbnail, video)
+            except Exception:
+                pass
             
         # The row's own words, and never nothing: a search row can carry its title key empty, and
         # building a checkbox straight out of it is where a results window died (see
@@ -6538,31 +6564,117 @@ class MainApp(BootstrapMixin,
                     self.tray_header_action.setText("No Track Playing")
 
     def _on_thumbnail_loaded(self, vid_id, pixmap):
-        if hasattr(self, '_thumbnail_labels') and vid_id in self._thumbnail_labels:
-            if not pixmap.isNull():
-                # Covering the box and cutting back to it, so the box is the same width on
-                # all four sides of the picture whatever shape the thumbnail arrived in.
-                self._thumbnail_labels[vid_id].setPixmap(cover_thumbnail(pixmap))
+        """Paint a thumbnail a fetch thread finished, and keep it at the size it is painted at.
+
+        A row is torn down when it scrolls out of the pane and rebuilt when it scrolls back, so the
+        same picture is wanted again a moment later - that is the job the cache exists for. It was
+        doing it while holding the arriving 320x180 picture, which is fifteen times the bytes of the
+        only thing a thumbnail is ever used for: measured 240 kB a track against the 32 kB the box
+        costs (.test_harness/probe_ram.py).
+
+        The picture is kept whether or not the row that asked for it is still on screen. The row is
+        the temporary thing here, the picture is not: keeping it only when a row was there to take
+        it threw away finished downloads, so every row scrolled past and back was rebuilt out of
+        nothing and sat grey until it fetched all over again.
+        """
+        if pixmap.isNull():
+            return
+        if pixmap.width() == THUMB_BOX_W and pixmap.height() == THUMB_BOX_H:
+            box = pixmap  # a cache hit: already covering the box, so no re-scaling, no re-rounding
+        else:
+            # Covering the box and cutting back to it, so the box is the same width on
+            # all four sides of the picture whatever shape the thumbnail arrived in.
+            box = cover_thumbnail(pixmap)
+        self._remember_thumbnail(vid_id, box)
+        label = getattr(self, '_thumbnail_labels', {}).get(vid_id)
+        if label is not None:
+            label.setPixmap(box)
+
+    def _thumbnail_cache_lock(self):
+        """The lock the fetched thumbnails are read, written and trimmed under.
+
+        The fetch threads read the cache and mark the picture they just used as the freshest; the
+        GUI thread puts pictures in and walks the cache to trim it to the cap. An OrderedDict walked
+        while another thread is adding to it raises, and a move_to_end on a key another thread has
+        just trimmed raises too - in a fetch thread that is an exception nobody ever reads (the
+        future is not inspected) and a thumbnail that silently never arrives. So nothing touches the
+        cache without this. A harness app built with __new__ never ran __init__ and has no lock of
+        its own, and is handed one.
+        """
+        lock = getattr(self, '_thumbnail_lock', None)
+        if lock is None:
+            lock = threading.Lock()
+            self._thumbnail_lock = lock
+        return lock
+
+    def _drop_thumbnail_cache(self):
+        """Forget the fetched thumbnails, because the list they belong to has been replaced.
+
+        A new search is a new set of tracks, so the pictures kept for the rows being thrown away are
+        not in the list on screen - dropping them is what stops a session of search after search
+        carrying every thumbnail it ever fetched. The generation goes up first so the fetches the
+        replaced list had queued are dropped too, instead of filling the cache that is emptied here.
+        A redraw of the list that stays is not this call's business: rebuilding those rows out of the
+        cache is the one job the cache has.
+        """
+        self._thumb_generation = getattr(self, '_thumb_generation', 0) + 1
+        with self._thumbnail_cache_lock():
+            cache = getattr(self, 'thumbnail_cache', None)
+            if cache is not None:
+                cache.clear()
+            self.thumbnail_cache_size = 0
+
+    def _remember_thumbnail(self, vid_id, box):
+        """Keep one fetched thumbnail, counted in the bytes it costs the process. Insertion order
+        is the age order, so trimming drops the pictures nothing has asked for since.
+
+        The trim walks the cache, which is the one thing here that cannot be done while a fetch
+        thread is adding to it - see _thumbnail_cache_lock."""
+        cache = getattr(self, 'thumbnail_cache', None)
+        if cache is None:
+            return
+        with self._thumbnail_cache_lock():
+            previous = cache.get(vid_id)
+            if previous is not None:
+                # The same picture for the same track arriving again - a row scrolled out and back
+                # paints out of the cache and hands that picture straight back here. Counting it a
+                # second time charged the track twice and trimmed a picture nothing was looking at.
+                self.thumbnail_cache_size -= thumbnail_pixmap_bytes(previous)
+            cache[vid_id] = box
+            cache.move_to_end(vid_id)   # asked for again, so it is the freshest thing kept
+            self.thumbnail_cache_size += thumbnail_pixmap_bytes(box)
+            while self.thumbnail_cache_size > THUMBNAIL_CACHE_MAX_BYTES and cache:
+                oldest = next(iter(cache))      # an OrderedDict iterates its keys
+                picture = cache.pop(oldest)
+                self.thumbnail_cache_size -= thumbnail_pixmap_bytes(picture)
 
     def _fetch_thumbnail(self, v):
         vid_id = v.get('id')
         if not vid_id: return
-        if vid_id in self.thumbnail_cache:
-            self.thumbnails_loaded_signal.emit(vid_id, self.thumbnail_cache[vid_id])
+        with self._thumbnail_cache_lock():
+            cached = self.thumbnail_cache.get(vid_id)
+            if cached is not None:
+                # Asked for again, so it is the freshest - read and marked in one go, because a
+                # picture the GUI thread trimmed between these two lines made this raise, and a
+                # raise in here is swallowed by the pool: the row simply never gets its picture.
+                self.thumbnail_cache.move_to_end(vid_id)
+        if cached is not None:
+            self.thumbnails_loaded_signal.emit(vid_id, cached)
             return
+        generation = self._thumb_generation
 
         try:
             url = f"https://i.ytimg.com/vi/{vid_id}/mqdefault.jpg"
             with urllib.request.urlopen(url, timeout=10) as req:
                 data = req.read()
-                if self.thumbnail_cache_size + len(data) > 256 * 1024 * 1024:
-                    self.thumbnail_cache.clear(); self.thumbnail_cache_size = 0
+            if generation != self._thumb_generation:
+                return  # the list this was fetched for has been replaced, so nothing wants it now
                 
-                img = Image.open(io.BytesIO(data))
-                qpixmap = pil_to_qpixmap(img)
-                self.thumbnail_cache[vid_id] = qpixmap
-                self.thumbnail_cache_size += len(data)
-                self.thumbnails_loaded_signal.emit(vid_id, qpixmap)
+            img = Image.open(io.BytesIO(data))
+            qpixmap = pil_to_qpixmap(img)
+            # The cache is written on the GUI thread, where the picture is painted, and with the
+            # box-size result of this one - see _remember_thumbnail.
+            self.thumbnails_loaded_signal.emit(vid_id, qpixmap)
         except: pass
 # Wave 5e: moved into yt_msd.crash and imported back because this file or the GUI Test Suite
 # still reads them by name. Wave 5h checked the group and dropped whatever nothing read.

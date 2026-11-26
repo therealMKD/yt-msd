@@ -243,6 +243,29 @@ THUMB_BOX_PAUSED = "#FF8C00"    # the box of the loaded track, held where it sto
 THUMB_BOX_COLORS = {"playing": THUMB_BOX_PLAYING, "paused": THUMB_BOX_PAUSED}
 
 
+# What the fetched thumbnails COST, which is not what they weighed when they arrived: a cached
+# picture is width x height x 4 bytes of RGBA, and the JPEG it was decoded from is a small fraction
+# of that. Guarding on the downloaded bytes let the cache grow to something the program could never
+# reach - 256 MB of JPEG is over 17,000 tracks - while the box a thumbnail is painted in is a fixed
+# THUMB_BOX_W x THUMB_BOX_H, so every cached track cost 240 kB to be useful as 32 kB of it
+# (.test_harness/probe_ram.py measures both). Sized at a thousand painted boxes, which is more
+# tracks than the results pane can show at once.
+THUMBNAIL_CACHE_MAX_BYTES = 32 * 1024 * 1024
+
+
+# How many downloads answer a burst of rows. A scroll over a long playlist asks for a picture for
+# every row it puts on screen at once, and each one is a request to i.ytimg.com that can take its
+# whole timeout. Fewer workers than that means the row the person is looking at waits behind the
+# rows they scrolled past, which reads as thumbnails that come and go; one thread per row (what
+# this replaced) is a hundred threads for a playlist scrolled through in a second.
+THUMBNAIL_FETCH_WORKERS = 8
+
+
+def thumbnail_pixmap_bytes(pixmap):
+    """What one cached picture costs the process: RGBA is four bytes a pixel."""
+    return pixmap.width() * pixmap.height() * 4
+
+
 # The play button on a thumbnail belongs to the pointer, not to the row: it is there while the
 # pointer is on that thumbnail and gone the moment it is not. Qt is what normally says when that
 # changes, and it can fail to say so. Scrolling the results list moves a row out from under a

@@ -10,6 +10,11 @@
 import os
 import sys
 import threading
+from collections import OrderedDict
+# ThreadPoolExecutor is named from the module that defines it, not from concurrent.futures, for the
+# reason written out at that import in the entry point: 3.15 hands it over with a "lazy from", and
+# the deferred binding is not callable.
+from concurrent.futures.thread import ThreadPoolExecutor
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import QTimer
 from yt_msd.audio.tuning import TUNING
@@ -20,7 +25,7 @@ from yt_msd.sync.discovery import UDPBeaconBroadcaster
 from yt_msd.sync.host import HostFolderWatcher, SyncHostServer
 from yt_msd.sync.lan import HOST_UP_SYNC_REQUEST_DELAY_MS, get_current_wifi_ssid
 from yt_msd.ui.render import LOCAL_RENDER_ROW_HEIGHT_GUESS
-from yt_msd.ui.widgets import THUMB_HOVER_RECHECK_MS
+from yt_msd.ui.widgets import THUMB_HOVER_RECHECK_MS, THUMBNAIL_FETCH_WORKERS
 
 class BootstrapMixin:
     def __init__(self):
@@ -77,8 +82,26 @@ class BootstrapMixin:
         # Qt's own serialisation of the window frame, kept only for windows that
         # were opened from MusicBee. See _apply_host_window_geometry.
         self.host_window_geometry = ""
-        self.thumbnail_cache = {}
+        # The thumbnails already fetched, kept at the size a row paints them: the box is a fixed
+        # 86x46 and the arriving picture is 320x180, so the arriving size is fifteen times the
+        # bytes of the only thing the picture is ever used for. Insertion order is the age order,
+        # so the cap drops what nothing is looking at, and what is totalled is RGBA bytes - the
+        # cost, not the weight of the JPEG it came from. See THUMBNAIL_CACHE_MAX_BYTES.
+        self.thumbnail_cache = OrderedDict()
         self.thumbnail_cache_size = 0
+        # The pictures are put in by the fetch threads and taken out by the GUI thread's trim, and
+        # walking an OrderedDict while another thread is adding to it raises - in a fetch thread,
+        # where nobody reads the future, that is a thumbnail that never arrives. Every read, write
+        # and trim of the cache takes this lock. See MainApp._thumbnail_cache_lock.
+        self._thumbnail_lock = threading.Lock()
+        # Fetching a thumbnail is a download, and a scroll asks for a burst of them at once. A
+        # handful of workers answers that burst; one thread per row was 100 threads for a
+        # playlist a user can scroll through in a second. Tasks from a list that has been replaced
+        # are dropped by the generation number below, so a new search is never queued behind the
+        # pictures of the one it replaced.
+        self._thumb_fetch_pool = ThreadPoolExecutor(max_workers=THUMBNAIL_FETCH_WORKERS,
+                                                    thread_name_prefix="thumbs")
+        self._thumb_generation = 0
         
         # Config Map
         self.format_var = "mp3"

@@ -1070,6 +1070,8 @@ class ReadingHarness:
     invalidate_next_track_prefetch = mod.MainApp.invalidate_next_track_prefetch
     _arm_stop_after_for_new_search = mod.MainApp._arm_stop_after_for_new_search
     _stream_track_in_progress = mod.MainApp._stream_track_in_progress
+    _thumbnail_cache_lock = mod.MainApp._thumbnail_cache_lock
+    _drop_thumbnail_cache = mod.MainApp._drop_thumbnail_cache
     set_stop_after_current = mod.MainApp.set_stop_after_current
     _update_stop_after_ui = mod.MainApp._update_stop_after_ui
 
@@ -3684,6 +3686,372 @@ check("AI16 the helper is the program's own, held by the module that reads searc
       and any(module.__name__ == 'yt_msd.ytdlp.runner' for module in seam.owners('entry_display_title')),
       [module.__name__ for module in seam.owners('entry_display_title')])
 
+
+# ---------------------------------------------------------------------------
+# AJ. the fetched thumbnails are kept at the size a row paints them, the cache is
+#     sized in what they cost, and a new search drops the ones it replaced.
+# ---------------------------------------------------------------------------
+print("=" * 72)
+print("AJ. a fetched thumbnail is kept at the size the row paints it")
+
+from collections import OrderedDict as _AJ_OD      # the cache is an LRU; the checks read it as one
+from yt_msd.ui.widgets import THUMB_BOX_H as _AJ_BOX_H   # only the width is re-exported to the entry point
+
+_AJ_BOX_BYTES = mod.THUMB_BOX_W * _AJ_BOX_H * 4     # RGBA, four bytes a pixel
+
+
+def _aj_app(with_label=True, vid="ajVid"):
+    """A MainApp carrying only what the thumbnail path touches, with no window built."""
+    app = mod.MainApp.__new__(mod.MainApp)
+    app.accent_color_name = "Blue"
+    app._thumbnail_labels = {}
+    app._playback_box = None
+    app.thumbnail_cache = _AJ_OD()
+    app.thumbnail_cache_size = 0
+    app._thumb_generation = 0
+    if with_label:
+        label = mod.QLabel()
+        label.setFixedSize(mod.THUMB_BOX_W, _AJ_BOX_H)
+        app._thumbnail_labels[vid] = label
+    return app
+
+
+def _aj_arriving(seed):
+    """A picture the size the app downloads one: i.ytimg.com's mqdefault is 320x180."""
+    pm = mod.QPixmap(320, 180)
+    pm.fill(mod.QColor((seed * 37) % 256, (seed * 91) % 256, (seed * 13) % 256))
+    return pm
+
+
+_aj_paint = _aj_app()
+_aj_label = _aj_paint._thumbnail_labels["ajVid"]
+_aj_paint._on_thumbnail_loaded("ajVid", _aj_arriving(1))
+_aj_kept = _aj_paint.thumbnail_cache.get("ajVid")
+check("AJ1 an arriving 320x180 thumbnail is painted at the size the box is",
+      _aj_label.pixmap().width() == mod.THUMB_BOX_W and _aj_label.pixmap().height() == _AJ_BOX_H,
+      (_aj_label.pixmap().width(), _aj_label.pixmap().height()))
+check("AJ2 what is kept for the track is that painted box, not the picture that arrived",
+      _aj_kept is not None and _aj_kept.width() == mod.THUMB_BOX_W and _aj_kept.height() == _AJ_BOX_H,
+      None if _aj_kept is None else (_aj_kept.width(), _aj_kept.height()))
+check("AJ3 the cache is totalled in the bytes the kept picture costs the process",
+      _aj_paint.thumbnail_cache_size == mod.thumbnail_pixmap_bytes(_aj_kept)
+      and _aj_paint.thumbnail_cache_size == _AJ_BOX_BYTES,
+      (_aj_paint.thumbnail_cache_size, _AJ_BOX_BYTES))
+
+_aj_before = (_aj_paint.thumbnail_cache_size, len(_aj_paint.thumbnail_cache))
+_aj_paint._on_thumbnail_loaded("ajVid", _aj_kept)
+check("AJ4 a cached thumbnail is painted as it is, so a re-scroll scales nothing a second time",
+      (_aj_paint.thumbnail_cache_size, len(_aj_paint.thumbnail_cache)) == _aj_before
+      and _aj_label.pixmap().width() == mod.THUMB_BOX_W,
+      (_aj_before, _aj_paint.thumbnail_cache_size, len(_aj_paint.thumbnail_cache)))
+
+with seam.patched("THUMBNAIL_CACHE_MAX_BYTES", 3 * _AJ_BOX_BYTES):
+    _aj_trim = _aj_app(with_label=False)
+    for _i in range(5):
+        _aj_trim._remember_thumbnail("vid%d" % _i, mod.cover_thumbnail(_aj_arriving(_i)))
+    check("AJ5 the cap counts the bytes kept and trims the pictures nothing is looking at",
+          len(_aj_trim.thumbnail_cache) == 3 and _aj_trim.thumbnail_cache_size == 3 * _AJ_BOX_BYTES
+          and list(_aj_trim.thumbnail_cache) == ["vid2", "vid3", "vid4"],
+          (len(_aj_trim.thumbnail_cache), _aj_trim.thumbnail_cache_size, list(_aj_trim.thumbnail_cache)))
+check("AJ6 the cap is stated in what a picture costs, not in the bytes it downloaded",
+      "THUMBNAIL_CACHE_MAX_BYTES = 32 * 1024 * 1024" in _source
+      and "self.thumbnail_cache_size += len(data)" not in _source,
+      _source.count("self.thumbnail_cache_size += len(data)"))
+
+_aj_gone = _aj_app(with_label=False)
+_aj_gone._on_thumbnail_loaded("ajVid", _aj_arriving(3))
+_aj_straggler = _aj_gone.thumbnail_cache.get("ajVid")
+check("AJ7 a picture arriving for a row that has been torn down is kept, because that row is rebuilt when it scrolls back",
+      _aj_straggler is not None and _aj_straggler.width() == mod.THUMB_BOX_W
+      and _aj_gone.thumbnail_cache_size == _AJ_BOX_BYTES,
+      (len(_aj_gone.thumbnail_cache), _aj_gone.thumbnail_cache_size))
+
+r.thumbnail_cache = _AJ_OD({"vid0": mod.cover_thumbnail(_aj_arriving(4))})
+r.thumbnail_cache_size = _AJ_BOX_BYTES
+r._on_search_results(r.search_results, False, reset_view=False)
+_pump()
+check("AJ8 a redraw of the list that stays keeps the pictures its rows are rebuilt out of",
+      "vid0" in r.thumbnail_cache and r.thumbnail_cache_size == _AJ_BOX_BYTES,
+      (dict(r.thumbnail_cache), r.thumbnail_cache_size))
+
+_aj_gen_before = getattr(r, "_thumb_generation", 0)
+r._on_search_results(_r_videos, False)
+_pump()
+check("AJ9 a new search drops the pictures of the list it replaced",
+      not r.thumbnail_cache and r.thumbnail_cache_size == 0,
+      (len(r.thumbnail_cache), r.thumbnail_cache_size))
+check("AJ10 a new search drops the fetches that list had queued with it",
+      getattr(r, "_thumb_generation", 0) == _aj_gen_before + 1,
+      (_aj_gen_before, getattr(r, "_thumb_generation", None)))
+
+
+class _AJ_Pool:
+    """Stands in for the app's shared fetch pool, and records what a row asked it for."""
+
+    def __init__(self):
+        self.submitted = []
+
+    def submit(self, target, *args):
+        self.submitted.append(args)
+
+
+_aj_build = _aj_app()
+_aj_build._fetch_thumbnail = lambda video: None
+_aj_build._thumb_fetch_pool = _AJ_Pool()
+_aj_row = mod.QWidget()
+_aj_row.setFixedHeight(54)
+_aj_video = {"id": "ajRow", "title": "Painted Row", "channel": "Chan"}
+_aj_raised = None
+try:
+    _aj_build.build_result_ui(_aj_row, _aj_video, set())
+except Exception as exc:
+    _aj_raised = exc
+check("AJ11 a result row asks the shared pool for its picture, and raises nothing",
+      _aj_raised is None and _aj_build._thumb_fetch_pool.submitted == [(_aj_video,)],
+      (_aj_raised, _aj_build._thumb_fetch_pool.submitted))
+check("AJ12 no row starts a thread of its own, and a fetch for a replaced list stops short of the cache",
+      "threading.Thread(target=self._fetch_thumbnail" not in _source
+      and "if generation != self._thumb_generation:" in _source[_source.index("def _fetch_thumbnail"):][:1400],
+      _source.count("threading.Thread(target=self._fetch_thumbnail"))
+check("AJ13 closing the window cancels the thumbnail fetches still queued",
+      "_thumb_pool.shutdown(wait=False, cancel_futures=True)" in _source[_source.index("def shutdown_for_exit"):][:1500])
+
+# ---------------------------------------------------------------------------
+# AK. every picture a fetch finishes gets painted. AJ wrote down what the fetch
+#     path was meant to do and left the two things that made thumbnails come and
+#     go untested: a download that landed while its row was scrolled out was
+#     thrown away, so the row rebuilt out of nothing sat grey; and the cache was
+#     read and marked by the fetch threads while the GUI thread walked it to trim
+#     it, which raises, in a thread whose exceptions nobody ever reads.
+# ---------------------------------------------------------------------------
+print("=" * 72)
+print("AK. a finished fetch paints, out of the cache the second time, under one lock")
+
+import inspect as _AK_inspect
+import threading as _AK_threading
+import urllib.request as _AK_request
+from yt_msd.ui.widgets import THUMBNAIL_FETCH_WORKERS as _AK_WORKERS
+
+_AK_urlopen = _AK_request.urlopen      # the attribute the entry point calls, kept to be given back
+
+
+class _AK_Response:
+    """What i.ytimg.com answers with, with no request leaving this machine."""
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    def read(self):
+        return self.payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _ak_fake_urlopen(payload, calls):
+    """A stand-in for the download, counted, that hands back a real JPEG."""
+    def _spy(request, *args, **kwargs):
+        calls.append(request)
+        return _AK_Response(payload)
+    return _spy
+
+
+def _ak_jpeg(seed):
+    """A picture in the shape mqdefault answers in: 320x180, encoded as JPEG."""
+    import io as _AK_io
+    from PIL import Image as _AK_Image
+    _buffer = _AK_io.BytesIO()
+    _AK_Image.new("RGB", (320, 180), ((seed * 37) % 256, (seed * 91) % 256, (seed * 13) % 256)).save(_buffer, "JPEG")
+    return _buffer.getvalue()
+
+
+def _ak_wired(app):
+    """Plays the part of the connection a real window gets from bootstrap.py.
+
+    An app built with __new__ cannot have its thumbnail signal connected - Qt refuses
+    with "Signal source has been deleted", because __init__ never ran - so the fetch's
+    emit is caught here and handed to the slot the real window connects. On the GUI
+    thread that is exactly what the real connection does. A check that never looked at
+    the emit is the shape this bug had: nothing painted, nothing failed.
+    """
+    app.thumbnails_loaded_signal = _AK_Emits(app)
+    return app
+
+
+class _AK_Emits:
+    """What a fetch emitted, and the paint slot that the app's signal is connected to."""
+
+    def __init__(self, app):
+        self.app = app
+        self.emitted = []
+
+    def emit(self, vid_id, pixmap):
+        self.emitted.append((vid_id, pixmap))
+        self.app._on_thumbnail_loaded(vid_id, pixmap)
+
+
+_ak_hit = _ak_wired(_aj_app(vid="akHit"))
+_ak_hit.thumbnail_cache["akHit"] = mod.cover_thumbnail(_aj_arriving(11))
+_ak_calls = []
+try:
+    _AK_request.urlopen = _ak_fake_urlopen(_ak_jpeg(11), _ak_calls)
+    _ak_hit._fetch_thumbnail({"id": "akHit"})
+    _pump()
+finally:
+    _AK_request.urlopen = _AK_urlopen
+check("AK1 a row whose picture is already cached is painted out of the cache, and downloads nothing",
+      _ak_calls == [] and len(_ak_hit.thumbnails_loaded_signal.emitted) == 1
+      and _ak_hit._thumbnail_labels["akHit"].pixmap().width() == mod.THUMB_BOX_W
+      and _ak_hit._thumbnail_labels["akHit"].pixmap().height() == _AJ_BOX_H,
+      (_ak_calls, _ak_hit._thumbnail_labels["akHit"].pixmap().rect().size()))
+
+_ak_scales = []
+_ak_real_cover = mod.cover_thumbnail
+
+
+def _ak_counted_cover(pixmap, *args, **kwargs):
+    _ak_scales.append(1)
+    return _ak_real_cover(pixmap, *args, **kwargs)
+
+
+_ak_scaled = _ak_wired(_aj_app(vid="akScaled"))
+_ak_scaled.thumbnail_cache["akScaled"] = mod.cover_thumbnail(_aj_arriving(12))
+_ak_calls2 = []
+with seam.patched("cover_thumbnail", _ak_counted_cover):
+    try:
+        _AK_request.urlopen = _ak_fake_urlopen(_ak_jpeg(12), _ak_calls2)
+        _ak_scaled._fetch_thumbnail({"id": "akScaled"})
+        _pump()
+    finally:
+        _AK_request.urlopen = _AK_urlopen
+check("AK2 the second visit is painted as the cached picture is, with no scaling done at all",
+      _ak_scales == [] and _ak_scaled._thumbnail_labels["akScaled"].pixmap().width() == mod.THUMB_BOX_W,
+      (_ak_scales, _ak_scaled._thumbnail_labels["akScaled"].pixmap().rect().size()))
+
+_ak_dl = _ak_wired(_aj_app(vid="akDl"))
+_ak_calls3 = []
+try:
+    _AK_request.urlopen = _ak_fake_urlopen(_ak_jpeg(5), _ak_calls3)
+    _ak_dl._fetch_thumbnail({"id": "akDl"})
+    _pump()
+finally:
+    _AK_request.urlopen = _AK_urlopen
+_ak_dl_box = _ak_dl.thumbnail_cache.get("akDl")
+check("AK3 a fetched picture is painted at the box size and kept at the box size",
+      len(_ak_calls3) == 1 and _ak_dl._thumbnail_labels["akDl"].pixmap().width() == mod.THUMB_BOX_W
+      and _ak_dl_box is not None and _ak_dl_box.height() == _AJ_BOX_H
+      and _ak_dl.thumbnail_cache_size == _AJ_BOX_BYTES,
+      (len(_ak_calls3), None if _ak_dl_box is None else (_ak_dl_box.width(), _ak_dl_box.height()),
+       _ak_dl.thumbnail_cache_size))
+
+_ak_back = _ak_wired(_aj_app(vid="akBack"))
+_ak_calls4 = []
+try:
+    _AK_request.urlopen = _ak_fake_urlopen(_ak_jpeg(9), _ak_calls4)
+    _ak_back._fetch_thumbnail({"id": "akBack"})                       # the row's first visit
+    _pump()
+    del _ak_back._thumbnail_labels["akBack"]                          # it scrolls out and is torn down
+    _ak_back._on_thumbnail_loaded("akBack", _ak_back.thumbnail_cache["akBack"])   # nothing to paint into
+    _ak_rebuilt = mod.QLabel()
+    _ak_rebuilt.setFixedSize(mod.THUMB_BOX_W, _AJ_BOX_H)
+    _ak_back._thumbnail_labels["akBack"] = _ak_rebuilt                # the same row, built again
+    _ak_back._fetch_thumbnail({"id": "akBack"})
+    _pump()
+finally:
+    _AK_request.urlopen = _AK_urlopen
+check("AK4 a row scrolled out and back is painted out of the cache, on one download for the two visits",
+      len(_ak_calls4) == 1 and _ak_rebuilt.pixmap().width() == mod.THUMB_BOX_W
+      and len(_ak_back.thumbnail_cache) == 1,
+      (len(_ak_calls4), _ak_rebuilt.pixmap().rect().size(), len(_ak_back.thumbnail_cache)))
+
+_ak_stale = _ak_wired(_aj_app(vid="akStale"))
+_ak_calls5 = []
+
+
+def _ak_superseded_urlopen(payload, calls, app):
+    """The download answering, with a new search landing while it was in flight - the
+    moment the generation check exists for. Raising the generation before the fetch was
+    asked would prove nothing: the number it compares is the one it read on the way in."""
+    def _spy(request, *args, **kwargs):
+        calls.append(request)
+        app._drop_thumbnail_cache()
+        return _AK_Response(payload)
+    return _spy
+
+
+try:
+    _AK_request.urlopen = _ak_superseded_urlopen(_ak_jpeg(7), _ak_calls5, _ak_stale)
+    _ak_stale._fetch_thumbnail({"id": "akStale"})
+    _pump()
+finally:
+    _AK_request.urlopen = _AK_urlopen
+check("AK5 a fetch superseded by a new search mid-download emits nothing, paints nothing and keeps nothing",
+      len(_ak_calls5) == 1 and not _ak_stale.thumbnails_loaded_signal.emitted
+      and not _ak_stale.thumbnail_cache and _ak_stale._thumbnail_labels["akStale"].pixmap().isNull(),
+      (len(_ak_calls5), _ak_stale.thumbnails_loaded_signal.emitted, len(_ak_stale.thumbnail_cache)))
+
+# The boxes are made on the GUI thread: what is being watched here is one cache being
+# read, added to and trimmed by four threads at once, not Qt painting off the GUI thread.
+_ak_boxes = [mod.cover_thumbnail(_aj_arriving(_i)) for _i in range(60)]
+_ak_shared = _ak_wired(_aj_app(with_label=False))
+for _i in range(40):
+    _ak_shared._remember_thumbnail("ak%02d" % _i, _ak_boxes[_i])
+_ak_errors = []
+
+
+def _ak_worker(_offset):
+    try:
+        for _n in range(60):
+            _key = "ak%02d" % ((_n + _offset) % 40)
+            _ak_shared._fetch_thumbnail({"id": _key})
+            _ak_shared._remember_thumbnail(_key, _ak_boxes[_n])
+    except Exception as _exc:
+        _ak_errors.append("%s: %s" % (type(_exc).__name__, _exc))
+
+
+with seam.patched("THUMBNAIL_CACHE_MAX_BYTES", 12 * _AJ_BOX_BYTES):
+    _ak_threads = [_AK_threading.Thread(target=_ak_worker, args=(k * 9,)) for k in range(4)]
+    for _t in _ak_threads:
+        _t.start()
+    for _t in _ak_threads:
+        _t.join()
+    _pump()
+_ak_sum = sum(mod.thumbnail_pixmap_bytes(_p) for _p in _ak_shared.thumbnail_cache.values())
+check("AK6 four threads reading, adding to and trimming the same cache raise nothing and leave the total exact",
+      not _ak_errors and _ak_shared.thumbnail_cache_size == _ak_sum
+      and _ak_shared.thumbnail_cache_size <= 12 * _AJ_BOX_BYTES
+      and len(_ak_shared.thumbnail_cache) <= 12,
+      (_ak_errors[:2], _ak_shared.thumbnail_cache_size, _ak_sum, len(_ak_shared.thumbnail_cache)))
+
+
+class _AK_DeadPool:
+    """What the app's pool answers a row that was built after it was shut down."""
+
+    def submit(self, target, *args):
+        raise RuntimeError("cannot schedule new futures after shutdown")
+
+
+_ak_dead = _aj_app(vid="akDead")
+_ak_dead._fetch_thumbnail = lambda video: None
+_ak_dead._thumb_fetch_pool = _AK_DeadPool()
+_ak_dead_row = mod.QWidget()
+_ak_dead_row.setFixedHeight(54)
+_ak_dead_raised = None
+try:
+    _ak_dead.build_result_ui(_ak_dead_row, {"id": "akDead", "title": "Dead Pool Row", "channel": "Chan"}, set())
+except Exception as _exc:
+    _ak_dead_raised = _exc
+check("AK7 a row built after the fetch pool is shut down builds itself and raises nothing",
+      _ak_dead_raised is None, _ak_dead_raised)
+
+_ak_bootstrap = _AK_inspect.getsource(mod.BootstrapMixin.__init__)
+check("AK8 the burst of pictures a scroll asks for is answered by a named pool of workers, not one thread per row",
+      "max_workers=THUMBNAIL_FETCH_WORKERS" in _ak_bootstrap and "max_workers=4" not in _ak_bootstrap
+      and _AK_WORKERS >= 8,
+      ("max_workers=THUMBNAIL_FETCH_WORKERS" in _ak_bootstrap, "max_workers=4" in _ak_bootstrap, _AK_WORKERS))
 
 print(f"{CHECKS - len(FAILS)} / {CHECKS} checks passed")
 if FAILS:
