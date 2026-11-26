@@ -2678,8 +2678,16 @@ class MainApp(BootstrapMixin,
             self._on_status_update("Please wait: a settings import is already running.", False, "#d9822b")
             return
         start_dir = getattr(self, 'download_path', '') or os.path.expanduser("~")
+        # The dialog opens on its FIRST filter, so that first entry is what a person sees the moment
+        # they click Import. It names both things this button can read - a package and a settings
+        # file - so a gui_config.json is sitting in the list without touching a filter dropdown.
+        # The narrower views follow behind it: packages only, the settings file by its own name, any
+        # json at all, and everything, which is what a folder full of unrelated json asks for.
         chosen, _ = QFileDialog.getOpenFileName(self, "Import yt-msd Package Or Settings", start_dir,
-                                                "yt-msd Package (*.zip);;yt-msd Settings (*.json);;"
+                                                "yt-msd Package And Settings (*.zip *.json);;"
+                                                "yt-msd Package (*.zip);;"
+                                                "yt-msd Settings (gui_config.json);;"
+                                                "yt-msd Settings (*.json);;"
                                                 "All Files (*)")
         if not chosen:
             return

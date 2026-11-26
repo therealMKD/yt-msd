@@ -14,8 +14,8 @@ From `GUI Source Code`:
 
 ```powershell
 python "GUI Test Suite\probe_playback.py"      # 565 playback / search / search-row / seam checks. No visible window, no network, no library writes.
-python "GUI Test Suite\probe_sync.py"          # 236 sync-chain checks. Loopback sockets only, fixture folders only, no LAN broadcast and no removable device; the Restore Host exchange runs as a real client socket against a real host server over two fixture folders.
-python "GUI Test Suite\probe_windows.py"       # 307 window checks: the settings window, the three chain builders, the sync manager and the visibility badge on a hosted card, the tray bubble, the three update windows, the rename window, the two promises made to the machine - which file Windows starts, which yt-dlp is looked for - what MainApp is assembled from since wave 6, the question a sync asks before it deletes, the window that searches the network for a host and how big it makes itself, and the main window's own start when there is a saved search and no saved session to go with it, and the three windows the Restore Host answer puts on screen and the main-window handlers that drive them.
+python "GUI Test Suite\probe_sync.py"          # 254 sync-chain checks. Loopback sockets only, fixture folders only, no LAN broadcast and no removable device; the Restore Host exchange runs as a real client socket against a real host server over two fixture folders.
+python "GUI Test Suite\probe_windows.py"       # 362 window checks: the settings window, the three chain builders, the sync manager and the visibility badge on a hosted card, the tray bubble, the three update windows, the rename window, the two promises made to the machine - which file Windows starts, which yt-dlp is looked for - what MainApp is assembled from since wave 6, the question a sync asks before it deletes, the window that searches the network for a host and how big it makes itself, and the main window's own start when there is a saved search and no saved session to go with it, and the three windows the Restore Host answer puts on screen and the main-window handlers that drive them, and the filters the Import button opens with - which is what puts a gui_config.json in the list without touching a dropdown.
 python "GUI Test Suite\probe_shell.py"         # 75 single-instance and crash-reporting checks. The crash log these checks write lands in their own fixture folder, never in the log a user reads.
 python "GUI Test Suite\probe_export.py"        # 70 export-package checks. Fixture folders only; every archive built is read back and deleted.
 python "GUI Test Suite\probe_trace.py"         # 42 command-trace checks. Fake yt-dlp, ffmpeg, ffprobe and winget stand in for the real ones: no network, no audio touched, nothing installed.
@@ -26,7 +26,8 @@ python "GUI Test Suite\measure_changeover.py"  # optional dev tool: where the ti
 ```
 
 Every regression script prints one line per check and a final `N / N checks passed`, and exits 1 when
-anything fails, so they are safe to chain. Those nine are the gate - 1339 checks - and they are what a
+anything fails, so they are safe to chain. Those nine are the gate - 1412 checks, measured on 26 Nov 2026 -
+and they are what a
 wave is measured against before it is accepted. `probe_playback.py` is the one to run after any edit to
 the `.pyw` or to `yt_msd/`; `probe_sync.py` is the one to run after anything in the sync chains - the
 TAG.yaml marker, the socket protocol, either end of a chain, the Restore Host offer registry and the
@@ -373,4 +374,25 @@ exactly a two-second grey pane.
 - `AL7` failed on its first run because the check assumed rows are pitched 54 px apart; the layout adds its default
   spacing, so the pitch is 60. The code had the nearest row right - the check now says "the first row that was not
   built" and does not care what the pitch is.
+
+## Import showing a settings file without a dropdown (`WN-N52`, `WN-N53`, 26 Nov 2026)
+
+`open_import_dialog` has offered a settings file beside a package since the bare-config-import change, and `WN-N38`
+has checked it since: `"yt-msd Package (*.zip);;yt-msd Settings (*.json);;All Files (*)"`. What that does not buy is
+visibility - `QFileDialog.getOpenFileName` **opens on its first filter**, so the Import dialog listed `.zip` files and
+a `gui_config.json` was invisible until somebody changed the filter in the dropdown. Nothing the suite asserted, so
+nothing the suite caught.
+
+- The filter string is now `"yt-msd Package And Settings (*.zip *.json);;yt-msd Package (*.zip);;yt-msd Settings
+  (gui_config.json);;yt-msd Settings (*.json);;All Files (*)"`. The first entry names both things the button can
+  read, so a settings file is in the list on opening; packages only, the settings file by its exact name, any json,
+  and everything follow behind it. Routing is untouched - `.json` goes to the settings import, everything else to the
+  package reader - and `WN-N38`/`WN-N39` keep their meaning, including `WN-N38`'s ordering assertion, which still
+  holds because the combined label does not contain the string `yt-msd Package (*.zip)`.
+- `WN-N52` reads the **first** filter entry and requires both `*.zip` and `*.json` in it, with the narrower views
+  behind it and `All Files (*)` last. `WN-N53` keeps the exact-name view honest: the name it names is the file the
+  app keeps its own settings in, so the view is naming something a settings import can be asked for.
+- `probe_windows.py` went 360 to 362. The per-file counts written in this README and in `AI Readme.md` had drifted
+  behind the harness (307 and 252 against 362 measured, and gate totals of 1339 and 1232 against 1412 measured);
+  they now carry the measured 26 Nov numbers.
 

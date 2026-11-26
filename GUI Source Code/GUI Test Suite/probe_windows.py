@@ -3574,6 +3574,18 @@ check("WN-N39 and a .zip still goes the way it has always gone, with the setting
       _waits_for_package and _package_worker_saw == [r"C:\Exported\yt-msd-package.zip"]
       and _package_choice_app._config_import_busy is False,
       (_package_worker_saw, _package_choice_app._config_import_busy))
+_first_filter = _picked_filters[0][1].split(";;")[0]
+check("WN-N52 the Import dialog opens listing both things it can read - a gui_config.json is in the list without touching a filter - and the narrower views sit behind it",
+      "*.zip" in _first_filter and "*.json" in _first_filter
+      and _picked_filters[0][1].split(";;")[1] == "yt-msd Package (*.zip)"
+      and _picked_filters[0][1].split(";;")[-1] == "All Files (*)"
+      and _picked_filters[0][1].split(";;").index("yt-msd Settings (gui_config.json)")
+          < _picked_filters[0][1].split(";;").index("yt-msd Settings (*.json)"),
+      _picked_filters[0][1])
+check("WN-N53 the view that names the settings file by name names the file the app keeps its own settings in, so the exact-name view is naming a file a settings import can actually be asked for",
+      Path(_import_choice_app.config_file).name == "gui_config.json"
+      and "yt-msd Settings (gui_config.json)" in _picked_filters[0][1],
+      (Path(_import_choice_app.config_file).name, _picked_filters[0][1]))
 _pyw_source = (Path(SRC_DIR) / "yt-msd-gui.pyw").read_text(encoding="utf-8")
 _bootstrap_source = (Path(SRC_DIR) / "yt_msd" / "ui" / "bootstrap.py").read_text(encoding="utf-8")
 _sync_client_source = (Path(SRC_DIR) / "yt_msd" / "sync" / "client.py").read_text(encoding="utf-8")
