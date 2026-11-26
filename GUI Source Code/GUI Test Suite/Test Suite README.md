@@ -14,7 +14,8 @@ From `GUI Source Code`:
 
 ```powershell
 python "GUI Test Suite\probe_playback.py"      # 565 playback / search / search-row / seam checks. No visible window, no network, no library writes.
-python "GUI Test Suite\probe_sync.py"          # 254 sync-chain checks. Loopback sockets only, fixture folders only, no LAN broadcast and no removable device; the Restore Host exchange runs as a real client socket against a real host server over two fixture folders.
+python "GUI Test Suite\probe_sync.py"          # 257 sync-chain checks. Loopback sockets only, fixture folders only, no LAN broadcast and no removable device; the Restore Host exchange runs as a real client socket against a real host server over two fixture folders.
+python "GUI Test Suite\probe_phone_wire.py"    # 39 sync-protocol checks for a client that is not this program: the Qt-free wire layer driven against a real host over a real loopback socket - discovery, the whole offline-playback session, the refusals at the door, a keepalive, a Restore Host rebuild, a coded push and a code-free one, and the recorded session compared with `fixtures/protocol/phone_session.json`.
 python "GUI Test Suite\probe_windows.py"       # 362 window checks: the settings window, the three chain builders, the sync manager and the visibility badge on a hosted card, the tray bubble, the three update windows, the rename window, the two promises made to the machine - which file Windows starts, which yt-dlp is looked for - what MainApp is assembled from since wave 6, the question a sync asks before it deletes, the window that searches the network for a host and how big it makes itself, and the main window's own start when there is a saved search and no saved session to go with it, and the three windows the Restore Host answer puts on screen and the main-window handlers that drive them, and the filters the Import button opens with - which is what puts a gui_config.json in the list without touching a dropdown.
 python "GUI Test Suite\probe_shell.py"         # 75 single-instance and crash-reporting checks. The crash log these checks write lands in their own fixture folder, never in the log a user reads.
 python "GUI Test Suite\probe_export.py"        # 70 export-package checks. Fixture folders only; every archive built is read back and deleted.
@@ -26,13 +27,14 @@ python "GUI Test Suite\measure_changeover.py"  # optional dev tool: where the ti
 ```
 
 Every regression script prints one line per check and a final `N / N checks passed`, and exits 1 when
-anything fails, so they are safe to chain. Those nine are the gate - 1412 checks, measured on 26 Nov 2026 -
+anything fails, so they are safe to chain. Those ten are the gate - 1454 checks, measured on 26 Nov 2026 -
 and they are what a
 wave is measured against before it is accepted. `probe_playback.py` is the one to run after any edit to
 the `.pyw` or to `yt_msd/`; `probe_sync.py` is the one to run after anything in the sync chains - the
 TAG.yaml marker, the socket protocol, either end of a chain, the Restore Host offer registry and the
 exchange built on it, the removable-media worker, or the message a host puts on the network a moment
-after it comes up and the beacon that reads it;
+after it comes up and the beacon that reads it; `probe_phone_wire.py` after the wire protocol itself -
+`yt_msd/sync/protocol.py`, `yt_msd/sync/wire.py`, the host's answers, or the protocol version;
 `probe_windows.py` after any window, the setting it writes, the question a sync asks before it deletes and
 the windows the Restore Host answer needs, the box that says this copy has just become a new version, or
 the startup entry and yt-dlp lookup the
@@ -103,6 +105,8 @@ on the class itself.
 | `probe_trace.py` | The trace harness, checks `TR1`-`TR42`: that `--trace`, `-v` and `--trace=all` are read and then dropped before Qt or the renamer's own argparse can mistake one for something else; that off means not one character printed and nothing buffered for later; that turning the gate on changes nothing about the call being watched - same returned path, same progress-callback count, same exception raised; and that what is printed is the whole command, including which program was resolved to run it. `TR11`-`TR13` are why the trace never prints a resolved stream URL: the formats offered, the host they come from and the size are printed, the signed query never is, and the player still gets the URL whole. `TR16` and `TR17` hold the feature's one performance promise - sixty progress lines from yt-dlp come out as one line of chatter while every line that names something (a destination, a conversion, an error) passes through. `TR21`-`TR25` are the renamer's half of it: the ffmpeg command as actually built, the silence-trim filter intact through the wrapping, the codec chosen for the suffix, and the per-file ffprobe question kept out of level 1 because a library folder of a few thousand songs is a few thousand lines answering nobody's question. `TR28b`-`TR28d` are winget installing yt-dlp - the command, the last thing winget said, and a machine with no winget saying so. `TR29`-`TR31` cover where the lines can go - dropped rather than raised when there is no console, kept when the console cannot take the box-drawing characters, and eight background threads producing eight whole commands rather than one interleaved mess. Fake yt-dlp, ffmpeg, ffprobe and winget are written into `copy/trace_fixtures/` and stood in through the same seams the program uses to find the real ones, so no request leaves the machine, no real audio is touched and nothing is installed. |
 | `probe_local_pane.py` | Written for wave 5g, which moved the five `LOCAL_RENDER_*` constants into `yt_msd.ui.render` - nothing in this suite touched the local folder pane before it. `LP1`-`LP12` drive `_local_screenful_rows` and `_fill_local_chunk` against a pane stand-in that holds a viewport height and a minimum height it was told, and check each constant by moving it through the seam and watching the next chunk change size: the screenful floor, the budget a chunk is measured against, the ceiling over it, the floor under it, and the height the pane is handed while only its first chunk exists. No folder is scanned, nothing is written, no window is shown. |
 | `probe_tuning_seam.py` | The 14 checks on the one seam the split has introduced that had no coverage of any kind before it: `yt_msd.audio.tuning.TUNING`, the object that replaced the four module globals the settings dialog used to write. It proves a write made from the entry point is visible to the module that reads it, that `from_settings()` decides the way the three call sites used to, and that a settings value survives into a subprocess. |
+| `probe_phone_wire.py` | The phone harness, checks `PW1`-`PW39`: the Qt-free wire layer (`yt_msd/sync/wire.py`) driven against a real `SyncHostServer` over a real loopback socket, exactly as a client that is not this program drives it - that the wire layer and the protocol module import no Qt and load none, that every command and status `protocol.py` names is a word `host.py` really says, the `HELLO` discovery a phone runs and what a private chain may be told to a machine that has its code, the whole offline-playback session (`AUTH` with the protocol version, `GET_INDEX`, two `PULL_FILE`s verified by the announced hash, a re-pull, `GET_CONFIG`, `PING`), the refusals at the door read as refusals, a keepalive that hands the socket back clean, the whole Restore Host exchange - requested, taken away mid-read, code mistyped, given up, rebuilt with nothing deleted - and a Push with a code and a Push from a trusted address, with the host keeping its own copy of a name it holds. It is the only suite here that does not import the entry point, because a phone speaks to the package. Loopback sockets on port 0 and `copy/phone_wire_fixture/` only. |
+| `fixtures/protocol/phone_session.json` | The recorded session `probe_phone_wire.py` compares against: 18 frames - every frame the client sent and every frame the host answered, in order, with the digest of the bytes that followed each `SENDING`. Written by `python probe_phone_wire.py --record`. **The contract a phone client is written against**: changing it is a protocol change, and it is reviewed like one. It is tracked by a negation in `.gitignore`, because the repo ignores `*.json` and this file is not scratch. |
 | `check_glyphs.py` | The icon-caption check that used to be several throwaway scripts in the OS temp folder. It asks Qt whether every private-use codepoint the source paints has a glyph on this machine, and then measures what the real buttons paint - a shape, or the hollow fallback box. |
 | `captions.png` | The sheet `check_glyphs.py` writes: the app's own captions at the sizes the app uses, beside the box they must not be, and every caption codepoint with the font's answer. A by-product, not an input - rewrite it by re-running the script. |
 | `measure_changeover.py` | Not a regression check. It times `resolve_stream_url()`, the libVLC open and `get_length()` on a real machine, which is the only way to know how much a prefetch can possibly save. The only thing here that touches the network. |
@@ -395,4 +399,53 @@ nothing the suite caught.
 - `probe_windows.py` went 360 to 362. The per-file counts written in this README and in `AI Readme.md` had drifted
   behind the harness (307 and 252 against 362 measured, and gate totals of 1339 and 1232 against 1412 measured);
   they now carry the measured 26 Nov numbers.
+
+## A protocol a phone can speak (`SY-G15`-`SY-G17`, `PW1`-`PW39`, 26 Nov 2026)
+
+The plan is at `feature-android-client-2026-11-26.md`, the specification at `docs/sync-protocol.md`, and the
+reasoning at `docs/voice-2026-11-26-android-client.md`. What the suite has to keep true:
+
+- **A version, named at last.** The protocol has run for six builds without one. `protocol.py` says
+  `PROTOCOL_VERSION = 1`; the host names it in its `HELLO` answer and its `AUTH` answer, and refuses a version
+  it does not speak at the door. `SY-G15` is a client that names 1, `SY-G16` is the one that matters - a client
+  that names **nothing**, which is every 3.0-to-3.5 client there is, answered exactly as it has always been
+  answered - and `SY-G17` is a client naming 99, refused, told which versions the two machines have, and not
+  answered at. `SY-G3` grew the new key in the `AUTH` answer, the one existing assertion that was an exact-dict
+  comparison.
+- **The words in one place, and checked against the words the host says.** `PW3`-`PW5` scan `host.py` and
+  `discovery.py` for every command, status and discovery type `protocol.py` names. A constant nobody compares
+  against the code is a constant that drifts; these are the comparison.
+- **A client with no Qt in it.** `PW1` reads the imports of `wire.py` and `protocol.py` out of their syntax
+  trees and `PW2` asserts no Qt module is loaded in the process - a phone cannot import PySide6, so this is a
+  buildability rule, not a tidiness one. It is why `probe_phone_wire.py` is the only suite here that imports the
+  package directly instead of the copied entry point: a phone speaks to `yt_msd`, not to the GUI, and the seam
+  exists for replacements inside the entry point, of which this suite makes none.
+- **The whole phone session, on a real socket.** `PW15`-`PW21` is M1 of the plan in one block: pair, list, pull
+  twice, re-pull, take the settings, ping. `PW17` is the rule that makes a pull trustworthy - the bytes are
+  checked against the hash the host announced *in its answer*, the file lands as `.tmp_sync`, and only a hash
+  match ever takes the final name. `PW19` is a host refusing to hand over `notes.txt`. `PW22`-`PW25` are the
+  refusals at the door, which a phone has to read as refusals: a host answers once and closes.
+- **The exchanges a phone is worst at.** `PW26` is a keepalive that pings while a person reads a code and hands
+  the socket back clean, so the next command is the next command and not somebody's `PONG`. `PW27`-`PW31` are a
+  whole Restore Host exchange - requested, taken away mid-read (`RESTORE_CLOSED` on the next `PING`), a code
+  mistyped, given up, and a rebuild that writes 5 files, keeps the host's 3, and deletes nothing. `PW32`-`PW36`
+  are a Push: a coded one whose limit of 3 takes the newest three, refuses the fourth for being over the limit
+  and refuses the phone's copy of `old song.mp3` because that name is the host's; and a trusted address pushing
+  with no code at all.
+- **The recording is the contract.** `PW37` compares the session's 18 frames with
+  `fixtures/protocol/phone_session.json`, byte for byte, on every run. Fixture files have fixed bytes and fixed
+  mtimes, which is what makes the recording reproducible on any machine. It is re-recorded with
+  `python probe_phone_wire.py --record` - read what it wrote before committing it, because the fixture is the
+  protocol.
+- **Two harness lessons for anyone adding socket checks here.** A host that refuses at its door closes the
+  connection, and a socket closed with data it has not read discards what it had already queued to send: send
+  the follow-up request first and you may read a reset instead of the refusal. `SY-G17` and `PW24` read in
+  order, one request and one answer at a time. And a probe must never call `SyncHostServer.start()`: it binds
+  63350-63370, and a yt-msd genuinely running is sitting on the first free one of them. `LoopbackHost` binds
+  port 0 and sets `active_port` itself, which is also what makes a `HELLO` answer's `port` mean anything.
+- `probe_sync.py` went 254 to 257, `probe_phone_wire.py` is 39, and the gate is **1454 checks** - 565 + 257 +
+  39 + 362 + 75 + 70 + 42 + 16 + 14 + 14, counted off the run, not off the sum of two numbers in prose
+  (`probe_trace.py` prints `42/42 checks passed` with no spaces, so anything that counts the gate by
+  matching that line has to match it as it is written).
+
 

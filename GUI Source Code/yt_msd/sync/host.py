@@ -12,6 +12,7 @@ from yt_msd.audio.tags import read_metadata_tags
 from yt_msd.constants import AUDIO_EXTENSIONS
 from yt_msd.deps import FileSystemEventHandler, Observer, _WATCHDOG_AVAILABLE
 from yt_msd.sync.config import client_is_push_trusted, host_chain_is_visible, push_file_limit
+from yt_msd.sync import protocol
 from yt_msd.sync.lan import (DISCOVERY_APP_NAME, MAX_CONFIG_PAYLOAD_BYTES, RESTORE_CODE_ALPHABET,
                              RESTORE_CODE_LENGTH, SYNC_PORT_END, SYNC_PORT_START,
                              SYNC_RESTORE_CODE_TIMEOUT, SYNC_RESTORE_HANDSHAKE_TIMEOUT,
@@ -50,7 +51,8 @@ def hello_reply(hosted_chains: List[dict], requested_code: str = '', active_port
                 'reason': f'Sync code {wanted} not found on host' if wanted
                 else 'This host advertises no sync chain'}
     return {'status': 'OK', 'app': DISCOVERY_APP_NAME, 'host_name': socket.gethostname(),
-            'port': int(active_port or 0), 'chains': named}
+            'port': int(active_port or 0), 'protocol_version': protocol.PROTOCOL_VERSION,
+            'chains': named}
 
 
 # ---------------------------------------------------------------------------
@@ -537,6 +539,16 @@ class SyncHostServer:
                 send_json_msg(sock, {'status': 'ERROR', 'reason': 'Expected AUTH command'})
                 return
 
+            # The protocol version the machine at the other end says it speaks, named on the same frame
+            # that names the chain it belongs to. A client that names none speaks the dialect every build
+            # since 3.0 has spoken, and is answered exactly as it always was; a client that names a dialect
+            # this machine does not have is told so at the door, before it is told anything about a chain,
+            # because a machine that went ahead and spoke would be speaking answers it cannot read.
+            refusal = protocol.version_answer(auth_msg)
+            if refusal:
+                send_json_msg(sock, {'status': 'ERROR', 'reason': refusal})
+                return
+
             sync_code = str(auth_msg.get('sync_code', ''))
             chains = self.get_hosted_chains_cb()
             matching_chain = None
@@ -558,7 +570,8 @@ class SyncHostServer:
             send_json_msg(sock, {
                 'status': 'OK',
                 'chain_name': matching_chain.get('name', 'Audio Playlist'),
-                'files_count': len(audio_files)
+                'files_count': len(audio_files),
+                'protocol_version': protocol.PROTOCOL_VERSION
             })
 
             if self.on_client_activity_cb:

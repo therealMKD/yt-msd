@@ -1,0 +1,179 @@
+{
+  "chain": "7301",
+  "client_ip": "192.168.1.77",
+  "frames": [
+    {
+      "dir": "send",
+      "frame": {
+        "client_ip": "192.168.1.77",
+        "cmd": "AUTH",
+        "protocol_version": 1,
+        "sync_code": "7301"
+      }
+    },
+    {
+      "dir": "recv",
+      "frame": {
+        "chain_name": "Phone Test",
+        "files_count": 2,
+        "protocol_version": 1,
+        "status": "OK"
+      }
+    },
+    {
+      "dir": "send",
+      "frame": {
+        "cmd": "GET_INDEX"
+      }
+    },
+    {
+      "dir": "recv",
+      "frame": {
+        "files": [
+          {
+            "artist": null,
+            "mtime": 1700000000.0,
+            "name": "one.mp3",
+            "sha256": "f9220a6b0df6edae2b109b64924a8abf17447f861d8e827f873d84e31a052c4c",
+            "size": 36,
+            "title": null
+          },
+          {
+            "artist": null,
+            "mtime": 1700000005.0,
+            "name": "two.mp3",
+            "sha256": "6bed4f3b47ff9a80ad399aea077d86a653a4377675c847dbd74117aa19277682",
+            "size": 43,
+            "title": null
+          }
+        ],
+        "status": "OK"
+      }
+    },
+    {
+      "dir": "send",
+      "frame": {
+        "cmd": "PULL_FILE",
+        "filename": "one.mp3"
+      }
+    },
+    {
+      "dir": "recv",
+      "frame": {
+        "filename": "one.mp3",
+        "filesize": 36,
+        "sha256": "f9220a6b0df6edae2b109b64924a8abf17447f861d8e827f873d84e31a052c4c",
+        "status": "SENDING"
+      }
+    },
+    {
+      "dir": "recv_bytes",
+      "frame": {
+        "filename": "one.mp3",
+        "sha256": "f9220a6b0df6edae2b109b64924a8abf17447f861d8e827f873d84e31a052c4c",
+        "size": 36
+      }
+    },
+    {
+      "dir": "send",
+      "frame": {
+        "cmd": "PULL_FILE",
+        "filename": "two.mp3"
+      }
+    },
+    {
+      "dir": "recv",
+      "frame": {
+        "filename": "two.mp3",
+        "filesize": 43,
+        "sha256": "6bed4f3b47ff9a80ad399aea077d86a653a4377675c847dbd74117aa19277682",
+        "status": "SENDING"
+      }
+    },
+    {
+      "dir": "recv_bytes",
+      "frame": {
+        "filename": "two.mp3",
+        "sha256": "6bed4f3b47ff9a80ad399aea077d86a653a4377675c847dbd74117aa19277682",
+        "size": 43
+      }
+    },
+    {
+      "dir": "send",
+      "frame": {
+        "cmd": "PULL_FILE",
+        "filename": "one.mp3"
+      }
+    },
+    {
+      "dir": "recv",
+      "frame": {
+        "filename": "one.mp3",
+        "filesize": 36,
+        "sha256": "f9220a6b0df6edae2b109b64924a8abf17447f861d8e827f873d84e31a052c4c",
+        "status": "SENDING"
+      }
+    },
+    {
+      "dir": "send",
+      "frame": {
+        "client_ip": "192.168.1.77",
+        "cmd": "GET_CONFIG",
+        "sync_code": "7301"
+      }
+    },
+    {
+      "dir": "recv",
+      "frame": {
+        "config": {
+          "accent": "Teal",
+          "bitrate": "192",
+          "client_chains": [],
+          "folders": [
+            "D:\\Host Downloads"
+          ],
+          "format": "m4a",
+          "hosted_chains": [
+            {
+              "id": "hc_7301",
+              "name": "Phone Test",
+              "sync_code": "7301"
+            }
+          ],
+          "last_search": "grass roots",
+          "mode": "Light",
+          "sync_settings": {
+            "auto_sync_interval_mins": 20
+          },
+          "volume": 60
+        },
+        "status": "CONFIG"
+      }
+    },
+    {
+      "dir": "send",
+      "frame": {
+        "cmd": "PING"
+      }
+    },
+    {
+      "dir": "recv",
+      "frame": {
+        "status": "PONG"
+      }
+    },
+    {
+      "dir": "send",
+      "frame": {
+        "cmd": "PING"
+      }
+    },
+    {
+      "dir": "recv",
+      "frame": {
+        "status": "PONG"
+      }
+    }
+  ],
+  "protocol_version": 1
+}

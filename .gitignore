@@ -56,6 +56,12 @@ ffmpeg.zip
 # Test Files
 *.json
 
+# The recorded sync-protocol session is the exception, and on purpose. It is not a file a suite
+# generates and throws away: it is the frame-by-frame record of a whole client session that a phone
+# client is written against and compared with, so it has to be part of the repo and reviewed when it
+# changes, like the checks that read it.
+!GUI Source Code/GUI Test Suite/fixtures/protocol/*.json
+
 # Cython build artifacts (generated C sources, compiled extensions, cythonize staging dir)
 build_dir_cython/
 *.pyd

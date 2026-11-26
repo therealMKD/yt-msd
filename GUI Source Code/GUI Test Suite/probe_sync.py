@@ -507,7 +507,8 @@ check("SY-G2 a sync code this machine does not host is refused by name",
 
 answers = _host_round([{"cmd": "AUTH", "sync_code": "4821"}, {"cmd": "PING"}], 2)
 check("SY-G3 a hosted chain answers with its name and how many tracks it holds",
-      answers[0] == {"status": "OK", "chain_name": "Kitchen", "files_count": 2}, answers)
+      answers[0] == {"status": "OK", "chain_name": "Kitchen", "files_count": 2, "protocol_version": 1},
+      answers)
 check("SY-G4 a hosted chain stays reachable between commands", answers[1] == {"status": "PONG"}, answers)
 
 answers = _host_round([{"cmd": "AUTH", "sync_code": "4821"}, {"cmd": "GET_INDEX"}], 2)
@@ -551,6 +552,52 @@ _server.close()
 check("SY-G11 the host records what its clients did, which is what the sync window shows as activity",
       HOST_ACTIVITY.count(("4821", "Connected")) >= 1
       and any(note.startswith("Sending two.mp3") for _code, note in HOST_ACTIVITY), HOST_ACTIVITY)
+
+# The protocol version, said at the door. Three checks and no more, because the rule is one sentence:
+# name a dialect this host has and it answers, name none and it answers as the build it is, name one it
+# does not have and it says so before it says anything else. Everything below in this suite is a client
+# that names nothing, which is the point of the second check - a protocol version added to a protocol
+# that has run for six builds must not be a protocol version that ends a single one of them.
+answers = _host_round([{"cmd": "AUTH", "sync_code": "4821", "protocol_version": 1}, {"cmd": "PING"}], 2)
+check("SY-G15 a client that names the version it speaks is answered, and is told the version the host speaks",
+      answers[0].get("status") == "OK" and answers[0].get("protocol_version") == 1
+      and answers[1] == {"status": "PONG"}, answers)
+
+answers = _host_round([{"cmd": "AUTH", "sync_code": "4821"}], 1)
+check("SY-G16 a client that names no version is a 3.0-and-later client and is answered exactly as it always was",
+      answers[0] == {"status": "OK", "chain_name": "Kitchen", "files_count": 2, "protocol_version": 1},
+      answers)
+
+# The two halves are read in the order the exchange happens and not sent together: a host that refuses at
+# its door closes the connection, and a socket closed with data it has not read discards what it had
+# already queued to send, so a client that fires its follow-up request first can be left reading a reset
+# instead of the refusal it was given.
+_refused_client, _refused_server = _loopback_pair()
+_refused_worker = threading.Thread(target=lambda: HOST_SERVER._handle_client(_refused_server,
+                                                                            "192.168.1.9"),
+                                   daemon=True)
+_refused_worker.start()
+_refused_answers = []
+for _message in ({"cmd": "AUTH", "sync_code": "4821", "protocol_version": 99}, {"cmd": "GET_INDEX"}):
+    try:
+        mod.send_json_msg(_refused_client, _message)
+    except OSError:
+        _refused_answers.append(None)
+        break
+    try:
+        _refused_answers.append(mod.recv_json_msg(_refused_client, timeout=8.0))
+    except OSError:
+        _refused_answers.append(None)
+_refused_client.close()
+_refused_worker.join(8)
+_refused_server.close()
+check("SY-G17 a client naming a protocol this host does not speak is refused at the door, told which, and not answered at",
+      (_refused_answers[0] or {}).get("status") == "ERROR"
+      and "protocol version 1" in (_refused_answers[0] or {}).get("reason", "")
+      and "99" in (_refused_answers[0] or {}).get("reason", "")
+      and not any((answer or {}).get("status") == "OK" for answer in _refused_answers[1:]),
+      _refused_answers)
+
 
 GONE = mod.SyncHostServer(
     lambda: [{"sync_code": "1111", "name": "Gone", "folder_path": str(FIXTURE_ROOT / "deleted folder")}])

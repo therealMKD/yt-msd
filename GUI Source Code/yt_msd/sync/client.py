@@ -8,6 +8,7 @@ import socket
 from typing import List, Optional, Tuple, Callable
 from PySide6.QtCore import Signal, QThread
 from yt_msd.audio.tags import read_metadata_tags, write_metadata_tags
+from yt_msd.sync import protocol
 from yt_msd.sync.config import chain_can_push, delete_confirm_limit
 from yt_msd.sync.discovery import discover_host_on_lan
 from yt_msd.sync.lan import (SYNC_CONFIRM_PING_INTERVAL, SYNC_RESTORE_HANDSHAKE_TIMEOUT,
@@ -698,7 +699,8 @@ class SyncClientWorker:
         one its card shows and its folder carries. A chain joined by an address and a code typed in by
         hand has no way of ever learning it except from the host itself.
         """
-        send_json_msg(sock, {'cmd': 'AUTH', 'sync_code': sync_code, 'client_ip': get_local_ip()})
+        send_json_msg(sock, protocol.with_protocol_version(
+            {'cmd': 'AUTH', 'sync_code': sync_code, 'client_ip': get_local_ip()}))
         auth_resp = recv_json_msg(sock)
         if not auth_resp or auth_resp.get('status') != 'OK':
             err = auth_resp.get('reason', 'Authentication rejected by host') if auth_resp else 'No auth response'
@@ -706,6 +708,12 @@ class SyncClientWorker:
         host_chain_name = str(auth_resp.get('chain_name') or '').strip()
         if host_chain_name:
             chain_config['host_chain_name'] = host_chain_name
+        # What the host says it speaks. Recorded on the chain because it is a fact about the machine this
+        # chain follows, and the one place it can be learned is this answer: a chain that is about to send
+        # its host a command only newer hosts answer has to know whether this one answers it.
+        answered_version = protocol.answered_protocol_version(auth_resp)
+        if answered_version is not None:
+            chain_config['host_protocol_version'] = answered_version
         return True, ''
 
     @staticmethod
