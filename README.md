@@ -47,7 +47,7 @@ Once the program is running, a failure it cannot handle reports itself like this
 
 ## First Startup Guide
 
-Regardless of whether you have the python or the exe version, the first startup of the program will trigger a few things:
+The first startup of the program will trigger a few things:
 
 - First of all, you will get a windows dialogue asking if you want to allow yt-msd to access your network (create a firewall rule). This is necessary for sync to work. If you refuse the dialogue, it will reappear every time you reopen the program. Yes, it's annoying, but it's a failsafe in case the rule gets removed. If you don't want it through your firewall, you'll have to continue clicking no every startup.
 
@@ -63,7 +63,7 @@ Again, a complete guide on how to do EVERYTHING can be found [here](https://gith
 Installation instructions for the Musicbee plugin are in the [Plugin Readme](https://github.com/therealMKD/yt-msd/tree/main/MusicBee%20Plugin#readme)
 
 ## Support for other operating systems (GUI version):
-I had previously planned for at least Linux support, but as the program has gotten further on in development, there are a lot of features that just won't work on Linux, and would require separate handling. I don't want to bloat up the main program, and having a dedicated Linux version isn't something I have time to support. Therefore, support for other operating systems does not exist, and if you run yt-msd on other operating systems, a great deal of features most likely will not work, due to dependency on windows. If you want to use yt-msd on other platforms, use the pyw version, but don't expect sync to work at all, and expect bugs.
+I had previously planned for at least Linux support, but as the program has gotten further on in development, there are a lot of features that just won't work on Linux, and would require separate handling. I don't want to bloat up the main program, and having a dedicated Linux version isn't something I have time to support. Therefore, support for other operating systems does not exist, and if you run yt-msd on other operating systems, a great deal of features most likely will not work, due to dependency on windows. If you want to use yt-msd on other platforms, use the legacy pyw version, but don't expect sync to work at all, and expect bugs.
 
 # CLI Version Readme
 
