@@ -206,6 +206,9 @@ from yt_msd.ui.widgets import (
     DoubleClickButton,
     DraggableQueueWidget,
     THUMBNAIL_CACHE_MAX_BYTES,
+    THUMBNAIL_FETCH_WORKERS,
+    THUMBNAIL_PREFETCH_BAND,
+    THUMBNAIL_PREFETCH_ROWS,
     THUMB_BOX_H,
     THUMB_BOX_W,
     THUMB_HOVER_RECHECK_MS,
@@ -4715,13 +4718,21 @@ class MainApp(BootstrapMixin,
         box = getattr(self, '_playback_box', None)
         if box is not None and box[0] == "search" and box[1] == video.get('id', ''):
             tw.set_highlight(box[2])
-        # A row's picture is a download, so it goes to the app's shared fetch pool: a scroll over a
-        # long playlist asks for a burst of them, and one thread per row made that burst a thread
-        # per row. A harness driving this method off a stand-in has no pool, and asks for nothing.
-        # The pool is shut down on the way out, and a row built in that moment must not take the
-        # window's shutdown down with it: a pool that will not take work means a row with no picture.
+        # The row is built out of nothing, so its label starts as the plain grey box. A picture the
+        # app already has goes on that label right here and now - same box-size pixmap, GUI thread,
+        # no download, no thread, no signal round-trip. A scroll down and back rebuilds every row in
+        # the pane, and each of them is a track whose picture is already sitting in the cache; asking
+        # the fetch pool and the event loop for a picture the app is holding is what made the whole
+        # pane go grey and fill back in a beat later.
+        # A row that has no picture yet asks the shared fetch pool - a scroll over a long playlist
+        # asks for a burst of them, and one thread per row made that burst a thread per row. The pool
+        # is shut down on the way out, and a row built in that moment must not take the window's
+        # shutdown down with it: a pool that will not take work means a row with no picture.
         _thumb_pool = getattr(self, '_thumb_fetch_pool', None)
-        if _thumb_pool is not None:
+        _thumb_box = self._cached_thumbnail(video.get('id'))
+        if _thumb_box is not None:
+            tw.thumb_label.setPixmap(_thumb_box)
+        elif _thumb_pool is not None:
             try:
                 _thumb_pool.submit(self._fetch_thumbnail, video)
             except Exception:
@@ -4821,7 +4832,17 @@ class MainApp(BootstrapMixin,
         load_bottom = scroll_val + viewport_height + buffer
         
         queue_ids = {q['video']['id'] for q in self.queue_items if 'video' in q and 'id' in q['video']}
-        
+
+        # The band beyond the rows being built: the rows the next flick of the wheel is about to
+        # build. See THUMBNAIL_PREFETCH_ROWS / THUMBNAIL_PREFETCH_BAND. They are collected during the
+        # pass below and asked for after it, nearest the band first, so the rows the pane is showing
+        # are queued ahead of the rows it is not, and the budget is spent on the pictures the next
+        # scroll is most likely to need rather than on the far end of the list.
+        prefetch_pool = getattr(self, '_thumb_fetch_pool', None)
+        prefetch_wanted = []
+        prefetch_top = load_top - THUMBNAIL_PREFETCH_BAND
+        prefetch_bottom = load_bottom + THUMBNAIL_PREFETCH_BAND
+
         for i in range(self.results_vbox.count()):
             layout_item = self.results_vbox.itemAt(i)
             if layout_item and layout_item.widget():
@@ -4842,6 +4863,21 @@ class MainApp(BootstrapMixin,
                 else:
                     if has_ui:
                         self.clear_result_ui(placeholder)
+                    elif (prefetch_pool is not None and len(prefetch_wanted) < THUMBNAIL_PREFETCH_ROWS
+                          and y + h >= prefetch_top and y <= prefetch_bottom):
+                        prefetch_wanted.append((load_top - (y + h) if y + h < load_top
+                                                else y - load_bottom, video))
+
+        if prefetch_pool is not None:
+            prefetch_wanted.sort(key=lambda pair: pair[0])
+            for _distance, video in prefetch_wanted[:THUMBNAIL_PREFETCH_ROWS]:
+                # Checked at the moment of asking, not in the pass above: a picture that arrived
+                # from a prefetch of the last scroll is not asked for twice.
+                if self._cached_thumbnail(video.get('id')) is None:
+                    try:
+                        prefetch_pool.submit(self._fetch_thumbnail, video, True)
+                    except Exception:
+                        pass
 
         # A scroll moves rows around under a pointer that never moved, and Qt sends no Leave for a
         # pointer that never moved - which is the row that keeps a play button nobody is pointing
@@ -6612,6 +6648,26 @@ class MainApp(BootstrapMixin,
         if label is not None:
             label.setPixmap(box)
 
+    def _cached_thumbnail(self, vid_id):
+        """The kept picture for a track, marked as the freshest, read under the lock.
+
+        A row built out of nothing asks this first. A picture already fetched is painted there and
+        then, on the GUI thread, and the fetch pool is not asked for it at all: a scroll down and
+        back rebuilds every row in the pane, and every one of those rows is a track the app has
+        already downloaded a picture for. Sending those rows through the pool and the event loop is
+        what made the whole pane go grey for a beat and then fill back in.
+        """
+        if not vid_id:
+            return None
+        cache = getattr(self, 'thumbnail_cache', None)
+        if cache is None:
+            return None
+        with self._thumbnail_cache_lock():
+            box = cache.get(vid_id)
+            if box is not None:
+                cache.move_to_end(vid_id)   # asked for again, so it is the freshest
+        return box
+
     def _thumbnail_cache_lock(self):
         """The lock the fetched thumbnails are read, written and trimmed under.
 
@@ -6670,18 +6726,18 @@ class MainApp(BootstrapMixin,
                 picture = cache.pop(oldest)
                 self.thumbnail_cache_size -= thumbnail_pixmap_bytes(picture)
 
-    def _fetch_thumbnail(self, v):
+    def _fetch_thumbnail(self, v, prefetch=False):
         vid_id = v.get('id')
         if not vid_id: return
-        with self._thumbnail_cache_lock():
-            cached = self.thumbnail_cache.get(vid_id)
-            if cached is not None:
-                # Asked for again, so it is the freshest - read and marked in one go, because a
-                # picture the GUI thread trimmed between these two lines made this raise, and a
-                # raise in here is swallowed by the pool: the row simply never gets its picture.
-                self.thumbnail_cache.move_to_end(vid_id)
+        cached = self._cached_thumbnail(vid_id)
         if cached is not None:
             self.thumbnails_loaded_signal.emit(vid_id, cached)
+            return
+        if not prefetch and getattr(self, '_thumbnail_labels', {}).get(vid_id) is None:
+            # The row that asked has been torn down by the scroll - it is off the band by the time
+            # this task got a worker. Downloading it spends the pool on a row nobody can see, which
+            # is the row on screen waiting behind work for a row that no longer exists. A prefetch
+            # is asked for exactly the rows that have no row built, so it is not stopped here.
             return
         generation = self._thumb_generation
 

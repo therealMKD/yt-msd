@@ -261,6 +261,17 @@ THUMBNAIL_CACHE_MAX_BYTES = 32 * 1024 * 1024
 THUMBNAIL_FETCH_WORKERS = 8
 
 
+# The rows the app fetches pictures for before it builds them. A row is built as it comes into the
+# band of viewport plus 200 px each way (lazy_load_visible_results) and torn down outside it, so the
+# rows just beyond that band are the ones the next flick of the wheel is about to build - and a row
+# built with no picture of its own shows the grey box until a download lands. Prefetching that
+# margin is what makes a row arrive already wearing its thumbnail. Capped per pass, because a scroll
+# over a thousand-track playlist must not queue a thousand downloads behind the rows on screen.
+THUMBNAIL_PREFETCH_ROWS = 24
+
+THUMBNAIL_PREFETCH_BAND = 800     # px beyond the band rows are built in
+
+
 def thumbnail_pixmap_bytes(pixmap):
     """What one cached picture costs the process: RGBA is four bytes a pixel."""
     return pixmap.width() * pixmap.height() * 4

@@ -4053,6 +4053,176 @@ check("AK8 the burst of pictures a scroll asks for is answered by a named pool o
       and _AK_WORKERS >= 8,
       ("max_workers=THUMBNAIL_FETCH_WORKERS" in _ak_bootstrap, "max_workers=4" in _ak_bootstrap, _AK_WORKERS))
 
+# ---------------------------------------------------------------------------
+# AL. a row built for a track the app has already fetched is painted when it is
+#     built. A scroll down and back tears every row in the pane down and builds it
+#     again out of nothing, grey, and sends each one to the fetch pool for a picture
+#     the cache was holding - which is the whole pane going grey for two seconds and
+#     then filling in. The pane is a real scroll area shown off every screen here,
+#     because the pass under test decides what to build by reading real geometry.
+# ---------------------------------------------------------------------------
+print("=" * 72)
+print("AL. a rebuilt row wears the picture the cache already has, on the spot")
+
+_al_scales = []
+
+
+def _al_counted_cover(pixmap, *args, **kwargs):
+    _al_scales.append(1)
+    return _ak_real_cover(pixmap, *args, **kwargs)
+
+
+_al_build = _aj_app(vid="alBuild")
+_al_build.thumbnail_cache["alBuild"] = mod.cover_thumbnail(_aj_arriving(21))
+_al_build._thumb_fetch_pool = _AJ_Pool()
+_al_build_row = mod.QWidget()
+_al_build_row.setFixedHeight(54)
+_al_build_video = {"id": "alBuild", "title": "Cached Row", "channel": "Chan"}
+_al_build_calls = []
+with seam.patched("cover_thumbnail", _al_counted_cover):
+    try:
+        _AK_request.urlopen = _ak_fake_urlopen(_ak_jpeg(21), _al_build_calls)
+        _al_build.build_result_ui(_al_build_row, _al_build_video, set())
+    finally:
+        _AK_request.urlopen = _AK_urlopen
+_al_build_label = _al_build._thumbnail_labels["alBuild"]
+check("AL1 a row built for a track the cache holds is painted as it is built - no download, no scaling, pool not asked",
+      _al_build_calls == [] and _al_build._thumb_fetch_pool.submitted == [] and _al_scales == []
+      and _al_build_label.pixmap().width() == mod.THUMB_BOX_W
+      and _al_build_label.pixmap().height() == _AJ_BOX_H,
+      (_al_build_calls, _al_build._thumb_fetch_pool.submitted, _al_scales,
+       _al_build_label.pixmap().rect().size()))
+
+_al_row2 = mod.QWidget()
+_al_row2.setFixedHeight(54)
+_al_row2.setProperty("video", {"id": "alCycle", "title": "Scroll Cycle", "channel": "Chan"})
+_al_cycle = _ak_wired(_aj_app(with_label=False))
+_al_cycle._thumb_fetch_pool = _AJ_Pool()
+_al_cycle_video = _al_row2.property("video")
+_al_cycle_calls = []
+try:
+    _AK_request.urlopen = _ak_fake_urlopen(_ak_jpeg(22), _al_cycle_calls)
+    _al_cycle.build_result_ui(_al_row2, _al_cycle_video, set())               # first visit: grey at build
+    _al_first_label = _al_cycle._thumbnail_labels["alCycle"]
+    _al_grey_at_build = _al_first_label.pixmap().isNull()
+    _al_cycle._fetch_thumbnail(_al_cycle_video)                              # the fetch does its job
+    _pump()
+    _al_after_fetch = _al_first_label.pixmap().width()
+    _al_cycle.clear_result_ui(_al_row2)                                      # scrolled out of the band
+    _al_cycle.build_result_ui(_al_row2, _al_cycle_video, set())             # scrolled back
+    _al_second_label = _al_cycle._thumbnail_labels["alCycle"]
+    _al_on_rebuild = _al_second_label.pixmap().width()                       # no _pump() here: it is now
+finally:
+    _AK_request.urlopen = _AK_urlopen
+check("AL2 a row torn down by a scroll and built again wears its picture the moment it is built, not two seconds later",
+      _al_grey_at_build and _al_after_fetch == mod.THUMB_BOX_W and _al_on_rebuild == mod.THUMB_BOX_W
+      and _al_cycle_calls == [_al_cycle_calls[0]] and len(_al_cycle.thumbnail_cache) == 1,
+      (_al_grey_at_build, _al_after_fetch, _al_on_rebuild, len(_al_cycle_calls),
+       len(_al_cycle.thumbnail_cache)))
+check("AL3 the row built again asks the fetch pool for nothing, because the picture was already there",
+      _al_cycle._thumb_fetch_pool.submitted == [(_al_cycle_video,)],
+      _al_cycle._thumb_fetch_pool.submitted)
+
+_al_gone = _ak_wired(_aj_app(vid="alGone"))
+del _al_gone._thumbnail_labels["alGone"]        # the row is gone and the picture was never fetched
+_al_gone_calls = []
+try:
+    _AK_request.urlopen = _ak_fake_urlopen(_ak_jpeg(23), _al_gone_calls)
+    _al_gone._fetch_thumbnail({"id": "alGone"})
+    _pump()
+finally:
+    _AK_request.urlopen = _AK_urlopen
+check("AL4 a fetch whose row was torn down while it was queued downloads nothing, leaving the workers to the rows on screen",
+      _al_gone_calls == [] and not _al_gone.thumbnail_cache
+      and not _al_gone.thumbnails_loaded_signal.emitted,
+      (_al_gone_calls, len(_al_gone.thumbnail_cache), _al_gone.thumbnails_loaded_signal.emitted))
+
+_al_pre = _ak_wired(_aj_app(with_label=False))
+_al_pre_calls = []
+try:
+    _AK_request.urlopen = _ak_fake_urlopen(_ak_jpeg(24), _al_pre_calls)
+    _al_pre._fetch_thumbnail({"id": "alPre"}, True)          # no row built for it - that is the point
+    _pump()
+finally:
+    _AK_request.urlopen = _AK_urlopen
+check("AL5 a prefetch is allowed to fetch the row it is ahead of, and what it gets is kept at the box size",
+      len(_al_pre_calls) == 1 and _al_pre.thumbnail_cache.get("alPre") is not None
+      and _al_pre.thumbnail_cache["alPre"].width() == mod.THUMB_BOX_W,
+      (len(_al_pre_calls), list(_al_pre.thumbnail_cache)))
+
+
+class _AL_Pane:
+    """The results pane the lazy pass works on, holding only what that pass reads.
+
+    A real QScrollArea shown off every screen: the pass decides what to build and what to prefetch
+    from the placeholders' geometry, and a widget that was never laid out has no geometry to read.
+    """
+
+    lazy_load_visible_results = mod.MainApp.lazy_load_visible_results
+    build_result_ui = mod.MainApp.build_result_ui
+    clear_result_ui = mod.MainApp.clear_result_ui
+    _cached_thumbnail = mod.MainApp._cached_thumbnail
+    _thumbnail_cache_lock = mod.MainApp._thumbnail_cache_lock
+    _recheck_thumb_hover = lambda self: None      # the pass ends settling a play button; not under test
+
+    def __init__(self, videos):
+        self.search_results = videos
+        self.queue_items = []
+        self._thumbnail_labels = {}
+        self.thumbnail_cache = _AJ_OD()
+        self.thumbnail_cache_size = 0
+        self._thumbnail_lock = _AK_threading.Lock()
+        self._thumb_generation = 0
+        self._playback_box = None
+        self.accent_color_name = "Blue"
+        self._thumb_fetch_pool = _AJ_Pool()
+        self._fetch_thumbnail = lambda video, prefetch=False: None
+        _pane = mod.QWidget()
+        self.results_vbox = mod.QVBoxLayout(_pane)
+        self.results_vbox.setContentsMargins(0, 0, 0, 0)
+        for _v in videos:
+            _ph = mod.QWidget()
+            _ph.setFixedHeight(54)
+            _ph.setProperty("video", _v)
+            _ph.setProperty("has_ui", False)
+            self.results_vbox.addWidget(_ph)
+        self._area = mod.QScrollArea()
+        self._area.setWidgetResizable(True)
+        self._area.setWidget(_pane)
+        self._area.resize(420, 300)
+        self._area.move(-32000, 0)
+        self.results_area = self._area
+        self._area.show()
+        _pump()
+
+    def asked_ids(self):
+        return [args[0]["id"] for args in self._thumb_fetch_pool.submitted]
+
+    def built_ids(self):
+        return [self.results_vbox.itemAt(_i).widget().property("video")["id"]
+                for _i in range(self.results_vbox.count())
+                if self.results_vbox.itemAt(_i).widget().property("has_ui")]
+
+
+from yt_msd.ui.widgets import THUMBNAIL_PREFETCH_ROWS as _AL_CAP
+
+_al_videos = [{"id": "alP%02d" % _i, "title": "Row %d" % _i, "channel": "Chan"} for _i in range(30)]
+_al_pane = _AL_Pane(_al_videos)
+_al_pane.thumbnail_cache["alP13"] = mod.cover_thumbnail(_aj_arriving(13))   # fetched already, in the prefetch band
+_al_pane.lazy_load_visible_results()
+_al_asked = _al_pane.asked_ids()
+_al_built = _al_pane.built_ids()
+_al_prefetch = _al_asked[len(_al_built):]
+check("AL6 a scroll pass builds the rows in its band and prefetches the rows just outside it, asking nothing it already has",
+      len(_al_built) >= 5 and 0 < len(_al_prefetch) <= _AL_CAP and "alP13" not in _al_asked
+      and len(set(_al_asked)) == len(_al_asked),
+      (len(_al_built), len(_al_prefetch), _AL_CAP, "alP13" in _al_asked))
+check("AL7 the rows on screen are asked for ahead of the prefetch, and the prefetch starts at the row nearest the band",
+      _al_asked[:len(_al_built)] == _al_built and bool(_al_prefetch)
+      and _al_prefetch[0] == "alP%02d" % len(_al_built),
+      (_al_asked[:len(_al_built) + 2], _al_prefetch[:4]))
+_al_pane.results_area.close()
+
 print(f"{CHECKS - len(FAILS)} / {CHECKS} checks passed")
 if FAILS:
     print("FAILED: " + "; ".join(FAILS))
