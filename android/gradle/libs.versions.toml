@@ -1,0 +1,52 @@
+# Every version the phone build uses, in one place. The ones here were resolved and compiled on
+# 2026-11-27 against dl.google.com and repo1.maven.org with Gradle 8.14.8.
+#
+# Kotlin 2.0.21, AGP 8.13.0 and Gradle 8.14.8 are the newest set that compiles this app, and the reason is
+# specific: the Kotlin-owned Compose compiler (2.1.x and 2.2.x, and 2.4.21) enforces composability at an
+# inline composable lambda's call site, so `Activity.setContent { }` in an ordinary `onCreate` - the way
+# every Compose window starts - is a `COMPOSABLE_EXPECTED`. The artifacts that carry the marker making that
+# call legal (`androidx.activity:activity-compose:1.13.0`'s `@ComposableInferredTarget`) require the
+# AndroidX-owned Compose compiler (`androidx.compose.compiler:compiler:1.5.x`), and Kotlin 2.4.21's Gradle
+# plugin has no knob to name it. AGP 9.1's built-in Kotlin (2.2.10) is the same compiler with the same rule.
+# So the window is written with Android views, Media3's `PlayerView` among them, and the Compose artifacts
+# are out of the build. The protocol layer - the part with the checks - is plain Kotlin/JVM and compiles
+# with any of these toolchains; `docs/voice-2026-11-26-android-client.md` records the whole attempt.
+[versions]
+agp = "8.13.0"
+kotlin = "2.0.21"
+# kotlinx-serialization 1.9.0 carries metadata a 2.0.21 compiler refuses to read.
+kotlinxSerialization = "1.7.3"
+coroutines = "1.9.0"
+coreKtx = "1.13.1"
+lifecycle = "2.8.7"
+media3 = "1.5.1"
+# The activity/lifecycle pieces the window needs without Compose: `ComponentActivity` (a view-model store, a
+# lifecycle, a saved-state registry), `viewModels()` for the view model, and `lifecycleScope` for the flows.
+activity = "1.8.2"
+# 4.15.1 is the release that carries an Android 16 (API 36) image - the API level this app targets.
+robolectric = "4.15.1"
+androidxTestCore = "1.6.1"
+junit = "4.13.2"
+
+[libraries]
+kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kotlinxSerialization" }
+kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }
+junit = { module = "junit:junit", version.ref = "junit" }
+robolectric = { module = "org.robolectric:robolectric", version.ref = "robolectric" }
+androidx-test-core = { module = "androidx.test:core", version.ref = "androidxTestCore" }
+androidx-core-ktx = { module = "androidx.core:core-ktx", version.ref = "coreKtx" }
+androidx-activity = { module = "androidx.activity:activity", version.ref = "activity" }
+androidx-activity-ktx = { module = "androidx.activity:activity-ktx", version.ref = "activity" }
+androidx-lifecycle-viewmodel = { module = "androidx.lifecycle:lifecycle-viewmodel", version.ref = "lifecycle" }
+androidx-lifecycle-viewmodel-ktx = { module = "androidx.lifecycle:lifecycle-viewmodel-ktx", version.ref = "lifecycle" }
+androidx-lifecycle-runtime-ktx = { module = "androidx.lifecycle:lifecycle-runtime-ktx", version.ref = "lifecycle" }
+media3-exoplayer = { module = "androidx.media3:media3-exoplayer", version.ref = "media3" }
+media3-common = { module = "androidx.media3:media3-common", version.ref = "media3" }
+media3-ui = { module = "androidx.media3:media3-ui", version.ref = "media3" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
+kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
+

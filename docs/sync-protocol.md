@@ -1,3 +1,4 @@
+# AI generated document
 # yt-msd sync protocol, version 1
 
 The wire language of a sync chain: the frames, the order they are allowed in, the timeouts, the sizes, and
@@ -415,6 +416,75 @@ The wire is the small part. What a phone brings to it:
     the desktop's fader.
   - **Codes.** A restore/push code is typed on a phone keypad, four characters from a 30-letter alphabet.
     Uppercase keyboard, no autocorrect, and a keypad that shows the alphabet it expects.
+
+## 13. Machine-readable anchors
+
+The protocol is a document, and a document drifts. These are the places where the same rules exist as code
+and as checks, so that a change here has to be made in every one of them at once.
+
+| Where | What it is | What checks it |
+| --- | --- | --- |
+| `GUI Source Code/yt_msd/sync/protocol.py` | `PROTOCOL_VERSION`, every command, status, discovery type, timeout, size and the key the version travels under | the host's own suite (`probe_sync.py`), and `ProtocolNamesTest` in `android/protocol` |
+| `GUI Source Code/yt_msd/sync/host.py`, `client.py`, `lan.py` | the host, the desktop client, discovery | `probe_sync.py` and `probe_phone_wire.py` |
+| `GUI Source Code/GUI Test Suite/probe_phone_wire.py` | the phone's whole session against a real host, frame by frame, with a `--record` mode that writes the golden fixture | the 39 checks in `probe_phone_wire.py` |
+| `GUI Source Code/GUI Test Suite/fixtures/protocol/phone_session.json` | the recording: `AUTH`, `GET_INDEX`, three `PULL_FILE`s, `GET_CONFIG`, two `PING`s, and the bodies that arrived | `FixtureContractTest`, and `PhoneSessionTest` in `:protocol` |
+| `android/protocol/src/main/kotlin/dev/ytmsd/protocol/` | `Protocol.kt` (names and version rules), `Json.kt`, `Wire.kt`, `WireClient.kt`, `Transfer.kt`, `Lan.kt`, `Beacon.kt`, `Discovery.kt`, `Keys.kt`, `Restore.kt` | `android/protocol/src/test/kotlin/...` |
+| `android/protocol/src/testFixtures/kotlin/dev/ytmsd/protocol/testing/` | `PhoneSession.kt` (the recording, loaded), `ScriptedHost.kt` (a host that answers out of the recording on a loopback socket), `FixtureLibrary.kt` (the MP3s the recording names) | used by the checks above and by the app's own checks |
+| `android/app/src/main/kotlin/dev/ytmsd/phone/SyncViewModel.kt` | the phone's side of a session as state: hosts found, the host's list, the pull into the app's own library folder, the player | `android/app/src/test/kotlin/dev/ytmsd/phone/SyncViewModelTest.kt`, under Robolectric against `ScriptedHost` |
+
+Running them, on a desktop with no phone:
+
+```
+gradlew :protocol:test                                    # the names, the recording, the session, frame for frame
+gradlew :protocol:test --tests dev.ytmsd.protocol.LiveHostTest \
+        -Pytmsd.host=192.168.1.20 -Pytmsd.port=63350 -Pytmsd.chain=7301
+                                                          # the same session against a host that is running
+python "GUI Test Suite\probe_phone_wire.py" --record      # re-record the golden fixture from a real host
+powershell -File build_dir_cython\android_desktop_suite.ps1 -Task all
+```
+
+`ProtocolNamesTest` is the one that keeps the two copies of the protocol from drifting silently: it reads the
+Python module off disk and fails on a name in one and not the other, on a count that differs, on a version
+that differs, and on the version rules answering differently - including the rule under the version rule,
+that a host naming no version is **not** a host naming version 1. `LiveHostTest` skips itself when no host is
+named, so a plain `:protocol:test` never asks for a running host.
+
+Two things the recording taught the Kotlin side, both of them real properties of the wire and not of the
+test:
+
+  - **A `SENDING` answer is followed by the file, every time.** The desktop probe hashes the two files it
+    pulls in its loop (`PW17`) and re-pulls a third without hashing (`PW18`), so the recording has three
+    `SENDING` answers and two recorded bodies. A client that reads a body after every answer is the client
+    the Python host is talking to today, so `ScriptedHost` sends the file after every `SENDING` answer,
+    recorded or not, and the acceptance check compares frames exactly and bodies as the recording being
+    inside the trace.
+  - **A number and a string are never the same frame.** A JVM writes `1.7E9` where Python writes
+    `1700000000.0`; `JsonCompat` compares numbers by value, ignores key order, and refuses a string against
+    a number - which is how Python compares the dicts it parsed.
+
+## 14. The client as it is built (27 Nov 2026)
+
+`:app` compiles and its window check passes on this desktop. What that means in protocol terms, and what it
+does not:
+
+  - **Everything a session does is the protocol module's, unchanged.** `SyncViewModel` opens a
+    `WireClient`, calls `authenticate`, `index`, `pull` and `fetchConfig`, and never invents a frame; the
+    scan runs on `Discovery.scan`, and the address it puts on its `AUTH` is the address the host sees it at -
+    `Lan.localIp()` on a phone, and the address the recording was made from in a check, because two AUTH
+    frames that name different addresses are two different frames.
+  - **The window is Android views, not Compose.** `MainActivity` draws `SyncViewModel`'s state with framework
+    widgets and Media3's `PlayerView`. Jetpack Compose was tried and taken out; the reason is a toolchain
+    story and it is in `docs/voice-2026-11-26-android-client.md`. Nothing about this protocol depends on it.
+  - **The toolchain is pinned where a build can read it.** `android/gradle/wrapper/gradle-wrapper.properties`
+    names Gradle 8.14.8; the version catalog names AGP 8.13.0, Kotlin 2.0.21, kotlinx-serialization 1.7.3,
+    Media3 1.5.1, Robolectric 4.15.1, compileSdk 36. A build that floats its own toolchain is a build that
+    cannot say what compiled it.
+  - **`GET_PLAY_URL` and `PUT_STATE` are not implemented, and are not faked.** The app pulls files and plays
+    what it pulled. The command this protocol reserves for live resolution (section 12) has no frames recorded
+    for it, no host answers it, and a client that asked for it would get `UNKNOWN_COMMAND`. Section 11's rules
+    are what it has to go through first.
+
+
 
 
 

@@ -1,0 +1,160 @@
+{
+    // The phone client, run from this desktop. The Python gate is the suite the phone protocol is derived
+    // from; the Kotlin checks are the phone's side of it, compared with the recording that gate writes.
+    // Nothing here needs a phone, and the two device tasks say so on their labels.
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "yt-msd: Desktop Python Gate",
+            "type": "shell",
+            "command": "powershell.exe",
+            "args": [
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-File", "${workspaceFolder}\\build_dir_cython\\android_desktop_suite.ps1",
+                "-Task", "gate"
+            ],
+            "group": { "kind": "test", "isDefault": true },
+            "problemMatcher": [],
+            "detail": "The ten suite probes - 1454 checks - from GUI Source Code. No phone, no emulator."
+        },
+        {
+            "label": "yt-msd: Phone Wire Checks",
+            "type": "shell",
+            "command": "powershell.exe",
+            "args": [
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-File", "${workspaceFolder}\\build_dir_cython\\android_desktop_suite.ps1",
+                "-Task", "wire"
+            ],
+            "group": "test",
+            "problemMatcher": [],
+            "detail": "probe_phone_wire.py alone - 39 checks, and the writer of the golden fixture."
+        },
+        {
+            "label": "yt-msd: Record Phone Fixture",
+            "type": "shell",
+            "command": "powershell.exe",
+            "args": [
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-File", "${workspaceFolder}\\build_dir_cython\\android_desktop_suite.ps1",
+                "-Task", "record"
+            ],
+            "problemMatcher": [],
+            "detail": "Re-record GUI Test Suite/fixtures/protocol/phone_session.json from a real host socket."
+        },
+        {
+            "label": "yt-msd: Android Protocol Tests",
+            "type": "shell",
+            "command": "${workspaceFolder}\\android\\gradlew.bat",
+            "args": [":protocol:test", "--stacktrace"],
+            "options": { "cwd": "${workspaceFolder}\\android" },
+            "group": "test",
+            "problemMatcher": [],
+            "detail": "The Kotlin protocol layer against the recorded Python session. Plain JVM - no phone, no emulator."
+        },
+        {
+            "label": "yt-msd: Android Protocol Tests (live host)",
+            "type": "shell",
+            "command": "${workspaceFolder}\\android\\gradlew.bat",
+            "args": [
+                ":protocol:test",
+                "--tests", "dev.ytmsd.protocol.LiveHostTest",
+                "-Pytmsd.host=127.0.0.1",
+                "-Pytmsd.port=63350",
+                "-Pytmsd.chain=7301",
+                "--stacktrace"
+            ],
+            "options": { "cwd": "${workspaceFolder}\\android" },
+            "problemMatcher": [],
+            "detail": "Needs the desktop app hosting a chain on this machine. Name no host and it skips itself."
+        },
+        {
+            "label": "yt-msd: Android Window Checks",
+            "type": "shell",
+            "command": "${workspaceFolder}\\android\\gradlew.bat",
+            "args": [":app:testDebugUnitTest", "--stacktrace"],
+            "options": { "cwd": "${workspaceFolder}\\android" },
+            "group": "test",
+            "problemMatcher": [],
+            "detail": "Robolectric - the app's view-model driven on this desktop's JVM against the recorded session."
+        },
+        {
+            "label": "yt-msd: Build Android Debug",
+            "type": "shell",
+            "command": "${workspaceFolder}\\android\\gradlew.bat",
+            "args": [":app:assembleDebug", "--stacktrace"],
+            "options": { "cwd": "${workspaceFolder}\\android" },
+            "group": "build",
+            "problemMatcher": [],
+            "detail": "android/app/build/outputs/apk/debug/app-debug.apk"
+        },
+        {
+            "label": "yt-msd: Gradle Sync",
+            "type": "shell",
+            "command": "${workspaceFolder}\\android\\gradlew.bat",
+            "args": ["help"],
+            "options": { "cwd": "${workspaceFolder}\\android" },
+            "problemMatcher": [],
+            "detail": "Resolves the build files, the version catalog and every plugin - the first thing to run after a clone."
+        },
+        {
+            "label": "yt-msd: Toolchain Check",
+            "type": "shell",
+            "command": "powershell.exe",
+            "args": [
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-File", "${workspaceFolder}\\build_dir_cython\\android_desktop_suite.ps1",
+                "-Task", "tools"
+            ],
+            "problemMatcher": [],
+            "detail": "JDK, Gradle, the wrapper, the SDK packages, the fixture - what is present and what is not."
+        }
+        {
+            "label": "yt-msd: Start AVD (needs an emulator, not a desktop run)",
+            "type": "shell",
+            "command": "powershell.exe",
+            "args": [
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-File", "${workspaceFolder}\\build_dir_cython\\android_desktop_suite.ps1",
+                "-Task", "avd"
+            ],
+            "problemMatcher": [],
+            "detail": "Emulator ytmsd_mvp. Everything the suite proves runs without it."
+        },
+        {
+            "label": "yt-msd: Logcat (device/emulator only)",
+            "type": "shell",
+            "command": "powershell.exe",
+            "args": [
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-File", "${workspaceFolder}\\build_dir_cython\\android_desktop_suite.ps1",
+                "-Task", "logcat"
+            ],
+            "problemMatcher": [],
+            "detail": "adb logcat for the phone client's own tag."
+        },
+        {
+            "label": "yt-msd: Full Desktop Dev Suite",
+            "type": "shell",
+            "command": "powershell.exe",
+            "args": [
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-File", "${workspaceFolder}\\build_dir_cython\\android_desktop_suite.ps1",
+                "-Task", "all"
+            ],
+            "group": { "kind": "build", "isDefault": true },
+            "runOptions": { "instanceLimit": 1 },
+            "problemMatcher": [],
+            "detail": "Tools, phone wire, Kotlin protocol, Android window checks, the debug build, then the full 1454-check gate."
+        }
+    ]
+}
+    ]
+}

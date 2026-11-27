@@ -1,0 +1,51 @@
+{
+    // The desktop side of the phone client. `android/` is a Gradle build, so VS Code's Java/Gradle
+    // extensions (redhat.java, vscjava.vscode-gradle) need the same JDK and the same Gradle the command
+    // line uses. Kotlin support is the Kotlin Language Server extension (fwkKotlin.kotlin).
+    "java.jdt.ls.java.home": "C:\\Program Files\\Eclipse Adoptium\\jdk-21.0.12.101-hotspot",
+    "java.configuration.runtimes": [
+        {
+            "name": "JavaSE-21",
+            "path": "C:\\Program Files\\Eclipse Adoptium\\jdk-21.0.12.101-hotspot",
+            "default": true
+        }
+    ],
+    "java.import.gradle.enabled": true,
+    "java.import.gradle.home": "C:\\Users\\mason\\.devtools\\gradle-8.14.8",
+    "java.import.gradle.java.home": "C:\\Program Files\\Eclipse Adoptium\\jdk-21.0.12.101-hotspot",
+    "java.import.gradle.version": "8.14.8",
+    "java.import.gradle.wrapper.enabled": true,
+    "java.import.gradle.offline.enabled": false,
+    "gradle.autoDetect": "on",
+    "gradle.nestedProjects": true,
+    "kotlin.languageServer.enabled": true,
+    "kotlin.kls.java": "C:\\Program Files\\Eclipse Adoptium\\jdk-21.0.12.101-hotspot",
+
+    // The Android app builds with the SDK the command line installs. `:protocol` needs none of it - that
+    // is what makes its checks runnable on this desktop with no phone.
+    "java.import.exclusions": [
+        "**/build/**",
+        "**/.gradle/**",
+        "**/build_dir_cython/**",
+        "**/.test_harness/**"
+    ],
+    "search.exclude": {
+        "**/build_dir_cython": true,
+        "**/android/build": true,
+        "**/android/.gradle": true,
+        "**/android/app/build": true,
+        "**/android/protocol/build": true,
+        "**/GUI Source Code/copy": true
+    },
+
+    // Every task below runs with the toolchain paths already in its environment.
+    "terminal.integrated.env.windows": {
+        "JAVA_HOME": "C:\\Program Files\\Eclipse Adoptium\\jdk-21.0.12.101-hotspot",
+        "ANDROID_HOME": "C:\\Users\\mason\\AppData\\Local\\Android\\Sdk",
+        "ANDROID_SDK_ROOT": "C:\\Users\\mason\\AppData\\Local\\Android\\Sdk",
+        "Path": "C:\\Program Files\\Eclipse Adoptium\\jdk-21.0.12.101-hotspot\\bin;C:\\Users\\mason\\AppData\\Local\\Android\\Sdk\\cmdline-tools\\latest\\bin;C:\\Users\\mason\\AppData\\Local\\Android\\Sdk\\platform-tools;C:\\Users\\mason\\AppData\\Local\\Android\\Sdk\\emulator;C:\\Users\\mason\\.devtools\\gradle-8.14.8\\bin;${env:Path}"
+    },
+    "workbench.editor.wrapTabs": true,
+    "java.configuration.updateBuildConfiguration": "automatic"
+}
+

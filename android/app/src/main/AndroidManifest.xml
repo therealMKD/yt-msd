@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Open Source Software under the Apache License, Version 2.0 - part of the yt-msd phone client. -->
+<!--
+  A phone that talks to a PC on the local network needs the network and nothing else: no storage permission
+  beyond its own app folder (files land in the app's private files dir), no camera, no contacts, no location.
+  The app draws over a socket, it does not send data off the machine - the host it talks to is chosen by a
+  scan of the network it is standing in, or typed in by a person.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <application
+        android:label="yt-msd"
+        android:icon="@android:drawable/ic_media_play"
+        android:allowBackup="true"
+        android:supportsRtl="true"
+        android:usesCleartextTraffic="true">
+
+        <!-- Cleartext on purpose: the chain speaks its own protocol on a local socket, with a four-character
+             sync code at the door. There is no TLS endpoint here to talk to. -->
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.Material.Light.NoActionBar">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

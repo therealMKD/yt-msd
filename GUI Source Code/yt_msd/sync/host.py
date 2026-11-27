@@ -648,14 +648,18 @@ class SyncHostServer:
                     # request, or simply out of time - the waiting machine is told instead of left
                     # waiting for a code that is never coming back.
                     if restore_offer is not None and pending_restore_request(sync_code) is None:
+                        # Reported before it is answered, as every other closing of a code is: the offer is
+                        # gone from this machine's screen by the time this line is reached, and a machine told
+                        # over the wire that it is gone must not be able to ask this machine's own window where
+                        # its code is and be told it is still there.
+                        self._restore_event('cancelled', sync_code, client_ip, 'offer closed')
                         send_json_msg(sock, {'status': 'RESTORE_CLOSED',
                                              'reason': 'That restore offer is no longer open on the host'})
-                        self._restore_event('cancelled', sync_code, client_ip, 'offer closed')
                         break
                     if push_offer is not None and pending_push_request(sync_code) is None:
+                        self._push_event('cancelled', sync_code, client_ip, 'offer closed')
                         send_json_msg(sock, {'status': 'PUSH_CLOSED',
                                              'reason': 'That push offer is no longer open on the host'})
-                        self._push_event('cancelled', sync_code, client_ip, 'offer closed')
                         break
                     send_json_msg(sock, {'status': 'PONG'})
 
@@ -673,10 +677,13 @@ class SyncHostServer:
                     else:
                         session = issue_restore_code(sync_code, client_ip)
                         restore_offer = session['code']
+                        # The code is on this machine's screen the moment it is issued, so the report of it
+                        # goes out before the answer that tells a client to go and read it: a window - and a
+                        # check reading that window - that is asked where the code is must find it there.
+                        self._restore_event('requested', sync_code, client_ip, session['code'])
                         send_json_msg(sock, {'status': 'WAITING_FOR_CODE',
                                              'chain_name': matching_chain.get('name', 'Audio Playlist'),
                                              'expires_in': int(session['expires_at'] - session['issued_at'])})
-                        self._restore_event('requested', sync_code, client_ip, session['code'])
                         if self.on_client_activity_cb:
                             self.on_client_activity_cb(sync_code, client_ip, 'Restore requested')
 
@@ -690,18 +697,20 @@ class SyncHostServer:
                         if granted is None:
                             # The wrong code is an answer, not a hint. It closes the offer rather than
                             # leaving it open to be guessed at, and the client keeps its own copy of
-                            # everything and its connection.
+                            # everything and its connection. Reported before it is answered, so this
+                            # machine's screen and this machine's answer say the same thing at the same time.
+                            self._restore_event('cancelled', sync_code, client_ip, 'wrong code')
                             send_json_msg(sock, {'status': 'ERROR',
                                                  'reason': 'That is not the code on the host screen'})
-                            self._restore_event('cancelled', sync_code, client_ip, 'wrong code')
                         else:
                             # Answered before the rebuild starts rather than after it: the client is
                             # about to spend a while adding up its own library, and it should find out
                             # in this moment - and not after that work - whether the code it typed was
-                            # the one on this screen.
+                            # the one on this screen. The report of the screen goes out first, for the
+                            # reason every report of a screen goes out first.
+                            self._restore_event('started', sync_code, client_ip, granted['code'])
                             send_json_msg(sock, {'status': 'CODE_ACCEPTED',
                                                  'chain_name': matching_chain.get('name', 'Audio Playlist')})
-                            self._restore_event('started', sync_code, client_ip, granted['code'])
                             received, note = self._receive_restore(sock, folder_path, sync_code, client_ip)
                             self._restore_event('finished', sync_code, client_ip, f"{received}: {note}")
                             break
@@ -713,8 +722,13 @@ class SyncHostServer:
                     # use to anyone.
                     cancel_restore_offer(sync_code, restore_offer)
                     restore_offer = None
-                    send_json_msg(sock, {'status': 'CANCELLED'})
+                    # Reported before the answer is sent, not after it. The host's own screen is what a
+                    # restore code lives on, and a client that has just been told the offer is closed and
+                    # asks the host where its code went has to be told the truth: an answer that leaves
+                    # this machine's report a moment behind itself is an answer that lets a window - and a
+                    # check reading that window - read a screen that is about to change.
                     self._restore_event('cancelled', sync_code, client_ip, 'client cancelled')
+                    send_json_msg(sock, {'status': 'CANCELLED'})
                     break
 
                 elif cmd == 'PUSH_REQUEST':
@@ -754,11 +768,14 @@ class SyncHostServer:
                     else:
                         session = issue_push_code(sync_code, client_ip)
                         push_offer = session['code']
+                        # Reported before the answer, exactly as a restore code is: the code is on this
+                        # machine's screen from the moment it is issued, and a client told to go and read it
+                        # must find this machine's own window able to say what it is.
+                        self._push_event('requested', sync_code, client_ip, session['code'])
                         send_json_msg(sock, {'status': 'WAITING_FOR_PUSH_CODE',
                                              'chain_name': matching_chain.get('name', 'Audio Playlist'),
                                              'limit': push_file_limit(matching_chain),
                                              'expires_in': int(session['expires_at'] - session['issued_at'])})
-                        self._push_event('requested', sync_code, client_ip, session['code'])
                         if self.on_client_activity_cb:
                             self.on_client_activity_cb(sync_code, client_ip, 'Push requested')
 
@@ -779,15 +796,16 @@ class SyncHostServer:
                         if granted is None:
                             # The same rule as a restore code: a wrong answer is an answer, it closes the
                             # offer instead of leaving it open to be guessed at, and this machine's screen
-                            # stops showing the thing somebody just failed to type.
+                            # stops showing the thing somebody just failed to type - and says so before it
+                            # answers, the way a screen does when it is asked what it is showing.
+                            self._push_event('cancelled', sync_code, client_ip, 'wrong code')
                             send_json_msg(sock, {'status': 'ERROR',
                                                   'reason': 'That is not the code on the host screen'})
-                            self._push_event('cancelled', sync_code, client_ip, 'wrong code')
                         else:
+                            self._push_event('started', sync_code, client_ip, granted['code'])
                             send_json_msg(sock, {'status': 'PUSH_ACCEPTED', 'code_required': True,
                                                   'chain_name': matching_chain.get('name', 'Audio Playlist'),
                                                   'limit': limit})
-                            self._push_event('started', sync_code, client_ip, granted['code'])
                             _received, _refused, _push_note = self._receive_push(sock, folder_path,
                                                                                  sync_code, client_ip, limit)
                             self._remember_push_counts(sync_code, _received, _refused)
@@ -805,10 +823,10 @@ class SyncHostServer:
                         # A trusted address. Re-checked here rather than taken from the answer a moment
                         # ago, because the person who grants that trust does it on this machine's own
                         # screen and may have granted it - or taken it back - between the two messages.
+                        self._push_event('started', sync_code, client_ip, 'trusted client')
                         send_json_msg(sock, {'status': 'PUSH_ACCEPTED', 'code_required': False,
                                              'chain_name': matching_chain.get('name', 'Audio Playlist'),
                                              'limit': limit})
-                        self._push_event('started', sync_code, client_ip, 'trusted client')
                         _received, _refused, _push_note = self._receive_push(sock, folder_path, sync_code,
                                                                              client_ip, limit)
                         self._remember_push_counts(sync_code, _received, _refused)
@@ -819,11 +837,14 @@ class SyncHostServer:
 
                 elif cmd == 'PUSH_CANCEL':
                     # The client changed its mind, or nobody read the code out. Closed here so this
-                    # machine's screen stops showing a code that is no longer any use to anyone.
+                    # machine's screen stops showing a code that is no longer any use to anyone - and
+                    # reported before the answer goes out, for the same reason the restore cancel above is:
+                    # the code is on this machine's screen, and a client told it is gone must not be able to
+                    # ask this machine where it is and get the answer that it is still there.
                     cancel_push_offer(sync_code, push_offer)
                     push_offer = None
-                    send_json_msg(sock, {'status': 'CANCELLED'})
                     self._push_event('cancelled', sync_code, client_ip, 'client cancelled')
+                    send_json_msg(sock, {'status': 'CANCELLED'})
                     break
 
                 elif cmd == 'GET_CONFIG':

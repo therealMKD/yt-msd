@@ -62,6 +62,13 @@ ffmpeg.zip
 # changes, like the checks that read it.
 !GUI Source Code/GUI Test Suite/fixtures/protocol/*.json
 
+# The VS Code development suite is part of the repo, not a machine's settings: the tasks, the JDK/Gradle/SDK
+# paths and the toolchain check are what a clone needs to run the phone client's checks. `*.json` above is
+# about the settings files the app writes.
+!.vscode/*.json
+
+!GUI Source Code/GUI Test Suite/fixtures/protocol/*.json
+
 # Cython build artifacts (generated C sources, compiled extensions, cythonize staging dir)
 build_dir_cython/
 *.pyd

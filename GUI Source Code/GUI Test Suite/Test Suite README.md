@@ -437,6 +437,13 @@ reasoning at `docs/voice-2026-11-26-android-client.md`. What the suite has to ke
   mtimes, which is what makes the recording reproducible on any machine. It is re-recorded with
   `python probe_phone_wire.py --record` - read what it wrote before committing it, because the fixture is the
   protocol.
+- **The host reports a change to its own screen before it answers a client about that change.** `host.py`
+  fires the `requested` / `started` / `cancelled` / `push_*` event into the window's callback *first* and sends
+  the answer second - at a code issued, a code named wrongly, a code accepted, an offer taken away on the host's
+  own screen (`RESTORE_CLOSED` / `PUSH_CLOSED` on a `PING`), and a cancel from either side (27 Nov 2026; found
+  by `PW36` failing reproducibly on a loaded machine, and by `PW28`, with `PW29` having passed the same shape on
+  luck). A code exists only in the host's own report, so a client told the offer is closed must not be able to
+  ask the host where it is and be told it is still on the screen.
 - **Two harness lessons for anyone adding socket checks here.** A host that refuses at its door closes the
   connection, and a socket closed with data it has not read discards what it had already queued to send: send
   the follow-up request first and you may read a reset instead of the refusal. `SY-G17` and `PW24` read in
@@ -447,5 +454,33 @@ reasoning at `docs/voice-2026-11-26-android-client.md`. What the suite has to ke
   39 + 362 + 75 + 70 + 42 + 16 + 14 + 14, counted off the run, not off the sum of two numbers in prose
   (`probe_trace.py` prints `42/42 checks passed` with no spaces, so anything that counts the gate by
   matching that line has to match it as it is written).
+
+## The same session, spoken by the client it was recorded for (27 Nov 2026)
+
+`android/` is a Gradle build with the phone client in it, and the contract this suite keeps is the contract
+that build is tested against. Nothing here runs on a phone, and nothing here needs one.
+
+- **`:protocol` is plain Kotlin/JVM (16 checks, 2 skipped).** `PhoneSessionTest` runs the Kotlin client against
+  `ScriptedHost`, which answers out of `fixtures/protocol/phone_session.json` on a loopback socket, and compares
+  the phone's side of the session with the recording frame for frame - the frames the suite records in `PW37`,
+  read by the language the phone is written in. `ProtocolNamesTest` reads `yt_msd/sync/protocol.py` off disk and
+  fails when a name in Python is missing from Kotlin, when a count differs, when the version rules answer
+  differently, and when a host naming no version is treated as a host naming version 1. `FixtureContractTest`
+  says out loud when the contract is missing. `LiveHostTest` runs the session against a host that is not a
+  recording (`-Pytmsd.host=…`) and skips itself when no host is named.
+- **`:app` builds, and its one window check is green.** `SyncViewModelTest` is M1's acceptance in Robolectric:
+  scan, pair, list, pull, and the file landing whole in the app's own library folder, hashing to the checksum the
+  host announced. `gradlew.bat :app:assembleDebug :app:testDebugUnitTest` builds an APK out of it.
+- **Run it from the suite's own directory.** `build_dir_cython/android_desktop_suite.ps1 -Task all` runs the
+  wire checks, this gate, the Kotlin protocol checks, the window build and the window checks, and exits non-zero
+  if any of them failed; `-Task wire|gate|protocol|app|apptest|record` runs one. The Kotlin side takes its
+  fixture path from `-Pytmsd.fixture=…` and its chain from `-Pytmsd.chain=…`, both defaulting to
+  `fixtures/protocol/phone_session.json` and `7301`.
+- **The toolchain is pinned in the build, and Compose is out of it.** `android/gradle/wrapper/` names Gradle
+  8.14.8; AGP 8.13.0, Kotlin 2.0.21, Media3 1.5.1, compileSdk 36. Jetpack Compose was tried on the 2026 stack
+  and the reason it is not in the app is written up in `docs/voice-2026-11-26-android-client.md` - read it before
+  adding Compose back. `JAVA_HOME` must point at the JDK Gradle runs on; it does not inherit from a shell that
+  only sets `PATH`.
+
 
 

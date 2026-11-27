@@ -1,0 +1,7 @@
+# Gradle and Kotlin/Android build output - never in the repo.
+.gradle/
+build/
+local.properties
+
+# The Gradle daemon writes these in a project that is opened on a phone build.
+*.hprof
