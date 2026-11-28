@@ -54,7 +54,7 @@ First, lyric videos will ONLY have music and no other sounds (A lot of music vid
 
 What is correctly? Well, it's a file named "Artist - Title.mp3". Artist goes first, because then the files are grouped correctly regardless of whether you use metadata or not. However, it's not always possible to find a youtube video of a song that has the correct title, and often there will be extra stuff tacked on, like (Lyrics), or (Official Audio). Additionally, any music player worth it's salt will support reading ID3 tags, instead of falling back to a title. Having a tagged file is greatly preferred, but manually adding tags is even more tedious than manually renaming songs. 
 
-Therefore, instead of making you use a separate program to correctly name and tag files, I built an integrated renamer to quickly rename files to Artist - Title, and automatically tag them, as well as normalize them (make them all the same volume), and trim silence off.
+Therefore, instead of making you use a separate program to correctly name and tag files, I built an integrated renamer to quickly rename files to Artist - Title, and automatically tag them, as well as normalize them (make them all the same volume), and trim silence off. 
 
 ## Basic Use
 
@@ -71,6 +71,8 @@ The renamer will open in the selected music download directory, which, as you ca
 The program will automatically skip files that already have ID3 tags, so it is not necessary to put new files into a separate folder before renaming and normalizing them, since already processed files will be skipped.
 
 Ideally, you never have to manually rename any of the files. However, the success rate of the renaming algorithms is determined by the videos that you choose. Like I said earlier, if you choose lyric videos, renaming will be a much faster process. The algorithm attempts to recreate "Artist - Title" using the filename, as close as possible. Once it has the Artist - Title, it uses that to correctly fill the respective ID3 tags on the file. 
+
+As of the 3.5 update, you can also safely use videos directly from the artist that only have the song's title as the video title. Yt-msd runs the renamer's artist absent check on the downloaded files, and if it doesn't detect an artist, it will automatically append the channel name before the title as the artist. **If this causes problems, there is a setting to turn it off (see [Normalization](#normalization)).** This feature will give you titles that won't need to be manually edited if the channel name is `[Artist name]`. It will break if the channel's name is `[Artist name] Topic` or `[Artist name] - Topic`.
 
 There are two possible states that a file can be in, and two possible sets of options.
 
@@ -121,11 +123,13 @@ Just like with normal skipping, you will be able to manually go through any skip
 
 The entire right column of the settings menu lets you change the normalization and silence trimming. Here's exactly what it all does:
 
-<img width="892" height="696" alt="image" src="https://github.com/user-attachments/assets/ca42ab88-5497-4adf-b461-7a2078ca0a0e" />
+<img width="982" height="669" alt="image" src="https://github.com/user-attachments/assets/9cdb54ad-a3e0-430e-b8a7-db5a8daeddf4" />
 
 At the very top, you can change how normalization works in the renamer. By default this is set to "Ask", which will give you a `y/n` query at the end of renaming. You can force this on, or off with this setting, so you never get asked.
 
 The checkbox below will automatically turn on [Auto](#auto-mode) mode, without you having to manually activate it with `AUTO` in the renamer window.
+
+Directly below that is the toggle for appending channel names to videos that don't have titles. It is recommended to keep this on, unless the feature is causing problems. Note that this will resolve almost all artist direct titles, since most of those videos will be formatted as `Song Title (Official Audio)` with just the artist name as the channel. `Artist - Topic` channels will break this though.
 
 The checkbox at the bottom of this section turns silence trimming on or off. This detects silence and automatically removes it. You can also increase the number in the silence padding box to add silence back onto the files, after the original silence has been removed. If you don't have a music player that can add silence in-between files, I would recommend setting this to `0.5`. 
 
@@ -170,7 +174,7 @@ That function runs the following steps on the title, in order:
 24. Multiple artist outlier handling. Removes anything in the artist block after a comma. Solves `Artist, Artist 2 - Title`
 25. Illegal windows characters are replaced with a space, and then whitespace collapse is run again.
 
-All of that happens almost instantly, to give you the suggested title. If you use the `f` command, all of this gets re run on the flipped title.
+All of that happens almost instantly, to give you the suggested title. If you use the `f` command, all of this gets re-run on the flipped title.
 
 # Local File Features
 
