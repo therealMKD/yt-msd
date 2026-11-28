@@ -14,6 +14,7 @@ package dev.ytmsd.protocol
 import java.io.File
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
@@ -31,6 +32,8 @@ class WireClient(
 ) {
 
     private var channel: FrameChannel? = null
+    private var warmer: Keepalive? = null
+    private var warmPingsDone = 0L
 
     /** What the host calls the chain this machine was let into, as `AUTH` answered it. */
     var chainName: String = ""
@@ -55,12 +58,93 @@ class WireClient(
     }
 
     fun close() {
+        stopWarm()
         channel?.close()
         channel = null
     }
 
+    /**
+     * Keep this connection warm while a person is looking at a screen.
+     *
+     * A host reads the next command with a 30-second timeout and closes the connection when nothing arrives -
+     * `host.py`'s own loop, `recv_json_msg(sock, timeout=30.0)` and a `break`. A phone that has listed 458
+     * files and left them on screen while somebody reads them is exactly that, every time, and the phone
+     * cannot see the connection go: the next ask writes into a socket nobody is reading. The protocol's answer
+     * is a `PING` every 10 seconds, and this runs the same [Keepalive] the desktop runs.
+     *
+     * It is not running during a file transfer and must not be: a `PING` in the middle of a transfer is bytes
+     * the host reads as its next frame. [stopWarm] is what puts it away before an ask, and it joins the thread
+     * so no `PONG` is left unread on a socket about to read its next answer.
+     */
+    fun startWarm(intervalMs: Int = Protocol.CONFIRM_PING_INTERVAL_MS) {
+        val wire = channel ?: return
+        if (warmer != null) return
+        Keepalive(wire, intervalMs, trace).also { warmer = it }.start()
+    }
+
+    /** Put the pings away, and leave the socket clean for the next exchange to read its answer from. */
+    fun stopWarm() {
+        val warmer = warmer ?: return
+        warmPingsDone += warmer.sent
+        warmer.stop()
+        this.warmer = null
+    }
+
+    /** The pings this client has sent to keep itself warm. A warmer that sent none is a warmer that only
+     *  looks like it is working, which is what a check reads. */
+    val warmPings: Long get() = warmPingsDone + (warmer?.sent ?: 0L)
+
     private fun wire(): FrameChannel =
         channel ?: throw IllegalStateException("WireClient is not connected")
+
+    /**
+     * The next answer, with the noticing that goes with it.
+     *
+     * A frame that is nothing at all is a host that has closed this connection - the clean-close shape
+     * `Frames.read` returns null for, which is exactly what a phone gets when it asks a host 40 seconds after
+     * the list landed on its screen and the host's 30-second command read hung up. A client that kept that
+     * connection would spend its next ask writing into a socket nobody is reading, and report the host as
+     * refusing a file it never saw. So the connection is put away here, and every ask after it says the true
+     * thing: there is no connection to ask with.
+     */
+    private fun answer(): JsonObject {
+        val frame = try {
+            wire().receive(trace)
+        } catch (_: SocketTimeoutException) {
+            // A host that has not answered inside the time allowed is a host that is still there - a slow
+            // drive hashing a library, a chain being rebuilt - and this is the one case a client keeps its
+            // connection for. The desktop client reads a timeout as no answer and carries on; a phone that
+            // hung up on a host for being slow would have to pair with it again for no reason.
+            return FrameWrite.empty
+        } catch (_: Exception) {
+            // A read the socket refuses - an aborted connection, a reset - is the same host that is gone,
+            // told a different way.
+            close()
+            return FrameWrite.empty
+        }
+        if (frame == null) {
+            close()
+            return FrameWrite.empty
+        }
+        return frame
+    }
+
+    /**
+     * A frame going out, with the noticing that goes with it.
+     *
+     * The other half of the same fact: a write the socket refuses - a connection the host aborted, a host that
+     * hung up on a phone that stopped to read a screen - is a host that is not there. A client that kept this
+     * connection would go on writing into a socket nobody is reading, and would say every time that the host
+     * refused a file it never saw. So the connection is put away and the complaint goes back up to be said.
+     */
+    private fun speak(frame: JsonObject) {
+        try {
+            wire().send(frame, trace)
+        } catch (problem: Exception) {
+            close()
+            throw problem
+        }
+    }
 
     // -- the door, and the questions every exchange starts with ---------------------------
 
@@ -78,8 +162,8 @@ class WireClient(
             put("sync_code", syncCode)
             put("client_ip", clientIp)
         })
-        wire().send(frame, trace)
-        val answer = wire().receive(trace) ?: FrameWrite.empty
+        speak(frame)
+        val answer = answer()
         if (FrameRead.status(answer) == Protocol.STATUS_OK) {
             chainName = FrameRead.text(answer, "chain_name").trim()
             hostProtocolVersion = Protocol.answeredProtocolVersion(answer)
@@ -90,8 +174,8 @@ class WireClient(
     /** Ask for the host's file list. The long timeout is the desktop client's: answering this means hashing
      *  the whole hosted folder, which is a slow drive working, not a dead connection. */
     fun index(timeoutMs: Int = Protocol.INDEX_TIMEOUT_MS): Pair<List<JsonObject>, String> {
-        wire().send(buildJsonObject { put("cmd", Protocol.CMD_GET_INDEX) }, trace)
-        val answer = withReadTimeout(timeoutMs) { wire().receive(trace) ?: FrameWrite.empty }
+        speak(buildJsonObject { put("cmd", Protocol.CMD_GET_INDEX) })
+        val answer = withReadTimeout(timeoutMs) { answer() }
         if (FrameRead.status(answer) != Protocol.STATUS_OK) {
             return emptyList<JsonObject>() to
                 FrameRead.reason(answer).ifEmpty { "the host did not answer with a file list" }
@@ -101,18 +185,18 @@ class WireClient(
 
     /** Keep this connection warm once, and report the answer. */
     fun ping(): JsonObject {
-        wire().send(buildJsonObject { put("cmd", Protocol.CMD_PING) }, trace)
-        return wire().receive(trace) ?: FrameWrite.empty
+        speak(buildJsonObject { put("cmd", Protocol.CMD_PING) })
+        return answer()
     }
 
     /** Ask the host for its settings, and bring back what it answers. */
     fun fetchConfig(): Triple<Boolean, String, JsonObject?> {
-        wire().send(buildJsonObject {
+        speak(buildJsonObject {
             put("cmd", Protocol.CMD_GET_CONFIG)
             put("sync_code", syncCode)
             put("client_ip", clientIp)
-        }, trace)
-        val answer = wire().receive(trace) ?: FrameWrite.empty
+        })
+        val answer = answer()
         if (FrameRead.status(answer) != Protocol.STATUS_CONFIG) {
             val reason = FrameRead.reason(answer).ifEmpty { "the host refused without a reason" }
             return Triple(false, "Settings refused by the host: $reason. Nothing here was changed.", null)
@@ -139,11 +223,11 @@ class WireClient(
      * ends up with a half file with a track's name on it is a phone whose library lies to it.
      */
     fun pull(filename: String, target: File, onProgress: ((Long, Long) -> Unit)? = null): PullResult {
-        wire().send(buildJsonObject {
+        speak(buildJsonObject {
             put("cmd", Protocol.CMD_PULL_FILE)
             put("filename", filename)
-        }, trace)
-        val answer = wire().receive(trace) ?: FrameWrite.empty
+        })
+        val answer = answer()
         if (FrameRead.status(answer) != Protocol.STATUS_SENDING) {
             return PullResult(false,
                 FrameRead.reason(answer).ifEmpty { "the host would not send $filename" }, filename)

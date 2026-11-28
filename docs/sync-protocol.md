@@ -416,6 +416,17 @@ The wire is the small part. What a phone brings to it:
     the desktop's fader.
   - **Codes.** A restore/push code is typed on a phone keypad, four characters from a 30-letter alphabet.
     Uppercase keyboard, no autocorrect, and a keypad that shows the alphabet it expects.
+  - **The connection has a life of its own, and a phone is the client most often caught by it.** A host reads
+    the next command with a 30-second timeout and lets the connection go when nothing arrives (§5). A PC
+    downloads in seconds and is not idle; a phone lists a library on a small screen and leaves it there while a
+    person reads 458 rows, which is half a minute of nothing going to a host that stops waiting. The phone
+    cannot see the connection go, so it has to keep it warm: a `PING` every 10 seconds from the moment a list
+    is on screen, and the pings put away before a `PULL_FILE` - a `PING` inside a transfer is bytes the host
+    reads as its next frame (§5). It also has to read the socket's own news: a frame that is nothing at all,
+    and a write the socket refuses, both mean a host that has closed, and the words for them are "the host
+    closed this connection - pair with it again", not a refusal the host never made. A read that merely
+    timed out is the one case that is not a lost host - a slow drive hashing a library is a host that is
+    there and slow, and the desktop client reads a timeout as no answer and keeps the connection.
 
 ## 13. Machine-readable anchors
 
@@ -483,6 +494,75 @@ does not:
     what it pulled. The command this protocol reserves for live resolution (section 12) has no frames recorded
     for it, no host answers it, and a client that asked for it would get `UNKNOWN_COMMAND`. Section 11's rules
     are what it has to go through first.
+  - **A phone that plays has to ask the phone for the sound.** `PhonePlayer` builds Media3 with
+    `USAGE_MEDIA` and `CONTENT_TYPE_MUSIC` and `handleAudioFocus = true`; `PhoneVolume` reads and moves
+    `STREAM_MUSIC`, which is the phone's own media volume, and follows the phone's volume-changed broadcast so
+    the app's slider and the hardware keys are the same dial. A player built with no audio attributes plays on
+    the media stream having never asked for it: the phone ducks it to a quarter of its volume under any system
+    sound and takes the stream away at the first one, and it does not come back by itself - which is what the
+    first run on a real emulator did, at 15/15 volume, with music barely audible that died when the
+    notification shade came down. This is the phone's audio policy, not Media3, and nothing in this protocol
+    predicts it.
+  - **The window's shape is a fact, not a preference.** A `FrameLayout` with `fitsSystemWindows` is the root,
+    and the two lists are weighted children of a `LinearLayout` that is **not** inside a `ScrollView`. A
+    `ListView` inside a `ScrollView` is measured with no height limit at all, so it lays out two rows and
+    hands the scrolling to the scroll view; a window laid out under the navigation bar has buttons whose taps
+    land on the system bar and never reach the app. Both halves of this were learned from a screenshot.
+  - **The keyboard is put away by the app** when the code has been named - on Scan, on pairing, on Play -
+    because it covers half the window, which is the half holding the file list.
+  - **A pull lives in the app, not in a service.** One file at a time, no resume, and a pull running when the
+    app is backgrounded dies with it. `onStop` pauses playback for the same reason: nothing in this app is
+    allowed to make sound from the background. A foreground service is what fixes both, and it is not written.
+
+### On the emulator, 28 Nov 2026
+
+The flow - scan, pair, take, play - was run end to end on a real emulator against a real host, and the sound
+came out of the phone. What the phone taught on the way:
+
+  - **The phone mutes this stream under its own sound, and a player cannot hear it happen.** `STREAM_MUSIC`
+    was found at `streamVolume:0` with `Muted: true` after the phone's own volume UI and system sounds had run,
+    with the app's slider sitting at the far left and Media3 reporting a healthy player. A file played into a
+    muted phone is a file played into nobody, and it reads as a broken app. So `Play` asks:
+    `PhoneVolume.raiseFromMute()` lifts the stream to a quarter of the dial (`quietComfortLevel`, 3 of 15 on
+    this phone) and the player line says so - `Playing. (the phone's volume was at 0, so it is at 3)`. A
+    quarter, not 1: a 1 of 15 is quiet enough to be reported as a bug too, which is where this started.
+  - **A Pause does not change the playback state.** Media3 sits in `STATE_READY` before and after a Pause and
+    only moves `playWhenReady`, so `onPlaybackStateChanged` never fires and a Pause that was reported through
+    it looks exactly like a player that is still playing. `onPlayWhenReadyChanged(playWhenReady, reason)` is
+    the callback that can say `Paused.`, and it is also the one that names the cause: reason 1 is the user's
+    own press, and `AUDIO_FOCUS_LOSS`, `AUDIO_BECOMING_NOISY` and `REMOTE` are the phone taking the sound.
+    Media3 1.5.1 names those four; the older Android library's `USER_PRESENT` and `MUTED`, and a later
+    Media3's `SUPPRESSION_CHANGED`, are not in this version and an app that writes them does not compile.
+  - **`input keyevent 24` moved the volume *up* on this AVD.** Injected hardware volume keys are not a
+    trustworthy way to set the phone's volume with `hw.keyboard=yes`; sixteen volume-down injections left the
+    stream at 14 of 15. The app's own slider is the dial that can be measured - tapping it at 20% moved
+    `streamVolume` 4 to 2, and its left end put the stream at 0 with `Muted: true`.
+  - **`uiautomator dump` fails while a video view is animating**, with "could not get idle state", because the
+    progress bar never stops moving. Screenshots and `dumpsys` are the readings that work while sound is
+    playing, and a dump works again the moment the player is paused or stopped.
+  - **The row of buttons moves when the video view appears** - the same row is at guest y 2054-2180 with
+    nothing playing and at about y 1852-1947 while playing, because the video view takes the bottom of the
+    window. A tap written for one layout lands on the video view in the other, and does nothing at all, which
+    is what a fixed-coordinate script of mine did for two runs before it was noticed.
+  - **The emulator window does not obey its own scale settings on this build.** `window.scale` in
+    `emulator-user.ini` and `-scale` are ignored; `-fixed-scale` gives 1:1, which is bigger than the desktop.
+    The window that fits was made from outside the emulator by Win32 `SetWindowPos` on the window the emulator
+    owns (`build_dir_cython/emulator_window_fit.ps1`), which is also what makes the side toolbar's lower
+    buttons reachable: those buttons are window chrome, and they fall off the work area when the window is
+    taller than it.
+  - **The side toolbar needs `hw.keyboard=yes` in the AVD.** With `hw.keyboard=no` its buttons do nothing; the
+    keyboard line in `config.ini` is what they are wired through.
+  - **A phone that stopped to read a screen is a phone whose host has hung up.** A take answered "the host
+    would not send …" and the second press said `Taking …` forever. The host's loop is
+    `recv_json_msg(sock, timeout=30.0)` and a `break` (`host.py`): 30 seconds after the list landed, with
+    nobody pressing anything, the host closed the connection. The phone's first ask then read a clean close -
+    `Frames.read` returns null for it - and the app said the host refused a file the host never saw. The
+    second ask wrote into a socket nobody was reading, the write threw inside a worker with nobody listening,
+    and the exception went into a `Future` that nobody collected, which is a window that says `Taking …` for
+    the rest of the session. Both halves are fixed: the phone keeps the connection warm with the `PING`s the
+    protocol already prescribes (§12), and a take reports what stopped it instead of saying nothing. The check
+    that keeps this honest is a scripted host that hangs up on a paired phone and a take pressed twice after
+    it - both presses have to say "pair with it again", and neither is allowed to sit on `Taking …`.
 
 
 

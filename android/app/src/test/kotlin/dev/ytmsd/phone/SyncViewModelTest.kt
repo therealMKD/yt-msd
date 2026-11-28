@@ -94,4 +94,83 @@ class SyncViewModelTest {
             root.deleteRecursively()
         }
     }
+
+    @Test
+    fun `a phone left showing a list keeps its connection warm`() {
+        val session = PhoneSession.load()
+        val root = Files.createTempDirectory("ytmsd-phone-warm").toFile()
+        val library = FixtureLibrary.writeInto(File(root, "host library"))
+        val host = ScriptedHost(session, library).also { it.start() }
+        val model = SyncViewModel()
+        try {
+            model.init(Robolectric.buildActivity(MainActivity::class.java).setup().get())
+            model.scan(targets = listOf("127.0.0.1"), ports = listOf(host.port))
+            assertTrue("the scan found nothing: " + model.status.value, await { model.hosts.value.isNotEmpty() })
+            model.pairAndLoad(model.hosts.value.first(), session.chain, session.clientIp)
+            assertTrue("pairing left no list: " + model.status.value, await { model.tracks.value.isNotEmpty() })
+
+            // The host reads its next command with a 30-second timeout and hangs up on a client that stopped to
+            // read a screen - which is what a phone does every time it lists a library for a person to pick at.
+            // The protocol's answer is a PING every 10 seconds, so the phone is left parked here exactly as it
+            // is parked in front of a person, and both ends have to be able to say the pings went.
+            assertTrue(
+                "the phone sent no PING while it sat showing a list: " + model.warmPings(),
+                await(millis = 25000) { model.warmPings() > 0 },
+            )
+            assertTrue(
+                "the phone sent pings the host did not answer: " + host.pingsAnswered.get(),
+                host.pingsAnswered.get() > 0,
+            )
+            assertTrue(
+                "the host saw frames the recording does not have: " + host.mismatches,
+                host.mismatches.isEmpty(),
+            )
+        } finally {
+            model.clear()
+            host.stop()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `a take from a host that has hung up is said, and said again on the second press`() {
+        val session = PhoneSession.load()
+        val root = Files.createTempDirectory("ytmsd-phone-hangup").toFile()
+        val library = FixtureLibrary.writeInto(File(root, "host library"))
+        val host = ScriptedHost(session, library).also { it.start() }
+        val model = SyncViewModel()
+        try {
+            model.init(Robolectric.buildActivity(MainActivity::class.java).setup().get())
+            model.scan(targets = listOf("127.0.0.1"), ports = listOf(host.port))
+            assertTrue("the scan found nothing: " + model.status.value, await { model.hosts.value.isNotEmpty() })
+            model.pairAndLoad(model.hosts.value.first(), session.chain, session.clientIp)
+            assertTrue("pairing left no list: " + model.status.value, await { model.tracks.value.isNotEmpty() })
+
+            // Half a minute of reading the list, and the host is gone. The phone cannot see this happen.
+            host.hangUp()
+            val track = model.tracks.value.first()
+            val taking = "Taking ${track.name} ..."
+
+            model.pull(track)
+            assertTrue("the first take sat on the window: " + model.status.value,
+                await(millis = 25000) { model.status.value != taking })
+            assertTrue("the first take did not name the lost connection: " + model.status.value,
+                model.status.value.contains("pair with it again", ignoreCase = true))
+            assertTrue("the first take left a file behind: " + model.downloaded.value,
+                model.downloaded.value.isEmpty())
+
+            // The press a person makes when the first one "did not work". This is where a phone used to say
+            // "Taking ..." and mean it forever, because the ask threw and nothing was listening for it.
+            model.pull(track)
+            assertTrue("the second take sat on the window saying Taking forever: " + model.status.value,
+                await(millis = 25000) { model.status.value != taking })
+            assertTrue("the second take did not name the lost connection: " + model.status.value,
+                model.status.value.contains("pair with it again", ignoreCase = true))
+        } finally {
+            model.clear()
+            host.stop()
+            root.deleteRecursively()
+        }
+    }
+
 }

@@ -40,11 +40,24 @@ class ScriptedHost(private val session: PhoneSession, private val library: File)
     /** The bytes a client sent between frames, hashed - what a push test reads. */
     val arrivals = CopyOnWriteArrayList<Pair<String, Long>>()
 
+    /** The `PING`s this host answered. A phone that keeps a host warm is a phone that sends these. */
+    val pingsAnswered = java.util.concurrent.atomic.AtomicInteger()
+
     var servedConnections = 0
         private set
 
     @Volatile private var running = true
     private var thread: Thread? = null
+    private var served: FrameChannel? = null
+
+    /**
+     * Hang up on the client this host is serving, the way the real host hangs up when its 30-second command
+     * read finds nothing there. A test uses this to stand in for the gap between a list landing on a phone's
+     * screen and a person pressing Take half a minute later.
+     */
+    fun hangUp() {
+        served?.close()
+    }
 
     fun start() {
         thread = Thread {
@@ -67,6 +80,7 @@ class ScriptedHost(private val session: PhoneSession, private val library: File)
 
     private fun serve(socket: Socket) {
         val channel = FrameChannel(socket)
+        served = channel
         val records = session.frames
         var position = 0
         while (position < records.size) {
@@ -82,6 +96,13 @@ class ScriptedHost(private val session: PhoneSession, private val library: File)
                         // So it is answered and the record is left where it is: the frame the client has to
                         // speak next is still the frame this record names.
                         channel.send(helloAnswer())
+                    } else if (FrameRead.text(spoken, "cmd") == Protocol.CMD_PING) {
+                        // A `PING` is not a step of the session either. It is what a client sends to keep a
+                        // host's 30-second command read from timing out while a person reads a screen, and a
+                        // real host answers `PONG` and carries on with whatever it was doing - so this answers
+                        // `PONG`, counts it, and leaves the record where it stands.
+                        pingsAnswered.incrementAndGet()
+                        channel.send(buildJsonObject { put("status", Protocol.STATUS_PONG) })
                     } else {
                         if (!JsonCompat.equal(wanted, spoken)) {
                             mismatches.add(

@@ -298,5 +298,56 @@ found are kept.
   - After both, `-Task all` is green end to end: 39 wire, 1454 gate, 16 protocol (2 skipped with no live host
     named), 1 window check, and an APK.
 
+### The emulator boots in gesture navigation, and that is why the buttons are missing
+
+`ytmsd_mvp` is a `pixel_6`, and a pixel_6 boots in **gesture navigation** (`navigation_mode` 2, the
+`com.android.internal.systemui.navbar.gestural` runtime overlay enabled): there is no Home / Back / Overview
+bar on the screen at all, and Back is a swipe from the left edge - which is not a thing a mouse does naturally,
+and is why the first thing said about the emulator was "the buttons don't work". They work; there are no
+buttons. Three ways to have them back, in the order of usefulness:
+
+  - **Three-button navigation**, from adb, and it survives a reboot:
+    `adb shell cmd overlay enable com.android.internal.systemui.navbar.threebutton`,
+    `adb shell cmd overlay disable com.android.internal.systemui.navbar.gestural`, which lands
+    `navigation_mode` at 0 and puts the bar on the screen.
+  - **The emulator's own toolbar** (the vertical strip at the right of the device window) has Back, Home,
+    Overview, rotate, volume and power - those send the key events, and the PC keyboard's `Esc` is Back when
+    the window has focus, with the rest of the shortcuts listed under **Extended controls → Settings →
+    Enable keyboard shortcuts**.
+  - **Key events from the command line**, which is what a check would use: `adb shell input keyevent 4` is
+    Back, `3` is Home, `187` is Overview. Proved on this machine by watching `dumpsys activity activities`:
+    with the app in front, `3` puts `com.google.android.apps.nexuslauncher/.NexusLauncherActivity` in focus and
+    `4` puts it back from the app - Home and Back, answered.
+
+This is a device fact, not a project fact, and it is written down for the same reason as the `sdkmanager`
+semicolon: the next person to boot `ytmsd_mvp` will ask the same question.
+
+## 28 November 2026 - the phone plays, out loud, and says what it is doing
+
+Scan, pair, take, play ran end to end on the emulator against the real host on port 63350 with code 6767. The
+file that landed in `/data/data/dev.ytmsd.phone/files/yt-msd/` is byte-identical to `C:/Users/mason/Music/`
+(`db492fd4…549ec1`, 7,878,986 bytes both sides), and the sound came out of the phone.
+
+What the window now says, read off screenshots:
+
+  - `Playing.` / `Paused. You pressed Pause.` / `The player is stopped.` / `The file has finished.`, each from
+    the player's own callbacks. The Pause half needed `onPlayWhenReadyChanged`, because Media3 is
+    `STATE_READY` on both sides of a Pause and `onPlaybackStateChanged` has nothing to say about it.
+  - `Volume 3/15` beside a slider that is the phone's `STREAM_MUSIC` dial - the same dial the hardware keys, a
+    headset and the system's own slider move. Tapping the app's slider at 20% moved the phone's
+    `streamVolume` from 4 to 2; tapping its left end put the phone at 0 with `Muted: true`.
+  - When Play finds the phone muted, it raises it to a quarter of the dial and says why on the same line:
+    `Playing. (the phone's volume was at 0, so it is at 3)`. The note rides the state line, because the
+    player's own `Playing.` arrives a moment later and would otherwise erase the only words that explain a
+    quiet phone.
+  - A notification shade pulled down over playing music does not end the music: `state:started` with
+    `USAGE_MEDIA` / `CONTENT_TYPE_MUSIC` before, during and after, and no player-stop message.
+
+The audio server was the referee for all of it - `dumpsys audio` for the stream and the player list,
+`dumpsys media_session` for the session - because `uiautomator dump` refuses to work while the video view's
+progress bar animates, and the row of buttons sits in a different place in the window when the video view is
+there to move it.
+
+
 
 

@@ -8,6 +8,7 @@
 package dev.ytmsd.phone
 
 import android.content.Context
+import android.util.Log
 import dev.ytmsd.protocol.FrameRead
 import dev.ytmsd.protocol.HostAnswer
 import dev.ytmsd.protocol.Lan
@@ -74,6 +75,8 @@ class SyncViewModel : ViewModel() {
             } else {
                 "${found.size} host(s) answered."
             }
+            Log.i("ytmsd", "scan: ${found.size} answer(s) across ${targets.size} addresses on " +
+                ports.joinToString() + " - " + found.joinToString { it.hostIp + ":" + it.port })
         }
     }
 
@@ -131,24 +134,58 @@ class SyncViewModel : ViewModel() {
                     )
                 }
                 _status.value = "${_tracks.value.size} file(s) from ${phone.chainName} at ${card.ip}:${card.port}."
+                Log.i("ytmsd", "paired with ${card.ip}:${card.port} chain ${phone.chainName}: " +
+                    "${_tracks.value.size} file(s)")
+                // The list is on the screen and a person is reading it, and the host is reading its next command
+                // with a 30-second timeout. This is the gap the protocol says a client keeps warm with a PING;
+                // a phone that leaves it cold finds its connection closed and every ask after it answered by
+                // nothing at all.
+                phone.startWarm()
             } catch (problem: Exception) {
                 _status.value = "The host at ${card.ip}:${card.port} could not be reached: ${problem.message}"
+                Log.w("ytmsd", "pairing with ${card.ip}:${card.port} failed: ${problem.message}")
             }
         }
     }
 
     /** Take one file into the app's own folder - and only when every byte hashes to what the host promised. */
     fun pull(track: Track) {
-        val phone = client ?: return
+        val phone = client
+        if (phone == null) {
+            // Saying nothing here is what made the first run on a phone look like a take that never happened.
+            _status.value = "Pair with a host first - there is no connection to take a file from."
+            return
+        }
         _status.value = "Taking ${track.name} ..."
         work.submit {
-            val result = phone.pull(track.name, File(storage, track.name))
-            _status.value = result.note
-            if (result.ok) {
-                _downloaded.value = _downloaded.value + File(storage, track.name)
+            // The pings come away before the ask and go back after it: a PING in the middle of a file transfer
+            // is bytes the host reads as its next frame.
+            phone.stopWarm()
+            try {
+                val result = phone.pull(track.name, File(storage, track.name))
+                _status.value = result.note + lostHostWords(phone)
+                Log.i("ytmsd", "pull ${track.name}: ok=" + result.ok + " " + result.note)
+                if (result.ok) {
+                    _downloaded.value = _downloaded.value + File(storage, track.name)
+                }
+            } catch (problem: Exception) {
+                // A take that threw and said nothing is a window that says "Taking ..." forever, which is what
+                // a phone does the second time it asks a host that has already hung up on it.
+                _status.value = "The take of ${track.name} stopped: ${problem.message} " +
+                    lostHostWords(phone).ifEmpty { "Try it again, and pair with the host if it stops again." }
+                Log.w("ytmsd", "pull ${track.name} stopped: ${problem.message}")
+            } finally {
+                if (phone.isConnected) phone.startWarm()
             }
         }
     }
+
+    /** The words to add when the host has this connection no longer, which is what a phone cannot see itself. */
+    private fun lostHostWords(phone: WireClient): String =
+        if (phone.isConnected) "" else " The host closed this connection - pair with it again."
+
+    /** The pings sent to keep this connection warm, which is what a check reads. */
+    fun warmPings(): Long = client?.warmPings ?: 0L
 
     /** Where a pulled file lives, which is what the player is given. */
     fun downloadedFile(name: String): File = File(storage, name)
