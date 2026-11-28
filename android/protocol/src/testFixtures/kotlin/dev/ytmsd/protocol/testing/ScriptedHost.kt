@@ -15,6 +15,7 @@ import dev.ytmsd.protocol.Protocol
 import dev.ytmsd.protocol.Transfer
 import java.io.File
 import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.security.MessageDigest
@@ -25,9 +26,19 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 
-class ScriptedHost(private val session: PhoneSession, private val library: File) {
+class ScriptedHost(
+    private val session: PhoneSession,
+    private val library: File,
+    private val bindPort: Int = 0,
+) {
 
-    private val server = ServerSocket(0, 20, InetAddress.getByName("127.0.0.1"))
+    private val server = ServerSocket().apply {
+        // A check that starts the app again pairs with the address the app remembered, which means the check
+        // has to be able to put a second host on the same port the first one had. Asking for the address to
+        // be reusable before the bind is what lets that happen the moment the first host closes.
+        reuseAddress = true
+        bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), bindPort), 20)
+    }
 
     val port: Int get() = server.localPort
 

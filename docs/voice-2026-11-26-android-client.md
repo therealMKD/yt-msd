@@ -348,6 +348,263 @@ The audio server was the referee for all of it - `dumpsys audio` for the stream 
 progress bar animates, and the row of buttons sits in a different place in the window when the video view is
 there to move it.
 
+## 28 November 2026 - a phone that stopped to read a screen had been losing its host
+
+Take answered "the host would not send (G)i-dle - HWAA.mp3", and the next press said `Taking …` and meant it for
+the rest of the session. It is the host that ends a session nobody is using: `host.py` reads the next command
+with `recv_json_msg(sock, timeout=30.0)` and `break`s out when nothing arrives, so the connection closes. A PC
+never sits that long; a phone lists 458 tracks, a person reads them, and 30 seconds is gone before anybody picks
+a row. The phone cannot see the connection close. So the first press asked a host that had already gone, got
+nothing back, and reported it as a refusal; the second press wrote into a socket nobody is reading, the write
+threw, and nothing in the take was listening for a thrown write - a take runs on a worker whose exceptions go
+into a `Future` nobody collects, which is a window that says `Taking …` and never stops.
+
+Two things are true now:
+
+  - **The phone keeps its connection warm.** A `PING` every 10 seconds from the moment a list lands on screen -
+    the keepalive the protocol already prescribes, which the desktop client has always run - and the pings put
+    away before a file is asked for, because a `PING` in the middle of a transfer is bytes the host reads as its
+    next frame. Measured on the emulator: paired at 12:43:48, nothing pressed for a minute, `ss` still showing
+    `ESTAB [::ffff:10.0.2.16]:33850 [::ffff:10.0.2.2]:63350`, Take at 12:44:46 and
+    `pull (G)i-dle - HWAA.mp3: ok=true` at 12:44:49.
+  - **A take that stops says so.** A frame that is nothing at all, a write the socket refuses, a read that finds
+    the connection aborted, all mean a host that is gone and end with "the host closed this connection - pair
+    with it again", and a take is never allowed to sit on `Taking …` with nobody reporting on it. A read that
+    merely timed out is *not* a lost host - a slow drive hashing a whole library is a host that is there and
+    slow - so that one case keeps the connection, as the desktop client's own `_recv` has always done.
+
+Two checks keep it honest, both against the scripted host that answers out of the recorded session: one leaves a
+paired phone parked for two intervals and reads the `PING`s the host answered; one hangs up on a paired phone
+and presses Take twice, and both presses have to name the lost connection and neither may sit on `Taking …`.
+
+And two things about automating this window, both learned the slow way:
+
+  - **A press is swallowed while the keyboard is animating in.** Type the code, send `keyevent 111`, and give
+    the window two seconds before the next press means anything; a press that lands during the insets animation
+    looks exactly like a button that does nothing (the log line for it is
+    `force finish cuj, time out: J<IME_INSETS_SHOW_ANIMATION>`).
+  - **The volume slider sits about 56 pixels under the button row once the video view has appeared**, and its
+    touch area is generous: presses aimed at the row at y 1900 moved the phone's volume from 13 to 11 and then
+    to 3 while the buttons were the target. Take the coordinates of the node being pressed from the window, and
+    read the phone's volume from `dumpsys audio` rather than assuming it did not move.
+
+## 28 November 2026 - the phone remembers the hosts it has synced with, gets the desktop's player bar, and is 30 percent louder
+
+Four asks, all of them about the sync side and none about searching YouTube: a host that is forgotten when the
+app closes is not a host; a phone with no player bar is a phone you can only ever play one file on; every track
+should be louder than the file on the phone before the phone's dial has anything to say about it; and the phone
+should be able to name a host by hand.
+
+### A host this phone has synced with is a host it knows
+
+`SavedHosts` writes six facts into the app's own preferences on a pair the host accepted: the address, the
+port, the `sync_code` that pair used, the chain name the host called itself, the protocol version it answered
+with, and when it was last seen. Nothing is guessed and nothing is derived - every one of those is something
+the host said. The next start of the app lists them **before any scanning**, marked `saved`, with the chain and
+the code on the row, and pressing one pairs with the stored code. The desktop's rule is the one being matched:
+a chain you have synced with is a chain you have, and it is not something a machine re-learns every time it
+boots.
+
+Three things about it are decisions, not consequences:
+
+  - **A record is written by a successful pair only.** A pair that was refused, and an address typed in by
+    hand, are not hosts the phone has synced with, and remembering them would make the list a list of guesses.
+  - **`Clear` does not forget a host.** It ends this session and puts the saved hosts back on the screen. A
+    button called Clear that emptied the phone's memory of every PC it has ever paired with is a button that
+    destroys the thing this exists to do. `Forget host` is the one that removes a record, and it takes the
+    connection with it.
+  - **The app does not pair by itself at start-up.** The host is *on the screen*, and one press pairs with it.
+    A phone that opens and immediately starts dialling every address it has ever seen is a phone making
+    connections a person did not ask for, on a network it may not be on any more.
+
+### The player bar is the desktop's controls, in the order a phone wants them
+
+`Shuffle` outside left, `Prev` / `Play-Pause` / `Restart` / `Next` across the middle, and one button cycling
+`Stop after current` through `Off`, `Once`, `Always` outside right - one click per state, `Off -> Once -> Always
+-> Off`. The play button says what pressing it would do, the desktop's rule for the same button: `Play` starts a
+stopped track, `Pause` holds a playing one, `Replay` takes a finished one from the top. The stop-after button is
+the desktop's own square with the desktop's own labels, in the desktop's own colours - grey, `#FF8C00` for
+"this track is the last one", `#E31E24` for "every track stops when it ends" - and the sentences it says are the
+ones `set_stop_after_current` and `_finish_stop_after_current` say:
+
+  - `Stop after current: off - playback will advance to the next track.`
+  - `Stop after current: once - this track is the last one.`
+  - `Stop after current: always - every track stops when it ends.`
+  - `Stopped after the current track.` / `Stopped after the current track - Stop after current is still on.`
+
+The rules themselves are in `PlayQueue`, plain Kotlin with no player and no Android in it, so they are checked
+as rules: shuffle takes a random one of the tracks not played yet and, when it has played everything, starts a
+fresh order that does not repeat the track just heard; `Prev` walks back out of the order the shuffle made, and
+off shuffle walks the host's list; a "once" is spent by the track it stopped, and an "always" is not spent by
+anything. The bar's presses are thin readers of that.
+Two things the desktop does not have to think about: the **captions are words**, because the desktop's glyphs
+are Segoe MDL2 Assets codepoints (`U+E768`, `U+E769`, `U+E72C`, `U+E892`, `U+E893`, `U+E8B1`) that exist in that
+Windows font and in no Android font - on a phone they draw empty boxes - so the bar uses the words the desktop's
+own tray menu uses, and every button carries the desktop's tooltip as its `tooltipText`; and **advancing to a
+track that is not on the phone is said, not swallowed** - `X is not on the phone yet - Take it first.` is the end
+of what a phone can play by itself, and a session that stops there in silence is a session that looks broken.
+The list's row moves with the bar: Prev/Next/auto-advance check the row they land on, because the bar's Next is
+the same fact as the list's Play - which track the phone is standing on.
+
+### Every track is 30 percent louder than the file, before the dial applies
+
+`GainAudioProcessor` scales decoded samples - 16-bit, 24-bit packed, 32-bit and float - by `1.30`, clamping at
+full scale, and it runs inside the player's audio sink: between the decoder and the phone's audio track. The
+phone's dial, its ducking under a notification, its headset switch, and its volume curve all apply to a signal
+that is already 30 percent louder, which is what "before the volume applies at all" means in a media player, and
+the only place a player is allowed to make a track louder than the phone's dial. `BoostedRenderersFactory` is
+where it is installed - `DefaultRenderersFactory` builds the sink, and the sink is where a processor chain lives.
+
+It is a processor of this app's own because Media3 1.5.1 has no volume scaling: `SonicAudioProcessor` in the
+version this app compiles against has `setSpeed` and `setPitch` and nothing else - `setVolumeScalingEnabled` and
+`setVolume` arrive in Media3 1.6 - and the version catalog pins 1.5.1 for the reasons written in the version
+catalog. `javap` on the artifact in the Gradle cache is what said so, which is the way to find out what a media
+library you are compiling against has, rather than what a later one has.
+
+What it costs, said plainly: replacing the factory's audio sink takes the audio-offload path with it, which is
+the same trade every app that scales its own audio makes; and a track recorded hot clips at the top of the
+range, because that is what a gain does - a clamped sample is distortion at the peaks, and a wrapped one is a
+buzz. The desktop has run its volume dial to 150 percent for years for the same reason the phone needed 13 of 15
+to hear a track normally: the loudness is wanted above the dial, not below it.
+
+### A host can be typed in
+
+The code box has a neighbour now: an address, a port (default 63350), and `Add`. A scan asks the networks the
+phone is standing on within its budget, and the networks where that fails are not exotic - a VPN, a guest wifi,
+a hotspot, a subnet wider than the scan. Press the row that lands on the list, type the code, pair. The host is
+remembered like any other, so the typing is a one-time thing.
+### What is checked, on this machine
+
+`:app:testDebugUnitTest` - five test classes, on this desktop's JVM, with the real Android framework classes:
+
+  - **`SavedHostsTest`** (6): a record written in one start is read back in the next, with the code, the chain,
+    the port and the version intact; the same address is updated and not doubled, newest first; the store is
+    capped at ten hosts, newest kept; a forgotten host stays forgotten through a restart; a store somebody has
+    written junk into is an empty list and not a crash, and is usable again afterwards; and the row a saved host
+    prints names the address, the chain, the code and the fact that it is saved.
+  - **`SyncViewModelTest`** (5): the three checks the idle-close fix brought, plus two new ones. The pair, the
+    close, and a **new view model on the same phone**: the saved host on the list with no scan run, marked
+    `saved`, paired from the record against a host standing on the address the record named, a file taken from
+    it, every frame compared with the recording the Python host made - and then the host forgotten, with the
+    next start showing nothing. The hand-typed host: on the list, paired by typing the code, an empty address
+    and a 70000 port said as what they are, and a dead address that says it is dead.
+  - **`PlayQueueTest`** (13): shuffle plays five distinct tracks in five plays, and plays no track straight
+    after playing it across 41 plays; `Prev` retraces the shuffle order and stops at the front; off-shuffle
+    `Next` walks the host's order and stops at the end; the cycle walks `Off -> Once -> Always -> Off` one click
+    at a time; a "once" is spent by the track it stopped and an "always" is not; and the words the phone says
+    are the words the desktop says, tooltip for tooltip.
+  - **`PhonePlayerTest`** (4): the three the first play session brought, plus the boost - `1.30` on the player,
+    the factory that carries it actually the one the player was built with, and the sample arithmetic itself:
+    16-bit samples scaled and clipped at full scale, 32-bit scaled, an encoding this code does not read handed
+    through untouched, and a format that comes out exactly as it went in.
+
+Three things about Media3's audio-processor API look like bugs in this app and are not, all three found the
+slow way. **`AudioProcessor.configure()` parks the format in the *pending* pair; `flush()` is what makes it the
+format the processor reads while it works** - a player calls flush before it feeds a processor any bytes, and a
+check that skips the flush hands the processor `NOT_SET`, and it passes audio through untouched, which is the
+right behaviour for a processor that has not been told what it is being fed. **`getOutput()` is a hand-over,
+not a peek** - Media3's implementation returns the filled buffer and puts an empty one back in its slot, so a
+check takes the output once and reads it from there. And
+`DefaultRenderersFactory.buildAudioRenderers` is Java with a `java.util.ArrayList` parameter, which this Kotlin
+accepts an override of only with the Java list type named in it - writing `List` compiles as "overrides
+nothing", which is the good outcome, because a factory that is silently never called is a player that is
+quietly not boosted at all.
+
+### What is not true yet
+
+Nothing in this section has been run on an emulator or a real phone yet. The bar, the remembered hosts and the
+boost are checked on this machine, and the emulator has to say what 1.30 does to a real track on a real dial -
+starting at the level this all started at, 13 of 15, and going down from there, reading the phone's own stream
+with `dumpsys audio` rather than trusting the app's slider.
+
+Clipping is a real risk on a track that is already recorded hot. If it bites, the number to argue with is
+`BoostedAudio.GAIN`, and it is in one place on purpose.
+
+`Stop after current` lives in the session. The desktop also persists it across starts; the phone persists the
+hosts, not the square. That is an open question, not an oversight.
+
+The phone still has no foreground service, so a pull and playback still stop with the app: a session that is
+advancing through tracks stops advancing when the window is backgrounded, and `onStop` pauses the player. A
+pull that is interrupted by the app being killed is a pull that starts again. That is the next thing, and the
+play bar makes it worth doing - a bar that advances through a list is a bar that wants to keep working when the
+phone is in a pocket.
 
 
+
+
+
+
+
+
+## Run on the emulator - 28 Nov 2026, and what it did and did not say
+
+This section replaces the note above it that said nothing had been run on an emulator.
+
+What ran, on `ytmsd_mvp` (API 36, 48 kHz, the app's own AVD), against the desktop that is running on this
+machine at `10.0.2.2:63350`:
+
+- The app was installed from `:app:assembleDebug`, restarted after the emulator was rebooted, and the saved
+  host appeared in the list on its own: `10.0.2.2:63350  Other Playlist  code 6767  protocol not named
+  saved`. One tap on that row paired it - no scan, no code typed - and the 458-file list came back.
+- A row that was already on the phone (`(G)i-dle - HWAA.mp3  7694 KiB  on the phone`) was selected, `PLAY`
+  was tapped, and the status line read `Playing.` and stayed there.
+- `dumpsys media.audio_flinger` says the mixer thread `AudioOut_D` is out of standby at 48000 Hz,
+  `AUDIO_FORMAT_PCM_16_BIT`, 2 channels, while the app plays - which is the phone's own voice saying audio is
+  going through it, with the boosted processor in the player's sink.
+- The play bar rendered as built: `Shuffle | Prev | Play | Restart | Next | ■ Off`, with `TAKE`/`PLAY`, the
+  host fields (`Host IP` and port `63350` with `Add`), `CLEAR` and `FORGET HOST`, and the phone's own volume
+  read back as `Volume 10/15`.
+- The first emulator run - before the buffer-aliasing fix - died on the player's first buffer with
+  `IllegalArgumentException: The source buffer is this buffer`. That is fixed, and it is the reason
+  `PhonePlayerTest` now hands the processor the buffer it is holding and asserts the samples come out scaled
+  once, not twice.
+
+**What did not get measured: the loudness, in decibels.** The instrument is not on this machine:
+
+- This emulator build has no `-audio-out` option (it answers `unknown option: -audio-out`), so its output
+  cannot be recorded to a WAV by the emulator itself.
+- `dumpsys media_metrics` - Android's per-player loudness metrics (`shortTermLoudness`, `maximumLoudness`, in
+  dBFS/LKFS) - prints nothing on this image: the metrics service is present in `dumpsys -l` and empty.
+- The host has no loopback capture device to record what the emulator plays: `ffmpeg -list_devices true -f
+  dshow -i dummy` lists microphones only, and no `Stereo Mix`.
+
+So the honest statement is: the 30% is proven at the sample level, and proven to be in the path on a device,
+and it has not been measured in decibels on a device. The sample-level proof is `PhonePlayerTest` - 16-bit,
+24-bit, 32-bit and float samples scaled by exactly 1.30 and clamped at full scale, the identity-buffer case,
+and `isActive()` answering that a gain of 1.00 is not in the path at all. `20 * log10(1.30)` is 2.30 dB, which
+is what a measurement should find on the same track at the same dial position, less whatever clipping takes
+back.
+
+To measure it, the cheapest route is to enable `Stereo Mix` on this machine (Sound settings → Recording
+devices → "Show disabled devices"), then capture while the app plays:
+
+```
+ffmpeg -f dshow -i audio="Stereo Mix" -t 30 -ac 2 -ar 48000 -c:a pcm_s16le build_dir_cython\tmp\boost-130.wav
+```
+
+Capture the same track at the same volume twice - once with `BoostedAudio.GAIN = 1.30f` and once with `1.00f`
+- and read the two files back with `ffprobe`/`ffmpeg`'s `volumedetect` filter (`-af volumedetect`), comparing
+`max_level` and `mean_volume`. Same file, same dial, same emulator boot, one rebuild between them.
+
+## The harness in `android/harness` is written again, and it is not wired in
+
+`Main.kt` was lost from disk with the rest of that folder on 28 Nov 2026 - the folder is untracked in git, and
+nothing in the repo is tracked that calls it, so there was nothing to restore it from. `Main.kt` and
+`Emulator.kt` here are written again from the work the originals did, with the provenance said in each file's
+header. They are not complete: `Main.kt` has the commands, the Gradle runner, the report voice, the desktop
+gate and the emulator/AVD commands, and it is not compiled, so treat every command in it as unproven.
+
+Two facts about it that matter to anyone using it:
+
+- `android/settings.gradle.kts` includes `:protocol` and `:app` only. `:harness` is not in the build, so
+  `android/harness/build.gradle.kts` does nothing today, and a broken harness cannot break an app build.
+- The runners that do exist, and are what this session used, are in the gitignored scratch folder:
+  `build_dir_cython/android_desktop_suite.ps1` (toolchain, the 39 phone-wire checks, `:protocol:test`, the
+  app's Robolectric checks, `:app:assembleDebug`, the desktop gate) and
+  `build_dir_cython/android_build.ps1` (the app build, its unit checks, and the counts read out of Gradle's
+  own XML). Those scripts are ground truth; the harness is a convenience over the same work.
+
+Last full run of the app's gates on 28 Nov 2026: `:app:check` BUILD SUCCESSFUL - lint clean, 29 Robolectric
+checks (5 player, 13 play queue, 6 saved hosts, 5 sync view-model) with 0 failures - and
+`:app:assembleDebug` producing `app-debug.apk`, which is the APK measured on the emulator above.
 

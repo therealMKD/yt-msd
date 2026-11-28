@@ -13,6 +13,7 @@
 package dev.ytmsd.phone
 
 import android.content.Context
+import android.graphics.Color
 import android.media.AudioManager
 import android.os.Bundle
 import android.text.InputType
@@ -36,7 +37,9 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.RenderersFactory
 import androidx.media3.ui.PlayerView
+import dev.ytmsd.protocol.Protocol
 import java.io.File
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
@@ -59,11 +62,26 @@ class MainActivity : ComponentActivity() {
     private lateinit var volumeBar: SeekBar
     private lateinit var volumeLabel: TextView
     private lateinit var codeBox: EditText
+    private lateinit var hostIpBox: EditText
+    private lateinit var hostPortBox: EditText
     private lateinit var hostList: ListView
     private lateinit var trackList: ListView
     private lateinit var playerView: PlayerView
     private lateinit var hostAdapter: ArrayAdapter<String>
     private lateinit var trackAdapter: ArrayAdapter<String>
+    private lateinit var playButton: Button
+    private lateinit var prevButton: Button
+    private lateinit var nextButton: Button
+    private lateinit var restartButton: Button
+    private lateinit var shuffleButton: Button
+    private lateinit var stopAfterButton: Button
+
+    /** The host's list as a playing session - shuffle, prev/next and stop-after all read this. */
+    private var queue = PlayQueue(emptyList())
+
+    /** The track on the player, and the one that ran to its end and is being held for a replay. */
+    private var playingTrack: Track? = null
+    private var finishedTrack: Track? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -83,6 +101,21 @@ class MainActivity : ComponentActivity() {
                 if (playedWithQuietPhone) "$state  (the phone's volume was at 0, so it is at ${volume.quietComfortLevel})"
                 else state
         }
+        // The play bar's button says what pressing it would do right now - start a stopped track, pause a
+        // playing one, start a finished one again from the beginning - which is the desktop's rule for the
+        // same button, and the reason it is redrawn from the player's states rather than from our presses.
+        player.reportPlayback { state -> paintPlayButton(state) }
+
+        // A track that ran to its end is where "stop after current" and shuffle are decided, exactly as it
+        // is on the desktop: this is the only place a session advances itself, and the only place a "once"
+        // is spent.
+        player.reportFinished { trackFinished() }
+
+        // The bar's buttons say their states from the first frame, so a window never shows a control in a
+        // state it is not in.
+        paintStopAfter()
+        paintShuffle()
+
         // The phone's volume moves under the hardware keys, a headset, and a system slider. The bar follows.
         volumeWatch = volume.follow { level ->
             volumeBar.progress = level
@@ -156,13 +189,43 @@ class MainActivity : ComponentActivity() {
         })
         column.addView(codeRow)
 
+        // The host's address, named by hand. A scan asks the networks the phone is standing on, and the
+        // networks where that does not work are not rare - a VPN, a guest wifi, a hotspot, a subnet bigger
+        // than the scan's budget. The desktop has always let a person name an address, and a phone that
+        // cannot is a phone that cannot pair with the machine across the room.
+        val hostRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        hostIpBox = EditText(this).apply {
+            hint = "Host IP"
+            inputType = InputType.TYPE_CLASS_TEXT
+            setSingleLine()
+            textSize = 16f
+        }
+        hostPortBox = EditText(this).apply {
+            hint = "Port"
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setSingleLine()
+            textSize = 16f
+            setText(Protocol.SYNC_PORT_START.toString())
+        }
+        hostRow.addView(hostIpBox, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        hostRow.addView(hostPortBox, LinearLayout.LayoutParams(dp(72), LinearLayout.LayoutParams.WRAP_CONTENT))
+        hostRow.addView(fileButton("Add") {
+            model.addHost(hostIpBox.text.toString(), hostPortBox.text.toString().toIntOrNull() ?: 0)
+            putKeyboardAway()
+        })
+        column.addView(hostRow)
+
         hostList = ListView(this)
         hostAdapter = readableRows(android.R.layout.simple_list_item_1)
         hostList.adapter = hostAdapter
         // A host is paired by naming the code the person typed - the code is what the host's `AUTH` answer
-        // is checked against, and the chain it hosts is what its `HELLO` named.
+        // is checked against, and the chain it hosts is what its `HELLO` named. A saved host is pressed
+        // without typing anything: the code it was paired with is on the phone with it, which is the entire
+        // point of having written it down.
         hostList.setOnItemClickListener { _, _, position, _ ->
-            model.pairAndLoad(model.hosts.value[position], codeBox.text.toString())
+            val card = model.hosts.value.getOrNull(position) ?: return@setOnItemClickListener
+            val remembered = model.saved.value.firstOrNull { it.ip == card.ip && it.port == card.port }
+            if (remembered != null) model.pairSaved(remembered) else model.pairAndLoad(card, codeBox.text.toString())
             putKeyboardAway()
         }
         column.addView(hostList, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 2f))
@@ -182,36 +245,36 @@ class MainActivity : ComponentActivity() {
         })
         fileRow.addView(fileButton("Play") {
             val track = selectedTrack()
-            if (track == null) {
-                playerLine.text = "Pick a file in the list first."
-            } else {
-                val file = model.downloadedFile(track.name)
-                // The player is not asked for a file the phone does not have. It used to be, and what came
-                // back was a source error two seconds deep in Media3 and a window that said nothing.
-                if (!file.exists()) {
-                    playerLine.text = "${track.name} is not on the phone yet - Take it first."
-                } else {
-                    playerView.visibility = View.VISIBLE
-                    player.play(file)
-                    putKeyboardAway()
-                    // The phone can be muted - its own audio policy ducks and mutes this stream under its own
-                    // sound - and a file played into a muted phone is a file played into nobody. The note is
-                    // kept so the state line carries it, because the player's own "Playing." arrives after it
-                    // and would otherwise wipe the only words explaining why the sound is quiet.
-                    if (volume.raiseFromMute()) {
-                        playedWithQuietPhone = true
-                        playerLine.text =
-                            "Playing - the phone's volume was at 0, so it is at ${volume.quietComfortLevel} now."
-                    }
-                }
-            }
+            if (track == null) playerLine.text = "Pick a file in the list first." else startTrack(track)
         })
-        fileRow.addView(fileButton("Pause") { player.pause() })
-        fileRow.addView(fileButton("Stop") {
-            player.stop()
-            playerView.visibility = View.GONE
-        })
+        // Pause and Stop are not in this row any more. The bar below has them, in the order the desktop's
+        // bar has them, and a phone with two ways to pause a track is a phone with one of them left stale.
         column.addView(fileRow)
+
+        // The play bar: the desktop's controls, in the order a phone screen wants them - shuffle outside
+        // left, prev / play-pause / restart / next across the middle, "stop after current" outside right.
+        //
+        // The captions are words, not the desktop's glyphs. The desktop's bar is drawn with Segoe MDL2
+        // Assets codepoints (U+E768 play, U+E769 pause, U+E72C replay, U+E892/E893 prev/next, U+E8B1
+        // shuffle), which are private-use codepoints that exist in that Windows font and in no Android
+        // font - on a phone they draw empty boxes. The words are the desktop's own: they are what its tray
+        // menu uses for the same commands, and each button carries the desktop's tooltip as its own.
+        val playBar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        shuffleButton = barButton("Shuffle", "Shuffle Playback (Toggle)") { pressShuffle() }
+        prevButton = barButton("Prev", "Previous track") { pressPrevious() }
+        playButton = barButton("Play", "Play / Pause") { pressPlayPause() }
+        restartButton = barButton("Restart", "Replay - play this track again from the beginning") { pressRestart() }
+        nextButton = barButton("Next", "Next track") { pressNext() }
+        stopAfterButton = barButton("■ Off", PlaybackWords.stopAfterTooltips.getValue(StopAfter.OFF)) {
+            pressStopAfter()
+        }
+        playBar.addView(shuffleButton, barLayout())
+        playBar.addView(prevButton, barLayout())
+        playBar.addView(playButton, barLayout(1.2f))
+        playBar.addView(restartButton, barLayout(1.2f))
+        playBar.addView(nextButton, barLayout())
+        playBar.addView(stopAfterButton, barLayout(1.1f))
+        column.addView(playBar)
 
         // The phone's media volume, on a bar in the window. The phone has its own ways to move it - hardware
         // keys, a headset, a system slider - and this bar reads the same stream those move, so it is never a
@@ -241,6 +304,7 @@ class MainActivity : ComponentActivity() {
         // Letting go of the host travels with the volume row, not the file row: five buttons in a row on a
         // phone screen is a row where the last one is unreadable.
         volumeRow.addView(fileButton("Clear") { model.clear() })
+        volumeRow.addView(fileButton("Forget host") { model.forgetNewest() })
         column.addView(volumeRow)
 
         playerView = PlayerView(this).apply {
@@ -284,6 +348,207 @@ class MainActivity : ComponentActivity() {
             setOnClickListener { action() }
         }
 
+    /** A button on the play bar. The bar's buttons are the same size and the same colour by default. */
+    private fun barButton(label: String, tooltip: String, action: () -> Unit): Button =
+        Button(this).apply {
+            text = label
+            textSize = 12f
+            isAllCaps = false
+            tooltipText = tooltip
+            contentDescription = tooltip
+            setBackgroundColor(BAR_BASE)
+            setOnClickListener { action() }
+        }
+
+    /** Bar buttons share a row evenly; a bigger weight is how the play button gets the desktop's bigger box. */
+    private fun barLayout(weight: Float = 1f): LinearLayout.LayoutParams =
+        LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, weight)
+
+    /** Put a track on the player from the beginning, and stand the session on it. */
+    private fun startTrack(track: Track) {
+        val file = model.downloadedFile(track.name)
+        // The player is not asked for a file the phone does not have. It used to be, and what came back was
+        // a source error two seconds deep in Media3 and a window that said nothing.
+        if (!file.exists()) {
+            playerLine.text = "${track.name} is not on the phone yet - Take it first."
+            return
+        }
+        playerView.visibility = View.VISIBLE
+        queue.select(track.name)
+        trackList.setItemChecked(queue.index, true)
+        playingTrack = track
+        finishedTrack = null
+        player.play(file)
+        putKeyboardAway()
+        // The phone can be muted - its own audio policy ducks and mutes this stream under its own sound - and
+        // a file played into a muted phone is a file played into nobody. The note is kept so the state line
+        // carries it, because the player's own "Playing." arrives after it and would otherwise wipe the only
+        // words explaining why the sound is quiet.
+        if (volume.raiseFromMute()) {
+            playedWithQuietPhone = true
+            playerLine.text =
+                "Playing - the phone's volume was at 0, so it is at ${volume.quietComfortLevel} now."
+        }
+    }
+
+    /**
+     * The play bar's middle button. It does what pressing it would do right now, which is the desktop's rule
+     * for the same button: start a stopped track, pause a playing one, start a finished one from the top.
+     */
+    private fun pressPlayPause() {
+        val finished = finishedTrack
+        if (finished != null) {
+            startTrack(finished)
+            return
+        }
+        val current = playingTrack
+        if (current == null) {
+            val picked = selectedTrack()
+            if (picked == null) {
+                playerLine.text = PlaybackWords.nothingPlaying
+                return
+            }
+            startTrack(picked)
+            return
+        }
+        // A player let go of by "stop after current" has no media item left: pressing Play there starts the
+        // track again rather than asking a stopped player to play nothing.
+        if (player.exo.playbackState == Player.STATE_IDLE) {
+            startTrack(current)
+            return
+        }
+        if (player.exo.isPlaying) player.pause() else player.exo.playWhenReady = true
+    }
+
+    /** The track from the top. The desktop's Replay, on its own button because a phone screen has room. */
+    private fun pressRestart() {
+        val track = playingTrack
+        if (track == null || finishedTrack != null) {
+            val picked = track ?: selectedTrack()
+            if (picked == null) {
+                playerLine.text = PlaybackWords.nothingPlaying
+                return
+            }
+            startTrack(picked)
+            return
+        }
+        player.exo.seekTo(0L)
+        player.exo.playWhenReady = true
+        playerLine.text = "Restarted ${track.name} from the beginning."
+    }
+    private fun pressPrevious() {
+        val moved = queue.previous()
+        if (moved == null) {
+            playerLine.text = PlaybackWords.noPrevious
+            return
+        }
+        playAt(moved)
+    }
+
+    private fun pressNext() {
+        val moved = queue.next()
+        if (moved == null) {
+            playerLine.text = PlaybackWords.noNext
+            return
+        }
+        playAt(moved)
+    }
+
+    private fun playAt(position: Int) {
+        val track = model.tracks.value.getOrNull(position) ?: return
+        trackList.setItemChecked(position, true)
+        startTrack(track)
+    }
+
+    private fun pressShuffle() {
+        val on = queue.toggleShuffle()
+        paintShuffle()
+        playerLine.text = if (on) PlaybackWords.shuffleOn else PlaybackWords.shuffleOff
+    }
+
+    private fun pressStopAfter() {
+        queue.cycleStopAfter()
+        paintStopAfter()
+        playerLine.text = queue.stopAfterWords()
+    }
+
+    /** The shuffle button says "on" the way the desktop's does - a colour, not a caption. */
+    private fun paintShuffle() {
+        shuffleButton.setBackgroundColor(if (queue.shuffled) Color.parseColor("#1E88E5") else BAR_BASE)
+    }
+
+    /**
+     * The stop-after button, in its three states.
+     *
+     * The caption is the desktop's own square with the desktop's own label, and the colours are the
+     * desktop's own - grey at off, the amber of "this track is the last one", the red of "every track stops
+     * when it ends". A control whose colour is its state is a control that can be read at a glance in a
+     * pocket, which is what a phone screen is for.
+     */
+    private fun paintStopAfter() {
+        val state = queue.stopAfter
+        stopAfterButton.text = "\u25A0 " + state.label
+        stopAfterButton.tooltipText = PlaybackWords.stopAfterTooltips.getValue(state)
+        stopAfterButton.setBackgroundColor(
+            when (state) {
+                StopAfter.OFF -> BAR_BASE
+                StopAfter.ONCE -> Color.parseColor("#FF8C00")
+                StopAfter.ALWAYS -> Color.parseColor("#E31E24")
+            },
+        )
+    }
+
+    /** The caption and the tooltip that say what pressing the middle button would do. */
+    private fun paintPlayButton(state: Playback) {
+        playButton.text = when (state) {
+            Playback.PLAYING -> "Pause"
+            Playback.ENDED -> "Replay"
+            Playback.PAUSED, Playback.STOPPED, Playback.GETTING_READY -> "Play"
+        }
+        playButton.tooltipText =
+            if (state == Playback.ENDED) "Replay - play this track again from the beginning" else "Play / Pause"
+    }
+
+    /**
+     * A file ran to its end. This is where "stop after current" and shuffle live, and it is the same on the
+     * desktop: a track ending advances to the next one, stops when the button says to, and spends a "once"
+     * on the way.
+     */
+    private fun trackFinished() {
+        val finished = playingTrack ?: return
+        finishedTrack = finished
+        val armed = queue.stopAfter
+        if (queue.shouldStopAfterCurrent()) {
+            paintStopAfter()
+            playerLine.text = if (armed == StopAfter.ALWAYS) PlaybackWords.stoppedAfterAlways
+            else PlaybackWords.stoppedAfterOnce
+            player.stop()
+            playerView.visibility = View.GONE
+            return
+        }
+        val moved = queue.next()
+        if (moved == null) {
+            playerLine.text = PlaybackWords.noNext
+            return
+        }
+        val next = model.tracks.value.getOrNull(moved) ?: return
+        trackList.setItemChecked(moved, true)
+        if (!model.downloadedFile(next.name).exists()) {
+            // Advancing onto a track that is not on the phone is not the player failing. It is the end of
+            // what this phone can play by itself, and saying so is what keeps a session from looking stuck.
+            playerLine.text = "${next.name} is not on the phone yet - Take it first."
+            player.stop()
+            playerView.visibility = View.GONE
+            return
+        }
+        startTrack(next)
+    }
+
+    /** What the bar's buttons are painted with when they have nothing to say. */
+    private val BAR_BASE: Int = Color.parseColor("#D8D8D8")
+
+
+
     /**
      * Put the keyboard away. It is needed for one thing in this window - naming the sync code - and it covers
      * half of the screen while it is up, which is exactly the half holding the file list a person is picking
@@ -318,7 +583,12 @@ class MainActivity : ComponentActivity() {
             model.hosts.collect { hosts ->
                 hostAdapter.clear()
                 hostAdapter.addAll(hosts.map { host ->
-                    host.ip + ":" + host.port + "  " +
+                    // A saved host is named by its record, because the record carries the chain the host
+                    // called itself and the code that paired with it, and a person needs to see that this row
+                    // is the machine they paired with before, not a machine the scan just found.
+                    val record = model.saved.value.firstOrNull { it.ip == host.ip && it.port == host.port }
+                    if (host.saved && record != null) record.row()
+                    else host.ip + ":" + host.port + "  " +
                         host.chains.joinToString(", ").ifEmpty { "no chain named" } +
                         "  protocol " + (host.protocolVersion ?: "not named")
                 })
@@ -327,10 +597,18 @@ class MainActivity : ComponentActivity() {
         // The file list says what is on the phone as well as what the host named, and the downloaded flow is
         // what changes under a Take, so both flows redraw the same rows.
         val showTracks = {
+            val names = model.tracks.value.map { it.name }
+            // A new list from a host is a new session, and the track this phone is playing is the one place
+            // in it the session is standing. Rebuilding the queue on every refresh and losing where the
+            // player is - which is what a naive refresh does - is how a Next lands on a random track.
+            if (names != queue.names) {
+                val held = playingTrack?.name
+                queue = PlayQueue(names).apply { held?.let { select(it) } }
+            }
             trackAdapter.clear()
-            trackAdapter.addAll(model.tracks.value.map { track ->
-                track.name + "  " + (track.size / 1024) + " KiB" +
-                    (if (model.downloadedFile(track.name).exists()) "  on the phone" else "")
+            trackAdapter.addAll(names.mapIndexed { position, name ->
+                name + "  " + (model.tracks.value[position].size / 1024) + " KiB" +
+                    (if (model.downloadedFile(name).exists()) "  on the phone" else "")
             })
         }
         lifecycleScope.launch { model.tracks.collect { showTracks() } }
@@ -341,6 +619,9 @@ class MainActivity : ComponentActivity() {
         TypedValue.COMPLEX_UNIT_DIP, value.toFloat(), resources.displayMetrics
     ).toInt()
 }
+
+/** What the player is doing, in the states a play bar's button cares about. */
+enum class Playback { PLAYING, PAUSED, ENDED, STOPPED, GETTING_READY }
 
 /**
  * The player. A file taken from a chain is played from where it lies on the phone - Media3 reads the local
@@ -353,18 +634,31 @@ class MainActivity : ComponentActivity() {
  * stream away entirely at the first system sound. That is exactly the music that plays barely audibly, stops
  * when the notification shade comes down, and will not start again - and `handleAudioFocus` is what makes the
  * player ask for the stream, hand it over when the phone takes it, and take it back when the phone offers it.
+ *
+ * The renderers factory is the other half of why it is not one line: it is where the thirty percent that
+ * every track gets before the phone's volume applies is put into the audio path (see [BoostedAudio]).
  */
-class PhonePlayer(context: Context) {
+class PhonePlayer(
+    context: Context,
+    private val renderers: RenderersFactory = BoostedRenderersFactory(context),
+) {
+
+    /** The renderers this player plays with, which is what a check reads. */
+    val renderersFactory: RenderersFactory get() = renderers
+
+    /** How much louder a track is than the file on the phone, before the phone's dial does anything. */
+    val boost: Float get() = BoostedAudio.GAIN
 
     val exo: ExoPlayer = ExoPlayer.Builder(context)
+        .setRenderersFactory(renderers)
         .setAudioAttributes(
             // Media3's own attributes type, not `android.media.AudioAttributes`: the player takes its own. The
-            // usage and content it names are Media3's `C.USAGE_MEDIA` and `C.CONTENT_TYPE_MUSIC`, which are the
+            // usage and content it names are Media3's `C.USAGE_MEDIA` and `C.AUDIO_CONTENT_TYPE_MUSIC`, which are the
             // phone's own `USAGE_MEDIA` and `CONTENT_TYPE_MUSIC` values - the phone's audio policy is what the
             // player is talking to.
             androidx.media3.common.AudioAttributes.Builder()
                 .setUsage(androidx.media3.common.C.USAGE_MEDIA)
-                .setContentType(androidx.media3.common.C.CONTENT_TYPE_MUSIC)
+                .setContentType(androidx.media3.common.C.AUDIO_CONTENT_TYPE_MUSIC)
                 .build(),
             /* handleAudioFocus = */ true,
         )
@@ -431,6 +725,48 @@ class PhonePlayer(context: Context) {
                 report(playingOrPaused(playWhenReady) + " " + reasonWords(reason))
             }
         })
+    }
+
+    /**
+     * Which of the states a play bar cares about the player is in.
+     *
+     * The bar's middle button says what pressing it would do, so it has to be told when the player starts,
+     * pauses, finishes, and stops - the same four facts the desktop's `_update_play_button` is called for.
+     * Both callbacks again, for the same reason [reportState] uses both: a Pause moves only
+     * `playWhenReady`, and a finished file moves only the playback state.
+     */
+    fun reportPlayback(report: (Playback) -> Unit) {
+        exo.addListener(object : Player.Listener {
+            override fun onPlaybackStateChanged(state: Int) {
+                report(classify(state, exo.playWhenReady))
+            }
+
+            override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                report(classify(exo.playbackState, playWhenReady))
+            }
+        })
+    }
+
+    /**
+     * The one fact a playing session runs on: a file ran to its end.
+     *
+     * Advancing to the next track, stopping because "stop after current" is armed, and spending a "once" are
+     * all decided by whoever is watching for this. A phone that never hears it is a phone whose session stops
+     * after the first track and calls that playing.
+     */
+    fun reportFinished(report: () -> Unit) {
+        exo.addListener(object : Player.Listener {
+            override fun onPlaybackStateChanged(state: Int) {
+                if (state == Player.STATE_ENDED) report()
+            }
+        })
+    }
+
+    private fun classify(state: Int, playing: Boolean): Playback = when (state) {
+        Player.STATE_IDLE -> Playback.STOPPED
+        Player.STATE_BUFFERING -> Playback.GETTING_READY
+        Player.STATE_ENDED -> Playback.ENDED
+        else -> if (playing) Playback.PLAYING else Playback.PAUSED
     }
 
     private fun playingOrPaused(playing: Boolean): String = if (playing) "Playing." else "Paused."

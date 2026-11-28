@@ -137,6 +137,23 @@ A phone needs a **manual fallback** for what discovery cannot solve: an address 
 Android does not grant multicast to ordinary apps on most access points, so a phone's discovery is a TCP
 scan plus a keypad, and it should remember the address a host last answered from - a host that changed
 address is found again by its code.
+### Saved host records
+
+A phone keeps what a pair taught it, and a saved record is **an invitation to pair again, not proof that a
+host exists**. The record is the answer a `HELLO` gave - address, port, the chain's `sync_code`, the chain
+name, the `protocol_version` the host named, and when it was last seen - and nothing else: no session, no
+key, no permission.
+
+- Only a pair that was **accepted** is saved. A `HELLO` that answered with chains is not a pair; a `AUTH`
+  that was refused saves nothing.
+- A saved record is offered to be tapped. Pairing from it is the same `AUTH` with the record's code - the
+  protocol has no other way in, and no saved record is read as a session that is already open.
+- A host that answers with a chain the phone has never seen saves that chain; a host that has gone away is
+  answered as gone, and the record stays. Forgetting a record is a thing the person asks for, and it closes
+  the connection it owns.
+- Ending a session - "clear" - keeps the records: the phones that were paired are exactly the addresses
+  worth finding again.
+
 
 ## 5. A session
 
@@ -513,6 +530,36 @@ does not:
   - **A pull lives in the app, not in a service.** One file at a time, no resume, and a pull running when the
     app is backgrounded dies with it. `onStop` pauses playback for the same reason: nothing in this app is
     allowed to make sound from the background. A foreground service is what fixes both, and it is not written.
+  - **A host this phone has paired with is written down on the phone** (`SavedHosts`, in the app's own
+    preferences): the address, the port, the `sync_code` that pair used, the chain name the host answered with,
+    the protocol version it named, and when it was last seen. The next start of the app lists that host before
+    any scanning and pairs with it from the record - the code is not typed again, and nothing is guessed. A
+    successful pair is the only thing that writes a record; a pair that failed, and an address added by hand,
+    are not hosts. `Clear` ends a session and leaves the records; `Forget host` crosses one off, and a
+    connection to a forgotten host goes with it. The check runs the pair twice - the first through a scripted
+    host, the second against a host standing on the same address the record named, with no scan in between -
+    and the frames the second pairing speaks are the frames the recording says a pairing speaks.
+  - **An address can be typed in by hand**, which is what a phone needs on a VPN, a hotspot, a guest network,
+    or a subnet wider than the scan's budget: the desktop has always let a person name an address. The port
+    defaults to 63350, and a hand-added host is remembered the moment it pairs, like any other.
+  - **The player bar is the desktop's controls**, in the order a phone screen wants: shuffle outside left,
+    previous / play-pause / restart / next across the middle, and one button cycling "stop after current"
+    through Off, Once, Always outside right. Shuffle picks out of the tracks not played yet and never plays a
+    track straight after playing it; Previous walks back out of the order the shuffle made. A track ending
+    advances to the next one, stops when the button says to, and spends a "once" on the way - the same rules as
+    `play_next`, `play_previous` and `_finish_stop_after_current`, with the same sentences. The captions are
+    words, because the desktop's glyphs are Segoe MDL2 codepoints (U+E768 and friends) that exist in no Android
+    font, and the tooltips are the desktop's own strings. The state of the session lives in `PlayQueue`, plain
+    Kotlin with no player in it, where it is checked without a phone.
+  - **Every track is played 30 percent louder than the file on the phone, before the phone's volume applies.**
+    `GainAudioProcessor` scales decoded PCM in the player's audio sink - 16-bit, 24-bit packed, 32-bit and
+    float, clamped at full scale - and `BoostedRenderersFactory` is what puts it in the sink. This is the
+    phone's loudness, not the protocol's: nothing on the wire changes, a host cannot see it, and a file taken
+    from a host is the file the host sent. It is here because a phone's media dial is coarse and quiet - this
+    app's emulator test phone needed 13 of 15 for what the desktop calls normal - and the desktop's own volume
+    control has always run to 150 percent for the same reason. Media3 1.5.1 has no volume scaling in
+    `SonicAudioProcessor` (`setVolumeScalingEnabled`/`setVolume` arrive in 1.6), so the scaling is this app's
+    own processor, and the price is the audio-offload path the factory's default sink would have used.
 
 ### On the emulator, 28 Nov 2026
 
@@ -552,6 +599,15 @@ came out of the phone. What the phone taught on the way:
     taller than it.
   - **The side toolbar needs `hw.keyboard=yes` in the AVD.** With `hw.keyboard=no` its buttons do nothing; the
     keyboard line in `config.ini` is what they are wired through.
+  - **A press is swallowed while the keyboard is animating in.** After typing into the code box, send
+    `keyevent 111` and wait two seconds before the next tap: during the insets animation the tap does not reach
+    the app, and a button that is wired correctly looks exactly like a button that does nothing. The log line
+    naming it is `force finish cuj, time out: J<IME_INSETS_SHOW_ANIMATION::0@0@dev.ytmsd.phone>`, and no amount
+    of tapping the right coordinates helps.
+  - **The volume slider sits about 56 pixels below the button row once the video view has appeared**, and a
+    slider's touch area is generous. Presses aimed at the row at y 1900 moved `STREAM_MUSIC` from 13 to 11 and
+    then to 3 while the intent was Pause and Play. Take each press's coordinates from the node in the window,
+    and read the phone's volume back from `dumpsys audio` rather than assuming a button press moved nothing.
   - **A phone that stopped to read a screen is a phone whose host has hung up.** A take answered "the host
     would not send …" and the second press said `Taking …` forever. The host's loop is
     `recv_json_msg(sock, timeout=30.0)` and a `break` (`host.py`): 30 seconds after the list landed, with

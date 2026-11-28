@@ -173,4 +173,140 @@ class SyncViewModelTest {
         }
     }
 
+    @Test
+    fun `a host this app paired with is the host the app starts again with`() {
+        val session = PhoneSession.load()
+        val root = Files.createTempDirectory("ytmsd-phone-saved").toFile()
+        val library = FixtureLibrary.writeInto(File(root, "host library"))
+        val context = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        SavedHosts(context).clear()
+
+        val first = ScriptedHost(session, library).also { it.start() }
+        val firstLaunch = SyncViewModel()
+        var savedPort = 0
+        try {
+            firstLaunch.init(context)
+            assertTrue(
+                "a fresh phone started showing hosts it never paired with",
+                firstLaunch.saved.value.isEmpty(),
+            )
+
+            firstLaunch.scan(targets = listOf("127.0.0.1"), ports = listOf(first.port))
+            assertTrue("the scan found nothing: " + firstLaunch.status.value,
+                await { firstLaunch.hosts.value.isNotEmpty() })
+            firstLaunch.pairAndLoad(firstLaunch.hosts.value.first(), session.chain, session.clientIp)
+            assertTrue("pairing left no list: " + firstLaunch.status.value,
+                await { firstLaunch.tracks.value.isNotEmpty() })
+
+            // The pair wrote the host down: the address, the port, the code typed, the chain the host called
+            // itself, and the version it answered with.
+            val records = firstLaunch.saved.value
+            assertEquals("a successful pair remembered no host", 1, records.size)
+            assertEquals("127.0.0.1", records.first().ip)
+            assertEquals(first.port, records.first().port)
+            assertEquals(session.chain, records.first().code)
+            assertEquals("Phone Test", records.first().chainName)
+            assertEquals(1, records.first().protocolVersion)
+            savedPort = first.port
+        } finally {
+            firstLaunch.clear()
+            first.stop()
+        }
+
+        // The app starts again: a new view model, the same phone. No scan has been run, and the host is
+        // already on the list - the desktop's rule being that a chain you have synced with is a chain you
+        // have, and not something a machine re-learns every time it wakes up.
+        val secondLaunch = SyncViewModel()
+        val second = ScriptedHost(session, library, bindPort = savedPort).also { it.start() }
+        try {
+            secondLaunch.init(context)
+            assertEquals("the restarted app remembered no host", 1, secondLaunch.saved.value.size)
+            assertEquals(
+                "the saved host is on the screen before any scan",
+                listOf("127.0.0.1:$savedPort"),
+                secondLaunch.hosts.value.map { it.ip + ":" + it.port },
+            )
+            assertTrue("the saved host must be marked as saved", secondLaunch.hosts.value.first().saved)
+            assertTrue(
+                "a restarted app must say what it has: " + secondLaunch.status.value,
+                secondLaunch.status.value.contains("saved host", ignoreCase = true),
+            )
+
+            // Pressing the saved host pairs with it - with the code typed at the time, and nothing typed now.
+            // The address named on the AUTH is the one the recording was made from, for the same reason the
+            // first pairing names it: two AUTH frames naming two addresses are two different frames.
+            secondLaunch.pairSaved(secondLaunch.saved.value.first(), clientIp = session.clientIp)
+            assertTrue(
+                "the saved host did not answer with its list: " + secondLaunch.status.value,
+                await { secondLaunch.tracks.value.isNotEmpty() },
+            )
+            assertEquals(listOf("one.mp3", "two.mp3"), secondLaunch.tracks.value.map { it.name })
+
+            // And the host is usable, not merely listed: a file takes the way it did on the first start.
+            secondLaunch.pull(secondLaunch.tracks.value.first())
+            assertTrue(
+                "the saved host took no file: " + secondLaunch.status.value,
+                await { secondLaunch.downloaded.value.isNotEmpty() },
+            )
+            assertTrue(secondLaunch.downloadedFile("one.mp3").exists())
+
+            // The pair spoke the frames the recording says a pair speaks, and nothing else: remembering a
+            // host may not change what a client says to it.
+            second.mismatches.forEach { line -> throw AssertionError("the host saw something else: $line") }
+
+            // A host can be crossed off, and the next start does not show it.
+            secondLaunch.forgetNewest()
+            assertTrue("forgetting left the host saved", secondLaunch.saved.value.isEmpty())
+            assertTrue("forgetting left the host on the list", secondLaunch.hosts.value.isEmpty())
+            assertTrue(secondLaunch.status.value.contains("forgotten", ignoreCase = true))
+            assertEquals(0, SavedHosts(context).all().size)
+        } finally {
+            secondLaunch.clear()
+            second.stop()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `a host named by hand goes on the list, and a bad one is said as a bad one`() {
+        val context = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        val model = SyncViewModel()
+        try {
+            model.init(context)
+            model.addHost("192.168.1.20", 63351)
+            assertEquals(
+                "the hand-added host is not on the list",
+                "192.168.1.20:63351",
+                model.hosts.value.firstOrNull()?.let { it.ip + ":" + it.port },
+            )
+            assertTrue(
+                "a hand-added host is paired by typing its code: " + model.status.value,
+                model.status.value.contains("type the code", ignoreCase = true),
+            )
+
+            model.addHost("   ", 63350)
+            assertTrue(
+                "an empty address has to be said as one: " + model.status.value,
+                model.status.value.contains("Type the host's address first", ignoreCase = true),
+            )
+            model.addHost("192.168.1.20", 70000)
+            assertTrue(
+                "a port off the end of the dial has to be said as one: " + model.status.value,
+                model.status.value.contains("not a port number", ignoreCase = true),
+            )
+
+            // An address with no host behind it answers the way an address with no host behind it answers, and
+            // says it on the window. A host nobody paired with is not a host to remember.
+            model.pairAndLoad(model.hosts.value.first(), "1234", "127.0.0.1")
+            assertTrue(
+                "a dead address left the window saying nothing: " + model.status.value,
+                await(millis = 20000) { model.status.value.contains("could not be reached") },
+            )
+            assertTrue("a host nobody paired with must not be remembered", model.saved.value.isEmpty())
+        } finally {
+            model.clear()
+        }
+    }
 }
+
+

@@ -41,6 +41,18 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
+    lint {
+        // Media3 marks its player plumbing - `Renderer`, `DefaultRenderersFactory`, `DefaultAudioSink` and
+        // the rest - `@UnstableApi`, and this app opts in to it with Kotlin's `@OptIn(UnstableApi::class)` on
+        // the two classes that touch that plumbing. The Kotlin compiler accepts that, and the build compiles;
+        // AGP's lint does not read a `@RequiresOptIn` marker defined in Java when it is opted in from Kotlin,
+        // and reports every use of an opted-in declaration as unopted-in - one error per call, over the whole
+        // file. This turns that one check off. It is not a way of ignoring a real problem: lint's own advice
+        // in the message is `@OptIn(markerClass = UnstableApi.class)`, which is what the code already says.
+        disable += "UnsafeOptInUsageError"
+    }
+
+
 
     testOptions {
         unitTests {
