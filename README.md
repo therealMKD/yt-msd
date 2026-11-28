@@ -65,6 +65,13 @@ Installation instructions for the Musicbee plugin are in the [Plugin Readme](htt
 ## Support for other operating systems (GUI version):
 I had previously planned for at least Linux support, but as the program has gotten further on in development, there are a lot of features that just won't work on Linux, and would require separate handling. I don't want to bloat up the main program, and having a dedicated Linux version isn't something I have time to support. Therefore, support for other operating systems does not exist, and if you run yt-msd on other operating systems, a great deal of features most likely will not work, due to dependency on windows. If you want to use yt-msd on other platforms, use the legacy pyw version, but don't expect sync to work at all, and expect bugs.
 
+## Legacy version support:
+This project makes no guarantees about legacy support, only the latest release is supported and verified to be 100% working. However, there ARE things that "should" be supported and will "probably" work on legacy versions, if you want to use a legacy version for whatever reason. 
+
+First of all, sync *should* work as far back to `PRE-2.5`, when it was first added. I haven't changed the core majorly, and obviously most modern features won't work, but the basic sync actions should still be operational. 
+
+Any version older than `RELEASE-3.0` will not be able to play videos, and quite possibly won't be able to search. This is because of yt-dlp previously being bundled with the program until 3.0, when it was made updatable through winget. Yt-dlp constantly updates because Google keeps changing youtube and breaking it, so old versions of yt-msd will have non functional versions of yt-dlp. If you really really want to use yt-msd 1.0 or a different pre-3.0 version, use the python edition, so you can update yt-dlp. Otherwise it won't work.
+
 # CLI Version Readme
 
 There are 3 versions of the CLI: The python version, which requires python to be installed, as well as yt-dlp `pip install yt-dlp` and ffmpeg `pip install ffpmeg` AND `winget install ffmpeg`, the pex version, which only requires python and ffmpeg `winget install ffmpeg`, as well as the exe version. This will run as a standalone program, and everything you need will be bundled with it. This can also be added to the system's PATH, so that you can run yt-msd from anywhere by just initializing it with `yt-msd` in the terminal. All versions will generate a config.json file in their root directory. 
